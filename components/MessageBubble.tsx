@@ -1,0 +1,168 @@
+import React, { useMemo } from 'react';
+import { User, Copy, AlertCircle } from 'lucide-react';
+import { Message, Agent } from '../types';
+
+interface MessageBubbleProps {
+  message: Message;
+  agent?: Agent; // Undefined if user
+}
+
+interface Emotion {
+  name: string;
+  value: number;
+}
+
+// Generate a consistent color based on the emotion name
+const getEmotionColor = (name: string): string => {
+  const colors = [
+    'bg-red-500', 'bg-orange-500', 'bg-amber-500', 'bg-yellow-500', 'bg-lime-500',
+    'bg-green-500', 'bg-emerald-500', 'bg-teal-500', 'bg-cyan-500', 'bg-sky-500',
+    'bg-blue-500', 'bg-indigo-500', 'bg-violet-500', 'bg-purple-500', 'bg-fuchsia-500', 'bg-pink-500', 'bg-rose-500'
+  ];
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = name.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  return colors[Math.abs(hash) % colors.length];
+};
+
+const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
+  const isUser = message.role === 'user';
+  
+  const handleCopy = () => {
+    navigator.clipboard.writeText(message.content);
+  };
+
+  // Parse emotions from the beginning of the content
+  // Format: 【Name】Value% ...
+  const { emotions, cleanContent } = useMemo(() => {
+    if (isUser || !message.content) return { emotions: [], cleanContent: message.content };
+
+    const emotionRegex = /【([^】]+)】(\d+)%/g;
+    const emotions: Emotion[] = [];
+    let lastIndex = 0;
+    let match;
+
+    // Only match at the very beginning of the string (allow multiple tags)
+    // We check if the match starts where the previous match ended.
+    // However, the simple regex loop finds all. We need to ensure they are contiguous at the start.
+    
+    // Alternative approach: Match the whole block at start
+    const startBlockRegex = /^((?:【[^】]+】\d+%)+)(.*)/s;
+    const blockMatch = message.content.match(startBlockRegex);
+
+    if (blockMatch) {
+        const emotionBlock = blockMatch[1];
+        const contentBody = blockMatch[2]; // The rest of the message (keep newlines if any)
+        
+        // Parse individual emotions from the block
+        while ((match = emotionRegex.exec(emotionBlock)) !== null) {
+            emotions.push({
+                name: match[1],
+                value: parseInt(match[2], 10)
+            });
+        }
+        
+        // Trim leading newlines from content body for display
+        return { 
+            emotions, 
+            cleanContent: contentBody.replace(/^\s+/, '') 
+        };
+    }
+
+    return { emotions: [], cleanContent: message.content };
+  }, [message.content, isUser]);
+
+  return (
+    <div className={`flex w-full mb-6 ${isUser ? 'justify-end' : 'justify-start'}`}>
+      <div className={`flex max-w-[95%] md:max-w-[85%] gap-3 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}>
+        
+        {/* Avatar */}
+        <div className="shrink-0 mt-1">
+          {isUser ? (
+            <div className="w-8 h-8 rounded-full bg-zinc-700 flex items-center justify-center text-zinc-300 border border-zinc-600">
+              <User className="w-5 h-5" />
+            </div>
+          ) : (
+            <div 
+              className={`w-8 h-8 rounded-full flex items-center justify-center text-sm shadow-sm border border-white/10 overflow-hidden ${agent?.avatarType === 'image' ? 'bg-zinc-800' : (agent?.color || 'bg-zinc-600')}`}
+              title={agent?.name}
+            >
+              {agent?.avatarType === 'image' ? (
+                <img src={agent.avatar} alt={agent.name} className="w-full h-full object-cover" />
+              ) : (
+                agent?.avatar || '🤖'
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Content Bubble Wrapper */}
+        <div className="flex flex-col min-w-0 flex-1">
+          {!isUser && agent && (
+            <div className="flex items-center gap-2 mb-1 ml-1">
+                <span className="text-xs text-zinc-400 font-medium">
+                {agent.name}
+                </span>
+                {agent.thinkingBudget > 0 && <span className="text-[9px] bg-purple-500/20 text-purple-300 px-1 rounded border border-purple-500/30">Thinking</span>}
+            </div>
+          )}
+
+          {/* Emotions Display */}
+          {!isUser && emotions.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mb-2 ml-1">
+              {emotions.map((e, idx) => {
+                 const colorClass = getEmotionColor(e.name);
+                 return (
+                    <div key={idx} className="flex items-center gap-1.5 bg-zinc-800/80 border border-zinc-700/50 rounded px-2 py-0.5 text-[10px] text-zinc-300">
+                        <span className="font-medium opacity-90">{e.name}</span>
+                        <div className="w-12 h-1.5 bg-zinc-700 rounded-full overflow-hidden">
+                            <div 
+                                className={`h-full rounded-full ${colorClass}`} 
+                                style={{ width: `${Math.min(e.value, 100)}%` }}
+                            />
+                        </div>
+                        <span className="w-6 text-right font-mono opacity-70">{e.value}%</span>
+                    </div>
+                 );
+              })}
+            </div>
+          )}
+          
+          <div 
+            className={`
+              relative px-4 py-3 rounded-2xl text-sm leading-relaxed overflow-hidden group shadow-sm
+              ${isUser 
+                ? 'bg-zinc-800 text-zinc-100 rounded-tr-sm border border-zinc-700' 
+                : 'bg-zinc-900/80 text-zinc-200 rounded-tl-sm border border-zinc-800/80'}
+              ${message.error ? 'border-red-500/50 bg-red-900/10' : ''}
+            `}
+          >
+            {message.error ? (
+               <div className="flex items-center gap-2 text-red-400">
+                  <AlertCircle className="w-4 h-4" />
+                  <span>Error: {cleanContent}</span>
+               </div>
+            ) : (
+              <div className="whitespace-pre-wrap break-words">
+                {cleanContent || (message.isStreaming ? '' : <span className="text-zinc-500 italic">No content</span>)}
+                {message.isStreaming && (
+                  <span className="inline-block w-2 h-4 ml-1 align-middle bg-zinc-400 animate-pulse" />
+                )}
+              </div>
+            )}
+
+            {/* Message Actions */}
+            <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                <button onClick={handleCopy} className="p-1 text-zinc-500 hover:text-white rounded bg-zinc-900/50 backdrop-blur-sm">
+                    <Copy className="w-3 h-3" />
+                </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default MessageBubble;

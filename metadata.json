@@ -1,0 +1,5 @@
+{
+  "name": "Multi-Agent Nexus",
+  "description": "A ChatGPT-like interface enabling simultaneous conversations with multiple custom AI agents powered by Gemini.",
+  "requestFramePermissions": []
+}
