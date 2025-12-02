@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { X, Shuffle, Brain, Upload, Image as ImageIcon, Smile } from 'lucide-react';
+import { X, Shuffle, Brain, Upload, Image as ImageIcon, Smile, FileText, Trash2 } from 'lucide-react';
 import { Agent, ModelType } from '../types';
 import { AVATAR_COLORS, MODEL_OPTIONS } from '../constants';
 
@@ -16,6 +16,10 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
   const [systemInstruction, setSystemInstruction] = useState('');
   const [model, setModel] = useState<string>(ModelType.GEMINI_FLASH);
   
+  // Imported System Instruction State
+  const [importedInstruction, setImportedInstruction] = useState<string>('');
+  const [importedFileName, setImportedFileName] = useState<string>('');
+
   // Avatar state
   const [avatarType, setAvatarType] = useState<'emoji' | 'image'>('emoji');
   const [emojiAvatar, setEmojiAvatar] = useState('🤖');
@@ -25,12 +29,15 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
   const [thinkingBudget, setThinkingBudget] = useState<number>(0);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const mdInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (editingAgent) {
       setName(editingAgent.name);
       setDescription(editingAgent.description);
       setSystemInstruction(editingAgent.systemInstruction);
+      setImportedInstruction(editingAgent.importedSystemInstruction || '');
+      setImportedFileName(editingAgent.importedSystemInstructionFileName || '');
       setModel(editingAgent.model);
       setColor(editingAgent.color);
       setThinkingBudget(editingAgent.thinkingBudget);
@@ -53,6 +60,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
     setName('');
     setDescription('');
     setSystemInstruction('You are a helpful AI assistant.');
+    setImportedInstruction('');
+    setImportedFileName('');
     setModel(ModelType.GEMINI_FLASH);
     setAvatarType('emoji');
     setEmojiAvatar('🤖');
@@ -68,6 +77,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       name: name || 'Unnamed Agent',
       description,
       systemInstruction,
+      importedSystemInstruction: importedInstruction,
+      importedSystemInstructionFileName: importedFileName,
       model,
       color,
       avatar: avatarType === 'image' && imageAvatar ? imageAvatar : emojiAvatar,
@@ -113,6 +124,26 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       img.src = event.target?.result as string;
     };
     reader.readAsDataURL(file);
+  };
+
+  const handleMdUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const text = event.target?.result as string;
+      setImportedInstruction(text);
+      setImportedFileName(file.name);
+    };
+    reader.readAsText(file);
+    // Reset value so same file can be selected again if needed
+    if (mdInputRef.current) mdInputRef.current.value = '';
+  };
+
+  const clearImportedFile = () => {
+    setImportedInstruction('');
+    setImportedFileName('');
   };
 
   if (!isOpen) return null;
@@ -280,7 +311,9 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
 
           {/* System Prompt */}
           <div>
-            <label className="block text-sm font-medium text-zinc-300 mb-1">System Instructions</label>
+            <div className="flex justify-between items-center mb-1">
+               <label className="block text-sm font-medium text-zinc-300">System Instructions (Manual)</label>
+            </div>
             <textarea
               value={systemInstruction}
               onChange={(e) => setSystemInstruction(e.target.value)}
@@ -288,6 +321,49 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
               className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-white placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-blue-500/50 font-mono text-sm resize-none"
               placeholder="How should this agent behave?"
             />
+            
+            {/* Markdown File Upload */}
+            <div className="mt-4">
+              <label className="block text-sm font-medium text-zinc-300 mb-2">Additional Context (.md file)</label>
+              {importedFileName ? (
+                <div className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-lg border border-zinc-700/50">
+                   <div className="flex items-center gap-3 overflow-hidden">
+                      <div className="p-2 bg-zinc-800 rounded border border-zinc-700">
+                        <FileText className="w-4 h-4 text-blue-400" />
+                      </div>
+                      <div className="flex flex-col min-w-0">
+                        <span className="text-sm text-zinc-200 truncate font-medium">{importedFileName}</span>
+                        <span className="text-[10px] text-zinc-500">
+                          {importedInstruction.length} characters loaded
+                        </span>
+                      </div>
+                   </div>
+                   <button 
+                     type="button"
+                     onClick={clearImportedFile} 
+                     className="p-2 hover:bg-red-500/10 hover:text-red-400 text-zinc-500 rounded-lg transition-colors"
+                     title="Remove file"
+                   >
+                      <Trash2 className="w-4 h-4" />
+                   </button>
+                </div>
+              ) : (
+                <div 
+                   onClick={() => mdInputRef.current?.click()}
+                   className="border border-dashed border-zinc-700 rounded-lg p-4 flex flex-col items-center justify-center text-zinc-500 hover:text-zinc-300 hover:border-zinc-500 hover:bg-zinc-800/50 transition-all cursor-pointer group"
+                >
+                   <Upload className="w-5 h-5 mb-2 group-hover:-translate-y-0.5 transition-transform" />
+                   <span className="text-xs font-medium">Click to upload .md file</span>
+                </div>
+              )}
+              <input 
+                type="file" 
+                accept=".md, .txt, .markdown" 
+                className="hidden" 
+                ref={mdInputRef} 
+                onChange={handleMdUpload} 
+              />
+            </div>
           </div>
 
           <div className="pt-2">

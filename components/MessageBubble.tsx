@@ -1,5 +1,5 @@
 import React, { useMemo } from 'react';
-import { User, Copy, AlertCircle } from 'lucide-react';
+import { User, Copy, AlertCircle, FileText, Image as ImageIcon } from 'lucide-react';
 import { Message, Agent } from '../types';
 
 interface MessageBubbleProps {
@@ -33,29 +33,19 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
     navigator.clipboard.writeText(message.content);
   };
 
-  // Parse emotions from the beginning of the content
-  // Format: 【Name】Value% ...
   const { emotions, cleanContent } = useMemo(() => {
     if (isUser || !message.content) return { emotions: [], cleanContent: message.content };
 
     const emotionRegex = /【([^】]+)】(\d+)%/g;
     const emotions: Emotion[] = [];
-    let lastIndex = 0;
     let match;
-
-    // Only match at the very beginning of the string (allow multiple tags)
-    // We check if the match starts where the previous match ended.
-    // However, the simple regex loop finds all. We need to ensure they are contiguous at the start.
-    
-    // Alternative approach: Match the whole block at start
     const startBlockRegex = /^((?:【[^】]+】\d+%)+)(.*)/s;
     const blockMatch = message.content.match(startBlockRegex);
 
     if (blockMatch) {
         const emotionBlock = blockMatch[1];
-        const contentBody = blockMatch[2]; // The rest of the message (keep newlines if any)
+        const contentBody = blockMatch[2];
         
-        // Parse individual emotions from the block
         while ((match = emotionRegex.exec(emotionBlock)) !== null) {
             emotions.push({
                 name: match[1],
@@ -63,7 +53,6 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
             });
         }
         
-        // Trim leading newlines from content body for display
         return { 
             emotions, 
             cleanContent: contentBody.replace(/^\s+/, '') 
@@ -108,7 +97,6 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
             </div>
           )}
 
-          {/* Emotions Display */}
           {!isUser && emotions.length > 0 && (
             <div className="flex flex-wrap gap-1.5 mb-2 ml-1">
               {emotions.map((e, idx) => {
@@ -138,6 +126,30 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
               ${message.error ? 'border-red-500/50 bg-red-900/10' : ''}
             `}
           >
+            {/* Attachment Display */}
+            {message.attachments && message.attachments.length > 0 && (
+               <div className="flex flex-wrap gap-2 mb-3">
+                  {message.attachments.map((att, idx) => (
+                    <div key={idx} className="overflow-hidden rounded-lg border border-white/10 bg-black/20">
+                      {att.type === 'image' ? (
+                        <div className="relative group/img cursor-pointer">
+                           <img 
+                              src={att.data} 
+                              alt={att.name} 
+                              className="max-w-[200px] max-h-[200px] object-cover" 
+                           />
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-2 px-3 py-2">
+                           <FileText className="w-4 h-4 text-zinc-400" />
+                           <span className="text-xs text-zinc-300 max-w-[150px] truncate">{att.name}</span>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+               </div>
+            )}
+
             {message.error ? (
                <div className="flex items-center gap-2 text-red-400">
                   <AlertCircle className="w-4 h-4" />
@@ -145,14 +157,13 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
                </div>
             ) : (
               <div className="whitespace-pre-wrap break-words">
-                {cleanContent || (message.isStreaming ? '' : <span className="text-zinc-500 italic">No content</span>)}
+                {cleanContent || (message.isStreaming ? '' : <span className="text-zinc-500 italic">No text content</span>)}
                 {message.isStreaming && (
                   <span className="inline-block w-2 h-4 ml-1 align-middle bg-zinc-400 animate-pulse" />
                 )}
               </div>
             )}
 
-            {/* Message Actions */}
             <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
                 <button onClick={handleCopy} className="p-1 text-zinc-500 hover:text-white rounded bg-zinc-900/50 backdrop-blur-sm">
                     <Copy className="w-3 h-3" />

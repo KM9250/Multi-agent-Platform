@@ -1,6 +1,8 @@
+
 import React, { useState } from 'react';
 import { Plus, Settings, Trash2, Edit3, MessageSquare, Bot, X, Network, Loader2 } from 'lucide-react';
 import { Agent, Room } from '../types';
+import { ROOM_TAGS } from '../constants';
 
 interface SidebarProps {
   // Rooms
@@ -45,6 +47,11 @@ const AgentSidebar: React.FC<SidebarProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<'chats' | 'agents'>('chats');
 
+  const getTagColor = (tagName: string) => {
+    const tag = ROOM_TAGS.find(t => t.value === tagName);
+    return tag ? tag.color : 'bg-zinc-700 text-zinc-300 border-zinc-600';
+  };
+
   const renderRoomList = () => (
     <div className="space-y-2">
       <button
@@ -63,30 +70,38 @@ const AgentSidebar: React.FC<SidebarProps> = ({
             key={room.id}
             onClick={() => onSwitchRoom(room.id)}
             className={`
-              group relative flex items-center gap-3 p-3 rounded-xl cursor-pointer transition-all duration-200
+              group relative flex flex-col gap-1 p-3 rounded-xl cursor-pointer transition-all duration-200 border
               ${room.id === activeRoomId 
-                ? 'bg-zinc-800 text-zinc-100' 
-                : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200'}
+                ? 'bg-zinc-800 border-zinc-700/50 shadow-md' 
+                : 'border-transparent text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200'}
             `}
           >
-            <MessageSquare className={`w-5 h-5 ${room.id === activeRoomId ? 'text-blue-400' : 'text-zinc-600'}`} />
-            
-            <div className="flex-1 min-w-0">
-              <h4 className="font-medium text-sm truncate">{room.title || "New Chat"}</h4>
-              <span className="text-[10px] text-zinc-500">
-                {new Date(room.updatedAt).toLocaleDateString()}
-              </span>
+            <div className="flex items-center gap-3">
+               <MessageSquare className={`w-4 h-4 shrink-0 ${room.id === activeRoomId ? 'text-blue-400' : 'text-zinc-600'}`} />
+               <h4 className={`font-medium text-sm truncate flex-1 ${room.id === activeRoomId ? 'text-zinc-100' : 'text-zinc-400'}`}>
+                 {room.title || "New Chat"}
+               </h4>
+               {rooms.length > 1 && (
+                <button 
+                  onClick={(e) => { e.stopPropagation(); onDeleteRoom(room.id); }}
+                  className="opacity-0 group-hover:opacity-100 p-1 hover:bg-red-500/20 rounded text-zinc-500 hover:text-red-400 transition-all shrink-0"
+                  title="Delete Chat"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              )}
             </div>
-
-            {rooms.length > 1 && (
-              <button 
-                onClick={(e) => { e.stopPropagation(); onDeleteRoom(room.id); }}
-                className="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-red-500/20 rounded text-zinc-500 hover:text-red-400 transition-all"
-                title="Delete Chat"
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
-            )}
+            
+            <div className="flex items-center gap-2 pl-7">
+               {room.type && (
+                 <span className={`text-[9px] px-1.5 py-0.5 rounded border ${getTagColor(room.type)}`}>
+                   {room.type}
+                 </span>
+               )}
+               <span className="text-[10px] text-zinc-500 truncate flex-1">
+                  {room.description || new Date(room.updatedAt).toLocaleDateString()}
+               </span>
+            </div>
           </div>
         ))}
       </div>

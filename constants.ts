@@ -1,4 +1,5 @@
-import { Agent, ModelType, Message, Room } from './types';
+
+import { Agent, ModelType, Message, Room, RoomTag } from './types';
 
 // Emotion instruction provided by user
 export const EMOTION_INSTRUCTION = `
@@ -189,6 +190,12 @@ export const MODEL_OPTIONS = [
   { value: ModelType.GEMINI_PRO, label: 'Gemini 3.0 Pro Preview (Smart)' },
 ];
 
+export const ROOM_TAGS: { value: RoomTag; label: string; color: string }[] = [
+  { value: 'Sandbox', label: 'Sandbox', color: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' },
+  { value: 'Recreation', label: 'Recreation', color: 'bg-blue-500/20 text-blue-300 border-blue-500/30' },
+  { value: 'Hard', label: 'Hard', color: 'bg-red-500/20 text-red-300 border-red-500/30' },
+];
+
 // --- TEST DATA ---
 const DUMMY_MESSAGES: Message[] = [
   {
@@ -220,10 +227,12 @@ const DUMMY_MESSAGES: Message[] = [
   }
 ];
 
-export const createNewRoom = (): Room => {
+export const createNewRoom = (title: string, description: string, type: RoomTag): Room => {
   return {
     id: crypto.randomUUID(),
-    title: 'New Chat',
+    title,
+    description,
+    type,
     agents: JSON.parse(JSON.stringify(DEFAULT_AGENTS)), // Deep copy defaults
     messages: [],
     updatedAt: Date.now()
@@ -233,7 +242,9 @@ export const createNewRoom = (): Room => {
 export const INITIAL_ROOMS: Room[] = [
   {
     id: 'dummy-room-1',
-    title: 'Quantum Computing Impact',
+    title: 'Quantum Computing',
+    description: 'Discussion about the future of encryption',
+    type: 'Sandbox',
     agents: JSON.parse(JSON.stringify(DEFAULT_AGENTS)),
     messages: DUMMY_MESSAGES,
     updatedAt: Date.now()

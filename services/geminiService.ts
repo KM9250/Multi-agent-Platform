@@ -1,27 +1,76 @@
-import { GoogleGenAI, Content } from "@google/genai";
+import { GoogleGenAI, Content, Part } from "@google/genai";
 import { Message, Agent, ModelType } from "../types";
 import { DECISION_SYSTEM_INSTRUCTION } from "../constants";
 
+// Helper to convert internal Message structure to Gemini Content Parts
+const messageToParts = (message: Message): Part[] => {
+  const parts: Part[] = [];
+
+  // 1. Add Attachments
+  if (message.attachments && message.attachments.length > 0) {
+    message.attachments.forEach(att => {
+      if (att.type === 'image') {
+        // Remove data URL header (e.g., "data:image/png;base64,") for the API
+        const base64Data = att.data.split(',')[1]; 
+        parts.push({
+          inlineData: {
+            mimeType: att.mimeType,
+            data: base64Data
+          }
+        });
+      } else if (att.type === 'text') {
+        // Format text files clearly
+        parts.push({
+          text: `\n\n--- File: ${att.name} ---\n${att.data}\n--- End of File ---\n\n`
+        });
+      }
+    });
+  }
+
+  // 2. Add Main Text Content
+  if (message.content) {
+    parts.push({ text: message.content });
+  }
+
+  return parts;
+};
+
 // Helper to sanitize/prepare history for the specific agent
-// We only want the USER messages and THIS AGENT'S messages.
-// We do not want Agent A to see Agent B's replies in the context usually,
-// unless it's a "debate" mode. For this UI, we treat them as parallel conversations.
 const buildHistoryForAgent = (allMessages: Message[], agentId: string): Content[] => {
   return allMessages
     .filter(m => m.role === 'user' || (m.role === 'model' && m.agentId === agentId))
     .map(m => ({
       role: m.role,
-      parts: [{ text: m.content }]
+      parts: messageToParts(m)
     }));
 };
 
 const buildHistoryForDecision = (allMessages: Message[]): Content[] => {
-  // For decision making, the agent needs to see the WHOLE conversation context
-  // to know if others have replied or if it's relevant.
-  return allMessages.map(m => ({
+  // For decision making, strictly use text to save tokens, ignoring images for now
+  // unless strictly necessary.
+  return allMessages.map(m => {
+    let content = m.content;
+    // Append attachment names to context so the agent knows a file exists
+    if (m.attachments?.length) {
+      const fileNames = m.attachments.map(a => `[${a.type} file: ${a.name}]`).join(', ');
+      content += `\n${fileNames}`;
+    }
+    return {
       role: m.role === 'user' ? 'user' : 'model',
-      parts: [{ text: `[${m.role === 'user' ? 'User' : 'Agent'}] ${m.content}` }]
-  }));
+      parts: [{ text: `[${m.role === 'user' ? 'User' : 'Agent'}] ${content}` }]
+    };
+  });
+};
+
+const getCombinedSystemInstruction = (agent: Agent): string => {
+  const parts = [];
+  if (agent.systemInstruction) {
+    parts.push(agent.systemInstruction);
+  }
+  if (agent.importedSystemInstruction) {
+    parts.push(`\n\n--- ADDITIONAL CONTEXT (${agent.importedSystemInstructionFileName || 'Imported File'}) ---\n${agent.importedSystemInstruction}\n--- END CONTEXT ---`);
+  }
+  return parts.join('\n');
 };
 
 export const evaluateShouldRespond = async (
@@ -33,23 +82,21 @@ export const evaluateShouldRespond = async (
     try {
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
         
-        // Use Flash for fast, cheap decision making
-        // We append specific context about "Who am I" to the system instruction
+        // Note: For decision making, we use the basic persona description + specific decision rules.
+        // We do NOT inject the full combined system instruction (which might be huge) to save tokens/speed for this check,
+        // unless the agent description is empty.
         const systemPrompt = `あなたは「${agent.name}」という名前のエージェントです。\n役割: ${agent.description}\n\n${DECISION_SYSTEM_INSTRUCTION}`;
-        
-        const lastMessage = allMessages[allMessages.length - 1];
-        // Taking last 10 messages for context is usually enough for decision
         const history = buildHistoryForDecision(allMessages.slice(-10));
 
         const response = await ai.models.generateContent({
-            model: ModelType.GEMINI_FLASH, // Always use Flash for this
+            model: ModelType.GEMINI_FLASH,
             contents: [
                 ...history,
                 { role: 'user', parts: [{ text: "このメッセージに対して返信すべきですか？ 'RESPOND' または 'IGNORE' で答えてください。" }] }
             ],
             config: {
                 systemInstruction: systemPrompt,
-                temperature: 0.1, // Deterministic
+                temperature: 0.1,
                 maxOutputTokens: 10,
             }
         });
@@ -60,15 +107,13 @@ export const evaluateShouldRespond = async (
 
     } catch (e) {
         console.error("Decision API Error:", e);
-        // Fallback: If decision fails, lean towards NOT responding to avoid chaos, 
-        // unless it's a very short conversation.
         return allMessages.length < 3; 
     }
 }
 
 export const streamAgentResponse = async (
   agent: Agent,
-  allMessages: Message[], // Full history including user prompt
+  allMessages: Message[], 
   onChunk: (text: string) => void,
   onComplete: () => void,
   onError: (error: Error) => void
@@ -81,21 +126,26 @@ export const streamAgentResponse = async (
   try {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     
-    // Extract the latest user message (prompt)
-    const lastMessage = allMessages[allMessages.length - 1];
+    // The last message is the trigger (User prompt or Agent reply)
+    // We separate the history from the "latest turn" conceptually, 
+    // but the SDK handles the last message in `sendMessageStream` argument usually if it's chat.
+    // However, since we construct history manually based on filter, we treat the LAST message
+    // as the `message` parameter of `sendMessageStream`, and the rest as `history`.
     
-    // In a multi-turn/parallel chat, the last message might not be 'user' if an agent is responding to another agent.
-    // But typically in this App flow, we trigger after user input or agent input.
-    // For safety, we just pass the content.
+    const messagesToUse = allMessages.slice();
+    const lastMessage = messagesToUse.pop(); // Remove last to use as prompt
 
-    // Build history excluding the very last message (which is the new prompt)
-    const history = buildHistoryForAgent(allMessages.slice(0, -1), agent.id);
+    if (!lastMessage) {
+        throw new Error("No messages to respond to");
+    }
+
+    const history = buildHistoryForAgent(messagesToUse, agent.id);
+    const combinedSystemInstruction = getCombinedSystemInstruction(agent);
 
     const config: any = {
-      systemInstruction: agent.systemInstruction,
+      systemInstruction: combinedSystemInstruction,
     };
 
-    // Apply thinking budget if set and > 0 (Only for 2.5 series usually, but generic implementation here)
     if (agent.thinkingBudget > 0) {
       config.thinkingConfig = { thinkingBudget: agent.thinkingBudget };
     }
@@ -106,8 +156,12 @@ export const streamAgentResponse = async (
       history: history
     });
 
+    // Convert the last message (prompt) to parts
+    const promptParts = messageToParts(lastMessage);
+
+    // sendMessageStream takes (string | Part[]), so we pass the parts directly
     const resultStream = await chat.sendMessageStream({
-      message: lastMessage.content
+      message: promptParts 
     });
 
     for await (const chunk of resultStream) {
