@@ -1,3 +1,4 @@
+
 import { GoogleGenAI, Content, Part } from "@google/genai";
 import { Message, Agent, ModelType } from "../types";
 import { DECISION_SYSTEM_INSTRUCTION } from "../constants";
@@ -62,34 +63,79 @@ const buildHistoryForDecision = (allMessages: Message[]): Content[] => {
   });
 };
 
-const getCombinedSystemInstruction = (agent: Agent): string => {
+const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction?: string): string => {
   const parts = [];
+  
+  // Special injection for mapped models to maintain illusion or explain behavior
+  if (agent.model.startsWith('gpt') || agent.model.startsWith('o1')) {
+      parts.push(`[SYSTEM NOTE: You are acting as ${agent.model}. Adopt the persona and capabilities associated with this model.]`);
+  }
+
+  if (roomSystemInstruction) {
+     parts.push(`=== ROOM CONTEXT & SHARED RULES ===\n${roomSystemInstruction}\n=== END ROOM CONTEXT ===\n`);
+  }
+
   if (agent.systemInstruction) {
     parts.push(agent.systemInstruction);
   }
+  
   if (agent.importedSystemInstruction) {
     parts.push(`\n\n--- ADDITIONAL CONTEXT (${agent.importedSystemInstructionFileName || 'Imported File'}) ---\n${agent.importedSystemInstruction}\n--- END CONTEXT ---`);
   }
   return parts.join('\n');
 };
 
+/**
+ * Maps the user-selected model to an available Gemini API model.
+ * Since this app only has a Google GenAI key, we simulate GPT models using Gemini.
+ */
+const resolveModel = (selectedModel: string): string => {
+  switch (selectedModel) {
+    // --- Gemini Series (Direct mapping) ---
+    case ModelType.GEMINI_3_PRO:
+    case ModelType.GEMINI_3_PRO_IMAGE:
+    case ModelType.GEMINI_2_5_FLASH:
+    case ModelType.GEMINI_2_5_FLASH_LITE:
+    case ModelType.GEMINI_2_5_FLASH_THINKING:
+    case ModelType.GEMINI_2_5_PRO:
+      return selectedModel;
+      
+    // --- OpenAI Mapping (Simulations) ---
+    case ModelType.GPT_4_O:
+      return ModelType.GEMINI_3_PRO; // High intelligence equivalent
+    case ModelType.GPT_O1:
+    case ModelType.GPT_O1_MINI:
+      return ModelType.GEMINI_3_PRO; // Use Pro for reasoning tasks
+    case ModelType.GPT_4_O_MINI:
+      return ModelType.GEMINI_2_5_FLASH; // High speed/efficiency equivalent
+      
+    // --- Fallback ---
+    default:
+      return ModelType.GEMINI_2_5_FLASH;
+  }
+};
+
 export const evaluateShouldRespond = async (
   agent: Agent,
   allMessages: Message[],
+  roomSystemInstruction?: string
 ): Promise<boolean> => {
     if (!process.env.API_KEY) return false;
 
     try {
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
         
-        // Note: For decision making, we use the basic persona description + specific decision rules.
-        // We do NOT inject the full combined system instruction (which might be huge) to save tokens/speed for this check,
-        // unless the agent description is empty.
-        const systemPrompt = `あなたは「${agent.name}」という名前のエージェントです。\n役割: ${agent.description}\n\n${DECISION_SYSTEM_INSTRUCTION}`;
+        let systemPrompt = `あなたは「${agent.name}」という名前のエージェントです。\n役割: ${agent.description}\n\n${DECISION_SYSTEM_INSTRUCTION}`;
+        
+        if (roomSystemInstruction) {
+             systemPrompt = `=== ROOM CONTEXT ===\n${roomSystemInstruction}\n=== END ROOM CONTEXT ===\n\n` + systemPrompt;
+        }
+
         const history = buildHistoryForDecision(allMessages.slice(-10));
 
+        // Use Flash for all decisions to keep it fast/cheap, regardless of agent model
         const response = await ai.models.generateContent({
-            model: ModelType.GEMINI_FLASH,
+            model: ModelType.GEMINI_2_5_FLASH,
             contents: [
                 ...history,
                 { role: 'user', parts: [{ text: "このメッセージに対して返信すべきですか？ 'RESPOND' または 'IGNORE' で答えてください。" }] }
@@ -114,6 +160,7 @@ export const evaluateShouldRespond = async (
 export const streamAgentResponse = async (
   agent: Agent,
   allMessages: Message[], 
+  roomSystemInstruction: string | undefined,
   onChunk: (text: string) => void,
   onComplete: () => void,
   onError: (error: Error) => void
@@ -140,18 +187,33 @@ export const streamAgentResponse = async (
     }
 
     const history = buildHistoryForAgent(messagesToUse, agent.id);
-    const combinedSystemInstruction = getCombinedSystemInstruction(agent);
+    const combinedSystemInstruction = getCombinedSystemInstruction(agent, roomSystemInstruction);
+    const actualModel = resolveModel(agent.model);
 
     const config: any = {
       systemInstruction: combinedSystemInstruction,
     };
 
-    if (agent.thinkingBudget > 0) {
-      config.thinkingConfig = { thinkingBudget: agent.thinkingBudget };
+    // If simulating 'o1' (Reasoning) using Gemini, force a high thinking budget if supported
+    // Otherwise use the user's setting.
+    if (agent.model === ModelType.GPT_O1 || agent.model === ModelType.GPT_O1_MINI) {
+       // Force thinking for 'o1' simulation if not already set high
+       const thinkingBudget = Math.max(agent.thinkingBudget || 0, 4096);
+       // Only apply thinking if model supports it (Gemini 2.5 series mostly, but assuming Pro might in future or we map to 2.5 Pro)
+       // For now, if mapped to 3.0 Pro, thinking might not be available via 'thinkingConfig' param same way, 
+       // but strictly following valid configs:
+       if (actualModel.includes('gemini-2.5')) {
+          config.thinkingConfig = { thinkingBudget };
+       }
+    } else if (agent.thinkingBudget > 0) {
+       // Only apply thinking config if the resolved model supports it
+       if (actualModel.includes('gemini-2.5')) {
+          config.thinkingConfig = { thinkingBudget: agent.thinkingBudget };
+       }
     }
 
     const chat = ai.chats.create({
-      model: agent.model,
+      model: actualModel,
       config: config,
       history: history
     });
@@ -172,7 +234,7 @@ export const streamAgentResponse = async (
 
     onComplete();
   } catch (err: any) {
-    console.error(`Error generating content for agent ${agent.name}:`, err);
+    console.error(`Error generating content for agent ${agent.name} (${agent.model} -> ${resolveModel(agent.model)}):`, err);
     onError(err instanceof Error ? err : new Error(String(err)));
   }
 };

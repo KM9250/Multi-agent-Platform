@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef } from 'react';
 import { X, Shuffle, Brain, Upload, Image as ImageIcon, Smile, FileText, Trash2 } from 'lucide-react';
 import { Agent, ModelType } from '../types';
@@ -14,7 +15,7 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [systemInstruction, setSystemInstruction] = useState('');
-  const [model, setModel] = useState<string>(ModelType.GEMINI_FLASH);
+  const [model, setModel] = useState<string>(ModelType.GEMINI_2_5_FLASH);
   
   // Imported System Instruction State
   const [importedInstruction, setImportedInstruction] = useState<string>('');
@@ -62,7 +63,7 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
     setSystemInstruction('You are a helpful AI assistant.');
     setImportedInstruction('');
     setImportedFileName('');
-    setModel(ModelType.GEMINI_FLASH);
+    setModel(ModelType.GEMINI_2_5_FLASH);
     setAvatarType('emoji');
     setEmojiAvatar('🤖');
     setImageAvatar('');

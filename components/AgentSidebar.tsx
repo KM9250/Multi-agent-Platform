@@ -1,7 +1,7 @@
 
 import React, { useState } from 'react';
-import { Plus, Settings, Trash2, Edit3, MessageSquare, Bot, X, Network, Loader2 } from 'lucide-react';
-import { Agent, Room } from '../types';
+import { Plus, Settings, Trash2, Edit3, MessageSquare, Bot, X, Network, Loader2, Box, Gamepad2, AlertTriangle } from 'lucide-react';
+import { Agent, Room, RoomTag } from '../types';
 import { ROOM_TAGS } from '../constants';
 
 interface SidebarProps {
@@ -47,9 +47,18 @@ const AgentSidebar: React.FC<SidebarProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<'chats' | 'agents'>('chats');
 
-  const getTagColor = (tagName: string) => {
+  const getTagStyle = (tagName: string) => {
     const tag = ROOM_TAGS.find(t => t.value === tagName);
     return tag ? tag.color : 'bg-zinc-700 text-zinc-300 border-zinc-600';
+  };
+
+  const getTagIcon = (type: RoomTag) => {
+    switch (type) {
+      case 'Sandbox': return <Box className="w-3 h-3" />;
+      case 'Recreation': return <Gamepad2 className="w-3 h-3" />;
+      case 'Hard': return <AlertTriangle className="w-3 h-3" />;
+      default: return null;
+    }
   };
 
   const renderRoomList = () => (
@@ -70,37 +79,44 @@ const AgentSidebar: React.FC<SidebarProps> = ({
             key={room.id}
             onClick={() => onSwitchRoom(room.id)}
             className={`
-              group relative flex flex-col gap-1 p-3 rounded-xl cursor-pointer transition-all duration-200 border
+              group relative flex flex-col gap-1.5 p-3 rounded-xl cursor-pointer transition-all duration-200 border
               ${room.id === activeRoomId 
                 ? 'bg-zinc-800 border-zinc-700/50 shadow-md' 
                 : 'border-transparent text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200'}
             `}
           >
-            <div className="flex items-center gap-3">
-               <MessageSquare className={`w-4 h-4 shrink-0 ${room.id === activeRoomId ? 'text-blue-400' : 'text-zinc-600'}`} />
-               <h4 className={`font-medium text-sm truncate flex-1 ${room.id === activeRoomId ? 'text-zinc-100' : 'text-zinc-400'}`}>
-                 {room.title || "New Chat"}
-               </h4>
+            <div className="flex items-start gap-3">
+               <div className={`mt-0.5 ${room.id === activeRoomId ? 'text-blue-400' : 'text-zinc-600'}`}>
+                 <MessageSquare className="w-4 h-4" />
+               </div>
+               
+               <div className="flex-1 min-w-0">
+                 <h4 className={`font-medium text-sm truncate mb-1 ${room.id === activeRoomId ? 'text-zinc-100' : 'text-zinc-300'}`}>
+                   {room.title || "New Chat"}
+                 </h4>
+                 
+                 <div className="flex items-center gap-2 flex-wrap">
+                    {room.type && (
+                      <span className={`inline-flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded-md ${getTagStyle(room.type)}`}>
+                        {getTagIcon(room.type)}
+                        {room.type}
+                      </span>
+                    )}
+                    <span className="text-[10px] text-zinc-500 truncate">
+                        {room.description ? room.description.slice(0, 20) + (room.description.length > 20 ? '...' : '') : new Date(room.updatedAt).toLocaleDateString()}
+                    </span>
+                 </div>
+               </div>
+
                {rooms.length > 1 && (
                 <button 
                   onClick={(e) => { e.stopPropagation(); onDeleteRoom(room.id); }}
-                  className="opacity-0 group-hover:opacity-100 p-1 hover:bg-red-500/20 rounded text-zinc-500 hover:text-red-400 transition-all shrink-0"
+                  className="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-red-500/20 rounded-lg text-zinc-500 hover:text-red-400 transition-all shrink-0 absolute top-2 right-2"
                   title="Delete Chat"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>
               )}
-            </div>
-            
-            <div className="flex items-center gap-2 pl-7">
-               {room.type && (
-                 <span className={`text-[9px] px-1.5 py-0.5 rounded border ${getTagColor(room.type)}`}>
-                   {room.type}
-                 </span>
-               )}
-               <span className="text-[10px] text-zinc-500 truncate flex-1">
-                  {room.description || new Date(room.updatedAt).toLocaleDateString()}
-               </span>
             </div>
           </div>
         ))}

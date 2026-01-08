@@ -134,7 +134,7 @@ export const DEFAULT_AGENTS: Agent[] = [
     name: 'Flash Assistant',
     description: 'Fast and concise helper',
     systemInstruction: `You are a helpful, concise assistant. Keep answers short and to the point.\n\n${EMOTION_INSTRUCTION}`,
-    model: ModelType.GEMINI_FLASH,
+    model: ModelType.GEMINI_2_5_FLASH,
     color: 'bg-blue-500',
     avatar: '⚡',
     avatarType: 'emoji',
@@ -146,7 +146,7 @@ export const DEFAULT_AGENTS: Agent[] = [
     name: 'Deep Thinker',
     description: 'Reasoning capability enabled',
     systemInstruction: `You are a thoughtful researcher. Analyze the user request deeply before answering.\n\n${EMOTION_INSTRUCTION}`,
-    model: ModelType.GEMINI_PRO,
+    model: ModelType.GEMINI_3_PRO,
     color: 'bg-purple-600',
     avatar: '🧠',
     avatarType: 'emoji',
@@ -158,7 +158,7 @@ export const DEFAULT_AGENTS: Agent[] = [
     name: 'The Skeptic',
     description: 'Critical analysis',
     systemInstruction: `You are a skeptical critic. Challenge assumptions in the user prompt and look for logical fallacies.\n\n${EMOTION_INSTRUCTION}`,
-    model: ModelType.GEMINI_FLASH,
+    model: ModelType.GEMINI_2_5_FLASH,
     color: 'bg-orange-600',
     avatar: '🧐',
     avatarType: 'emoji',
@@ -186,14 +186,42 @@ export const AVATAR_COLORS = [
 ];
 
 export const MODEL_OPTIONS = [
-  { value: ModelType.GEMINI_FLASH, label: 'Gemini 2.5 Flash (Fast)' },
-  { value: ModelType.GEMINI_PRO, label: 'Gemini 3.0 Pro Preview (Smart)' },
+  { value: 'label-gemini-3', label: '--- Google Gemini 3.0 Series ---', disabled: true },
+  { value: ModelType.GEMINI_3_PRO, label: 'Gemini 3.0 Pro Preview' },
+  { value: ModelType.GEMINI_3_PRO_IMAGE, label: 'Gemini 3.0 Pro (Image Capable)' },
+  
+  { value: 'label-gemini-2-5', label: '--- Google Gemini 2.5 Series ---', disabled: true },
+  { value: ModelType.GEMINI_2_5_PRO, label: 'Gemini 2.5 Pro' },
+  { value: ModelType.GEMINI_2_5_FLASH, label: 'Gemini 2.5 Flash' },
+  { value: ModelType.GEMINI_2_5_FLASH_THINKING, label: 'Gemini 2.5 Flash (Thinking)' },
+  { value: ModelType.GEMINI_2_5_FLASH_LITE, label: 'Gemini 2.5 Flash Lite' },
+  
+  { value: 'label-gpt', label: '--- OpenAI GPT Series ---', disabled: true },
+  { value: ModelType.GPT_4_O, label: 'GPT-4o' },
+  { value: ModelType.GPT_4_O_MINI, label: 'GPT-4o mini' },
+  { value: ModelType.GPT_O1, label: 'o1 (Reasoning)' },
+  { value: ModelType.GPT_O1_MINI, label: 'o1-mini' },
 ];
 
-export const ROOM_TAGS: { value: RoomTag; label: string; color: string }[] = [
-  { value: 'Sandbox', label: 'Sandbox', color: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' },
-  { value: 'Recreation', label: 'Recreation', color: 'bg-blue-500/20 text-blue-300 border-blue-500/30' },
-  { value: 'Hard', label: 'Hard', color: 'bg-red-500/20 text-red-300 border-red-500/30' },
+export const ROOM_TAGS: { value: RoomTag; label: string; color: string; description: string }[] = [
+  { 
+    value: 'Sandbox', 
+    label: 'Sandbox', 
+    color: 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20', 
+    description: 'Experiment freely. Memory is not strictly enforced.' 
+  },
+  { 
+    value: 'Recreation', 
+    label: 'Recreation', 
+    color: 'bg-blue-500/10 text-blue-400 border border-blue-500/20 hover:bg-blue-500/20', 
+    description: 'Casual roleplay. Agents remember key context.' 
+  },
+  { 
+    value: 'Hard', 
+    label: 'Hard Mode', 
+    color: 'bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20', 
+    description: 'Strict continuity. Agents enforce rules and logic rigorously.' 
+  },
 ];
 
 // --- TEST DATA ---
@@ -227,11 +255,12 @@ const DUMMY_MESSAGES: Message[] = [
   }
 ];
 
-export const createNewRoom = (title: string, description: string, type: RoomTag): Room => {
+export const createNewRoom = (title: string, description: string, type: RoomTag, systemInstruction: string = ''): Room => {
   return {
     id: crypto.randomUUID(),
     title,
     description,
+    systemInstruction,
     type,
     agents: JSON.parse(JSON.stringify(DEFAULT_AGENTS)), // Deep copy defaults
     messages: [],
@@ -244,6 +273,7 @@ export const INITIAL_ROOMS: Room[] = [
     id: 'dummy-room-1',
     title: 'Quantum Computing',
     description: 'Discussion about the future of encryption',
+    systemInstruction: '',
     type: 'Sandbox',
     agents: JSON.parse(JSON.stringify(DEFAULT_AGENTS)),
     messages: DUMMY_MESSAGES,

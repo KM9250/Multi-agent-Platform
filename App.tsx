@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useRef } from 'react';
-import { Menu, Send, StopCircle, Trash2, BrainCircuit, Paperclip, X, FileText, Image as ImageIcon, Upload } from 'lucide-react';
+import { Menu, Send, StopCircle, Trash2, BrainCircuit, Paperclip, X, FileText, Image as ImageIcon, Upload, Settings, Box, Gamepad2, AlertTriangle } from 'lucide-react';
 import AgentSidebar from './components/AgentSidebar';
 import AgentModal from './components/AgentModal';
 import MessageBubble from './components/MessageBubble';
@@ -31,6 +31,7 @@ export default function App() {
   const [isRoomModalOpen, setIsRoomModalOpen] = useState(false);
   
   const [editingAgent, setEditingAgent] = useState<Agent | null>(null);
+  const [editingRoom, setEditingRoom] = useState<Room | null>(null);
   
   const [isGenerating, setIsGenerating] = useState(false);
   const [planningAgents, setPlanningAgents] = useState<string[]>([]);
@@ -200,7 +201,7 @@ export default function App() {
         if (isMentioned) {
              return { agent, shouldRespond: true, reason: 'mentioned' };
         }
-        const shouldRespond = await evaluateShouldRespond(agent, currentHistory);
+        const shouldRespond = await evaluateShouldRespond(agent, currentHistory, activeRoom.systemInstruction);
         return { agent, shouldRespond, reason: 'llm_decision' };
     }));
     
@@ -260,7 +261,8 @@ export default function App() {
 
         streamAgentResponse(
           agent,
-          [...currentHistory], 
+          [...currentHistory],
+          activeRoom.systemInstruction, 
           (chunk) => {
             if (!isGeneratingRef.current) return;
             accumulatedText += chunk;
@@ -290,10 +292,15 @@ export default function App() {
 
   // --- Handlers ---
 
-  const handleCreateRoom = (title: string, description: string, type: RoomTag) => {
-    const newRoom = createNewRoom(title, description, type);
-    setRooms(prev => [newRoom, ...prev]);
-    setActiveRoomId(newRoom.id);
+  const handleSaveRoom = (title: string, description: string, type: RoomTag, systemInstruction: string) => {
+    if (editingRoom) {
+      setRooms(prev => prev.map(r => r.id === editingRoom.id ? { ...r, title, description, type, systemInstruction, updatedAt: Date.now() } : r));
+      setEditingRoom(null);
+    } else {
+      const newRoom = createNewRoom(title, description, type, systemInstruction);
+      setRooms(prev => [newRoom, ...prev]);
+      setActiveRoomId(newRoom.id);
+    }
     if (window.innerWidth < 768) setIsSidebarOpen(false);
   };
 
@@ -383,6 +390,15 @@ export default function App() {
     return tag ? tag.color : 'text-zinc-500';
   };
 
+  const getTagIcon = (type: RoomTag) => {
+    switch (type) {
+      case 'Sandbox': return <Box className="w-3 h-3" />;
+      case 'Recreation': return <Gamepad2 className="w-3 h-3" />;
+      case 'Hard': return <AlertTriangle className="w-3 h-3" />;
+      default: return null;
+    }
+  };
+
   if (!activeRoom) return <div className="flex items-center justify-center h-screen bg-zinc-950 text-zinc-500">Loading...</div>;
 
   return (
@@ -392,7 +408,7 @@ export default function App() {
         rooms={rooms}
         activeRoomId={activeRoomId}
         onSwitchRoom={handleSwitchRoom}
-        onNewRoom={() => setIsRoomModalOpen(true)}
+        onNewRoom={() => { setEditingRoom(null); setIsRoomModalOpen(true); }}
         onDeleteRoom={handleDeleteRoom}
         agents={agents}
         onToggleAgent={handleAgentToggle}
@@ -416,15 +432,17 @@ export default function App() {
               <Menu className="w-5 h-5" />
             </button>
             <div className="flex flex-col">
-                 <div className="flex items-center gap-2">
-                    <h1 className="font-bold text-sm md:text-lg tracking-tight bg-gradient-to-r from-white to-zinc-400 bg-clip-text text-transparent">
+                 <div className="flex items-center gap-2 group cursor-pointer" onClick={() => { setEditingRoom(activeRoom); setIsRoomModalOpen(true); }}>
+                    <h1 className="font-bold text-sm md:text-lg tracking-tight bg-gradient-to-r from-white to-zinc-400 bg-clip-text text-transparent group-hover:text-blue-300 transition-colors">
                       {activeRoom.title}
                     </h1>
                     {activeRoom.type && (
-                      <span className={`text-[9px] px-1.5 py-0.5 rounded border ${getTagColor(activeRoom.type)}`}>
+                      <span className={`inline-flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded-md ${getTagColor(activeRoom.type)}`}>
+                        {getTagIcon(activeRoom.type)}
                         {activeRoom.type}
                       </span>
                     )}
+                    <Settings className="w-3.5 h-3.5 text-zinc-600 group-hover:text-zinc-400 transition-colors opacity-0 group-hover:opacity-100" />
                  </div>
                 <span className="text-[10px] text-zinc-500 hidden md:block">
                     {agents.filter(a => a.isEnabled).length} Agents Active
@@ -455,6 +473,12 @@ export default function App() {
                   </div>
                   <p className="text-sm font-medium text-zinc-400">Welcome to {activeRoom.title}</p>
                   <p className="text-xs max-w-sm text-center">{activeRoom.description || "Start the conversation by sending a message below."}</p>
+                  {activeRoom.systemInstruction && (
+                      <div className="text-[10px] text-zinc-500 max-w-xs text-center border border-zinc-800 rounded p-2 bg-zinc-900/50">
+                        <span className="font-semibold block mb-1">Shared Rules:</span>
+                        {activeRoom.systemInstruction.slice(0, 100)}{activeRoom.systemInstruction.length > 100 ? '...' : ''}
+                      </div>
+                  )}
                </div>
             ) : (
               messages.map(msg => {
@@ -625,7 +649,8 @@ export default function App() {
       <RoomModal 
         isOpen={isRoomModalOpen}
         onClose={() => setIsRoomModalOpen(false)}
-        onSave={handleCreateRoom}
+        onSave={handleSaveRoom}
+        editingRoom={editingRoom}
       />
 
       <RelationshipGraphModal 
