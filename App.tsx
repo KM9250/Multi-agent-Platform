@@ -1,11 +1,12 @@
 
 import React, { useState, useEffect, useRef } from 'react';
-import { Menu, Send, StopCircle, Trash2, BrainCircuit, Paperclip, X, FileText, Image as ImageIcon, Upload, Settings, Box, Gamepad2, AlertTriangle } from 'lucide-react';
+import { Menu, Send, StopCircle, Trash2, BrainCircuit, Paperclip, X, FileText, Image as ImageIcon, Upload, Settings, Box, Gamepad2, AlertTriangle, Cuboid, MonitorPlay } from 'lucide-react';
 import AgentSidebar from './components/AgentSidebar';
 import AgentModal from './components/AgentModal';
 import MessageBubble from './components/MessageBubble';
 import RelationshipGraphModal from './components/RelationshipGraphModal';
 import RoomModal from './components/RoomModal';
+import SceneView from './components/SceneView';
 import { streamAgentResponse, evaluateShouldRespond } from './services/geminiService';
 import { INITIAL_ROOMS, createNewRoom, calculateRelationshipWeights, ROOM_TAGS } from './constants';
 import { Agent, Message, Room, Attachment, RoomTag } from './types';
@@ -25,10 +26,12 @@ export default function App() {
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   
+  // UI Toggles
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isAgentModalOpen, setIsAgentModalOpen] = useState(false);
   const [isGraphModalOpen, setIsGraphModalOpen] = useState(false);
   const [isRoomModalOpen, setIsRoomModalOpen] = useState(false);
+  const [is3DMode, setIs3DMode] = useState(false); // New: 3D Mode Toggle
   
   const [editingAgent, setEditingAgent] = useState<Agent | null>(null);
   const [editingRoom, setEditingRoom] = useState<Room | null>(null);
@@ -52,6 +55,9 @@ export default function App() {
 
   const allThinkingAgentIds = [...new Set([...planningAgents, ...generatingAgentIds])];
 
+  // Determine currently speaking agent for the 3D view
+  const currentSpeakingAgentId = generatingAgentIds.length > 0 ? generatingAgentIds[0] : null;
+
   // --- Effects ---
   useEffect(() => {
     localStorage.setItem('rooms', JSON.stringify(rooms));
@@ -62,12 +68,15 @@ export default function App() {
   }, [activeRoomId]);
 
   const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    // Small delay to allow layout to adjust
+    setTimeout(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }, 100);
   };
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages.length, activeRoomId, planningAgents.length]);
+  }, [messages.length, activeRoomId, planningAgents.length, is3DMode]);
 
   // --- File Handling ---
   const processFiles = (files: FileList | File[]) => {
@@ -421,7 +430,7 @@ export default function App() {
         onClose={() => setIsSidebarOpen(false)}
       />
 
-      <div className="flex-1 flex flex-col h-full relative w-full transition-all">
+      <div className="flex-1 flex flex-col h-full relative w-full transition-all duration-300">
         
         <header className="h-14 border-b border-zinc-800 flex items-center justify-between px-4 bg-zinc-950/80 backdrop-blur z-10 shrink-0">
           <div className="flex items-center gap-3">
@@ -450,6 +459,16 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            
+             {/* 3D Mode Toggle */}
+             <button
+               onClick={() => setIs3DMode(!is3DMode)}
+               className={`p-2 rounded-lg transition-colors border ${is3DMode ? 'bg-blue-500/10 text-blue-400 border-blue-500/30' : 'text-zinc-400 hover:bg-zinc-800 border-transparent'}`}
+               title="Toggle 3D Scene View"
+             >
+                <MonitorPlay className="w-4 h-4" />
+             </button>
+
              {messages.length > 0 && (
                 <button 
                   onClick={handleClearChat}
@@ -462,179 +481,193 @@ export default function App() {
           </div>
         </header>
 
-        {/* Chat Area */}
-        <div className="flex-1 overflow-y-auto p-4 md:p-6 scroll-smooth">
-          <div className="max-w-4xl mx-auto min-h-full flex flex-col">
-            
-            {messages.length === 0 ? (
-               <div className="flex-1 flex flex-col items-center justify-center text-zinc-500 space-y-4 pb-20 opacity-50">
-                  <div className="w-16 h-16 rounded-2xl bg-zinc-900 border border-zinc-800 flex items-center justify-center text-4xl mb-2">
-                    ⚡
-                  </div>
-                  <p className="text-sm font-medium text-zinc-400">Welcome to {activeRoom.title}</p>
-                  <p className="text-xs max-w-sm text-center">{activeRoom.description || "Start the conversation by sending a message below."}</p>
-                  {activeRoom.systemInstruction && (
-                      <div className="text-[10px] text-zinc-500 max-w-xs text-center border border-zinc-800 rounded p-2 bg-zinc-900/50">
-                        <span className="font-semibold block mb-1">Shared Rules:</span>
-                        {activeRoom.systemInstruction.slice(0, 100)}{activeRoom.systemInstruction.length > 100 ? '...' : ''}
+        {/* Layout Split Container */}
+        <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+          
+          {/* Top Half: 3D Scene View (Only visible if is3DMode is true) */}
+          {is3DMode && (
+            <div className="h-1/2 min-h-[300px] border-b border-zinc-800 relative animate-in fade-in slide-in-from-top-4 duration-300">
+               <SceneView agents={agents} speakingAgentId={currentSpeakingAgentId} />
+            </div>
+          )}
+
+          {/* Bottom Half: Chat Area */}
+          <div className={`flex-1 flex flex-col min-h-0 relative ${is3DMode ? 'h-1/2' : 'h-full'}`}>
+            <div className="flex-1 overflow-y-auto p-4 md:p-6 scroll-smooth">
+              <div className="max-w-4xl mx-auto min-h-full flex flex-col">
+                
+                {messages.length === 0 ? (
+                  <div className="flex-1 flex flex-col items-center justify-center text-zinc-500 space-y-4 pb-20 opacity-50">
+                      <div className="w-16 h-16 rounded-2xl bg-zinc-900 border border-zinc-800 flex items-center justify-center text-4xl mb-2">
+                        ⚡
                       </div>
-                  )}
-               </div>
-            ) : (
-              messages.map(msg => {
-                const agent = msg.role === 'model' && msg.agentId 
-                  ? agents.find(a => a.id === msg.agentId) 
-                  : undefined;
-                return (
-                  <MessageBubble 
-                    key={msg.id} 
-                    message={msg} 
-                    agent={agent} 
-                  />
-                );
-              })
-            )}
-            
-            {/* Planning/Thinking Indicator */}
-            {planningAgents.length > 0 && (
-                <div className="flex flex-col gap-2 items-start ml-4 mb-6 mt-2 animate-in fade-in duration-300">
-                    <div className="flex items-center gap-2 text-xs text-zinc-400 font-medium bg-zinc-900/50 px-3 py-1.5 rounded-full border border-zinc-800">
-                       <BrainCircuit className="w-3.5 h-3.5 text-purple-400" />
-                       Deciding who should respond...
-                    </div>
-                    <div className="flex items-center gap-[-0.5rem] pl-2">
-                      {planningAgents.map(id => {
-                        const agent = agents.find(a => a.id === id);
-                        if (!agent) return null;
-                        return (
-                           <div key={id} className="relative -ml-2 first:ml-0 group">
-                              <div className={`
-                                w-8 h-8 rounded-full border-2 border-zinc-950 flex items-center justify-center text-sm shadow-sm overflow-hidden bg-zinc-800 relative z-0
-                                ring-2 ring-purple-500/50 animate-pulse
-                                ${agent.avatarType === 'image' ? '' : agent.color}
-                              `}>
-                                {agent.avatarType === 'image' ? (
-                                    <img src={agent.avatar} alt={agent.name} className="w-full h-full object-cover" />
-                                ) : (
-                                    agent.avatar
-                                )}
-                              </div>
-                           </div>
-                        );
-                      })}
-                    </div>
-                </div>
-            )}
-
-            <div ref={messagesEndRef} className="h-4" />
-          </div>
-        </div>
-
-        <div className="p-4 border-t border-zinc-800 bg-zinc-950 shrink-0">
-          <div 
-            className={`max-w-4xl mx-auto relative bg-zinc-900 border rounded-xl overflow-hidden transition-all duration-200
-              ${isDragging 
-                ? 'border-blue-500 ring-2 ring-blue-500/20 bg-zinc-800' 
-                : 'border-zinc-800 focus-within:ring-2 focus-within:ring-zinc-700'
-              }
-            `}
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
-            onDrop={handleDrop}
-          >
-            {/* Drag Overlay */}
-            {isDragging && (
-                <div className="absolute inset-0 z-50 flex items-center justify-center bg-zinc-900/90 backdrop-blur-sm m-1 rounded-lg border-2 border-dashed border-blue-500/50">
-                   <div className="text-blue-400 flex flex-col items-center gap-2 animate-in fade-in zoom-in-95 duration-200">
-                      <Upload className="w-10 h-10 animate-bounce" />
-                      <span className="font-medium text-lg">Drop files to attach</span>
-                   </div>
-                </div>
-            )}
-            
-            {/* Attachment Previews */}
-            {attachments.length > 0 && (
-              <div className="flex gap-2 p-3 pb-0 overflow-x-auto custom-scrollbar">
-                {attachments.map(att => (
-                  <div key={att.id} className="relative group shrink-0 w-20 h-20 bg-zinc-800 rounded-lg border border-zinc-700 overflow-hidden flex items-center justify-center">
-                    {att.type === 'image' ? (
-                       <img src={att.data} alt={att.name} className="w-full h-full object-cover" />
-                    ) : (
-                       <FileText className="w-8 h-8 text-zinc-500" />
-                    )}
-                    <button 
-                      onClick={() => removeAttachment(att.id)}
-                      className="absolute top-1 right-1 p-0.5 bg-black/60 rounded-full text-white opacity-0 group-hover:opacity-100 transition-opacity"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                    <span className="absolute bottom-0 inset-x-0 text-[9px] bg-black/60 text-white truncate px-1 py-0.5 text-center">
-                      {att.name}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            <div className="flex items-end">
-                <div className="p-2">
-                  <input 
-                    type="file" 
-                    multiple 
-                    ref={fileInputRef}
-                    className="hidden" 
-                    onChange={handleFileSelect}
-                  />
-                  <button 
-                    onClick={() => fileInputRef.current?.click()}
-                    className="p-2 text-zinc-400 hover:text-white hover:bg-zinc-800 rounded-lg transition-colors"
-                    title="Attach file"
-                    disabled={isGenerating}
-                  >
-                    <Paperclip className="w-5 h-5" />
-                  </button>
-                </div>
-
-                <textarea
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) {
-                      e.preventDefault();
-                      handleSendMessage();
-                    }
-                  }}
-                  placeholder={`Message ${activeRoom.title}...`}
-                  className="w-full bg-transparent border-0 text-zinc-100 px-2 py-3.5 focus:outline-none focus:ring-0 resize-none min-h-[50px] max-h-32"
-                  rows={1}
-                  disabled={isGenerating}
-                />
-
-                <div className="p-2">
-                    <button
-                      onClick={isGenerating ? handleStop : handleSendMessage}
-                      disabled={(!input.trim() && attachments.length === 0) && !isGenerating}
-                      className={`
-                        p-2 rounded-lg transition-all duration-200
-                        ${(input.trim() || attachments.length > 0 || isGenerating)
-                          ? 'bg-white text-black hover:bg-zinc-200' 
-                          : 'bg-zinc-800 text-zinc-500 cursor-not-allowed'}
-                      `}
-                    >
-                      {isGenerating ? (
-                        <StopCircle className="w-5 h-5 animate-pulse text-red-500" />
-                      ) : (
-                        <Send className="w-5 h-5" />
+                      <p className="text-sm font-medium text-zinc-400">Welcome to {activeRoom.title}</p>
+                      <p className="text-xs max-w-sm text-center">{activeRoom.description || "Start the conversation by sending a message below."}</p>
+                      {activeRoom.systemInstruction && (
+                          <div className="text-[10px] text-zinc-500 max-w-xs text-center border border-zinc-800 rounded p-2 bg-zinc-900/50">
+                            <span className="font-semibold block mb-1">Shared Rules:</span>
+                            {activeRoom.systemInstruction.slice(0, 100)}{activeRoom.systemInstruction.length > 100 ? '...' : ''}
+                          </div>
                       )}
-                    </button>
+                  </div>
+                ) : (
+                  messages.map(msg => {
+                    const agent = msg.role === 'model' && msg.agentId 
+                      ? agents.find(a => a.id === msg.agentId) 
+                      : undefined;
+                    return (
+                      <MessageBubble 
+                        key={msg.id} 
+                        message={msg} 
+                        agent={agent} 
+                      />
+                    );
+                  })
+                )}
+                
+                {/* Planning/Thinking Indicator */}
+                {planningAgents.length > 0 && (
+                    <div className="flex flex-col gap-2 items-start ml-4 mb-6 mt-2 animate-in fade-in duration-300">
+                        <div className="flex items-center gap-2 text-xs text-zinc-400 font-medium bg-zinc-900/50 px-3 py-1.5 rounded-full border border-zinc-800">
+                          <BrainCircuit className="w-3.5 h-3.5 text-purple-400" />
+                          Deciding who should respond...
+                        </div>
+                        <div className="flex items-center gap-[-0.5rem] pl-2">
+                          {planningAgents.map(id => {
+                            const agent = agents.find(a => a.id === id);
+                            if (!agent) return null;
+                            return (
+                              <div key={id} className="relative -ml-2 first:ml-0 group">
+                                  <div className={`
+                                    w-8 h-8 rounded-full border-2 border-zinc-950 flex items-center justify-center text-sm shadow-sm overflow-hidden bg-zinc-800 relative z-0
+                                    ring-2 ring-purple-500/50 animate-pulse
+                                    ${agent.avatarType === 'image' ? '' : agent.color}
+                                  `}>
+                                    {agent.avatarType === 'image' ? (
+                                        <img src={agent.avatar} alt={agent.name} className="w-full h-full object-cover" />
+                                    ) : (
+                                        agent.avatar
+                                    )}
+                                  </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                    </div>
+                )}
+
+                <div ref={messagesEndRef} className="h-4" />
+              </div>
+            </div>
+
+            <div className="p-4 border-t border-zinc-800 bg-zinc-950 shrink-0">
+              <div 
+                className={`max-w-4xl mx-auto relative bg-zinc-900 border rounded-xl overflow-hidden transition-all duration-200
+                  ${isDragging 
+                    ? 'border-blue-500 ring-2 ring-blue-500/20 bg-zinc-800' 
+                    : 'border-zinc-800 focus-within:ring-2 focus-within:ring-zinc-700'
+                  }
+                `}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
+              >
+                {/* Drag Overlay */}
+                {isDragging && (
+                    <div className="absolute inset-0 z-50 flex items-center justify-center bg-zinc-900/90 backdrop-blur-sm m-1 rounded-lg border-2 border-dashed border-blue-500/50">
+                      <div className="text-blue-400 flex flex-col items-center gap-2 animate-in fade-in zoom-in-95 duration-200">
+                          <Upload className="w-10 h-10 animate-bounce" />
+                          <span className="font-medium text-lg">Drop files to attach</span>
+                      </div>
+                    </div>
+                )}
+                
+                {/* Attachment Previews */}
+                {attachments.length > 0 && (
+                  <div className="flex gap-2 p-3 pb-0 overflow-x-auto custom-scrollbar">
+                    {attachments.map(att => (
+                      <div key={att.id} className="relative group shrink-0 w-20 h-20 bg-zinc-800 rounded-lg border border-zinc-700 overflow-hidden flex items-center justify-center">
+                        {att.type === 'image' ? (
+                          <img src={att.data} alt={att.name} className="w-full h-full object-cover" />
+                        ) : (
+                          <FileText className="w-8 h-8 text-zinc-500" />
+                        )}
+                        <button 
+                          onClick={() => removeAttachment(att.id)}
+                          className="absolute top-1 right-1 p-0.5 bg-black/60 rounded-full text-white opacity-0 group-hover:opacity-100 transition-opacity"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                        <span className="absolute bottom-0 inset-x-0 text-[9px] bg-black/60 text-white truncate px-1 py-0.5 text-center">
+                          {att.name}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="flex items-end">
+                    <div className="p-2">
+                      <input 
+                        type="file" 
+                        multiple 
+                        ref={fileInputRef}
+                        className="hidden" 
+                        onChange={handleFileSelect}
+                      />
+                      <button 
+                        onClick={() => fileInputRef.current?.click()}
+                        className="p-2 text-zinc-400 hover:text-white hover:bg-zinc-800 rounded-lg transition-colors"
+                        title="Attach file"
+                        disabled={isGenerating}
+                      >
+                        <Paperclip className="w-5 h-5" />
+                      </button>
+                    </div>
+
+                    <textarea
+                      value={input}
+                      onChange={(e) => setInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !e.shiftKey) {
+                          e.preventDefault();
+                          handleSendMessage();
+                        }
+                      }}
+                      placeholder={`Message ${activeRoom.title}...`}
+                      className="w-full bg-transparent border-0 text-zinc-100 px-2 py-3.5 focus:outline-none focus:ring-0 resize-none min-h-[50px] max-h-32"
+                      rows={1}
+                      disabled={isGenerating}
+                    />
+
+                    <div className="p-2">
+                        <button
+                          onClick={isGenerating ? handleStop : handleSendMessage}
+                          disabled={(!input.trim() && attachments.length === 0) && !isGenerating}
+                          className={`
+                            p-2 rounded-lg transition-all duration-200
+                            ${(input.trim() || attachments.length > 0 || isGenerating)
+                              ? 'bg-white text-black hover:bg-zinc-200' 
+                              : 'bg-zinc-800 text-zinc-500 cursor-not-allowed'}
+                          `}
+                        >
+                          {isGenerating ? (
+                            <StopCircle className="w-5 h-5 animate-pulse text-red-500" />
+                          ) : (
+                            <Send className="w-5 h-5" />
+                          )}
+                        </button>
+                    </div>
                 </div>
+              </div>
+              <div className="text-center mt-2">
+                  <p className="text-[10px] text-zinc-600">
+                      AI responses may be inaccurate. Verify important information.
+                  </p>
+              </div>
             </div>
           </div>
-          <div className="text-center mt-2">
-              <p className="text-[10px] text-zinc-600">
-                  AI responses may be inaccurate. Verify important information.
-              </p>
-          </div>
+
         </div>
 
       </div>
