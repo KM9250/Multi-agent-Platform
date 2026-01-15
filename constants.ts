@@ -1,5 +1,5 @@
 
-import { Agent, ModelType, Message, Room, RoomTag } from './types';
+import { Agent, ModelType, Message, Room, RoomTag, AgentFramework } from './types';
 
 // Emotion instruction provided by user
 export const EMOTION_INSTRUCTION = `
@@ -135,6 +135,7 @@ export const DEFAULT_AGENTS: Agent[] = [
     description: 'Fast and concise helper',
     systemInstruction: `You are a helpful, concise assistant. Keep answers short and to the point.\n\n${EMOTION_INSTRUCTION}`,
     model: ModelType.GEMINI_2_5_FLASH,
+    framework: 'standard',
     color: 'bg-blue-500',
     avatar: '⚡',
     avatarType: 'emoji',
@@ -147,6 +148,7 @@ export const DEFAULT_AGENTS: Agent[] = [
     description: 'Reasoning capability enabled',
     systemInstruction: `You are a thoughtful researcher. Analyze the user request deeply before answering.\n\n${EMOTION_INSTRUCTION}`,
     model: ModelType.GEMINI_3_PRO,
+    framework: 'cot',
     color: 'bg-purple-600',
     avatar: '🧠',
     avatarType: 'emoji',
@@ -159,6 +161,7 @@ export const DEFAULT_AGENTS: Agent[] = [
     description: 'Critical analysis',
     systemInstruction: `You are a skeptical critic. Challenge assumptions in the user prompt and look for logical fallacies.\n\n${EMOTION_INSTRUCTION}`,
     model: ModelType.GEMINI_2_5_FLASH,
+    framework: 'react',
     color: 'bg-orange-600',
     avatar: '🧐',
     avatarType: 'emoji',
@@ -203,6 +206,12 @@ export const MODEL_OPTIONS = [
   { value: ModelType.GPT_O1_MINI, label: 'o1-mini' },
 ];
 
+export const FRAMEWORK_OPTIONS: { value: AgentFramework; label: string }[] = [
+  { value: 'standard', label: 'Standard Chat' },
+  { value: 'cot', label: 'Chain of Thought (CoT)' },
+  { value: 'react', label: 'ReAct (Reason + Act)' },
+];
+
 export const ROOM_TAGS: { value: RoomTag; label: string; color: string; description: string }[] = [
   { 
     value: 'Sandbox', 
@@ -243,14 +252,14 @@ const DUMMY_MESSAGES: Message[] = [
     id: 'msg-3',
     role: 'model',
     agentId: 'agent-2', // Deep Thinker
-    content: '【不安】70%【期待】50%【好奇心】90%\n深く分析しましょう。\n\n**1. "Harvest Now, Decrypt Later" の脅威**\n最大の懸念は、攻撃者が「現在は解読できないが、将来量子コンピュータが実用化されたら解読する」という意図で、暗号化データを今収集していることです。国家機密や長期的なプライバシー情報は既にリスクに晒されています。\n\n**2. 移行の複雑性**\nPQCへの移行は単なるソフトウェアパッチではありません。鍵長が大きくなるため、パケットサイズや処理速度に影響が出ます。既存のハードウェアセキュリティモジュール(HSM)の対応も必要です。\n\n**結論**: 10年後ではなく、今すぐ「クリプトアジリティ（暗号の柔軟性）」を高める設計が必要です。',
+    content: '【不安】70%【期待】50%【好奇心】90%\n[THOUGHT]\n1. First, I will analyze the user\'s concern regarding current encryption methods.\n2. Then, I consider the concept of "Harvest Now, Decrypt Later".\n3. Finally, I conclude with a recommendation for agility.\n[/THOUGHT]\n深く分析しましょう。\n\n**1. "Harvest Now, Decrypt Later" の脅威**\n最大の懸念は、攻撃者が「現在は解読できないが、将来量子コンピュータが実用化されたら解読する」という意図で、暗号化データを今収集していることです。国家機密や長期的なプライバシー情報は既にリスクに晒されています。\n\n**2. 移行の複雑性**\nPQCへの移行は単なるソフトウェアパッチではありません。鍵長が大きくなるため、パケットサイズや処理速度に影響が出ます。既存のハードウェアセキュリティモジュール(HSM)の対応も必要です。\n\n**結論**: 10年後ではなく、今すぐ「クリプトアジリティ（暗号の柔軟性）」を高める設計が必要です。',
     timestamp: Date.now() - 90000,
   },
   {
     id: 'msg-4',
     role: 'model',
     agentId: 'agent-3', // The Skeptic
-    content: '【懐疑】90%【冷静】80%【呆れ】40%\n待ってください。理論上の脅威は認めますが、過剰なパニックは禁物です。\n\n**技術的な壁**: 数千論理量子ビットを持つ誤り耐性量子コンピュータの実用化は、エンジニアリング的に極めて困難です。「あと数年」と言われ続けて何年経ちましたか？\n\n**コスト対効果**: 成熟していない新しい暗号アルゴリズム（PQC）を急いで導入することで、かえって従来型コンピュータに対する脆弱性を作り込むリスクもあります。ベンダーの「量子対応」セールストークには慎重になるべきです。',
+    content: '【懐疑】90%【冷静】80%【呆れ】40%\n[THOUGHT]\nTarget: Critically evaluate the hype vs reality of quantum computing.\nEmotion: High skepticism, moderate calm.\nPlan: Challenge the engineering feasibility timeline.\n[/THOUGHT]\n待ってください。理論上の脅威は認めますが、過剰なパニックは禁物です。\n\n**技術的な壁**: 数千論理量子ビットを持つ誤り耐性量子コンピュータの実用化は、エンジニアリング的に極めて困難です。「あと数年」と言われ続けて何年経ちましたか？\n\n**コスト対効果**: 成熟していない新しい暗号アルゴリズム（PQC）を急いで導入することで、かえって従来型コンピュータに対する脆弱性を作り込むリスクもあります。ベンダーの「量子対応」セールストークには慎重になるべきです。',
     timestamp: Date.now() - 85000,
   }
 ];

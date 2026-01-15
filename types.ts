@@ -17,6 +17,8 @@ export enum ModelType {
   GPT_O1_MINI = 'o1-mini'
 }
 
+export type AgentFramework = 'standard' | 'cot' | 'react';
+
 export interface Agent {
   id: string;
   name: string;
@@ -25,6 +27,7 @@ export interface Agent {
   importedSystemInstruction?: string; // Content read from MD file
   importedSystemInstructionFileName?: string; // Filename for display
   model: string;
+  framework: AgentFramework; // New: Selected reasoning framework
   color: string;
   avatar: string; // Emoji char or Base64 Image string
   avatarType?: 'emoji' | 'image'; // Distinguish between types

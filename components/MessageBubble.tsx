@@ -1,5 +1,6 @@
-import React, { useMemo } from 'react';
-import { User, Copy, AlertCircle, FileText, Image as ImageIcon } from 'lucide-react';
+
+import React, { useMemo, useState } from 'react';
+import { User, Copy, AlertCircle, FileText, ChevronDown, ChevronRight, Brain } from 'lucide-react';
 import { Message, Agent } from '../types';
 
 interface MessageBubbleProps {
@@ -27,39 +28,66 @@ const getEmotionColor = (name: string): string => {
 };
 
 const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
+  const [isThoughtOpen, setIsThoughtOpen] = useState(false);
   const isUser = message.role === 'user';
   
   const handleCopy = () => {
     navigator.clipboard.writeText(message.content);
   };
 
-  const { emotions, cleanContent } = useMemo(() => {
-    if (isUser || !message.content) return { emotions: [], cleanContent: message.content };
+  const { emotions, cleanContent, thoughtContent, actionContent } = useMemo(() => {
+    if (isUser || !message.content) {
+      return { emotions: [], cleanContent: message.content, thoughtContent: null, actionContent: null };
+    }
 
-    const emotionRegex = /【([^】]+)】(\d+)%/g;
+    let currentContent = message.content;
     const emotions: Emotion[] = [];
-    let match;
+
+    // 1. Extract Emotions (at start)
+    const emotionRegex = /【([^】]+)】(\d+)%/g;
     const startBlockRegex = /^((?:【[^】]+】\d+%)+)(.*)/s;
-    const blockMatch = message.content.match(startBlockRegex);
+    const blockMatch = currentContent.match(startBlockRegex);
 
     if (blockMatch) {
         const emotionBlock = blockMatch[1];
-        const contentBody = blockMatch[2];
+        currentContent = blockMatch[2].replace(/^\s+/, '');
         
+        let match;
         while ((match = emotionRegex.exec(emotionBlock)) !== null) {
             emotions.push({
                 name: match[1],
                 value: parseInt(match[2], 10)
             });
         }
-        
-        return { 
-            emotions, 
-            cleanContent: contentBody.replace(/^\s+/, '') 
-        };
     }
 
-    return { emotions: [], cleanContent: message.content };
+    // 2. Extract Thoughts [THOUGHT]...[/THOUGHT]
+    let thoughtContent = null;
+    const thoughtRegex = /\[THOUGHT\]([\s\S]*?)\[\/THOUGHT\]/;
+    const thoughtMatch = currentContent.match(thoughtRegex);
+    if (thoughtMatch) {
+      thoughtContent = thoughtMatch[1].trim();
+      currentContent = currentContent.replace(thoughtRegex, '').trim();
+    }
+
+    // 3. Extract Actions [ACTION]...[/ACTION]
+    let actionContent = null;
+    const actionRegex = /\[ACTION\]([\s\S]*?)\[\/ACTION\]/;
+    const actionMatch = currentContent.match(actionRegex);
+    if (actionMatch) {
+      actionContent = actionMatch[1].trim();
+      currentContent = currentContent.replace(actionRegex, '').trim();
+    }
+    
+    // Clean up "Final Response:" markers if left over from ReAct
+    currentContent = currentContent.replace(/^Final Response:\s*/i, '');
+
+    return { 
+        emotions, 
+        cleanContent: currentContent,
+        thoughtContent,
+        actionContent
+    };
   }, [message.content, isUser]);
 
   return (
@@ -94,6 +122,9 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
                 {agent.name}
                 </span>
                 {agent.thinkingBudget > 0 && <span className="text-[9px] bg-purple-500/20 text-purple-300 px-1 rounded border border-purple-500/30">Thinking</span>}
+                {agent.framework && agent.framework !== 'standard' && (
+                  <span className="text-[9px] bg-teal-500/20 text-teal-300 px-1 rounded border border-teal-500/30 uppercase">{agent.framework}</span>
+                )}
             </div>
           )}
 
@@ -116,6 +147,25 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
               })}
             </div>
           )}
+
+          {/* Thought Process (Collapsible) */}
+          {!isUser && thoughtContent && (
+             <div className="mb-2 ml-1 mr-1">
+                <button 
+                  onClick={() => setIsThoughtOpen(!isThoughtOpen)}
+                  className="flex items-center gap-1.5 text-[10px] text-zinc-500 hover:text-zinc-300 transition-colors bg-zinc-900/50 px-2 py-1 rounded border border-zinc-800 w-full text-left"
+                >
+                  <Brain className="w-3 h-3" />
+                  <span className="font-mono uppercase tracking-wider flex-1">Agent thought process</span>
+                  {isThoughtOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                </button>
+                {isThoughtOpen && (
+                  <div className="mt-1 p-2 bg-zinc-900 border border-zinc-800 rounded text-xs text-zinc-400 font-mono whitespace-pre-wrap leading-relaxed animate-in slide-in-from-top-1 fade-in duration-200">
+                    {thoughtContent}
+                  </div>
+                )}
+             </div>
+          )}
           
           <div 
             className={`
@@ -126,6 +176,14 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
               ${message.error ? 'border-red-500/50 bg-red-900/10' : ''}
             `}
           >
+            {/* Action Display (ReAct) */}
+            {actionContent && (
+               <div className="mb-3 p-2 bg-teal-900/20 border border-teal-500/20 rounded-lg text-xs font-mono text-teal-300">
+                  <strong className="block mb-1 text-[9px] uppercase tracking-widest text-teal-500">Suggested Action</strong>
+                  {actionContent}
+               </div>
+            )}
+
             {/* Attachment Display */}
             {message.attachments && message.attachments.length > 0 && (
                <div className="flex flex-wrap gap-2 mb-3">

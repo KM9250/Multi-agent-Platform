@@ -2,6 +2,7 @@
 import { GoogleGenAI, Content, Part } from "@google/genai";
 import { Message, Agent, ModelType } from "../types";
 import { DECISION_SYSTEM_INSTRUCTION } from "../constants";
+import { getStrategy } from "./agentStrategies";
 
 // Helper to convert internal Message structure to Gemini Content Parts
 const messageToParts = (message: Message): Part[] => {
@@ -82,7 +83,11 @@ const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction?: stri
   if (agent.importedSystemInstruction) {
     parts.push(`\n\n--- ADDITIONAL CONTEXT (${agent.importedSystemInstructionFileName || 'Imported File'}) ---\n${agent.importedSystemInstruction}\n--- END CONTEXT ---`);
   }
-  return parts.join('\n');
+
+  // --- FRAMEWORK INJECTION ---
+  const strategy = getStrategy(agent.framework);
+  const baseInstruction = parts.join('\n');
+  return strategy.injectSystemPrompt(baseInstruction);
 };
 
 /**

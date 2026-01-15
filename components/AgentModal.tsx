@@ -1,8 +1,9 @@
 
 import React, { useState, useEffect, useRef } from 'react';
-import { X, Shuffle, Brain, Upload, Image as ImageIcon, Smile, FileText, Trash2 } from 'lucide-react';
-import { Agent, ModelType } from '../types';
-import { AVATAR_COLORS, MODEL_OPTIONS } from '../constants';
+import { X, Shuffle, Brain, Upload, Image as ImageIcon, Smile, FileText, Trash2, Cpu } from 'lucide-react';
+import { Agent, ModelType, AgentFramework } from '../types';
+import { AVATAR_COLORS, MODEL_OPTIONS, FRAMEWORK_OPTIONS } from '../constants';
+import { getStrategy } from '../services/agentStrategies';
 
 interface AgentModalProps {
   isOpen: boolean;
@@ -16,6 +17,7 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
   const [description, setDescription] = useState('');
   const [systemInstruction, setSystemInstruction] = useState('');
   const [model, setModel] = useState<string>(ModelType.GEMINI_2_5_FLASH);
+  const [framework, setFramework] = useState<AgentFramework>('standard');
   
   // Imported System Instruction State
   const [importedInstruction, setImportedInstruction] = useState<string>('');
@@ -40,6 +42,7 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       setImportedInstruction(editingAgent.importedSystemInstruction || '');
       setImportedFileName(editingAgent.importedSystemInstructionFileName || '');
       setModel(editingAgent.model);
+      setFramework(editingAgent.framework || 'standard');
       setColor(editingAgent.color);
       setThinkingBudget(editingAgent.thinkingBudget);
       
@@ -64,6 +67,7 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
     setImportedInstruction('');
     setImportedFileName('');
     setModel(ModelType.GEMINI_2_5_FLASH);
+    setFramework('standard');
     setAvatarType('emoji');
     setEmojiAvatar('🤖');
     setImageAvatar('');
@@ -81,6 +85,7 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       importedSystemInstruction: importedInstruction,
       importedSystemInstructionFileName: importedFileName,
       model,
+      framework,
       color,
       avatar: avatarType === 'image' && imageAvatar ? imageAvatar : emojiAvatar,
       avatarType,
@@ -148,6 +153,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
   };
 
   if (!isOpen) return null;
+  
+  const currentStrategy = getStrategy(framework);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
@@ -308,6 +315,34 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
                 Higher values allow more "thinking" before answering (Gemini 2.5 only).
               </p>
             </div>
+          </div>
+
+          {/* Framework Strategy Config */}
+          <div className="border border-zinc-800 rounded-lg p-3 bg-zinc-900/30">
+             <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-2">
+                <Cpu className="w-4 h-4 text-teal-400" />
+                Agent Framework / Strategy
+             </label>
+             <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+               {FRAMEWORK_OPTIONS.map((opt) => (
+                 <button
+                   key={opt.value}
+                   type="button"
+                   onClick={() => setFramework(opt.value)}
+                   className={`
+                     px-3 py-2 rounded-lg text-xs font-medium border transition-all text-left
+                     ${framework === opt.value 
+                       ? 'bg-teal-500/10 text-teal-300 border-teal-500/30' 
+                       : 'bg-zinc-900 text-zinc-400 border-zinc-800 hover:bg-zinc-800'}
+                   `}
+                 >
+                   {opt.label}
+                 </button>
+               ))}
+             </div>
+             <p className="text-[10px] text-zinc-500 mt-2">
+               {currentStrategy.description}
+             </p>
           </div>
 
           {/* System Prompt */}
