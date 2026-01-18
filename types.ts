@@ -52,6 +52,8 @@ export interface Message {
   timestamp: number;
   isStreaming?: boolean;
   error?: boolean;
+  errorCode?: string; // e.g., 'QUOTA_EXCEEDED', 'SAFETY_FILTER'
+  errorDetail?: string; // Technical details or suggestions
 }
 
 export type RoomTag = 'Sandbox' | 'Recreation' | 'Hard';

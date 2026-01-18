@@ -1,6 +1,6 @@
 
 import React, { useMemo, useState } from 'react';
-import { User, Copy, AlertCircle, FileText, ChevronDown, ChevronRight, Brain } from 'lucide-react';
+import { User, Copy, AlertCircle, FileText, ChevronDown, ChevronRight, Brain, Info, AlertTriangle, Terminal } from 'lucide-react';
 import { Message, Agent } from '../types';
 
 interface MessageBubbleProps {
@@ -13,7 +13,6 @@ interface Emotion {
   value: number;
 }
 
-// Generate a consistent color based on the emotion name
 const getEmotionColor = (name: string): string => {
   const colors = [
     'bg-red-500', 'bg-orange-500', 'bg-amber-500', 'bg-yellow-500', 'bg-lime-500',
@@ -29,6 +28,7 @@ const getEmotionColor = (name: string): string => {
 
 const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
   const [isThoughtOpen, setIsThoughtOpen] = useState(false);
+  const [isErrorDetailOpen, setIsErrorDetailOpen] = useState(false);
   const isUser = message.role === 'user';
   
   const handleCopy = () => {
@@ -36,7 +36,7 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
   };
 
   const { emotions, cleanContent, thoughtContent, actionContent } = useMemo(() => {
-    if (isUser || !message.content) {
+    if (isUser || !message.content || message.error) {
       return { emotions: [], cleanContent: message.content, thoughtContent: null, actionContent: null };
     }
 
@@ -79,7 +79,6 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
       currentContent = currentContent.replace(actionRegex, '').trim();
     }
     
-    // Clean up "Final Response:" markers if left over from ReAct
     currentContent = currentContent.replace(/^Final Response:\s*/i, '');
 
     return { 
@@ -88,7 +87,7 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
         thoughtContent,
         actionContent
     };
-  }, [message.content, isUser]);
+  }, [message.content, isUser, message.error]);
 
   return (
     <div className={`flex w-full mb-6 ${isUser ? 'justify-end' : 'justify-start'}`}>
@@ -173,53 +172,87 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
               ${isUser 
                 ? 'bg-zinc-800 text-zinc-100 rounded-tr-sm border border-zinc-700' 
                 : 'bg-zinc-900/80 text-zinc-200 rounded-tl-sm border border-zinc-800/80'}
-              ${message.error ? 'border-red-500/50 bg-red-900/10' : ''}
+              ${message.error ? 'border-red-500/40 bg-red-500/5' : ''}
             `}
           >
-            {/* Action Display (ReAct) */}
-            {actionContent && (
-               <div className="mb-3 p-2 bg-teal-900/20 border border-teal-500/20 rounded-lg text-xs font-mono text-teal-300">
-                  <strong className="block mb-1 text-[9px] uppercase tracking-widest text-teal-500">Suggested Action</strong>
-                  {actionContent}
-               </div>
-            )}
-
-            {/* Attachment Display */}
-            {message.attachments && message.attachments.length > 0 && (
-               <div className="flex flex-wrap gap-2 mb-3">
-                  {message.attachments.map((att, idx) => (
-                    <div key={idx} className="overflow-hidden rounded-lg border border-white/10 bg-black/20">
-                      {att.type === 'image' ? (
-                        <div className="relative group/img cursor-pointer">
-                           <img 
-                              src={att.data} 
-                              alt={att.name} 
-                              className="max-w-[200px] max-h-[200px] object-cover" 
-                           />
-                        </div>
-                      ) : (
-                        <div className="flex items-center gap-2 px-3 py-2">
-                           <FileText className="w-4 h-4 text-zinc-400" />
-                           <span className="text-xs text-zinc-300 max-w-[150px] truncate">{att.name}</span>
-                        </div>
-                      )}
-                    </div>
-                  ))}
-               </div>
-            )}
-
+            {/* Error Display */}
             {message.error ? (
-               <div className="flex items-center gap-2 text-red-400">
-                  <AlertCircle className="w-4 h-4" />
-                  <span>Error: {cleanContent}</span>
-               </div>
-            ) : (
-              <div className="whitespace-pre-wrap break-words">
-                {cleanContent || (message.isStreaming ? '' : <span className="text-zinc-500 italic">No text content</span>)}
-                {message.isStreaming && (
-                  <span className="inline-block w-2 h-4 ml-1 align-middle bg-zinc-400 animate-pulse" />
+              <div className="space-y-3">
+                <div className="flex items-start gap-3">
+                  <div className="shrink-0 p-1.5 bg-red-500/10 rounded-lg text-red-500">
+                    <AlertTriangle className="w-5 h-5" />
+                  </div>
+                  <div className="flex-1 space-y-1">
+                    <div className="flex items-center gap-2">
+                       <span className="text-xs font-bold text-red-400 uppercase tracking-wider">
+                         {message.errorCode || 'ERROR'}
+                       </span>
+                       <div className="h-3 w-px bg-zinc-800" />
+                       <span className="text-xs text-zinc-400">Agent Response Failed</span>
+                    </div>
+                    <p className="text-sm font-medium text-zinc-200">{message.content}</p>
+                  </div>
+                </div>
+
+                {message.errorDetail && (
+                  <div className="pt-2 border-t border-red-500/10">
+                    <button 
+                      onClick={() => setIsErrorDetailOpen(!isErrorDetailOpen)}
+                      className="flex items-center gap-2 text-[10px] text-zinc-500 hover:text-zinc-300 transition-colors mb-2"
+                    >
+                      <Terminal className="w-3 h-3" />
+                      Technical Details
+                      {isErrorDetailOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                    </button>
+                    {isErrorDetailOpen && (
+                      <div className="p-3 bg-black/40 border border-red-500/10 rounded-lg text-[11px] font-mono text-zinc-400 leading-relaxed break-all animate-in slide-in-from-top-1 fade-in duration-200">
+                        {message.errorDetail}
+                      </div>
+                    )}
+                  </div>
                 )}
               </div>
+            ) : (
+              <>
+                {/* Action Display (ReAct) */}
+                {actionContent && (
+                  <div className="mb-3 p-2 bg-teal-900/20 border border-teal-500/20 rounded-lg text-xs font-mono text-teal-300">
+                      <strong className="block mb-1 text-[9px] uppercase tracking-widest text-teal-500">Suggested Action</strong>
+                      {actionContent}
+                  </div>
+                )}
+
+                {/* Attachment Display */}
+                {message.attachments && message.attachments.length > 0 && (
+                  <div className="flex flex-wrap gap-2 mb-3">
+                      {message.attachments.map((att, idx) => (
+                        <div key={idx} className="overflow-hidden rounded-lg border border-white/10 bg-black/20">
+                          {att.type === 'image' ? (
+                            <div className="relative group/img cursor-pointer">
+                              <img 
+                                  src={att.data} 
+                                  alt={att.name} 
+                                  className="max-w-[200px] max-h-[200px] object-cover" 
+                              />
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-2 px-3 py-2">
+                              <FileText className="w-4 h-4 text-zinc-400" />
+                              <span className="text-xs text-zinc-300 max-w-[150px] truncate">{att.name}</span>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                  </div>
+                )}
+
+                <div className="whitespace-pre-wrap break-words">
+                  {cleanContent || (message.isStreaming ? '' : <span className="text-zinc-500 italic">No text content</span>)}
+                  {message.isStreaming && (
+                    <span className="inline-block w-2 h-4 ml-1 align-middle bg-zinc-400 animate-pulse" />
+                  )}
+                </div>
+              </>
             )}
 
             <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">

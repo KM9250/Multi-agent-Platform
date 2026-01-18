@@ -1,4 +1,3 @@
-
 import { GoogleGenAI, Content, Part } from "@google/genai";
 import { Message, Agent, ModelType } from "../types";
 import { DECISION_SYSTEM_INSTRUCTION } from "../constants";
@@ -48,11 +47,8 @@ const buildHistoryForAgent = (allMessages: Message[], agentId: string): Content[
 };
 
 const buildHistoryForDecision = (allMessages: Message[]): Content[] => {
-  // For decision making, strictly use text to save tokens, ignoring images for now
-  // unless strictly necessary.
   return allMessages.map(m => {
     let content = m.content;
-    // Append attachment names to context so the agent knows a file exists
     if (m.attachments?.length) {
       const fileNames = m.attachments.map(a => `[${a.type} file: ${a.name}]`).join(', ');
       content += `\n${fileNames}`;
@@ -67,7 +63,6 @@ const buildHistoryForDecision = (allMessages: Message[]): Content[] => {
 const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction?: string): string => {
   const parts = [];
   
-  // Special injection for mapped models to maintain illusion or explain behavior
   if (agent.model.startsWith('gpt') || agent.model.startsWith('o1')) {
       parts.push(`[SYSTEM NOTE: You are acting as ${agent.model}. Adopt the persona and capabilities associated with this model.]`);
   }
@@ -84,19 +79,13 @@ const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction?: stri
     parts.push(`\n\n--- ADDITIONAL CONTEXT (${agent.importedSystemInstructionFileName || 'Imported File'}) ---\n${agent.importedSystemInstruction}\n--- END CONTEXT ---`);
   }
 
-  // --- FRAMEWORK INJECTION ---
   const strategy = getStrategy(agent.framework);
   const baseInstruction = parts.join('\n');
   return strategy.injectSystemPrompt(baseInstruction);
 };
 
-/**
- * Maps the user-selected model to an available Gemini API model.
- * Since this app only has a Google GenAI key, we simulate GPT models using Gemini.
- */
 const resolveModel = (selectedModel: string): string => {
   switch (selectedModel) {
-    // --- Gemini Series (Direct mapping) ---
     case ModelType.GEMINI_3_PRO:
     case ModelType.GEMINI_3_PRO_IMAGE:
     case ModelType.GEMINI_2_5_FLASH:
@@ -104,20 +93,69 @@ const resolveModel = (selectedModel: string): string => {
     case ModelType.GEMINI_2_5_FLASH_THINKING:
     case ModelType.GEMINI_2_5_PRO:
       return selectedModel;
-      
-    // --- OpenAI Mapping (Simulations) ---
     case ModelType.GPT_4_O:
-      return ModelType.GEMINI_3_PRO; // High intelligence equivalent
+      return ModelType.GEMINI_3_PRO;
     case ModelType.GPT_O1:
     case ModelType.GPT_O1_MINI:
-      return ModelType.GEMINI_3_PRO; // Use Pro for reasoning tasks
+      return ModelType.GEMINI_3_PRO;
     case ModelType.GPT_4_O_MINI:
-      return ModelType.GEMINI_2_5_FLASH; // High speed/efficiency equivalent
-      
-    // --- Fallback ---
+      return ModelType.GEMINI_2_5_FLASH;
     default:
       return ModelType.GEMINI_2_5_FLASH;
   }
+};
+
+/**
+ * Classifies an error into a human-readable code and detailed description.
+ */
+const classifyError = (err: any): { code: string; detail: string; message: string } => {
+  const msg = err.message || String(err);
+  
+  if (msg.includes("API Key is missing") || msg.includes("401")) {
+    return { 
+      code: 'AUTH_ERROR', 
+      message: 'Authentication failed.', 
+      detail: 'The API key is missing or invalid. Please check your configuration.' 
+    };
+  }
+  
+  if (msg.includes("429") || msg.includes("QuotaExceeded")) {
+    return { 
+      code: 'QUOTA_EXCEEDED', 
+      message: 'Rate limit reached.', 
+      detail: 'The API quota has been exhausted. Try again later or upgrade your plan.' 
+    };
+  }
+
+  if (msg.includes("Safety") || msg.includes("block") || msg.includes("finishReason: SAFETY")) {
+    return { 
+      code: 'SAFETY_BLOCK', 
+      message: 'Response blocked.', 
+      detail: 'The request was flagged by safety filters. Consider rephrasing.' 
+    };
+  }
+
+  if (msg.includes("503") || msg.includes("Overloaded") || msg.includes("Service Unavailable")) {
+    return { 
+      code: 'MODEL_OVERLOADED', 
+      message: 'Model is overloaded.', 
+      detail: 'Google\'s servers are currently under heavy load. Please retry in a moment.' 
+    };
+  }
+
+  if (msg.includes("Failed to fetch") || msg.includes("NetworkError")) {
+    return { 
+      code: 'NETWORK_ERROR', 
+      message: 'Connection failed.', 
+      detail: 'Unable to reach the API. Please check your internet connection.' 
+    };
+  }
+
+  return { 
+    code: 'UNKNOWN_ERROR', 
+    message: 'An unexpected error occurred.', 
+    detail: msg 
+  };
 };
 
 export const evaluateShouldRespond = async (
@@ -129,16 +167,11 @@ export const evaluateShouldRespond = async (
 
     try {
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        
         let systemPrompt = `あなたは「${agent.name}」という名前のエージェントです。\n役割: ${agent.description}\n\n${DECISION_SYSTEM_INSTRUCTION}`;
-        
         if (roomSystemInstruction) {
              systemPrompt = `=== ROOM CONTEXT ===\n${roomSystemInstruction}\n=== END ROOM CONTEXT ===\n\n` + systemPrompt;
         }
-
         const history = buildHistoryForDecision(allMessages.slice(-10));
-
-        // Use Flash for all decisions to keep it fast/cheap, regardless of agent model
         const response = await ai.models.generateContent({
             model: ModelType.GEMINI_2_5_FLASH,
             contents: [
@@ -149,16 +182,17 @@ export const evaluateShouldRespond = async (
                 systemInstruction: systemPrompt,
                 temperature: 0.1,
                 maxOutputTokens: 10,
+                // Disabling thinking to ensure maxOutputTokens are utilized for response
+                thinkingConfig: { thinkingBudget: 0 }
             }
         });
 
+        // Using .text property directly as per latest guidelines
         const decision = response.text?.trim().toUpperCase();
-        console.log(`Agent ${agent.name} decision: ${decision}`);
         return decision?.includes("RESPOND") ?? false;
-
     } catch (e) {
         console.error("Decision API Error:", e);
-        return allMessages.length < 3; 
+        return false; 
     }
 }
 
@@ -168,24 +202,17 @@ export const streamAgentResponse = async (
   roomSystemInstruction: string | undefined,
   onChunk: (text: string) => void,
   onComplete: () => void,
-  onError: (error: Error) => void
+  onError: (error: { message: string, code: string, detail: string }) => void
 ) => {
   if (!process.env.API_KEY) {
-    onError(new Error("API Key is missing"));
+    onError(classifyError(new Error("API Key is missing")));
     return;
   }
 
   try {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    
-    // The last message is the trigger (User prompt or Agent reply)
-    // We separate the history from the "latest turn" conceptually, 
-    // but the SDK handles the last message in `sendMessageStream` argument usually if it's chat.
-    // However, since we construct history manually based on filter, we treat the LAST message
-    // as the `message` parameter of `sendMessageStream`, and the rest as `history`.
-    
     const messagesToUse = allMessages.slice();
-    const lastMessage = messagesToUse.pop(); // Remove last to use as prompt
+    const lastMessage = messagesToUse.pop();
 
     if (!lastMessage) {
         throw new Error("No messages to respond to");
@@ -199,20 +226,15 @@ export const streamAgentResponse = async (
       systemInstruction: combinedSystemInstruction,
     };
 
-    // If simulating 'o1' (Reasoning) using Gemini, force a high thinking budget if supported
-    // Otherwise use the user's setting.
     if (agent.model === ModelType.GPT_O1 || agent.model === ModelType.GPT_O1_MINI) {
-       // Force thinking for 'o1' simulation if not already set high
        const thinkingBudget = Math.max(agent.thinkingBudget || 0, 4096);
-       // Only apply thinking if model supports it (Gemini 2.5 series mostly, but assuming Pro might in future or we map to 2.5 Pro)
-       // For now, if mapped to 3.0 Pro, thinking might not be available via 'thinkingConfig' param same way, 
-       // but strictly following valid configs:
-       if (actualModel.includes('gemini-2.5')) {
+       // Gemini 2.5 and 3.0 series both support thinkingConfig
+       if (actualModel.includes('gemini-2.5') || actualModel.includes('gemini-3')) {
           config.thinkingConfig = { thinkingBudget };
        }
     } else if (agent.thinkingBudget > 0) {
-       // Only apply thinking config if the resolved model supports it
-       if (actualModel.includes('gemini-2.5')) {
+       // Gemini 2.5 and 3.0 series both support thinkingConfig
+       if (actualModel.includes('gemini-2.5') || actualModel.includes('gemini-3')) {
           config.thinkingConfig = { thinkingBudget: agent.thinkingBudget };
        }
     }
@@ -223,15 +245,13 @@ export const streamAgentResponse = async (
       history: history
     });
 
-    // Convert the last message (prompt) to parts
     const promptParts = messageToParts(lastMessage);
-
-    // sendMessageStream takes (string | Part[]), so we pass the parts directly
     const resultStream = await chat.sendMessageStream({
       message: promptParts 
     });
 
     for await (const chunk of resultStream) {
+      // Accessing .text property from stream chunk
       if (chunk.text) {
         onChunk(chunk.text);
       }
@@ -239,7 +259,6 @@ export const streamAgentResponse = async (
 
     onComplete();
   } catch (err: any) {
-    console.error(`Error generating content for agent ${agent.name} (${agent.model} -> ${resolveModel(agent.model)}):`, err);
-    onError(err instanceof Error ? err : new Error(String(err)));
+    onError(classifyError(err));
   }
 };
