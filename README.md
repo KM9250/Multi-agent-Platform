@@ -1,20 +1,46 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# Multi-agent-Platform
 
-# Run and deploy your AI Studio app
+Multi-agent-Platform is an experimental implementation project for a simple but important idea:
 
-This contains everything you need to run your app locally.
+**the future of advanced AI systems may depend less on a single super-agent, and more on structured cooperation between multiple agents with different roles.**
 
-View your app in AI Studio: https://ai.studio/apps/drive/1k_AxacBRRbgEcqGCcD1wEvTcKkZZ5JqZ
+Instead of treating intelligence as something that must be concentrated into one model, this project explores a platform-based approach where AI agents can specialize, evaluate each other, hand off tasks, and work under human supervision.
 
-## Run Locally
+## Motivation
 
-**Prerequisites:**  Node.js
+My working hypothesis is that scalable and reliable AI systems will require:
 
+- specialization instead of monolithic design
+- evaluation layers instead of blind execution
+- handoff and coordination instead of isolated outputs
+- institutional structure and role boundaries instead of trust in a single agent
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+This repository is an attempt to turn that hypothesis into a working platform.
+
+## What this repository explores
+
+Multi-agent-Platform focuses on the implementation side of multi-agent orchestration:
+
+- agent coordination
+- task routing and handoff
+- role-based execution
+- human-in-the-loop control
+- experimental UI / workflow for multi-agent operation
+
+This is not intended to be a finished product yet.  
+It is a prototype environment for testing how a network of AI agents can function as a practical system.
+
+## Related repository
+
+The design philosophy and protocol-level ideas are documented separately in:  
+**[Multi-Agent-Command-Protocol](https://github.com/KM9250/Multi-Agent-Command-Protocol)**
+
+In short:
+
+- **Multi-Agent-Command-Protocol** = protocol / architecture / operating concept
+- **Multi-agent-Platform** = implementation / experimentation / prototype platform
+
+## Status
+
+Work in progress.  
+The goal is to build a foundation for AI systems where intelligence emerges from **coordination, structure, and controlled interaction**, not only from model size.
