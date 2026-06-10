@@ -74,7 +74,7 @@ const AgentSidebar: React.FC<SidebarProps> = ({
       </button>
 
       <div className="space-y-1">
-        {rooms.sort((a,b) => b.updatedAt - a.updatedAt).map((room) => (
+        {[...rooms].sort((a,b) => b.updatedAt - a.updatedAt).map((room) => (
           <div 
             key={room.id}
             onClick={() => onSwitchRoom(room.id)}

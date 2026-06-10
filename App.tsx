@@ -6,20 +6,28 @@ import MessageBubble from './components/MessageBubble';
 import RelationshipGraphModal from './components/RelationshipGraphModal';
 import RoomModal from './components/RoomModal';
 import SceneView from './components/SceneView';
-import { streamAgentResponse, evaluateShouldRespond } from './services/geminiService';
+import { streamAgentResponse, evaluateShouldRespond, hasApiKey } from './services/geminiService';
 import { INITIAL_ROOMS, createNewRoom, calculateRelationshipWeights, ROOM_TAGS } from './constants';
 import { Agent, Message, Room, Attachment, RoomTag } from './types';
 
 export default function App() {
   // --- State ---
   const [rooms, setRooms] = useState<Room[]>(() => {
-    const saved = localStorage.getItem('rooms');
-    return saved ? JSON.parse(saved) : INITIAL_ROOMS;
+    try {
+      const saved = localStorage.getItem('rooms');
+      return saved ? JSON.parse(saved) : INITIAL_ROOMS;
+    } catch (e) {
+      console.error('Failed to restore rooms from localStorage:', e);
+      return INITIAL_ROOMS;
+    }
   });
 
   const [activeRoomId, setActiveRoomId] = useState<string>(() => {
     const saved = localStorage.getItem('activeRoomId');
-    return saved || (rooms[0]?.id ?? '');
+    // A stale id (e.g. the room was deleted in a previous session) would make
+    // every room update silently miss, so validate it against the loaded rooms.
+    if (saved && rooms.some(r => r.id === saved)) return saved;
+    return rooms[0]?.id ?? '';
   });
 
   const [input, setInput] = useState('');
@@ -57,7 +65,13 @@ export default function App() {
 
   // --- Effects ---
   useEffect(() => {
-    localStorage.setItem('rooms', JSON.stringify(rooms));
+    try {
+      localStorage.setItem('rooms', JSON.stringify(rooms));
+    } catch (e) {
+      // Base64 image attachments/avatars can exceed the ~5MB storage quota.
+      // Keep the app running; the session simply won't survive a reload.
+      console.error('Failed to persist rooms to localStorage:', e);
+    }
   }, [rooms]);
 
   useEffect(() => {
@@ -163,6 +177,24 @@ export default function App() {
         return;
     }
 
+    // Without a key, the decision module silently returns IGNORE for every
+    // agent and the user gets no feedback at all — surface the error instead.
+    if (!hasApiKey()) {
+        const errMsg: Message = {
+            id: crypto.randomUUID(),
+            role: 'model',
+            content: 'Authentication failed.',
+            timestamp: Date.now(),
+            error: true,
+            errorCode: 'AUTH_ERROR',
+            errorDetail: 'The API key is missing. Set GEMINI_API_KEY in .env.local and restart the dev server.'
+        };
+        updateActiveRoom({ messages: [...currentHistory, errMsg] });
+        setIsGenerating(false);
+        isGeneratingRef.current = false;
+        return;
+    }
+
     setPlanningAgents(activeAgents.map(a => a.id));
     const relationshipWeights = calculateRelationshipWeights(rooms);
 
@@ -236,12 +268,16 @@ export default function App() {
           },
           () => {
             updateLocalHistory(msgId, accumulatedText, false);
-            const targetMsg = nextHistory.find(m => m.id === msgId);
-            if (targetMsg) targetMsg.content = accumulatedText;
+            nextHistory = nextHistory.map(m => m.id === msgId
+              ? { ...m, content: accumulatedText, isStreaming: false }
+              : m);
             resolve();
           },
           (errorInfo) => {
             updateLocalHistory(msgId, errorInfo.message, false, true, errorInfo.code, errorInfo.detail);
+            nextHistory = nextHistory.map(m => m.id === msgId
+              ? { ...m, content: errorInfo.message, isStreaming: false, error: true, errorCode: errorInfo.code, errorDetail: errorInfo.detail }
+              : m);
             resolve();
           }
         );
