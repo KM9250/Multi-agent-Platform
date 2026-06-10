@@ -3,6 +3,13 @@ import { Message, Agent, ModelType } from "../types";
 import { DECISION_SYSTEM_INSTRUCTION } from "../constants";
 import { getStrategy } from "./agentStrategies";
 
+export const hasApiKey = (): boolean => !!process.env.API_KEY;
+
+// Failed responses and empty placeholders must not reach the API:
+// a message that maps to zero Parts makes generateContent reject the request.
+const isSendableMessage = (m: Message): boolean =>
+  !m.error && (!!m.content || !!m.attachments?.length);
+
 // Helper to convert internal Message structure to Gemini Content Parts
 const messageToParts = (message: Message): Part[] => {
   const parts: Part[] = [];
@@ -47,7 +54,7 @@ const buildHistoryForAgent = (allMessages: Message[], agentId: string): Content[
 };
 
 const buildHistoryForDecision = (allMessages: Message[]): Content[] => {
-  return allMessages.map(m => {
+  return allMessages.filter(isSendableMessage).map(m => {
     let content = m.content;
     if (m.attachments?.length) {
       const fileNames = m.attachments.map(a => `[${a.type} file: ${a.name}]`).join(', ');
@@ -90,9 +97,15 @@ const resolveModel = (selectedModel: string): string => {
     case ModelType.GEMINI_3_PRO_IMAGE:
     case ModelType.GEMINI_2_5_FLASH:
     case ModelType.GEMINI_2_5_FLASH_LITE:
-    case ModelType.GEMINI_2_5_FLASH_THINKING:
     case ModelType.GEMINI_2_5_PRO:
       return selectedModel;
+    case ModelType.GEMINI_2_5_FLASH_THINKING:
+      // 'gemini-2.5-flash-thinking' is not a real API model; thinking is
+      // enabled on the standard flash model via thinkingConfig instead.
+      return ModelType.GEMINI_2_5_FLASH;
+    case 'gemini-2.5-pro-preview-02-05':
+      // Legacy ID that may persist in saved rooms from older versions
+      return ModelType.GEMINI_2_5_PRO;
     case ModelType.GPT_4_O:
       return ModelType.GEMINI_3_PRO;
     case ModelType.GPT_O1:
@@ -211,7 +224,7 @@ export const streamAgentResponse = async (
 
   try {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const messagesToUse = allMessages.slice();
+    const messagesToUse = allMessages.filter(isSendableMessage);
     const lastMessage = messagesToUse.pop();
 
     if (!lastMessage) {
@@ -226,7 +239,7 @@ export const streamAgentResponse = async (
       systemInstruction: combinedSystemInstruction,
     };
 
-    if (agent.model === ModelType.GPT_O1 || agent.model === ModelType.GPT_O1_MINI) {
+    if (agent.model === ModelType.GPT_O1 || agent.model === ModelType.GPT_O1_MINI || agent.model === ModelType.GEMINI_2_5_FLASH_THINKING) {
        const thinkingBudget = Math.max(agent.thinkingBudget || 0, 4096);
        // Gemini 2.5 and 3.0 series both support thinkingConfig
        if (actualModel.includes('gemini-2.5') || actualModel.includes('gemini-3')) {
