@@ -77,6 +77,10 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    // If the image tab is selected but nothing was uploaded, fall back to the
+    // emoji avatar entirely — saving avatarType 'image' with an emoji string
+    // would render a broken <img> everywhere the avatar is shown.
+    const effectiveAvatarType = avatarType === 'image' && imageAvatar ? 'image' : 'emoji';
     onSave({
       id: editingAgent ? editingAgent.id : crypto.randomUUID(),
       name: name || 'Unnamed Agent',
@@ -87,9 +91,9 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       model,
       framework,
       color,
-      avatar: avatarType === 'image' && imageAvatar ? imageAvatar : emojiAvatar,
-      avatarType,
-      isEnabled: true,
+      avatar: effectiveAvatarType === 'image' ? imageAvatar : emojiAvatar,
+      avatarType: effectiveAvatarType,
+      isEnabled: editingAgent ? editingAgent.isEnabled : true,
       thinkingBudget
     });
     onClose();
