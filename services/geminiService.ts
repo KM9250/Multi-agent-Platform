@@ -43,33 +43,55 @@ const messageToParts = (message: Message): Part[] => {
   return parts;
 };
 
-// Helper to sanitize/prepare history for the specific agent
-const buildHistoryForAgent = (allMessages: Message[], agentId: string): Content[] => {
-  return allMessages
-    .filter(m => m.role === 'user' || (m.role === 'model' && m.agentId === agentId))
-    .map(m => ({
-      role: m.role,
-      parts: messageToParts(m)
-    }));
+// Resolves an agentId to a display name for speaker labels in shared history
+const makeNameResolver = (agents?: Agent[]) => (id?: string): string =>
+  agents?.find(a => a.id === id)?.name || 'Agent';
+
+// Build the shared conversation from one agent's perspective: its own
+// messages stay 'model' turns, while the user and every other agent become
+// labeled 'user' turns so the model can follow who said what.
+const buildHistoryForAgent = (
+  allMessages: Message[],
+  agentId: string,
+  nameOf: (id?: string) => string
+): Content[] => {
+  return allMessages.map(m => {
+    if (m.role === 'model' && m.agentId === agentId) {
+      return { role: 'model', parts: messageToParts(m) };
+    }
+    const speaker = m.role === 'user' ? 'User' : nameOf(m.agentId);
+    const labeled: Message = { ...m, content: `[${speaker}]: ${m.content || ''}` };
+    return { role: 'user', parts: messageToParts(labeled) };
+  });
 };
 
-const buildHistoryForDecision = (allMessages: Message[]): Content[] => {
+const buildHistoryForDecision = (
+  allMessages: Message[],
+  nameOf: (id?: string) => string
+): Content[] => {
   return allMessages.filter(isSendableMessage).map(m => {
     let content = m.content;
     if (m.attachments?.length) {
       const fileNames = m.attachments.map(a => `[${a.type} file: ${a.name}]`).join(', ');
       content += `\n${fileNames}`;
     }
+    const speaker = m.role === 'user' ? 'User' : nameOf(m.agentId);
     return {
       role: m.role === 'user' ? 'user' : 'model',
-      parts: [{ text: `[${m.role === 'user' ? 'User' : 'Agent'}] ${content}` }]
+      parts: [{ text: `[${speaker}] ${content}` }]
     };
   });
 };
 
 const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction?: string): string => {
   const parts = [];
-  
+
+  parts.push(
+    `You are "${agent.name}" in a multi-agent chat room. ` +
+    `Messages from the user and from other agents appear prefixed with their speaker label like "[Name]:". ` +
+    `Reply only as ${agent.name}: never write a "[Name]:" prefix yourself and never speak on behalf of the user or other agents.`
+  );
+
   if (agent.model.startsWith('gpt') || agent.model.startsWith('o1')) {
       parts.push(`[SYSTEM NOTE: You are acting as ${agent.model}. Adopt the persona and capabilities associated with this model.]`);
   }
@@ -171,10 +193,16 @@ const classifyError = (err: any): { code: string; detail: string; message: strin
   };
 };
 
+export interface AgentCallOptions {
+  agents?: Agent[];        // Room agents, used to label speakers in history
+  signal?: AbortSignal;    // Aborts the underlying API request (Stop button)
+}
+
 export const evaluateShouldRespond = async (
   agent: Agent,
   allMessages: Message[],
-  roomSystemInstruction?: string
+  roomSystemInstruction?: string,
+  options?: AgentCallOptions
 ): Promise<boolean> => {
     if (!process.env.API_KEY) return false;
 
@@ -184,7 +212,7 @@ export const evaluateShouldRespond = async (
         if (roomSystemInstruction) {
              systemPrompt = `=== ROOM CONTEXT ===\n${roomSystemInstruction}\n=== END ROOM CONTEXT ===\n\n` + systemPrompt;
         }
-        const history = buildHistoryForDecision(allMessages.slice(-10));
+        const history = buildHistoryForDecision(allMessages.slice(-10), makeNameResolver(options?.agents));
         const response = await ai.models.generateContent({
             model: ModelType.GEMINI_2_5_FLASH,
             contents: [
@@ -196,7 +224,8 @@ export const evaluateShouldRespond = async (
                 temperature: 0.1,
                 maxOutputTokens: 10,
                 // Disabling thinking to ensure maxOutputTokens are utilized for response
-                thinkingConfig: { thinkingBudget: 0 }
+                thinkingConfig: { thinkingBudget: 0 },
+                abortSignal: options?.signal
             }
         });
 
@@ -211,32 +240,35 @@ export const evaluateShouldRespond = async (
 
 export const streamAgentResponse = async (
   agent: Agent,
-  allMessages: Message[], 
+  allMessages: Message[],
   roomSystemInstruction: string | undefined,
   onChunk: (text: string) => void,
   onComplete: () => void,
-  onError: (error: { message: string, code: string, detail: string }) => void
+  onError: (error: { message: string, code: string, detail: string }) => void,
+  options?: AgentCallOptions
 ) => {
   if (!process.env.API_KEY) {
     onError(classifyError(new Error("API Key is missing")));
     return;
   }
 
+  const signal = options?.signal;
+
   try {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     const messagesToUse = allMessages.filter(isSendableMessage);
-    const lastMessage = messagesToUse.pop();
 
-    if (!lastMessage) {
+    if (messagesToUse.length === 0) {
         throw new Error("No messages to respond to");
     }
 
-    const history = buildHistoryForAgent(messagesToUse, agent.id);
+    const contents = buildHistoryForAgent(messagesToUse, agent.id, makeNameResolver(options?.agents));
     const combinedSystemInstruction = getCombinedSystemInstruction(agent, roomSystemInstruction);
     const actualModel = resolveModel(agent.model);
 
     const config: any = {
       systemInstruction: combinedSystemInstruction,
+      abortSignal: signal,
     };
 
     if (agent.model === ModelType.GPT_O1 || agent.model === ModelType.GPT_O1_MINI || agent.model === ModelType.GEMINI_2_5_FLASH_THINKING) {
@@ -252,18 +284,14 @@ export const streamAgentResponse = async (
        }
     }
 
-    const chat = ai.chats.create({
+    const resultStream = await ai.models.generateContentStream({
       model: actualModel,
-      config: config,
-      history: history
-    });
-
-    const promptParts = messageToParts(lastMessage);
-    const resultStream = await chat.sendMessageStream({
-      message: promptParts 
+      contents,
+      config
     });
 
     for await (const chunk of resultStream) {
+      if (signal?.aborted) break;
       // Accessing .text property from stream chunk
       if (chunk.text) {
         onChunk(chunk.text);
@@ -272,6 +300,11 @@ export const streamAgentResponse = async (
 
     onComplete();
   } catch (err: any) {
+    // A user-initiated stop is not an error; finalize the message as-is
+    if (signal?.aborted) {
+      onComplete();
+      return;
+    }
     onError(classifyError(err));
   }
 };

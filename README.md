@@ -30,6 +30,28 @@ Multi-agent-Platform focuses on the implementation side of multi-agent orchestra
 This is not intended to be a finished product yet.  
 It is a prototype environment for testing how a network of AI agents can function as a practical system.
 
+## Getting started
+
+Requirements: Node.js 20+ and a Google Gemini API key ([Google AI Studio](https://aistudio.google.com/apikey)).
+
+```bash
+npm install
+
+# Configure the API key
+echo "GEMINI_API_KEY=your-api-key-here" > .env.local
+
+# Development server (http://localhost:3000)
+npm run dev
+
+# Production build
+npm run build
+```
+
+> **Note:** The API key is injected into the client bundle at build time
+> (`vite.config.ts` → `define`). Anyone who can load the page can extract it,
+> so do not deploy a build made this way to a public URL with a key you care
+> about — use a server-side proxy for real deployments.
+
 ## Related repository
 
 The design philosophy and protocol-level ideas are documented separately in:  

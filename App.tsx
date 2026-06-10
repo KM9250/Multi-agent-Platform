@@ -15,7 +15,14 @@ export default function App() {
   const [rooms, setRooms] = useState<Room[]>(() => {
     try {
       const saved = localStorage.getItem('rooms');
-      return saved ? JSON.parse(saved) : INITIAL_ROOMS;
+      if (!saved) return INITIAL_ROOMS;
+      // A reload during generation persists isStreaming: true, which would
+      // leave a forever-blinking cursor and "Thinking" badges. Clear it.
+      const parsed: Room[] = JSON.parse(saved);
+      return parsed.map(room => ({
+        ...room,
+        messages: room.messages.map(m => m.isStreaming ? { ...m, isStreaming: false } : m)
+      }));
     } catch (e) {
       console.error('Failed to restore rooms from localStorage:', e);
       return INITIAL_ROOMS;
@@ -48,6 +55,7 @@ export default function App() {
   const [isDragging, setIsDragging] = useState(false);
   
   const isGeneratingRef = useRef(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -211,7 +219,10 @@ export default function App() {
         }
         if (isMentioned) return { agent, shouldRespond: true, reason: 'mentioned' };
         
-        const shouldRespond = await evaluateShouldRespond(agent, currentHistory, activeRoom.systemInstruction);
+        const shouldRespond = await evaluateShouldRespond(agent, currentHistory, activeRoom.systemInstruction, {
+          agents,
+          signal: abortControllerRef.current?.signal
+        });
         return { agent, shouldRespond, reason: 'llm_decision' };
     }));
     
@@ -237,7 +248,7 @@ export default function App() {
 
     const timestamp = Date.now();
     const agentMessageIds: Record<string, string> = {};
-    const newAgentMessages: Message[] = sortedAgents.map(agent => {
+    const newAgentMessages: Message[] = sortedAgents.map((agent, idx) => {
       const msgId = crypto.randomUUID();
       agentMessageIds[agent.id] = msgId;
       return {
@@ -245,7 +256,8 @@ export default function App() {
         role: 'model',
         content: '',
         agentId: agent.id,
-        timestamp: timestamp + 1,
+        // Distinct timestamps keep ordering stable for sorting and the graph
+        timestamp: timestamp + idx + 1,
         isStreaming: true
       };
     });
@@ -279,6 +291,10 @@ export default function App() {
               ? { ...m, content: errorInfo.message, isStreaming: false, error: true, errorCode: errorInfo.code, errorDetail: errorInfo.detail }
               : m);
             resolve();
+          },
+          {
+            agents,
+            signal: abortControllerRef.current?.signal
           }
         );
       });
@@ -326,6 +342,7 @@ export default function App() {
     if ((!input.trim() && attachments.length === 0) || isGenerating || !activeRoom) return;
     setIsGenerating(true);
     isGeneratingRef.current = true;
+    abortControllerRef.current = new AbortController();
     const newUserMessage: Message = {
       id: crypto.randomUUID(),
       role: 'user',
@@ -341,6 +358,8 @@ export default function App() {
   };
 
   const handleStop = () => {
+    // Cancels in-flight API requests; aborted streams finalize via onComplete
+    abortControllerRef.current?.abort();
     setIsGenerating(false);
     isGeneratingRef.current = false;
     setPlanningAgents([]);
