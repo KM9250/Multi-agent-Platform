@@ -146,6 +146,12 @@ const resolveModel = (selectedModel: string): string => {
     case 'gemini-2.5-pro-preview-02-05':
       // Legacy ID that may persist in saved rooms from older versions
       return ModelType.GEMINI_2_5_PRO;
+    case 'gemini-3-pro-preview':
+      // Shut down 2026-03-09; remap saved agents to the GA successor
+      return ModelType.GEMINI_3_PRO;
+    case 'gemini-3-pro-image-preview':
+      // Preview retires 2026-06-25; remap to the GA model
+      return ModelType.GEMINI_3_PRO_IMAGE;
     case ModelType.GPT_4_O:
       return ModelType.GEMINI_3_PRO;
     case ModelType.GPT_O1:

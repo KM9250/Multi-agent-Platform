@@ -1,8 +1,8 @@
 
 export enum ModelType {
-  // --- Gemini 3.0 Series ---
-  GEMINI_3_PRO = 'gemini-3-pro-preview',
-  GEMINI_3_PRO_IMAGE = 'gemini-3-pro-image-preview', // Capable of high res generation
+  // --- Gemini 3 Series ---
+  GEMINI_3_PRO = 'gemini-3.1-pro', // GA since 2026-02; gemini-3-pro-preview was shut down 2026-03-09
+  GEMINI_3_PRO_IMAGE = 'gemini-3-pro-image', // GA since 2026-05-28 (preview retires 2026-06-25)
 
   // --- Gemini 2.5 Series ---
   GEMINI_2_5_PRO = 'gemini-2.5-pro', // High reasoning 2.5
