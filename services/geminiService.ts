@@ -43,6 +43,24 @@ const messageToParts = (message: Message): Part[] => {
   return parts;
 };
 
+// Applies the agent's memory window: keep only the most recent N messages,
+// optionally pinning the first user message (the conversation's task anchor)
+// so the original request survives truncation. Exported for testing.
+export const applyHistoryWindow = (messages: Message[], agent: Agent): Message[] => {
+  const limit = agent.historyWindow ?? 0;
+  if (limit <= 0 || messages.length <= limit) return messages;
+
+  const recent = messages.slice(-limit);
+  if (agent.pinFirstMessage ?? true) {
+    const firstUser = messages.find(m => m.role === 'user');
+    if (firstUser && !recent.includes(firstUser)) {
+      const rest = limit > 1 ? recent.slice(-(limit - 1)) : [];
+      return [firstUser, ...rest];
+    }
+  }
+  return recent;
+};
+
 // Resolves an agentId to a display name for speaker labels in shared history
 const makeNameResolver = (agents?: Agent[]) => (id?: string): string =>
   agents?.find(a => a.id === id)?.name || 'Agent';
@@ -212,7 +230,8 @@ export const evaluateShouldRespond = async (
         if (roomSystemInstruction) {
              systemPrompt = `=== ROOM CONTEXT ===\n${roomSystemInstruction}\n=== END ROOM CONTEXT ===\n\n` + systemPrompt;
         }
-        const history = buildHistoryForDecision(allMessages.slice(-10), makeNameResolver(options?.agents));
+        const visibleHistory = applyHistoryWindow(allMessages.filter(isSendableMessage), agent).slice(-10);
+        const history = buildHistoryForDecision(visibleHistory, makeNameResolver(options?.agents));
         const response = await ai.models.generateContent({
             model: ModelType.GEMINI_2_5_FLASH,
             contents: [
@@ -256,7 +275,7 @@ export const streamAgentResponse = async (
 
   try {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const messagesToUse = allMessages.filter(isSendableMessage);
+    const messagesToUse = applyHistoryWindow(allMessages.filter(isSendableMessage), agent);
 
     if (messagesToUse.length === 0) {
         throw new Error("No messages to respond to");

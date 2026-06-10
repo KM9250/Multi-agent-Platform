@@ -34,6 +34,8 @@ export interface Agent {
   avatarType?: 'emoji' | 'image'; // Distinguish between types
   isEnabled: boolean;
   thinkingBudget: number; // 0 to disable
+  historyWindow?: number; // Max recent messages sent to the API; 0/undefined = unlimited
+  pinFirstMessage?: boolean; // Keep the first user message even when the window cuts it off
 }
 
 export interface Attachment {

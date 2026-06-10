@@ -141,6 +141,8 @@ export const DEFAULT_AGENTS: Agent[] = [
     avatarType: 'emoji',
     isEnabled: true,
     thinkingBudget: 0,
+    historyWindow: 0,
+    pinFirstMessage: true,
   },
   {
     id: 'agent-2',
@@ -154,6 +156,8 @@ export const DEFAULT_AGENTS: Agent[] = [
     avatarType: 'emoji',
     isEnabled: true,
     thinkingBudget: 4096,
+    historyWindow: 0,
+    pinFirstMessage: true,
   },
   {
     id: 'agent-3',
@@ -167,6 +171,8 @@ export const DEFAULT_AGENTS: Agent[] = [
     avatarType: 'emoji',
     isEnabled: true,
     thinkingBudget: 0,
+    historyWindow: 0,
+    pinFirstMessage: true,
   }
 ];
 
