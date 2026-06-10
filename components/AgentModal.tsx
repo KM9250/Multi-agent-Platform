@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useRef } from 'react';
-import { X, Shuffle, Brain, Upload, Image as ImageIcon, Smile, FileText, Trash2, Cpu } from 'lucide-react';
+import { X, Shuffle, Brain, Upload, Image as ImageIcon, Smile, FileText, Trash2, Cpu, History } from 'lucide-react';
 import { Agent, ModelType, AgentFramework } from '../types';
 import { AVATAR_COLORS, MODEL_OPTIONS, FRAMEWORK_OPTIONS } from '../constants';
 import { getStrategy } from '../services/agentStrategies';
@@ -30,6 +30,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
   
   const [color, setColor] = useState(AVATAR_COLORS[0]);
   const [thinkingBudget, setThinkingBudget] = useState<number>(0);
+  const [historyWindow, setHistoryWindow] = useState<number>(0);
+  const [pinFirstMessage, setPinFirstMessage] = useState<boolean>(true);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mdInputRef = useRef<HTMLInputElement>(null);
@@ -45,6 +47,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       setFramework(editingAgent.framework || 'standard');
       setColor(editingAgent.color);
       setThinkingBudget(editingAgent.thinkingBudget);
+      setHistoryWindow(editingAgent.historyWindow ?? 0);
+      setPinFirstMessage(editingAgent.pinFirstMessage ?? true);
       
       if (editingAgent.avatarType === 'image') {
         setAvatarType('image');
@@ -73,6 +77,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
     setImageAvatar('');
     setColor(AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)]);
     setThinkingBudget(0);
+    setHistoryWindow(0);
+    setPinFirstMessage(true);
   };
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -94,7 +100,9 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       avatar: effectiveAvatarType === 'image' ? imageAvatar : emojiAvatar,
       avatarType: effectiveAvatarType,
       isEnabled: editingAgent ? editingAgent.isEnabled : true,
-      thinkingBudget
+      thinkingBudget,
+      historyWindow,
+      pinFirstMessage
     });
     onClose();
   };
@@ -319,6 +327,49 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
                 Higher values allow more "thinking" before answering (Gemini 2.5 only).
               </p>
             </div>
+          </div>
+
+          {/* Memory Window Config */}
+          <div className="border border-zinc-800 rounded-lg p-3 bg-zinc-900/50">
+            <div className="flex items-center justify-between mb-2">
+              <label className="flex items-center gap-2 text-sm font-medium text-zinc-300">
+                <History className="w-4 h-4 text-sky-400" />
+                Memory Window
+              </label>
+              <span className="text-xs font-mono text-zinc-500">
+                {historyWindow > 0 ? `last ${historyWindow} msgs` : 'Unlimited'}
+              </span>
+            </div>
+            <div className="grid grid-cols-5 gap-2">
+              {[0, 8, 16, 32, 64].map(n => (
+                <button
+                  key={n}
+                  type="button"
+                  onClick={() => setHistoryWindow(n)}
+                  className={`
+                    px-2 py-1.5 rounded-lg text-xs font-medium border transition-all
+                    ${historyWindow === n
+                      ? 'bg-sky-500/10 text-sky-300 border-sky-500/30'
+                      : 'bg-zinc-900 text-zinc-400 border-zinc-800 hover:bg-zinc-800'}
+                  `}
+                >
+                  {n === 0 ? 'Off' : n}
+                </button>
+              ))}
+            </div>
+            <label className={`flex items-center gap-2 mt-3 text-xs ${historyWindow > 0 ? 'text-zinc-300 cursor-pointer' : 'text-zinc-600 cursor-not-allowed'}`}>
+              <input
+                type="checkbox"
+                checked={pinFirstMessage}
+                disabled={historyWindow === 0}
+                onChange={(e) => setPinFirstMessage(e.target.checked)}
+                className="accent-sky-500 disabled:opacity-50"
+              />
+              Always keep the first user message
+            </label>
+            <p className="text-[10px] text-zinc-500 mt-1">
+              Limits how many recent messages this agent sees per turn (per room). Reduces token usage in long conversations.
+            </p>
           </div>
 
           {/* Framework Strategy Config */}
