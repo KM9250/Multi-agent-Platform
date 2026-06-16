@@ -1,11 +1,13 @@
 
 import React, { useMemo, useState } from 'react';
-import { User, Copy, AlertCircle, FileText, ChevronDown, ChevronRight, Brain, Info, AlertTriangle, Terminal } from 'lucide-react';
+import { User, Copy, AlertCircle, FileText, ChevronDown, ChevronRight, Brain, Info, AlertTriangle, Terminal, RotateCcw, RefreshCw } from 'lucide-react';
 import { Message, Agent } from '../types';
 
 interface MessageBubbleProps {
   message: Message;
   agent?: Agent; // Undefined if user
+  onRetry?: (messageId: string) => void;
+  onRegenerate?: (messageId: string) => void;
 }
 
 interface Emotion {
@@ -26,7 +28,7 @@ const getEmotionColor = (name: string): string => {
   return colors[Math.abs(hash) % colors.length];
 };
 
-const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
+const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent, onRetry, onRegenerate }) => {
   const [isThoughtOpen, setIsThoughtOpen] = useState(false);
   const [isErrorDetailOpen, setIsErrorDetailOpen] = useState(false);
   const isUser = message.role === 'user';
@@ -194,6 +196,22 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
                   </div>
                 </div>
 
+                <div className="flex flex-wrap gap-2 pt-1">
+                  {onRetry && (
+                    <button onClick={() => onRetry(message.id)} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-red-500/10 text-red-300 border border-red-500/20 hover:bg-red-500/20 text-xs">
+                      <RotateCcw className="w-3 h-3" /> Retry
+                    </button>
+                  )}
+                  {onRegenerate && (
+                    <button onClick={() => onRegenerate(message.id)} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-blue-500/10 text-blue-300 border border-blue-500/20 hover:bg-blue-500/20 text-xs">
+                      <RefreshCw className="w-3 h-3" /> Regenerate
+                    </button>
+                  )}
+                  {message.generationContext && (
+                    <span className="text-[10px] text-zinc-500 self-center">Attempt {message.generationContext.attempt}</span>
+                  )}
+                </div>
+
                 {message.errorDetail && (
                   <div className="pt-2 border-t border-red-500/10">
                     <button 
@@ -246,6 +264,13 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent }) => {
                   </div>
                 )}
 
+                {onRegenerate && (
+                  <div className="flex justify-end mb-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button onClick={() => onRegenerate(message.id)} className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-zinc-800 text-zinc-400 hover:text-zinc-100 text-[10px]">
+                      <RefreshCw className="w-3 h-3" /> Regenerate
+                    </button>
+                  </div>
+                )}
                 <div className="whitespace-pre-wrap break-words">
                   {cleanContent || (message.isStreaming ? '' : <span className="text-zinc-500 italic">No text content</span>)}
                   {message.isStreaming && (

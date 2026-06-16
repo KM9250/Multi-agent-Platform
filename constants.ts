@@ -197,7 +197,7 @@ export const AVATAR_COLORS = [
 
 export const MODEL_OPTIONS = [
   { value: 'label-gemini-3', label: '--- Google Gemini 3 Series ---', disabled: true },
-  { value: ModelType.GEMINI_3_PRO, label: 'Gemini 3.1 Pro' },
+  { value: ModelType.GEMINI_3_PRO, label: 'Gemini 3.1 Pro Preview' },
   { value: ModelType.GEMINI_3_PRO_IMAGE, label: 'Gemini 3 Pro Image (Image Capable)' },
   
   { value: 'label-gemini-2-5', label: '--- Google Gemini 2.5 Series ---', disabled: true },
