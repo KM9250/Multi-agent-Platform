@@ -144,6 +144,8 @@ assert.equal(normalizeGenerationHistory([{ role: 'user', parts: [{ text: 'User' 
 assert.equal(normalizeModelId('gemini-3.1-pro'), 'gemini-3.1-pro-preview');
 assert.equal(normalizeModelId('gemini-3-pro-preview'), 'gemini-3.1-pro-preview');
 assert.equal(normalizeModelId('gemini-3.1-pro-preview'), 'gemini-3.1-pro-preview');
+assert.equal(normalizeModelId('gemini-3-flash'), 'gemini-3.0-flash');
+assert.equal(normalizeModelId('gemini-3.0-flash'), 'gemini-3.0-flash');
 assert.equal(normalizeAgent(normalizeAgent({ ...baseAgent, model: 'gemini-3.1-pro' })).model, 'gemini-3.1-pro-preview');
 assert.equal(classifyGenerationResult('', { finishReason: 'SAFETY' }, false).errorCode, 'CONTENT_BLOCKED');
 assert.equal(classifyGenerationResult('partial', { finishReason: 'MAX_TOKENS' }, false).errorCode, 'PARTIAL_RESPONSE');
