@@ -20,6 +20,38 @@ export enum ModelType {
 
 export type AgentFramework = 'standard' | 'cot' | 'react';
 
+export interface AgentContextFile {
+  id: string;
+  name: string;
+  content: string;
+  mimeType: string;
+  charCount: number;
+  sizeBytes: number;
+  order: number;
+  addedAt: number;
+}
+
+export type DecisionOutcome = 'RESPOND' | 'IGNORE' | 'ERROR';
+export type DecisionSource = 'mentioned' | 'llm_decision' | 'turn_limit' | 'broadcast' | 'fallback' | 'api_error' | 'invalid_decision' | 'timeout' | 'empty_response';
+
+export interface ResponseDecision {
+  outcome: DecisionOutcome;
+  source: DecisionSource;
+  latencyMs: number;
+  decisionModel?: string;
+  rawDecision?: string;
+  errorCode?: string;
+  errorDetail?: string;
+}
+
+export interface AgentDecisionEvent extends ResponseDecision {
+  id: string;
+  turnId: string;
+  timestamp: number;
+  agentId: string;
+  agentName: string;
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -27,6 +59,7 @@ export interface Agent {
   systemInstruction: string; // Manual input
   importedSystemInstruction?: string; // Content read from MD file
   importedSystemInstructionFileName?: string; // Filename for display
+  additionalContextFiles?: AgentContextFile[];
   model: string;
   framework: AgentFramework; // New: Selected reasoning framework
   color: string;
@@ -57,6 +90,7 @@ export interface Message {
   error?: boolean;
   errorCode?: string; // e.g., 'QUOTA_EXCEEDED', 'SAFETY_FILTER'
   errorDetail?: string; // Technical details or suggestions
+  turnId?: string;
 }
 
 export type RoomTag = 'Sandbox' | 'Recreation' | 'Hard';
@@ -69,5 +103,6 @@ export interface Room {
   type: RoomTag;
   agents: Agent[];
   messages: Message[];
+  decisionEvents?: AgentDecisionEvent[];
   updatedAt: number;
 }
