@@ -1,14 +1,21 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Menu, Send, StopCircle, Trash2, BrainCircuit, Paperclip, X, FileText, Image as ImageIcon, Upload, Settings, Box, Gamepad2, AlertTriangle, Cuboid, MonitorPlay } from 'lucide-react';
+import { Menu, Send, StopCircle, Trash2, BrainCircuit, Paperclip, X, FileText, Settings, Box, Gamepad2, AlertTriangle, MonitorPlay } from 'lucide-react';
 import AgentSidebar from './components/AgentSidebar';
 import AgentModal from './components/AgentModal';
 import MessageBubble from './components/MessageBubble';
 import RelationshipGraphModal from './components/RelationshipGraphModal';
 import RoomModal from './components/RoomModal';
 import SceneView from './components/SceneView';
+import DecisionDiagnosticsPanel from './components/DecisionDiagnosticsPanel';
 import { streamAgentResponse, evaluateShouldRespond, hasApiKey } from './services/geminiService';
 import { INITIAL_ROOMS, createNewRoom, calculateRelationshipWeights, ROOM_TAGS } from './constants';
-import { Agent, Message, Room, Attachment, RoomTag } from './types';
+import { normalizePersistedRooms } from './utils/persistenceMigration';
+import { appendDecisionEvents, createDecisionEvent, fixedDecision } from './utils/decisionDiagnostics';
+import { classifyStreamCompletion } from './utils/streamCompletion';
+import { GenerationMode, GenerationSession, isSameGenerationSession, shouldAcceptStreamChunk } from './utils/generationSession';
+import { canRegenerateGeneration, canRetryGeneration } from './utils/retryPolicy';
+import { applyInitialUserTurnFallback } from './utils/responseFallback';
+import { Agent, Message, Room, Attachment, RoomTag, AgentDecisionEvent, GenerationContext } from './types';
 
 export default function App() {
   // --- State ---
@@ -19,10 +26,7 @@ export default function App() {
       // A reload during generation persists isStreaming: true, which would
       // leave a forever-blinking cursor and "Thinking" badges. Clear it.
       const parsed: Room[] = JSON.parse(saved);
-      return parsed.map(room => ({
-        ...room,
-        messages: room.messages.map(m => m.isStreaming ? { ...m, isStreaming: false } : m)
-      }));
+      return normalizePersistedRooms(parsed);
     } catch (e) {
       console.error('Failed to restore rooms from localStorage:', e);
       return INITIAL_ROOMS;
@@ -53,9 +57,10 @@ export default function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [planningAgents, setPlanningAgents] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [storageWarning, setStorageWarning] = useState<string | null>(null);
   
   const isGeneratingRef = useRef(false);
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const generationSessionRef = useRef<GenerationSession | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -79,6 +84,7 @@ export default function App() {
       // Base64 image attachments/avatars can exceed the ~5MB storage quota.
       // Keep the app running; the session simply won't survive a reload.
       console.error('Failed to persist rooms to localStorage:', e);
+      setStorageWarning('Some data could not be saved locally. The current session will continue, but recent changes may be lost after reload.');
     }
   }, [rooms]);
 
@@ -160,9 +166,14 @@ export default function App() {
     setAttachments(prev => prev.filter(a => a.id !== id));
   };
 
-  const updateLocalHistory = (msgId: string, content: string, streaming: boolean, error: boolean = false, errorCode?: string, errorDetail?: string) => {
+  const addDecisionEvents = (roomId: string, events: AgentDecisionEvent[]) => {
+    if (events.length === 0) return;
+    setRooms(prev => prev.map(r => r.id === roomId ? { ...appendDecisionEvents(r, events), updatedAt: Date.now() } : r));
+  };
+
+  const updateLocalHistory = (roomId: string, msgId: string, content: string, streaming: boolean, error: boolean = false, errorCode?: string, errorDetail?: string) => {
     setRooms(prev => prev.map(r => {
-       if (r.id !== activeRoomId) return r;
+       if (r.id !== roomId) return r;
        return {
            ...r,
            messages: r.messages.map(m => m.id === msgId ? { ...m, content, isStreaming: streaming, error, errorCode, errorDetail } : m)
@@ -170,40 +181,72 @@ export default function App() {
     }));
   };
 
+  const removeMessageFromRoom = (roomId: string, msgId: string) => {
+    setRooms(prev => prev.map(r => r.id === roomId
+      ? { ...r, messages: r.messages.filter(m => m.id !== msgId) }
+      : r
+    ));
+  };
+
+
+  const isCurrentGenerationSession = (sessionId: string, turnId: string, roomId: string): boolean =>
+    isSameGenerationSession(generationSessionRef.current, { sessionId, turnId, roomId });
+
+  const finishGenerationSession = (sessionId: string, turnId: string, roomId: string) => {
+    if (!isCurrentGenerationSession(sessionId, turnId, roomId)) return;
+    setIsGenerating(false);
+    isGeneratingRef.current = false;
+    setPlanningAgents([]);
+    generationSessionRef.current = null;
+  };
+
   // --- Conversation Loop ---
-  const processConversationTurn = async (currentHistory: Message[], turnDepth: number) => {
-    if (turnDepth >= 3 || !isGeneratingRef.current) {
-        setIsGenerating(false);
-        isGeneratingRef.current = false;
+  const processConversationTurn = async (currentHistory: Message[], turnDepth: number, turnId: string, roomId: string, sessionId: string) => {
+    if (!isCurrentGenerationSession(sessionId, turnId, roomId)) return;
+
+    if (turnDepth >= 3) {
+        finishGenerationSession(sessionId, turnId, roomId);
         return;
     }
 
-    const activeAgents = agents.filter(a => a.isEnabled);
+    const targetRoom = rooms.find(room => room.id === roomId);
+    if (!targetRoom) {
+        finishGenerationSession(sessionId, turnId, roomId);
+        return;
+    }
+
+    const roomAgents = targetRoom.agents;
+    const roomSystemInstruction = targetRoom.systemInstruction;
+    const requestSignal = generationSessionRef.current?.controller.signal;
+
+    const activeAgents = roomAgents.filter(a => a.isEnabled);
     if (activeAgents.length === 0) {
-        setIsGenerating(false);
-        isGeneratingRef.current = false;
+        finishGenerationSession(sessionId, turnId, roomId);
         return;
     }
 
     // Without a key, the decision module silently returns IGNORE for every
     // agent and the user gets no feedback at all — surface the error instead.
     if (!hasApiKey()) {
+        addDecisionEvents(roomId, activeAgents.map(agent => createDecisionEvent(turnId, agent, { outcome: 'ERROR', source: 'api_error', latencyMs: 0, decisionModel: 'none', errorCode: 'AUTH_ERROR', errorDetail: 'API key is missing.' })));
         const errMsg: Message = {
             id: crypto.randomUUID(),
             role: 'model',
             content: 'Authentication failed.',
             timestamp: Date.now(),
+            turnId,
             error: true,
             errorCode: 'AUTH_ERROR',
             errorDetail: 'The API key is missing. Set GEMINI_API_KEY in .env.local and restart the dev server.'
         };
-        updateActiveRoom({ messages: [...currentHistory, errMsg] });
-        setIsGenerating(false);
-        isGeneratingRef.current = false;
+        setRooms(prev => prev.map(r => r.id === roomId ? { ...r, messages: [...currentHistory, errMsg], updatedAt: Date.now() } : r));
+        finishGenerationSession(sessionId, turnId, roomId);
         return;
     }
 
-    setPlanningAgents(activeAgents.map(a => a.id));
+    if (isCurrentGenerationSession(sessionId, turnId, roomId)) {
+      setPlanningAgents(activeAgents.map(a => a.id));
+    }
     const relationshipWeights = calculateRelationshipWeights(rooms);
 
     const decisions = await Promise.all(activeAgents.map(async (agent) => {
@@ -215,24 +258,27 @@ export default function App() {
           const recentHistory = currentHistory.slice(-8);
           // Fixed: changed 'agentId' to 'agent.id' to fix reference error
           const myCount = recentHistory.filter(m => m.agentId === agent.id).length;
-          if (myCount >= 3) return { agent, shouldRespond: false, reason: 'turn_limit' };
+          if (myCount >= 3) return { agent, decision: fixedDecision('IGNORE', 'turn_limit') };
         }
-        if (isMentioned) return { agent, shouldRespond: true, reason: 'mentioned' };
+        if (isMentioned) return { agent, decision: fixedDecision('RESPOND', 'mentioned') };
         
-        const shouldRespond = await evaluateShouldRespond(agent, currentHistory, activeRoom.systemInstruction, {
-          agents,
-          signal: abortControllerRef.current?.signal
+        const decision = await evaluateShouldRespond(agent, currentHistory, roomSystemInstruction, {
+          agents: roomAgents,
+          signal: requestSignal
         });
-        return { agent, shouldRespond, reason: 'llm_decision' };
+        return { agent, decision };
     }));
     
-    setPlanningAgents([]); 
-    if (!isGeneratingRef.current) return;
+    const finalDecisions = applyInitialUserTurnFallback(decisions, currentHistory, turnDepth);
+    const decisionEvents = finalDecisions.map(d => createDecisionEvent(turnId, d.agent, d.decision));
+    addDecisionEvents(roomId, decisionEvents);
 
-    const respondingAgents = decisions.filter(d => d.shouldRespond).map(d => d.agent);
+    if (!isCurrentGenerationSession(sessionId, turnId, roomId)) return;
+    setPlanningAgents([]);
+
+    const respondingAgents = finalDecisions.filter(d => d.decision.outcome === 'RESPOND').map(d => d.agent);
     if (respondingAgents.length === 0) {
-        setIsGenerating(false);
-        isGeneratingRef.current = false;
+        finishGenerationSession(sessionId, turnId, roomId);
         return; 
     }
 
@@ -258,13 +304,20 @@ export default function App() {
         agentId: agent.id,
         // Distinct timestamps keep ordering stable for sorting and the graph
         timestamp: timestamp + idx + 1,
-        isStreaming: true
+        isStreaming: true,
+        turnId,
+        generationContext: {
+          historyMessageIds: currentHistory.map(message => message.id),
+          attempt: 1,
+          modelId: agent.model
+        }
       };
     });
 
     let nextHistory = [...currentHistory, ...newAgentMessages];
-    updateActiveRoom({ messages: nextHistory });
+    setRooms(prev => prev.map(r => r.id === roomId ? { ...r, messages: nextHistory, updatedAt: Date.now() } : r));
 
+    let hadGenerationError = false;
     const agentPromises = sortedAgents.map(agent => {
       return new Promise<void>((resolve) => {
         const msgId = agentMessageIds[agent.id];
@@ -272,38 +325,64 @@ export default function App() {
         streamAgentResponse(
           agent,
           [...currentHistory],
-          activeRoom.systemInstruction, 
+          roomSystemInstruction,
           (chunk) => {
-            if (!isGeneratingRef.current) return;
+            if (!shouldAcceptStreamChunk(isCurrentGenerationSession(sessionId, turnId, roomId), !!requestSignal?.aborted)) return;
             accumulatedText += chunk;
-            updateLocalHistory(msgId, accumulatedText, true);
+            updateLocalHistory(roomId, msgId, accumulatedText, true);
           },
-          () => {
-            updateLocalHistory(msgId, accumulatedText, false);
-            nextHistory = nextHistory.map(m => m.id === msgId
-              ? { ...m, content: accumulatedText, isStreaming: false }
-              : m);
+          (result) => {
+            const completionKind = classifyStreamCompletion(accumulatedText, !!requestSignal?.aborted);
+            if (completionKind === 'aborted_empty') {
+              removeMessageFromRoom(roomId, msgId);
+              nextHistory = nextHistory.filter(m => m.id !== msgId);
+              resolve();
+              return;
+            }
+            if (completionKind === 'aborted_partial' || (completionKind === 'complete' && result.outcome === 'SUCCESS')) {
+              updateLocalHistory(roomId, msgId, accumulatedText, false);
+              nextHistory = nextHistory.map(m => m.id === msgId
+                ? { ...m, content: accumulatedText, isStreaming: false }
+                : m);
+              resolve();
+              return;
+            }
+
+            hadGenerationError = true;
+            const code = result.errorCode || 'EMPTY_RESPONSE';
+            const detail = result.errorDetail || 'The response stream completed without any text.';
+            const message = code === 'PARTIAL_RESPONSE' && accumulatedText ? accumulatedText : (code === 'EMPTY_RESPONSE' ? 'Empty response from model.' : (result.finishMessage || 'Agent response failed.'));
+            updateLocalHistory(roomId, msgId, message, false, true, code, detail);
+            nextHistory = nextHistory.map(m => m.id === msgId ? { ...m, content: message, isStreaming: false, error: true, errorCode: code, errorDetail: detail } : m);
             resolve();
           },
           (errorInfo) => {
-            updateLocalHistory(msgId, errorInfo.message, false, true, errorInfo.code, errorInfo.detail);
+            hadGenerationError = true;
+            updateLocalHistory(roomId, msgId, errorInfo.message, false, true, errorInfo.code, errorInfo.detail);
             nextHistory = nextHistory.map(m => m.id === msgId
               ? { ...m, content: errorInfo.message, isStreaming: false, error: true, errorCode: errorInfo.code, errorDetail: errorInfo.detail }
               : m);
             resolve();
           },
           {
-            agents,
-            signal: abortControllerRef.current?.signal
+            agents: roomAgents,
+            signal: requestSignal,
+            mode: generationSessionRef.current?.mode || 'normal'
           }
         );
       });
     });
 
     await Promise.all(agentPromises);
-    if (isGeneratingRef.current) {
+    if (hadGenerationError) {
+        finishGenerationSession(sessionId, turnId, roomId);
+        return;
+    }
+
+    if (isCurrentGenerationSession(sessionId, turnId, roomId) && !requestSignal?.aborted) {
         await new Promise(r => setTimeout(r, 500));
-        await processConversationTurn(nextHistory, turnDepth + 1);
+        if (!isCurrentGenerationSession(sessionId, turnId, roomId) || requestSignal?.aborted) return;
+        await processConversationTurn(nextHistory, turnDepth + 1, turnId, roomId, sessionId);
     }
   };
 
@@ -340,26 +419,113 @@ export default function App() {
 
   const handleSendMessage = async () => {
     if ((!input.trim() && attachments.length === 0) || isGenerating || !activeRoom) return;
+    const turnId = crypto.randomUUID();
+    const roomId = activeRoom.id;
+    const sessionId = crypto.randomUUID();
+    const controller = new AbortController();
+    generationSessionRef.current = { sessionId, turnId, roomId, controller, mode: 'normal' };
     setIsGenerating(true);
     isGeneratingRef.current = true;
-    abortControllerRef.current = new AbortController();
     const newUserMessage: Message = {
       id: crypto.randomUUID(),
       role: 'user',
       content: input,
       attachments: [...attachments],
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      turnId
     };
     const updatedMessages = [...messages, newUserMessage];
     updateActiveRoom({ messages: updatedMessages });
     setInput('');
     setAttachments([]);
-    await processConversationTurn(updatedMessages, 0);
+    await processConversationTurn(updatedMessages, 0, turnId, roomId, sessionId);
   };
 
+  const runSingleMessageGeneration = async (messageId: string, mode: GenerationMode) => {
+    if (isGenerating) return;
+    const room = rooms.find(r => r.messages.some(m => m.id === messageId));
+    if (!room) return;
+    const targetMessage = room.messages.find(m => m.id === messageId);
+    if (!targetMessage?.agentId || !targetMessage.generationContext) return;
+    const agent = room.agents.find(a => a.id === targetMessage.agentId);
+    if (!agent) return;
+    const history = targetMessage.generationContext.historyMessageIds
+      .map(id => room.messages.find(m => m.id === id))
+      .filter((message): message is Message => !!message);
+    if (history.length !== targetMessage.generationContext.historyMessageIds.length) {
+      updateLocalHistory(room.id, messageId, 'Cannot regenerate because some source history messages were deleted.', false, true, 'HISTORY_MISSING', 'One or more messages used for the original generation no longer exist.');
+      return;
+    }
+
+    const turnId = targetMessage.turnId || crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    const controller = new AbortController();
+    generationSessionRef.current = { sessionId, turnId, roomId: room.id, controller, targetMessageId: messageId, mode };
+    setIsGenerating(true);
+    isGeneratingRef.current = true;
+    setPlanningAgents([agent.id]);
+
+    const nextContext: GenerationContext = {
+      ...targetMessage.generationContext,
+      attempt: targetMessage.generationContext.attempt + 1,
+      modelId: agent.model
+    };
+    setRooms(prev => prev.map(r => r.id === room.id ? {
+      ...r,
+      messages: r.messages.map(m => m.id === messageId ? { ...m, content: '', error: false, errorCode: undefined, errorDetail: undefined, isStreaming: true, generationContext: nextContext } : m),
+      updatedAt: Date.now()
+    } : r));
+
+    let accumulatedText = '';
+    const requestSignal = controller.signal;
+    await new Promise<void>((resolve) => {
+      streamAgentResponse(
+        { ...agent, model: nextContext.modelId },
+        history,
+        room.systemInstruction,
+        (chunk) => {
+          if (!shouldAcceptStreamChunk(isCurrentGenerationSession(sessionId, turnId, room.id), requestSignal.aborted)) return;
+          accumulatedText += chunk;
+          updateLocalHistory(room.id, messageId, accumulatedText, true);
+        },
+        (result) => {
+          const completionKind = classifyStreamCompletion(accumulatedText, requestSignal.aborted);
+          if (completionKind === 'aborted_empty') {
+            removeMessageFromRoom(room.id, messageId);
+            resolve();
+            return;
+          }
+          if (completionKind === 'aborted_partial' || (completionKind === 'complete' && result.outcome === 'SUCCESS')) {
+            updateLocalHistory(room.id, messageId, accumulatedText, false);
+            resolve();
+            return;
+          }
+          const code = result.errorCode || 'EMPTY_RESPONSE';
+          const detail = result.errorDetail || 'The response stream completed without any text.';
+          const message = code === 'PARTIAL_RESPONSE' && accumulatedText ? accumulatedText : (code === 'EMPTY_RESPONSE' ? 'Empty response from model.' : (result.finishMessage || 'Agent response failed.'));
+          updateLocalHistory(room.id, messageId, message, false, true, code, detail);
+          resolve();
+        },
+        (errorInfo) => {
+          updateLocalHistory(room.id, messageId, errorInfo.message, false, true, errorInfo.code, errorInfo.detail);
+          resolve();
+        },
+        { agents: room.agents, signal: requestSignal, mode }
+      );
+    });
+    finishGenerationSession(sessionId, turnId, room.id);
+  };
+
+  const handleRetryMessage = (messageId: string) => runSingleMessageGeneration(messageId, 'retry');
+  const handleRegenerateMessage = (messageId: string) => runSingleMessageGeneration(messageId, 'regenerate');
+
   const handleStop = () => {
-    // Cancels in-flight API requests; aborted streams finalize via onComplete
-    abortControllerRef.current?.abort();
+    // Cancels only the active generation session; old callbacks may clean up
+    // their own messages but must not mutate global generation state.
+    const session = generationSessionRef.current;
+    if (!session) return;
+    session.controller.abort();
+    generationSessionRef.current = null;
     setIsGenerating(false);
     isGeneratingRef.current = false;
     setPlanningAgents([]);
@@ -367,7 +533,7 @@ export default function App() {
 
   const handleClearChat = () => {
     if (confirm("Are you sure you want to clear the conversation for this room?")) {
-        updateActiveRoom({ messages: [] });
+        updateActiveRoom({ messages: [], decisionEvents: [] });
     }
   };
 
@@ -442,6 +608,13 @@ export default function App() {
           </div>
         </header>
         <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+          {storageWarning && (
+            <div className="mx-4 mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200 flex items-center justify-between gap-3">
+              <span>{storageWarning}</span>
+              <button onClick={() => setStorageWarning(null)} className="text-amber-100 hover:text-white"><X className="w-4 h-4" /></button>
+            </div>
+          )}
+          <DecisionDiagnosticsPanel events={activeRoom.decisionEvents || []} />
           {is3DMode && (
             <div className="h-1/2 min-h-[300px] border-b border-zinc-800 relative animate-in fade-in slide-in-from-top-4 duration-300">
                <SceneView agents={agents} speakingAgentId={currentSpeakingAgentId} />
@@ -460,7 +633,9 @@ export default function App() {
                     <MessageBubble 
                       key={msg.id} 
                       message={msg} 
-                      agent={msg.role === 'model' && msg.agentId ? agents.find(a => a.id === msg.agentId) : undefined} 
+                      agent={msg.role === 'model' && msg.agentId ? agents.find(a => a.id === msg.agentId) : undefined}
+                      onRetry={msg.error && canRetryGeneration(msg.errorCode) ? handleRetryMessage : undefined}
+                      onRegenerate={msg.role === 'model' && !msg.isStreaming && canRegenerateGeneration(msg.errorCode) ? handleRegenerateMessage : undefined}
                     />
                   ))
                 )}

@@ -1,7 +1,7 @@
 
 export enum ModelType {
   // --- Gemini 3 Series ---
-  GEMINI_3_PRO = 'gemini-3.1-pro', // GA since 2026-02; gemini-3-pro-preview was shut down 2026-03-09
+  GEMINI_3_PRO = 'gemini-3.1-pro-preview', // Preview model ID per Gemini API
   GEMINI_3_PRO_IMAGE = 'gemini-3-pro-image', // GA since 2026-05-28 (preview retires 2026-06-25)
 
   // --- Gemini 2.5 Series ---
@@ -20,6 +20,38 @@ export enum ModelType {
 
 export type AgentFramework = 'standard' | 'cot' | 'react';
 
+export interface AgentContextFile {
+  id: string;
+  name: string;
+  content: string;
+  mimeType: string;
+  charCount: number;
+  sizeBytes: number;
+  order: number;
+  addedAt: number;
+}
+
+export type DecisionOutcome = 'RESPOND' | 'IGNORE' | 'ERROR';
+export type DecisionSource = 'mentioned' | 'llm_decision' | 'turn_limit' | 'broadcast' | 'fallback' | 'api_error' | 'invalid_decision' | 'timeout' | 'empty_response';
+
+export interface ResponseDecision {
+  outcome: DecisionOutcome;
+  source: DecisionSource;
+  latencyMs: number;
+  decisionModel?: string;
+  rawDecision?: string;
+  errorCode?: string;
+  errorDetail?: string;
+}
+
+export interface AgentDecisionEvent extends ResponseDecision {
+  id: string;
+  turnId: string;
+  timestamp: number;
+  agentId: string;
+  agentName: string;
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -27,6 +59,7 @@ export interface Agent {
   systemInstruction: string; // Manual input
   importedSystemInstruction?: string; // Content read from MD file
   importedSystemInstructionFileName?: string; // Filename for display
+  additionalContextFiles?: AgentContextFile[];
   model: string;
   framework: AgentFramework; // New: Selected reasoning framework
   color: string;
@@ -46,6 +79,12 @@ export interface Attachment {
   data: string; // Base64 string for images, plain text for text files
 }
 
+export interface GenerationContext {
+  historyMessageIds: string[];
+  attempt: number;
+  modelId: string;
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'model';
@@ -57,6 +96,8 @@ export interface Message {
   error?: boolean;
   errorCode?: string; // e.g., 'QUOTA_EXCEEDED', 'SAFETY_FILTER'
   errorDetail?: string; // Technical details or suggestions
+  turnId?: string;
+  generationContext?: GenerationContext;
 }
 
 export type RoomTag = 'Sandbox' | 'Recreation' | 'Hard';
@@ -69,5 +110,6 @@ export interface Room {
   type: RoomTag;
   agents: Agent[];
   messages: Message[];
+  decisionEvents?: AgentDecisionEvent[];
   updatedAt: number;
 }
