@@ -146,6 +146,7 @@ export const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction
 const resolveModel = (selectedModel: string): string => {
   switch (selectedModel) {
     case ModelType.GEMINI_3_PRO:
+    case ModelType.GEMINI_3_FLASH:
     case ModelType.GEMINI_3_PRO_IMAGE:
     case ModelType.GEMINI_2_5_FLASH:
     case ModelType.GEMINI_2_5_FLASH_LITE:
