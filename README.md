@@ -32,7 +32,7 @@ It is a prototype environment for testing how a network of AI agents can functio
 
 ## Getting started
 
-Requirements: Node.js 20+ and a Google Gemini API key ([Google AI Studio](https://aistudio.google.com/apikey)).
+Requirements: Node.js 22.7+ and a Google Gemini API key ([Google AI Studio](https://aistudio.google.com/apikey)).
 
 ```bash
 npm install

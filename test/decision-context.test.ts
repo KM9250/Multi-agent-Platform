@@ -3,6 +3,7 @@ import { normalizeAgent, normalizeContextFileOrder, buildAdditionalContext } fro
 import { appendDecisionEvents, createDecisionEvent, fixedDecision, MAX_DECISION_EVENTS, parseDecisionText } from '../utils/decisionDiagnostics';
 import { normalizePersistedRooms, normalizeRoom } from '../utils/persistenceMigration';
 import { classifyStreamCompletion } from '../utils/streamCompletion';
+import { isSameGenerationSession, shouldAcceptStreamChunk } from '../utils/generationSession';
 import { createDecisionError, getCombinedSystemInstruction } from '../services/geminiService';
 import type { Agent, AgentContextFile, Room } from '../types';
 
@@ -105,5 +106,22 @@ assert.equal(classifyStreamCompletion(' \n\t', false), 'empty_response');
 assert.equal(classifyStreamCompletion('hello', false), 'complete');
 assert.equal(classifyStreamCompletion('', true), 'aborted_empty');
 assert.equal(classifyStreamCompletion('partial', true), 'aborted_partial');
+
+
+
+// Generation session identity and chunk acceptance.
+const sessionA = { turnId: 'turn-a', roomId: 'room-1' };
+const sessionB = { turnId: 'turn-b', roomId: 'room-1' };
+assert.equal(isSameGenerationSession(sessionA, { turnId: 'turn-a', roomId: 'room-1' }), true);
+assert.equal(isSameGenerationSession(sessionA, { turnId: 'turn-b', roomId: 'room-1' }), false);
+assert.equal(isSameGenerationSession(sessionA, { turnId: 'turn-a', roomId: 'room-2' }), false);
+assert.equal(isSameGenerationSession(null, { turnId: 'turn-a', roomId: 'room-1' }), false);
+assert.equal(isSameGenerationSession(sessionA, sessionA), true);
+assert.equal(isSameGenerationSession(sessionA, sessionB), false);
+assert.equal(isSameGenerationSession(sessionB, sessionB), true);
+assert.equal(shouldAcceptStreamChunk(true, false), true);
+assert.equal(shouldAcceptStreamChunk(true, true), false);
+assert.equal(shouldAcceptStreamChunk(false, false), false);
+assert.equal(shouldAcceptStreamChunk(false, true), false);
 
 console.log('All production-module diagnostics/context tests passed');
