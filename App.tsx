@@ -12,8 +12,10 @@ import { INITIAL_ROOMS, createNewRoom, calculateRelationshipWeights, ROOM_TAGS }
 import { normalizePersistedRooms } from './utils/persistenceMigration';
 import { appendDecisionEvents, createDecisionEvent, fixedDecision } from './utils/decisionDiagnostics';
 import { classifyStreamCompletion } from './utils/streamCompletion';
-import { GenerationSession, isSameGenerationSession, shouldAcceptStreamChunk } from './utils/generationSession';
-import { Agent, Message, Room, Attachment, RoomTag, AgentDecisionEvent } from './types';
+import { GenerationMode, GenerationSession, isSameGenerationSession, shouldAcceptStreamChunk } from './utils/generationSession';
+import { canRegenerateGeneration, canRetryGeneration } from './utils/retryPolicy';
+import { applyInitialUserTurnFallback } from './utils/responseFallback';
+import { Agent, Message, Room, Attachment, RoomTag, AgentDecisionEvent, GenerationContext } from './types';
 
 export default function App() {
   // --- State ---
@@ -187,11 +189,11 @@ export default function App() {
   };
 
 
-  const isCurrentGenerationSession = (turnId: string, roomId: string): boolean =>
-    isSameGenerationSession(generationSessionRef.current, { turnId, roomId });
+  const isCurrentGenerationSession = (sessionId: string, turnId: string, roomId: string): boolean =>
+    isSameGenerationSession(generationSessionRef.current, { sessionId, turnId, roomId });
 
-  const finishGenerationSession = (turnId: string, roomId: string) => {
-    if (!isCurrentGenerationSession(turnId, roomId)) return;
+  const finishGenerationSession = (sessionId: string, turnId: string, roomId: string) => {
+    if (!isCurrentGenerationSession(sessionId, turnId, roomId)) return;
     setIsGenerating(false);
     isGeneratingRef.current = false;
     setPlanningAgents([]);
@@ -199,17 +201,17 @@ export default function App() {
   };
 
   // --- Conversation Loop ---
-  const processConversationTurn = async (currentHistory: Message[], turnDepth: number, turnId: string, roomId: string) => {
-    if (!isCurrentGenerationSession(turnId, roomId)) return;
+  const processConversationTurn = async (currentHistory: Message[], turnDepth: number, turnId: string, roomId: string, sessionId: string) => {
+    if (!isCurrentGenerationSession(sessionId, turnId, roomId)) return;
 
     if (turnDepth >= 3) {
-        finishGenerationSession(turnId, roomId);
+        finishGenerationSession(sessionId, turnId, roomId);
         return;
     }
 
     const targetRoom = rooms.find(room => room.id === roomId);
     if (!targetRoom) {
-        finishGenerationSession(turnId, roomId);
+        finishGenerationSession(sessionId, turnId, roomId);
         return;
     }
 
@@ -219,7 +221,7 @@ export default function App() {
 
     const activeAgents = roomAgents.filter(a => a.isEnabled);
     if (activeAgents.length === 0) {
-        finishGenerationSession(turnId, roomId);
+        finishGenerationSession(sessionId, turnId, roomId);
         return;
     }
 
@@ -238,11 +240,11 @@ export default function App() {
             errorDetail: 'The API key is missing. Set GEMINI_API_KEY in .env.local and restart the dev server.'
         };
         setRooms(prev => prev.map(r => r.id === roomId ? { ...r, messages: [...currentHistory, errMsg], updatedAt: Date.now() } : r));
-        finishGenerationSession(turnId, roomId);
+        finishGenerationSession(sessionId, turnId, roomId);
         return;
     }
 
-    if (isCurrentGenerationSession(turnId, roomId)) {
+    if (isCurrentGenerationSession(sessionId, turnId, roomId)) {
       setPlanningAgents(activeAgents.map(a => a.id));
     }
     const relationshipWeights = calculateRelationshipWeights(rooms);
@@ -267,15 +269,16 @@ export default function App() {
         return { agent, decision };
     }));
     
-    const decisionEvents = decisions.map(d => createDecisionEvent(turnId, d.agent, d.decision));
+    const finalDecisions = applyInitialUserTurnFallback(decisions, currentHistory, turnDepth);
+    const decisionEvents = finalDecisions.map(d => createDecisionEvent(turnId, d.agent, d.decision));
     addDecisionEvents(roomId, decisionEvents);
 
-    if (!isCurrentGenerationSession(turnId, roomId)) return;
+    if (!isCurrentGenerationSession(sessionId, turnId, roomId)) return;
     setPlanningAgents([]);
 
-    const respondingAgents = decisions.filter(d => d.decision.outcome === 'RESPOND').map(d => d.agent);
+    const respondingAgents = finalDecisions.filter(d => d.decision.outcome === 'RESPOND').map(d => d.agent);
     if (respondingAgents.length === 0) {
-        finishGenerationSession(turnId, roomId);
+        finishGenerationSession(sessionId, turnId, roomId);
         return; 
     }
 
@@ -302,13 +305,19 @@ export default function App() {
         // Distinct timestamps keep ordering stable for sorting and the graph
         timestamp: timestamp + idx + 1,
         isStreaming: true,
-        turnId
+        turnId,
+        generationContext: {
+          historyMessageIds: currentHistory.map(message => message.id),
+          attempt: 1,
+          modelId: agent.model
+        }
       };
     });
 
     let nextHistory = [...currentHistory, ...newAgentMessages];
     setRooms(prev => prev.map(r => r.id === roomId ? { ...r, messages: nextHistory, updatedAt: Date.now() } : r));
 
+    let hadGenerationError = false;
     const agentPromises = sortedAgents.map(agent => {
       return new Promise<void>((resolve) => {
         const msgId = agentMessageIds[agent.id];
@@ -318,11 +327,11 @@ export default function App() {
           [...currentHistory],
           roomSystemInstruction,
           (chunk) => {
-            if (!shouldAcceptStreamChunk(isCurrentGenerationSession(turnId, roomId), !!requestSignal?.aborted)) return;
+            if (!shouldAcceptStreamChunk(isCurrentGenerationSession(sessionId, turnId, roomId), !!requestSignal?.aborted)) return;
             accumulatedText += chunk;
             updateLocalHistory(roomId, msgId, accumulatedText, true);
           },
-          () => {
+          (result) => {
             const completionKind = classifyStreamCompletion(accumulatedText, !!requestSignal?.aborted);
             if (completionKind === 'aborted_empty') {
               removeMessageFromRoom(roomId, msgId);
@@ -330,7 +339,7 @@ export default function App() {
               resolve();
               return;
             }
-            if (completionKind === 'aborted_partial' || completionKind === 'complete') {
+            if (completionKind === 'aborted_partial' || (completionKind === 'complete' && result.outcome === 'SUCCESS')) {
               updateLocalHistory(roomId, msgId, accumulatedText, false);
               nextHistory = nextHistory.map(m => m.id === msgId
                 ? { ...m, content: accumulatedText, isStreaming: false }
@@ -339,12 +348,16 @@ export default function App() {
               return;
             }
 
-            const message = 'Empty response from model.';
-            updateLocalHistory(roomId, msgId, message, false, true, 'EMPTY_RESPONSE', 'The response stream completed without any text.');
-            nextHistory = nextHistory.map(m => m.id === msgId ? { ...m, content: message, isStreaming: false, error: true, errorCode: 'EMPTY_RESPONSE', errorDetail: 'The response stream completed without any text.' } : m);
+            hadGenerationError = true;
+            const code = result.errorCode || 'EMPTY_RESPONSE';
+            const detail = result.errorDetail || 'The response stream completed without any text.';
+            const message = code === 'PARTIAL_RESPONSE' && accumulatedText ? accumulatedText : (code === 'EMPTY_RESPONSE' ? 'Empty response from model.' : (result.finishMessage || 'Agent response failed.'));
+            updateLocalHistory(roomId, msgId, message, false, true, code, detail);
+            nextHistory = nextHistory.map(m => m.id === msgId ? { ...m, content: message, isStreaming: false, error: true, errorCode: code, errorDetail: detail } : m);
             resolve();
           },
           (errorInfo) => {
+            hadGenerationError = true;
             updateLocalHistory(roomId, msgId, errorInfo.message, false, true, errorInfo.code, errorInfo.detail);
             nextHistory = nextHistory.map(m => m.id === msgId
               ? { ...m, content: errorInfo.message, isStreaming: false, error: true, errorCode: errorInfo.code, errorDetail: errorInfo.detail }
@@ -353,17 +366,23 @@ export default function App() {
           },
           {
             agents: roomAgents,
-            signal: requestSignal
+            signal: requestSignal,
+            mode: generationSessionRef.current?.mode || 'normal'
           }
         );
       });
     });
 
     await Promise.all(agentPromises);
-    if (isCurrentGenerationSession(turnId, roomId) && !requestSignal?.aborted) {
+    if (hadGenerationError) {
+        finishGenerationSession(sessionId, turnId, roomId);
+        return;
+    }
+
+    if (isCurrentGenerationSession(sessionId, turnId, roomId) && !requestSignal?.aborted) {
         await new Promise(r => setTimeout(r, 500));
-        if (!isCurrentGenerationSession(turnId, roomId) || requestSignal?.aborted) return;
-        await processConversationTurn(nextHistory, turnDepth + 1, turnId, roomId);
+        if (!isCurrentGenerationSession(sessionId, turnId, roomId) || requestSignal?.aborted) return;
+        await processConversationTurn(nextHistory, turnDepth + 1, turnId, roomId, sessionId);
     }
   };
 
@@ -402,8 +421,9 @@ export default function App() {
     if ((!input.trim() && attachments.length === 0) || isGenerating || !activeRoom) return;
     const turnId = crypto.randomUUID();
     const roomId = activeRoom.id;
+    const sessionId = crypto.randomUUID();
     const controller = new AbortController();
-    generationSessionRef.current = { turnId, roomId, controller };
+    generationSessionRef.current = { sessionId, turnId, roomId, controller, mode: 'normal' };
     setIsGenerating(true);
     isGeneratingRef.current = true;
     const newUserMessage: Message = {
@@ -418,8 +438,86 @@ export default function App() {
     updateActiveRoom({ messages: updatedMessages });
     setInput('');
     setAttachments([]);
-    await processConversationTurn(updatedMessages, 0, turnId, roomId);
+    await processConversationTurn(updatedMessages, 0, turnId, roomId, sessionId);
   };
+
+  const runSingleMessageGeneration = async (messageId: string, mode: GenerationMode) => {
+    if (isGenerating) return;
+    const room = rooms.find(r => r.messages.some(m => m.id === messageId));
+    if (!room) return;
+    const targetMessage = room.messages.find(m => m.id === messageId);
+    if (!targetMessage?.agentId || !targetMessage.generationContext) return;
+    const agent = room.agents.find(a => a.id === targetMessage.agentId);
+    if (!agent) return;
+    const history = targetMessage.generationContext.historyMessageIds
+      .map(id => room.messages.find(m => m.id === id))
+      .filter((message): message is Message => !!message);
+    if (history.length !== targetMessage.generationContext.historyMessageIds.length) {
+      updateLocalHistory(room.id, messageId, 'Cannot regenerate because some source history messages were deleted.', false, true, 'HISTORY_MISSING', 'One or more messages used for the original generation no longer exist.');
+      return;
+    }
+
+    const turnId = targetMessage.turnId || crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    const controller = new AbortController();
+    generationSessionRef.current = { sessionId, turnId, roomId: room.id, controller, targetMessageId: messageId, mode };
+    setIsGenerating(true);
+    isGeneratingRef.current = true;
+    setPlanningAgents([agent.id]);
+
+    const nextContext: GenerationContext = {
+      ...targetMessage.generationContext,
+      attempt: targetMessage.generationContext.attempt + 1,
+      modelId: agent.model
+    };
+    setRooms(prev => prev.map(r => r.id === room.id ? {
+      ...r,
+      messages: r.messages.map(m => m.id === messageId ? { ...m, content: '', error: false, errorCode: undefined, errorDetail: undefined, isStreaming: true, generationContext: nextContext } : m),
+      updatedAt: Date.now()
+    } : r));
+
+    let accumulatedText = '';
+    const requestSignal = controller.signal;
+    await new Promise<void>((resolve) => {
+      streamAgentResponse(
+        { ...agent, model: nextContext.modelId },
+        history,
+        room.systemInstruction,
+        (chunk) => {
+          if (!shouldAcceptStreamChunk(isCurrentGenerationSession(sessionId, turnId, room.id), requestSignal.aborted)) return;
+          accumulatedText += chunk;
+          updateLocalHistory(room.id, messageId, accumulatedText, true);
+        },
+        (result) => {
+          const completionKind = classifyStreamCompletion(accumulatedText, requestSignal.aborted);
+          if (completionKind === 'aborted_empty') {
+            removeMessageFromRoom(room.id, messageId);
+            resolve();
+            return;
+          }
+          if (completionKind === 'aborted_partial' || (completionKind === 'complete' && result.outcome === 'SUCCESS')) {
+            updateLocalHistory(room.id, messageId, accumulatedText, false);
+            resolve();
+            return;
+          }
+          const code = result.errorCode || 'EMPTY_RESPONSE';
+          const detail = result.errorDetail || 'The response stream completed without any text.';
+          const message = code === 'PARTIAL_RESPONSE' && accumulatedText ? accumulatedText : (code === 'EMPTY_RESPONSE' ? 'Empty response from model.' : (result.finishMessage || 'Agent response failed.'));
+          updateLocalHistory(room.id, messageId, message, false, true, code, detail);
+          resolve();
+        },
+        (errorInfo) => {
+          updateLocalHistory(room.id, messageId, errorInfo.message, false, true, errorInfo.code, errorInfo.detail);
+          resolve();
+        },
+        { agents: room.agents, signal: requestSignal, mode }
+      );
+    });
+    finishGenerationSession(sessionId, turnId, room.id);
+  };
+
+  const handleRetryMessage = (messageId: string) => runSingleMessageGeneration(messageId, 'retry');
+  const handleRegenerateMessage = (messageId: string) => runSingleMessageGeneration(messageId, 'regenerate');
 
   const handleStop = () => {
     // Cancels only the active generation session; old callbacks may clean up
@@ -535,7 +633,9 @@ export default function App() {
                     <MessageBubble 
                       key={msg.id} 
                       message={msg} 
-                      agent={msg.role === 'model' && msg.agentId ? agents.find(a => a.id === msg.agentId) : undefined} 
+                      agent={msg.role === 'model' && msg.agentId ? agents.find(a => a.id === msg.agentId) : undefined}
+                      onRetry={msg.error && canRetryGeneration(msg.errorCode) ? handleRetryMessage : undefined}
+                      onRegenerate={msg.role === 'model' && !msg.isStreaming && canRegenerateGeneration(msg.errorCode) ? handleRegenerateMessage : undefined}
                     />
                   ))
                 )}

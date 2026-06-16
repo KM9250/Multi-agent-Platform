@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
-import { normalizeAgent, normalizeContextFileOrder, buildAdditionalContext } from '../utils/contextFiles';
+import { normalizeAgent, normalizeContextFileOrder, buildAdditionalContext, normalizeModelId } from '../utils/contextFiles';
 import { appendDecisionEvents, createDecisionEvent, fixedDecision, MAX_DECISION_EVENTS, parseDecisionText } from '../utils/decisionDiagnostics';
 import { normalizePersistedRooms, normalizeRoom } from '../utils/persistenceMigration';
 import { classifyStreamCompletion } from '../utils/streamCompletion';
 import { isSameGenerationSession, shouldAcceptStreamChunk } from '../utils/generationSession';
+import { normalizeGenerationHistory } from '../utils/geminiHistory';
+import { classifyGenerationResult } from '../utils/generationResult';
+import { canRetryGeneration } from '../utils/retryPolicy';
+import { applyInitialUserTurnFallback, selectFallbackAgent } from '../utils/responseFallback';
 import { createDecisionError, getCombinedSystemInstruction } from '../services/geminiService';
 import type { Agent, AgentContextFile, Room } from '../types';
 
@@ -110,12 +114,13 @@ assert.equal(classifyStreamCompletion('partial', true), 'aborted_partial');
 
 
 // Generation session identity and chunk acceptance.
-const sessionA = { turnId: 'turn-a', roomId: 'room-1' };
-const sessionB = { turnId: 'turn-b', roomId: 'room-1' };
-assert.equal(isSameGenerationSession(sessionA, { turnId: 'turn-a', roomId: 'room-1' }), true);
-assert.equal(isSameGenerationSession(sessionA, { turnId: 'turn-b', roomId: 'room-1' }), false);
-assert.equal(isSameGenerationSession(sessionA, { turnId: 'turn-a', roomId: 'room-2' }), false);
-assert.equal(isSameGenerationSession(null, { turnId: 'turn-a', roomId: 'room-1' }), false);
+const sessionA = { sessionId: 'session-a', turnId: 'turn-a', roomId: 'room-1' };
+const sessionB = { sessionId: 'session-b', turnId: 'turn-a', roomId: 'room-1' };
+assert.equal(isSameGenerationSession(sessionA, { sessionId: 'session-a', turnId: 'turn-a', roomId: 'room-1' }), true);
+assert.equal(isSameGenerationSession(sessionA, { sessionId: 'session-b', turnId: 'turn-a', roomId: 'room-1' }), false);
+assert.equal(isSameGenerationSession(sessionA, { sessionId: 'session-a', turnId: 'turn-b', roomId: 'room-1' }), false);
+assert.equal(isSameGenerationSession(sessionA, { sessionId: 'session-a', turnId: 'turn-a', roomId: 'room-2' }), false);
+assert.equal(isSameGenerationSession(null, { sessionId: 'session-a', turnId: 'turn-a', roomId: 'room-1' }), false);
 assert.equal(isSameGenerationSession(sessionA, sessionA), true);
 assert.equal(isSameGenerationSession(sessionA, sessionB), false);
 assert.equal(isSameGenerationSession(sessionB, sessionB), true);
@@ -123,5 +128,55 @@ assert.equal(shouldAcceptStreamChunk(true, false), true);
 assert.equal(shouldAcceptStreamChunk(true, true), false);
 assert.equal(shouldAcceptStreamChunk(false, false), false);
 assert.equal(shouldAcceptStreamChunk(false, true), false);
+
+
+// Gemini generation history normalization.
+assert.deepEqual(normalizeGenerationHistory([{ role: 'user', parts: [{ text: 'u' }] }, { role: 'model', parts: [{ text: 'm' }] }], 'Curren Chan').contents.map(c => c.role), ['user', 'model', 'user']);
+assert.deepEqual(normalizeGenerationHistory([{ role: 'user', parts: [{ text: 'u1' }] }, { role: 'user', parts: [{ text: 'u2' }] }, { role: 'model', parts: [{ text: 'm' }] }], 'Curren Chan').contents.map(c => c.role), ['user', 'model', 'user']);
+assert.deepEqual(normalizeGenerationHistory([{ role: 'user', parts: [{ text: 'u' }] }, { role: 'model', parts: [{ text: 'm' }] }, { role: 'user', parts: [{ text: 'u2' }] }], 'Curren Chan').contents.map(c => c.role), ['user', 'model', 'user']);
+['Curren Chan', 'Admire Vega'].forEach(name => {
+  assert.equal(normalizeGenerationHistory([{ role: 'user', parts: [{ text: 'User' }] }, { role: 'model', parts: [{ text: name }] }], name).contents.at(-1)?.role, 'user');
+});
+assert.equal(normalizeGenerationHistory([{ role: 'user', parts: [{ text: 'User' }] }, { role: 'model', parts: [{ text: 'Curren' }] }, { role: 'user', parts: [{ text: 'Admire' }] }], 'Admire Vega').contents.at(-1)?.role, 'user');
+assert.equal(normalizeGenerationHistory([{ role: 'user', parts: [{ text: 'User' }] }, { role: 'model', parts: [{ text: 'Curren' }] }, { role: 'user', parts: [{ text: 'Admire' }] }, { role: 'model', parts: [{ text: 'Admire 2' }] }], 'Admire Vega').contents.at(-1)?.role, 'user');
+
+// Model migration and generation error classification.
+assert.equal(normalizeModelId('gemini-3.1-pro'), 'gemini-3.1-pro-preview');
+assert.equal(normalizeModelId('gemini-3-pro-preview'), 'gemini-3.1-pro-preview');
+assert.equal(normalizeModelId('gemini-3.1-pro-preview'), 'gemini-3.1-pro-preview');
+assert.equal(normalizeAgent(normalizeAgent({ ...baseAgent, model: 'gemini-3.1-pro' })).model, 'gemini-3.1-pro-preview');
+assert.equal(classifyGenerationResult('', { finishReason: 'SAFETY' }, false).errorCode, 'CONTENT_BLOCKED');
+assert.equal(classifyGenerationResult('partial', { finishReason: 'MAX_TOKENS' }, false).errorCode, 'PARTIAL_RESPONSE');
+assert.equal(classifyGenerationResult('', { finishReason: 'STOP' }, false).errorCode, 'EMPTY_RESPONSE');
+assert.equal(canRetryGeneration('EMPTY_RESPONSE'), true);
+assert.equal(canRetryGeneration('NETWORK_ERROR'), true);
+assert.equal(canRetryGeneration('MODEL_OVERLOADED'), true);
+assert.equal(canRetryGeneration('AUTH_ERROR'), false);
+assert.equal(canRetryGeneration('MODEL_NOT_FOUND'), false);
+assert.equal(canRetryGeneration('CONTENT_BLOCKED'), false);
+
+
+
+// Initial user-turn response fallback.
+const curren = { ...baseAgent, id: 'curren', name: 'Curren Chan' };
+const admire = { ...baseAgent, id: 'admire', name: 'Admire Vega' };
+const userOnlyHistory = [{ id: 'u1', role: 'user' as const, content: 'hello', timestamp: 1 }];
+const ignoreDecisions = [
+  { agent: curren, decision: { outcome: 'IGNORE' as const, source: 'llm_decision' as const, latencyMs: 1 } },
+  { agent: admire, decision: { outcome: 'IGNORE' as const, source: 'llm_decision' as const, latencyMs: 1 } },
+];
+assert.equal(applyInitialUserTurnFallback(ignoreDecisions, userOnlyHistory, 0).filter(result => result.decision.outcome === 'RESPOND' && result.decision.source === 'fallback').length, 1);
+assert.equal(applyInitialUserTurnFallback([{ agent: curren, decision: { outcome: 'RESPOND' as const, source: 'llm_decision' as const, latencyMs: 1 } }, ignoreDecisions[1]], userOnlyHistory, 0).filter(result => result.decision.outcome === 'RESPOND').length, 1);
+assert.equal(applyInitialUserTurnFallback([{ agent: curren, decision: { outcome: 'ERROR' as const, source: 'api_error' as const, latencyMs: 1 } }, ignoreDecisions[1]], userOnlyHistory, 0).find(result => result.agent.id === 'admire')?.decision.source, 'fallback');
+assert.equal(applyInitialUserTurnFallback([{ agent: curren, decision: { outcome: 'ERROR' as const, source: 'api_error' as const, latencyMs: 1 } }, { agent: admire, decision: { outcome: 'ERROR' as const, source: 'api_error' as const, latencyMs: 1 } }], userOnlyHistory, 0).filter(result => result.decision.outcome === 'RESPOND').length, 0);
+assert.equal(applyInitialUserTurnFallback(ignoreDecisions, userOnlyHistory, 1).filter(result => result.decision.outcome === 'RESPOND').length, 0);
+assert.equal(selectFallbackAgent([curren, admire], [...userOnlyHistory, { id: 'm1', role: 'model' as const, agentId: 'curren', content: 'x', timestamp: 2 }])?.id, 'admire');
+assert.equal(selectFallbackAgent([curren], userOnlyHistory)?.id, 'curren');
+const turnLimitOnly = [
+  { agent: curren, decision: { outcome: 'IGNORE' as const, source: 'turn_limit' as const, latencyMs: 0 } },
+  { agent: admire, decision: { outcome: 'IGNORE' as const, source: 'turn_limit' as const, latencyMs: 0 } },
+];
+assert.equal(applyInitialUserTurnFallback(turnLimitOnly, userOnlyHistory, 0).filter(result => result.decision.source === 'fallback').length, 1);
+assert.equal(applyInitialUserTurnFallback(turnLimitOnly, userOnlyHistory, 1).filter(result => result.decision.source === 'fallback').length, 0);
 
 console.log('All production-module diagnostics/context tests passed');

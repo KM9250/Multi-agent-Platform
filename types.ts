@@ -1,7 +1,7 @@
 
 export enum ModelType {
   // --- Gemini 3 Series ---
-  GEMINI_3_PRO = 'gemini-3.1-pro', // GA since 2026-02; gemini-3-pro-preview was shut down 2026-03-09
+  GEMINI_3_PRO = 'gemini-3.1-pro-preview', // Preview model ID per Gemini API
   GEMINI_3_PRO_IMAGE = 'gemini-3-pro-image', // GA since 2026-05-28 (preview retires 2026-06-25)
 
   // --- Gemini 2.5 Series ---
@@ -79,6 +79,12 @@ export interface Attachment {
   data: string; // Base64 string for images, plain text for text files
 }
 
+export interface GenerationContext {
+  historyMessageIds: string[];
+  attempt: number;
+  modelId: string;
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'model';
@@ -91,6 +97,7 @@ export interface Message {
   errorCode?: string; // e.g., 'QUOTA_EXCEEDED', 'SAFETY_FILTER'
   errorDetail?: string; // Technical details or suggestions
   turnId?: string;
+  generationContext?: GenerationContext;
 }
 
 export type RoomTag = 'Sandbox' | 'Recreation' | 'Hard';

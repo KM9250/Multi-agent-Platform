@@ -5,6 +5,9 @@ import type { Message, Agent, ResponseDecision } from "../types";
 import { DECISION_SYSTEM_INSTRUCTION } from "../constants";
 import { getStrategy } from "./agentStrategies";
 import { buildAdditionalContext } from "../utils/contextFiles";
+import { normalizeDecisionHistory, normalizeGenerationHistory, createRegeneratePrompt } from "../utils/geminiHistory";
+import { classifyGenerationResult, getFinishMetadata } from "../utils/generationResult";
+import type { GenerationResult } from "../utils/generationResult";
 import { parseDecisionText } from "../utils/decisionDiagnostics";
 
 export const hasApiKey = (): boolean => !!process.env.API_KEY;
@@ -72,7 +75,7 @@ const makeNameResolver = (agents?: Agent[]) => (id?: string): string =>
 // Build the shared conversation from one agent's perspective: its own
 // messages stay 'model' turns, while the user and every other agent become
 // labeled 'user' turns so the model can follow who said what.
-const buildHistoryForAgent = (
+export const buildHistoryForAgent = (
   allMessages: Message[],
   agentId: string,
   nameOf: (id?: string) => string
@@ -87,7 +90,7 @@ const buildHistoryForAgent = (
   });
 };
 
-const buildHistoryForDecision = (
+export const buildHistoryForDecision = (
   allMessages: Message[],
   nameOf: (id?: string) => string
 ): Content[] => {
@@ -155,8 +158,8 @@ const resolveModel = (selectedModel: string): string => {
     case 'gemini-2.5-pro-preview-02-05':
       // Legacy ID that may persist in saved rooms from older versions
       return ModelType.GEMINI_2_5_PRO;
+    case 'gemini-3.1-pro':
     case 'gemini-3-pro-preview':
-      // Shut down 2026-03-09; remap saved agents to the GA successor
       return ModelType.GEMINI_3_PRO;
     case 'gemini-3-pro-image-preview':
       // Preview retires 2026-06-25; remap to the GA model
@@ -187,6 +190,14 @@ export const classifyError = (err: any): { code: string; detail: string; message
     };
   }
   
+  if (msg.includes("404") || /model not found/i.test(msg) || /does not exist/i.test(msg) || /not available/i.test(msg) || /unsupported model/i.test(msg)) {
+    return {
+      code: 'MODEL_NOT_FOUND',
+      message: 'Selected model is unavailable.',
+      detail: 'The configured model ID may be invalid, deprecated, or unavailable for this API key.'
+    };
+  }
+
   if (msg.includes("429") || msg.includes("QuotaExceeded")) {
     return { 
       code: 'QUOTA_EXCEEDED', 
@@ -246,6 +257,7 @@ export const createDecisionError = (
 export interface AgentCallOptions {
   agents?: Agent[];        // Room agents, used to label speakers in history
   signal?: AbortSignal;    // Aborts the underlying API request (Stop button)
+  mode?: 'normal' | 'retry' | 'regenerate';
 }
 
 export const evaluateShouldRespond = async (
@@ -269,7 +281,7 @@ export const evaluateShouldRespond = async (
              systemPrompt = `=== ROOM CONTEXT ===\n${roomSystemInstruction}\n=== END ROOM CONTEXT ===\n\n` + systemPrompt;
         }
         const visibleHistory = applyHistoryWindow(allMessages.filter(isSendableMessage), agent).slice(-10);
-        const history = buildHistoryForDecision(visibleHistory, makeNameResolver(options?.agents));
+        const history = normalizeDecisionHistory(buildHistoryForDecision(visibleHistory, makeNameResolver(options?.agents)));
         const response = await ai.models.generateContent({
             model: decisionModel,
             contents: [
@@ -296,7 +308,7 @@ export const streamAgentResponse = async (
   allMessages: Message[],
   roomSystemInstruction: string | undefined,
   onChunk: (text: string) => void,
-  onComplete: () => void,
+  onComplete: (result: GenerationResult) => void,
   onError: (error: { message: string, code: string, detail: string }) => void,
   options?: AgentCallOptions
 ) => {
@@ -315,7 +327,11 @@ export const streamAgentResponse = async (
         throw new Error("No messages to respond to");
     }
 
-    const contents = buildHistoryForAgent(messagesToUse, agent.id, makeNameResolver(options?.agents));
+    const baseContents = buildHistoryForAgent(messagesToUse, agent.id, makeNameResolver(options?.agents));
+    const normalizedHistory = normalizeGenerationHistory(baseContents, agent.name);
+    const contents = options?.mode === 'regenerate'
+      ? [...normalizedHistory.contents, createRegeneratePrompt()]
+      : normalizedHistory.contents;
     const combinedSystemInstruction = getCombinedSystemInstruction(agent, roomSystemInstruction);
     const actualModel = resolveModel(agent.model);
 
@@ -337,6 +353,10 @@ export const streamAgentResponse = async (
        }
     }
 
+    const startedAt = performance.now();
+    let accumulatedText = '';
+    let finishMetadata: ReturnType<typeof getFinishMetadata> = {};
+
     const resultStream = await ai.models.generateContentStream({
       model: actualModel,
       contents,
@@ -346,16 +366,18 @@ export const streamAgentResponse = async (
     for await (const chunk of resultStream) {
       if (signal?.aborted) break;
       // Accessing .text property from stream chunk
+      finishMetadata = { ...finishMetadata, ...getFinishMetadata(chunk) };
       if (chunk.text) {
+        accumulatedText += chunk.text;
         onChunk(chunk.text);
       }
     }
 
-    onComplete();
+    onComplete(classifyGenerationResult(accumulatedText, finishMetadata, !!signal?.aborted, Math.round(performance.now() - startedAt)));
   } catch (err: any) {
     // A user-initiated stop is not an error; finalize the message as-is
     if (signal?.aborted) {
-      onComplete();
+      onComplete({ outcome: 'ABORTED', text: '', latencyMs: 0 });
       return;
     }
     onError(classifyError(err));

@@ -1,3 +1,4 @@
+import { ModelType } from '../types';
 import type { Agent, AgentContextFile } from '../types';
 
 const byteSize = (text: string): number => new TextEncoder().encode(text).length;
@@ -18,18 +19,30 @@ export const normalizeContextFileOrder = (files: AgentContextFile[] = []): Agent
       addedAt: file.addedAt || 0,
     }));
 
+export const normalizeModelId = (model: string): string => {
+  switch (model) {
+    case 'gemini-3.1-pro':
+    case 'gemini-3-pro-preview':
+      return ModelType.GEMINI_3_PRO;
+    default:
+      return model;
+  }
+};
+
 export const normalizeAgent = (agent: Agent, now = Date.now()): Agent => {
+  const normalizedModel = normalizeModelId(agent.model);
   if (Array.isArray(agent.additionalContextFiles)) {
-    return { ...agent, additionalContextFiles: normalizeContextFileOrder(agent.additionalContextFiles) };
+    return { ...agent, model: normalizedModel, additionalContextFiles: normalizeContextFileOrder(agent.additionalContextFiles) };
   }
 
   if (!agent.importedSystemInstruction) {
-    return { ...agent, additionalContextFiles: [] };
+    return { ...agent, model: normalizedModel, additionalContextFiles: [] };
   }
 
   const content = agent.importedSystemInstruction;
   return {
     ...agent,
+    model: normalizedModel,
     additionalContextFiles: [{
       id: `legacy-${agent.id}-${byteSize(content)}-${content.length}`,
       name: agent.importedSystemInstructionFileName || 'legacy-context.md',
