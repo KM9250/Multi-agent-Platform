@@ -1,14 +1,17 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Menu, Send, StopCircle, Trash2, BrainCircuit, Paperclip, X, FileText, Image as ImageIcon, Upload, Settings, Box, Gamepad2, AlertTriangle, Cuboid, MonitorPlay } from 'lucide-react';
+import { Menu, Send, StopCircle, Trash2, BrainCircuit, Paperclip, X, FileText, Settings, Box, Gamepad2, AlertTriangle, MonitorPlay } from 'lucide-react';
 import AgentSidebar from './components/AgentSidebar';
 import AgentModal from './components/AgentModal';
 import MessageBubble from './components/MessageBubble';
 import RelationshipGraphModal from './components/RelationshipGraphModal';
 import RoomModal from './components/RoomModal';
 import SceneView from './components/SceneView';
+import DecisionDiagnosticsPanel from './components/DecisionDiagnosticsPanel';
 import { streamAgentResponse, evaluateShouldRespond, hasApiKey } from './services/geminiService';
 import { INITIAL_ROOMS, createNewRoom, calculateRelationshipWeights, ROOM_TAGS } from './constants';
-import { Agent, Message, Room, Attachment, RoomTag } from './types';
+import { normalizePersistedRooms } from './utils/persistenceMigration';
+import { appendDecisionEvents, createDecisionEvent, fixedDecision } from './utils/decisionDiagnostics';
+import { Agent, Message, Room, Attachment, RoomTag, AgentDecisionEvent } from './types';
 
 export default function App() {
   // --- State ---
@@ -19,10 +22,7 @@ export default function App() {
       // A reload during generation persists isStreaming: true, which would
       // leave a forever-blinking cursor and "Thinking" badges. Clear it.
       const parsed: Room[] = JSON.parse(saved);
-      return parsed.map(room => ({
-        ...room,
-        messages: room.messages.map(m => m.isStreaming ? { ...m, isStreaming: false } : m)
-      }));
+      return normalizePersistedRooms(parsed);
     } catch (e) {
       console.error('Failed to restore rooms from localStorage:', e);
       return INITIAL_ROOMS;
@@ -53,6 +53,7 @@ export default function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [planningAgents, setPlanningAgents] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [storageWarning, setStorageWarning] = useState<string | null>(null);
   
   const isGeneratingRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -79,6 +80,7 @@ export default function App() {
       // Base64 image attachments/avatars can exceed the ~5MB storage quota.
       // Keep the app running; the session simply won't survive a reload.
       console.error('Failed to persist rooms to localStorage:', e);
+      setStorageWarning('Some data could not be saved locally. The current session will continue, but recent changes may be lost after reload.');
     }
   }, [rooms]);
 
@@ -160,9 +162,14 @@ export default function App() {
     setAttachments(prev => prev.filter(a => a.id !== id));
   };
 
-  const updateLocalHistory = (msgId: string, content: string, streaming: boolean, error: boolean = false, errorCode?: string, errorDetail?: string) => {
+  const addDecisionEvents = (roomId: string, events: AgentDecisionEvent[]) => {
+    if (events.length === 0) return;
+    setRooms(prev => prev.map(r => r.id === roomId ? { ...appendDecisionEvents(r, events), updatedAt: Date.now() } : r));
+  };
+
+  const updateLocalHistory = (roomId: string, msgId: string, content: string, streaming: boolean, error: boolean = false, errorCode?: string, errorDetail?: string) => {
     setRooms(prev => prev.map(r => {
-       if (r.id !== activeRoomId) return r;
+       if (r.id !== roomId) return r;
        return {
            ...r,
            messages: r.messages.map(m => m.id === msgId ? { ...m, content, isStreaming: streaming, error, errorCode, errorDetail } : m)
@@ -171,7 +178,7 @@ export default function App() {
   };
 
   // --- Conversation Loop ---
-  const processConversationTurn = async (currentHistory: Message[], turnDepth: number) => {
+  const processConversationTurn = async (currentHistory: Message[], turnDepth: number, turnId: string, roomId: string) => {
     if (turnDepth >= 3 || !isGeneratingRef.current) {
         setIsGenerating(false);
         isGeneratingRef.current = false;
@@ -188,16 +195,18 @@ export default function App() {
     // Without a key, the decision module silently returns IGNORE for every
     // agent and the user gets no feedback at all — surface the error instead.
     if (!hasApiKey()) {
+        addDecisionEvents(roomId, activeAgents.map(agent => createDecisionEvent(turnId, agent, { outcome: 'ERROR', source: 'api_error', latencyMs: 0, decisionModel: 'none', errorCode: 'AUTH_ERROR', errorDetail: 'API key is missing.' })));
         const errMsg: Message = {
             id: crypto.randomUUID(),
             role: 'model',
             content: 'Authentication failed.',
             timestamp: Date.now(),
+            turnId,
             error: true,
             errorCode: 'AUTH_ERROR',
             errorDetail: 'The API key is missing. Set GEMINI_API_KEY in .env.local and restart the dev server.'
         };
-        updateActiveRoom({ messages: [...currentHistory, errMsg] });
+        setRooms(prev => prev.map(r => r.id === roomId ? { ...r, messages: [...currentHistory, errMsg], updatedAt: Date.now() } : r));
         setIsGenerating(false);
         isGeneratingRef.current = false;
         return;
@@ -215,21 +224,24 @@ export default function App() {
           const recentHistory = currentHistory.slice(-8);
           // Fixed: changed 'agentId' to 'agent.id' to fix reference error
           const myCount = recentHistory.filter(m => m.agentId === agent.id).length;
-          if (myCount >= 3) return { agent, shouldRespond: false, reason: 'turn_limit' };
+          if (myCount >= 3) return { agent, decision: fixedDecision('IGNORE', 'turn_limit') };
         }
-        if (isMentioned) return { agent, shouldRespond: true, reason: 'mentioned' };
+        if (isMentioned) return { agent, decision: fixedDecision('RESPOND', 'mentioned') };
         
-        const shouldRespond = await evaluateShouldRespond(agent, currentHistory, activeRoom.systemInstruction, {
+        const decision = await evaluateShouldRespond(agent, currentHistory, activeRoom.systemInstruction, {
           agents,
           signal: abortControllerRef.current?.signal
         });
-        return { agent, shouldRespond, reason: 'llm_decision' };
+        return { agent, decision };
     }));
     
+    const decisionEvents = decisions.map(d => createDecisionEvent(turnId, d.agent, d.decision));
+    addDecisionEvents(roomId, decisionEvents);
+
     setPlanningAgents([]); 
     if (!isGeneratingRef.current) return;
 
-    const respondingAgents = decisions.filter(d => d.shouldRespond).map(d => d.agent);
+    const respondingAgents = decisions.filter(d => d.decision.outcome === 'RESPOND').map(d => d.agent);
     if (respondingAgents.length === 0) {
         setIsGenerating(false);
         isGeneratingRef.current = false;
@@ -258,7 +270,8 @@ export default function App() {
         agentId: agent.id,
         // Distinct timestamps keep ordering stable for sorting and the graph
         timestamp: timestamp + idx + 1,
-        isStreaming: true
+        isStreaming: true,
+        turnId
       };
     });
 
@@ -276,17 +289,23 @@ export default function App() {
           (chunk) => {
             if (!isGeneratingRef.current) return;
             accumulatedText += chunk;
-            updateLocalHistory(msgId, accumulatedText, true);
+            updateLocalHistory(roomId, msgId, accumulatedText, true);
           },
           () => {
-            updateLocalHistory(msgId, accumulatedText, false);
-            nextHistory = nextHistory.map(m => m.id === msgId
-              ? { ...m, content: accumulatedText, isStreaming: false }
-              : m);
+            if (!abortControllerRef.current?.signal.aborted && accumulatedText.length === 0) {
+              const message = 'Empty response from model.';
+              updateLocalHistory(roomId, msgId, message, false, true, 'EMPTY_RESPONSE', 'The response stream completed without any text.');
+              nextHistory = nextHistory.map(m => m.id === msgId ? { ...m, content: message, isStreaming: false, error: true, errorCode: 'EMPTY_RESPONSE', errorDetail: 'The response stream completed without any text.' } : m);
+            } else {
+              updateLocalHistory(roomId, msgId, accumulatedText, false);
+              nextHistory = nextHistory.map(m => m.id === msgId
+                ? { ...m, content: accumulatedText, isStreaming: false }
+                : m);
+            }
             resolve();
           },
           (errorInfo) => {
-            updateLocalHistory(msgId, errorInfo.message, false, true, errorInfo.code, errorInfo.detail);
+            updateLocalHistory(roomId, msgId, errorInfo.message, false, true, errorInfo.code, errorInfo.detail);
             nextHistory = nextHistory.map(m => m.id === msgId
               ? { ...m, content: errorInfo.message, isStreaming: false, error: true, errorCode: errorInfo.code, errorDetail: errorInfo.detail }
               : m);
@@ -303,7 +322,7 @@ export default function App() {
     await Promise.all(agentPromises);
     if (isGeneratingRef.current) {
         await new Promise(r => setTimeout(r, 500));
-        await processConversationTurn(nextHistory, turnDepth + 1);
+        await processConversationTurn(nextHistory, turnDepth + 1, turnId, roomId);
     }
   };
 
@@ -343,18 +362,21 @@ export default function App() {
     setIsGenerating(true);
     isGeneratingRef.current = true;
     abortControllerRef.current = new AbortController();
+    const turnId = crypto.randomUUID();
+    const roomId = activeRoom.id;
     const newUserMessage: Message = {
       id: crypto.randomUUID(),
       role: 'user',
       content: input,
       attachments: [...attachments],
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      turnId
     };
     const updatedMessages = [...messages, newUserMessage];
     updateActiveRoom({ messages: updatedMessages });
     setInput('');
     setAttachments([]);
-    await processConversationTurn(updatedMessages, 0);
+    await processConversationTurn(updatedMessages, 0, turnId, roomId);
   };
 
   const handleStop = () => {
@@ -367,7 +389,7 @@ export default function App() {
 
   const handleClearChat = () => {
     if (confirm("Are you sure you want to clear the conversation for this room?")) {
-        updateActiveRoom({ messages: [] });
+        updateActiveRoom({ messages: [], decisionEvents: [] });
     }
   };
 
@@ -442,6 +464,13 @@ export default function App() {
           </div>
         </header>
         <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+          {storageWarning && (
+            <div className="mx-4 mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200 flex items-center justify-between gap-3">
+              <span>{storageWarning}</span>
+              <button onClick={() => setStorageWarning(null)} className="text-amber-100 hover:text-white"><X className="w-4 h-4" /></button>
+            </div>
+          )}
+          <DecisionDiagnosticsPanel events={activeRoom.decisionEvents || []} />
           {is3DMode && (
             <div className="h-1/2 min-h-[300px] border-b border-zinc-800 relative animate-in fade-in slide-in-from-top-4 duration-300">
                <SceneView agents={agents} speakingAgentId={currentSpeakingAgentId} />

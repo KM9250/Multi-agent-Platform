@@ -1,7 +1,9 @@
 import { GoogleGenAI, Content, Part } from "@google/genai";
-import { Message, Agent, ModelType } from "../types";
+import { Message, Agent, ModelType, ResponseDecision } from "../types";
 import { DECISION_SYSTEM_INSTRUCTION } from "../constants";
 import { getStrategy } from "./agentStrategies";
+import { buildAdditionalContext } from "../utils/contextFiles";
+import { parseDecisionText } from "../utils/decisionDiagnostics";
 
 export const hasApiKey = (): boolean => !!process.env.API_KEY;
 
@@ -122,8 +124,11 @@ const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction?: stri
     parts.push(agent.systemInstruction);
   }
   
-  if (agent.importedSystemInstruction) {
-    parts.push(`\n\n--- ADDITIONAL CONTEXT (${agent.importedSystemInstructionFileName || 'Imported File'}) ---\n${agent.importedSystemInstruction}\n--- END CONTEXT ---`);
+  const additionalContext = buildAdditionalContext(agent.additionalContextFiles);
+  if (additionalContext) {
+    parts.push(additionalContext);
+  } else if (agent.importedSystemInstruction) {
+    parts.push(`\n\n--- ADDITIONAL CONTEXT 1: ${agent.importedSystemInstructionFileName || 'Imported File'} ---\n${agent.importedSystemInstruction}\n--- END CONTEXT: ${agent.importedSystemInstructionFileName || 'Imported File'} ---`);
   }
 
   const strategy = getStrategy(agent.framework);
@@ -167,7 +172,7 @@ const resolveModel = (selectedModel: string): string => {
 /**
  * Classifies an error into a human-readable code and detailed description.
  */
-const classifyError = (err: any): { code: string; detail: string; message: string } => {
+export const classifyError = (err: any): { code: string; detail: string; message: string } => {
   const msg = err.message || String(err);
   
   if (msg.includes("API Key is missing") || msg.includes("401")) {
@@ -227,8 +232,14 @@ export const evaluateShouldRespond = async (
   allMessages: Message[],
   roomSystemInstruction?: string,
   options?: AgentCallOptions
-): Promise<boolean> => {
-    if (!process.env.API_KEY) return false;
+): Promise<ResponseDecision> => {
+    const decisionModel = ModelType.GEMINI_2_5_FLASH;
+    const startedAt = performance.now();
+    const latency = () => Math.round(performance.now() - startedAt);
+
+    if (!process.env.API_KEY) {
+      return { outcome: 'ERROR', source: 'api_error', latencyMs: latency(), decisionModel, errorCode: 'AUTH_ERROR', errorDetail: 'API Key is missing' };
+    }
 
     try {
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -239,7 +250,7 @@ export const evaluateShouldRespond = async (
         const visibleHistory = applyHistoryWindow(allMessages.filter(isSendableMessage), agent).slice(-10);
         const history = buildHistoryForDecision(visibleHistory, makeNameResolver(options?.agents));
         const response = await ai.models.generateContent({
-            model: ModelType.GEMINI_2_5_FLASH,
+            model: decisionModel,
             contents: [
                 ...history,
                 { role: 'user', parts: [{ text: "このメッセージに対して返信すべきですか？ 'RESPOND' または 'IGNORE' で答えてください。" }] }
@@ -248,18 +259,15 @@ export const evaluateShouldRespond = async (
                 systemInstruction: systemPrompt,
                 temperature: 0.1,
                 maxOutputTokens: 10,
-                // Disabling thinking to ensure maxOutputTokens are utilized for response
                 thinkingConfig: { thinkingBudget: 0 },
                 abortSignal: options?.signal
             }
         });
 
-        // Using .text property directly as per latest guidelines
-        const decision = response.text?.trim().toUpperCase();
-        return decision?.includes("RESPOND") ?? false;
+        return parseDecisionText(response.text, latency(), decisionModel);
     } catch (e) {
-        console.error("Decision API Error:", e);
-        return false; 
+        const classified = classifyError(e);
+        return { outcome: 'ERROR', source: 'api_error', latencyMs: latency(), decisionModel, errorCode: classified.code, errorDetail: classified.detail };
     }
 }
 
