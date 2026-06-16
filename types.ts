@@ -3,6 +3,7 @@ export enum ModelType {
   // --- Gemini 3 Series ---
   GEMINI_3_PRO = 'gemini-3.1-pro-preview', // Preview model ID per Gemini API
   GEMINI_3_PRO_IMAGE = 'gemini-3-pro-image', // GA since 2026-05-28 (preview retires 2026-06-25)
+  GEMINI_3_FLASH = 'gemini-3-flash-preview',
 
   // --- Gemini 2.5 Series ---
   GEMINI_2_5_PRO = 'gemini-2.5-pro', // High reasoning 2.5

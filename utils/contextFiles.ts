@@ -24,6 +24,9 @@ export const normalizeModelId = (model: string): string => {
     case 'gemini-3.1-pro':
     case 'gemini-3-pro-preview':
       return ModelType.GEMINI_3_PRO;
+    case 'gemini-3.0-flash':
+    case 'gemini-3-flash':
+      return ModelType.GEMINI_3_FLASH;
     default:
       return model;
   }
