@@ -1,5 +1,6 @@
 
-import { Agent, ModelType, Message, Room, RoomTag, AgentFramework } from './types';
+import { ModelType } from './types';
+import type { Agent, Message, Room, RoomTag, AgentFramework } from './types';
 
 // Emotion instruction provided by user
 export const EMOTION_INSTRUCTION = `

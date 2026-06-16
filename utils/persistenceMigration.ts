@@ -1,4 +1,4 @@
-import { Room } from '../types';
+import type { Room } from '../types';
 import { normalizeAgent } from './contextFiles';
 import { MAX_DECISION_EVENTS } from './decisionDiagnostics';
 

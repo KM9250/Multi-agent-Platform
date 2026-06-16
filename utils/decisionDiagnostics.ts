@@ -1,4 +1,4 @@
-import { Agent, AgentDecisionEvent, DecisionSource, ResponseDecision, Room } from '../types';
+import type { Agent, AgentDecisionEvent, DecisionSource, ResponseDecision, Room } from '../types';
 
 export const MAX_DECISION_EVENTS = 50;
 

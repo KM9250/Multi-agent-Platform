@@ -93,8 +93,6 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       name: name || 'Unnamed Agent',
       description,
       systemInstruction,
-      importedSystemInstruction: editingAgent?.importedSystemInstruction,
-      importedSystemInstructionFileName: editingAgent?.importedSystemInstructionFileName,
       additionalContextFiles: normalizeContextFileOrder(additionalContextFiles),
       model,
       framework,
@@ -147,7 +145,7 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
   };
 
   const handleMdUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = Array.from(e.target.files || []);
+    const selected: File[] = Array.from(e.target.files ?? []);
     if (selected.length === 0) return;
 
     const results = await Promise.all(selected.map(async (file, index) => {

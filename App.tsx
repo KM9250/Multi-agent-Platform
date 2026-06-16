@@ -11,6 +11,7 @@ import { streamAgentResponse, evaluateShouldRespond, hasApiKey } from './service
 import { INITIAL_ROOMS, createNewRoom, calculateRelationshipWeights, ROOM_TAGS } from './constants';
 import { normalizePersistedRooms } from './utils/persistenceMigration';
 import { appendDecisionEvents, createDecisionEvent, fixedDecision } from './utils/decisionDiagnostics';
+import { classifyStreamCompletion } from './utils/streamCompletion';
 import { Agent, Message, Room, Attachment, RoomTag, AgentDecisionEvent } from './types';
 
 export default function App() {
@@ -177,6 +178,13 @@ export default function App() {
     }));
   };
 
+  const removeMessageFromRoom = (roomId: string, msgId: string) => {
+    setRooms(prev => prev.map(r => r.id === roomId
+      ? { ...r, messages: r.messages.filter(m => m.id !== msgId) }
+      : r
+    ));
+  };
+
   // --- Conversation Loop ---
   const processConversationTurn = async (currentHistory: Message[], turnDepth: number, turnId: string, roomId: string) => {
     if (turnDepth >= 3 || !isGeneratingRef.current) {
@@ -281,27 +289,37 @@ export default function App() {
     const agentPromises = sortedAgents.map(agent => {
       return new Promise<void>((resolve) => {
         const msgId = agentMessageIds[agent.id];
+        const requestSignal = abortControllerRef.current?.signal;
         let accumulatedText = "";
         streamAgentResponse(
           agent,
           [...currentHistory],
-          activeRoom.systemInstruction, 
+          activeRoom.systemInstruction,
           (chunk) => {
-            if (!isGeneratingRef.current) return;
+            if (!isGeneratingRef.current && !requestSignal?.aborted) return;
             accumulatedText += chunk;
             updateLocalHistory(roomId, msgId, accumulatedText, true);
           },
           () => {
-            if (!abortControllerRef.current?.signal.aborted && accumulatedText.length === 0) {
-              const message = 'Empty response from model.';
-              updateLocalHistory(roomId, msgId, message, false, true, 'EMPTY_RESPONSE', 'The response stream completed without any text.');
-              nextHistory = nextHistory.map(m => m.id === msgId ? { ...m, content: message, isStreaming: false, error: true, errorCode: 'EMPTY_RESPONSE', errorDetail: 'The response stream completed without any text.' } : m);
-            } else {
+            const completionKind = classifyStreamCompletion(accumulatedText, !!requestSignal?.aborted);
+            if (completionKind === 'aborted_empty') {
+              removeMessageFromRoom(roomId, msgId);
+              nextHistory = nextHistory.filter(m => m.id !== msgId);
+              resolve();
+              return;
+            }
+            if (completionKind === 'aborted_partial' || completionKind === 'complete') {
               updateLocalHistory(roomId, msgId, accumulatedText, false);
               nextHistory = nextHistory.map(m => m.id === msgId
                 ? { ...m, content: accumulatedText, isStreaming: false }
                 : m);
+              resolve();
+              return;
             }
+
+            const message = 'Empty response from model.';
+            updateLocalHistory(roomId, msgId, message, false, true, 'EMPTY_RESPONSE', 'The response stream completed without any text.');
+            nextHistory = nextHistory.map(m => m.id === msgId ? { ...m, content: message, isStreaming: false, error: true, errorCode: 'EMPTY_RESPONSE', errorDetail: 'The response stream completed without any text.' } : m);
             resolve();
           },
           (errorInfo) => {
@@ -313,7 +331,7 @@ export default function App() {
           },
           {
             agents,
-            signal: abortControllerRef.current?.signal
+            signal: requestSignal
           }
         );
       });

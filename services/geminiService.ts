@@ -1,5 +1,7 @@
-import { GoogleGenAI, Content, Part } from "@google/genai";
-import { Message, Agent, ModelType, ResponseDecision } from "../types";
+import { GoogleGenAI } from "@google/genai";
+import type { Content, Part } from "@google/genai";
+import { ModelType } from "../types";
+import type { Message, Agent, ResponseDecision } from "../types";
 import { DECISION_SYSTEM_INSTRUCTION } from "../constants";
 import { getStrategy } from "./agentStrategies";
 import { buildAdditionalContext } from "../utils/contextFiles";
@@ -103,7 +105,7 @@ const buildHistoryForDecision = (
   });
 };
 
-const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction?: string): string => {
+export const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction?: string): string => {
   const parts = [];
 
   parts.push(
@@ -124,9 +126,11 @@ const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction?: stri
     parts.push(agent.systemInstruction);
   }
   
-  const additionalContext = buildAdditionalContext(agent.additionalContextFiles);
-  if (additionalContext) {
-    parts.push(additionalContext);
+  if (Array.isArray(agent.additionalContextFiles)) {
+    const additionalContext = buildAdditionalContext(agent.additionalContextFiles);
+    if (additionalContext) {
+      parts.push(additionalContext);
+    }
   } else if (agent.importedSystemInstruction) {
     parts.push(`\n\n--- ADDITIONAL CONTEXT 1: ${agent.importedSystemInstructionFileName || 'Imported File'} ---\n${agent.importedSystemInstruction}\n--- END CONTEXT: ${agent.importedSystemInstructionFileName || 'Imported File'} ---`);
   }
@@ -222,6 +226,23 @@ export const classifyError = (err: any): { code: string; detail: string; message
   };
 };
 
+
+export const createDecisionError = (
+  error: unknown,
+  latencyMs: number,
+  decisionModel: string
+): ResponseDecision => {
+  const classified = classifyError(error);
+  return {
+    outcome: 'ERROR',
+    source: 'api_error',
+    latencyMs,
+    decisionModel,
+    errorCode: classified.code,
+    errorDetail: classified.detail
+  };
+};
+
 export interface AgentCallOptions {
   agents?: Agent[];        // Room agents, used to label speakers in history
   signal?: AbortSignal;    // Aborts the underlying API request (Stop button)
@@ -266,8 +287,7 @@ export const evaluateShouldRespond = async (
 
         return parseDecisionText(response.text, latency(), decisionModel);
     } catch (e) {
-        const classified = classifyError(e);
-        return { outcome: 'ERROR', source: 'api_error', latencyMs: latency(), decisionModel, errorCode: classified.code, errorDetail: classified.detail };
+        return createDecisionError(e, latency(), decisionModel);
     }
 }
 

@@ -1,4 +1,4 @@
-import { Agent, AgentContextFile } from '../types';
+import type { Agent, AgentContextFile } from '../types';
 
 const byteSize = (text: string): number => new TextEncoder().encode(text).length;
 
@@ -19,7 +19,7 @@ export const normalizeContextFileOrder = (files: AgentContextFile[] = []): Agent
     }));
 
 export const normalizeAgent = (agent: Agent, now = Date.now()): Agent => {
-  if (agent.additionalContextFiles?.length) {
+  if (Array.isArray(agent.additionalContextFiles)) {
     return { ...agent, additionalContextFiles: normalizeContextFileOrder(agent.additionalContextFiles) };
   }
 
