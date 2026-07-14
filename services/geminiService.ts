@@ -1,14 +1,7 @@
-import { GoogleGenAI } from "@google/genai";
-import type { Content, Part } from "@google/genai";
-import { ModelType } from "../types";
-import type { Message, Agent, ResponseDecision } from "../types";
+import { GoogleGenAI, Content, Part } from "@google/genai";
+import { Message, Agent, ModelType } from "../types";
 import { DECISION_SYSTEM_INSTRUCTION } from "../constants";
 import { getStrategy } from "./agentStrategies";
-import { buildAdditionalContext } from "../utils/contextFiles";
-import { normalizeDecisionHistory, normalizeGenerationHistory, createRegeneratePrompt } from "../utils/geminiHistory";
-import { classifyGenerationResult, getFinishMetadata } from "../utils/generationResult";
-import type { GenerationResult } from "../utils/generationResult";
-import { parseDecisionText } from "../utils/decisionDiagnostics";
 
 export const hasApiKey = (): boolean => !!process.env.API_KEY;
 
@@ -75,7 +68,7 @@ const makeNameResolver = (agents?: Agent[]) => (id?: string): string =>
 // Build the shared conversation from one agent's perspective: its own
 // messages stay 'model' turns, while the user and every other agent become
 // labeled 'user' turns so the model can follow who said what.
-export const buildHistoryForAgent = (
+const buildHistoryForAgent = (
   allMessages: Message[],
   agentId: string,
   nameOf: (id?: string) => string
@@ -90,7 +83,7 @@ export const buildHistoryForAgent = (
   });
 };
 
-export const buildHistoryForDecision = (
+const buildHistoryForDecision = (
   allMessages: Message[],
   nameOf: (id?: string) => string
 ): Content[] => {
@@ -108,7 +101,7 @@ export const buildHistoryForDecision = (
   });
 };
 
-export const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction?: string): string => {
+const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction?: string): string => {
   const parts = [];
 
   parts.push(
@@ -129,13 +122,8 @@ export const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction
     parts.push(agent.systemInstruction);
   }
   
-  if (Array.isArray(agent.additionalContextFiles)) {
-    const additionalContext = buildAdditionalContext(agent.additionalContextFiles);
-    if (additionalContext) {
-      parts.push(additionalContext);
-    }
-  } else if (agent.importedSystemInstruction) {
-    parts.push(`\n\n--- ADDITIONAL CONTEXT 1: ${agent.importedSystemInstructionFileName || 'Imported File'} ---\n${agent.importedSystemInstruction}\n--- END CONTEXT: ${agent.importedSystemInstructionFileName || 'Imported File'} ---`);
+  if (agent.importedSystemInstruction) {
+    parts.push(`\n\n--- ADDITIONAL CONTEXT (${agent.importedSystemInstructionFileName || 'Imported File'}) ---\n${agent.importedSystemInstruction}\n--- END CONTEXT ---`);
   }
 
   const strategy = getStrategy(agent.framework);
@@ -158,8 +146,8 @@ const resolveModel = (selectedModel: string): string => {
     case 'gemini-2.5-pro-preview-02-05':
       // Legacy ID that may persist in saved rooms from older versions
       return ModelType.GEMINI_2_5_PRO;
-    case 'gemini-3.1-pro':
     case 'gemini-3-pro-preview':
+      // Shut down 2026-03-09; remap saved agents to the GA successor
       return ModelType.GEMINI_3_PRO;
     case 'gemini-3-pro-image-preview':
       // Preview retires 2026-06-25; remap to the GA model
@@ -179,7 +167,7 @@ const resolveModel = (selectedModel: string): string => {
 /**
  * Classifies an error into a human-readable code and detailed description.
  */
-export const classifyError = (err: any): { code: string; detail: string; message: string } => {
+const classifyError = (err: any): { code: string; detail: string; message: string } => {
   const msg = err.message || String(err);
   
   if (msg.includes("API Key is missing") || msg.includes("401")) {
@@ -190,14 +178,6 @@ export const classifyError = (err: any): { code: string; detail: string; message
     };
   }
   
-  if (msg.includes("404") || /model not found/i.test(msg) || /does not exist/i.test(msg) || /not available/i.test(msg) || /unsupported model/i.test(msg)) {
-    return {
-      code: 'MODEL_NOT_FOUND',
-      message: 'Selected model is unavailable.',
-      detail: 'The configured model ID may be invalid, deprecated, or unavailable for this API key.'
-    };
-  }
-
   if (msg.includes("429") || msg.includes("QuotaExceeded")) {
     return { 
       code: 'QUOTA_EXCEEDED', 
@@ -237,27 +217,9 @@ export const classifyError = (err: any): { code: string; detail: string; message
   };
 };
 
-
-export const createDecisionError = (
-  error: unknown,
-  latencyMs: number,
-  decisionModel: string
-): ResponseDecision => {
-  const classified = classifyError(error);
-  return {
-    outcome: 'ERROR',
-    source: 'api_error',
-    latencyMs,
-    decisionModel,
-    errorCode: classified.code,
-    errorDetail: classified.detail
-  };
-};
-
 export interface AgentCallOptions {
   agents?: Agent[];        // Room agents, used to label speakers in history
   signal?: AbortSignal;    // Aborts the underlying API request (Stop button)
-  mode?: 'normal' | 'retry' | 'regenerate';
 }
 
 export const evaluateShouldRespond = async (
@@ -265,14 +227,8 @@ export const evaluateShouldRespond = async (
   allMessages: Message[],
   roomSystemInstruction?: string,
   options?: AgentCallOptions
-): Promise<ResponseDecision> => {
-    const decisionModel = ModelType.GEMINI_2_5_FLASH;
-    const startedAt = performance.now();
-    const latency = () => Math.round(performance.now() - startedAt);
-
-    if (!process.env.API_KEY) {
-      return { outcome: 'ERROR', source: 'api_error', latencyMs: latency(), decisionModel, errorCode: 'AUTH_ERROR', errorDetail: 'API Key is missing' };
-    }
+): Promise<boolean> => {
+    if (!process.env.API_KEY) return false;
 
     try {
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -281,9 +237,9 @@ export const evaluateShouldRespond = async (
              systemPrompt = `=== ROOM CONTEXT ===\n${roomSystemInstruction}\n=== END ROOM CONTEXT ===\n\n` + systemPrompt;
         }
         const visibleHistory = applyHistoryWindow(allMessages.filter(isSendableMessage), agent).slice(-10);
-        const history = normalizeDecisionHistory(buildHistoryForDecision(visibleHistory, makeNameResolver(options?.agents)));
+        const history = buildHistoryForDecision(visibleHistory, makeNameResolver(options?.agents));
         const response = await ai.models.generateContent({
-            model: decisionModel,
+            model: ModelType.GEMINI_2_5_FLASH,
             contents: [
                 ...history,
                 { role: 'user', parts: [{ text: "このメッセージに対して返信すべきですか？ 'RESPOND' または 'IGNORE' で答えてください。" }] }
@@ -292,14 +248,18 @@ export const evaluateShouldRespond = async (
                 systemInstruction: systemPrompt,
                 temperature: 0.1,
                 maxOutputTokens: 10,
+                // Disabling thinking to ensure maxOutputTokens are utilized for response
                 thinkingConfig: { thinkingBudget: 0 },
                 abortSignal: options?.signal
             }
         });
 
-        return parseDecisionText(response.text, latency(), decisionModel);
+        // Using .text property directly as per latest guidelines
+        const decision = response.text?.trim().toUpperCase();
+        return decision?.includes("RESPOND") ?? false;
     } catch (e) {
-        return createDecisionError(e, latency(), decisionModel);
+        console.error("Decision API Error:", e);
+        return false; 
     }
 }
 
@@ -308,7 +268,7 @@ export const streamAgentResponse = async (
   allMessages: Message[],
   roomSystemInstruction: string | undefined,
   onChunk: (text: string) => void,
-  onComplete: (result: GenerationResult) => void,
+  onComplete: () => void,
   onError: (error: { message: string, code: string, detail: string }) => void,
   options?: AgentCallOptions
 ) => {
@@ -327,11 +287,7 @@ export const streamAgentResponse = async (
         throw new Error("No messages to respond to");
     }
 
-    const baseContents = buildHistoryForAgent(messagesToUse, agent.id, makeNameResolver(options?.agents));
-    const normalizedHistory = normalizeGenerationHistory(baseContents, agent.name);
-    const contents = options?.mode === 'regenerate'
-      ? [...normalizedHistory.contents, createRegeneratePrompt()]
-      : normalizedHistory.contents;
+    const contents = buildHistoryForAgent(messagesToUse, agent.id, makeNameResolver(options?.agents));
     const combinedSystemInstruction = getCombinedSystemInstruction(agent, roomSystemInstruction);
     const actualModel = resolveModel(agent.model);
 
@@ -353,10 +309,6 @@ export const streamAgentResponse = async (
        }
     }
 
-    const startedAt = performance.now();
-    let accumulatedText = '';
-    let finishMetadata: ReturnType<typeof getFinishMetadata> = {};
-
     const resultStream = await ai.models.generateContentStream({
       model: actualModel,
       contents,
@@ -366,18 +318,16 @@ export const streamAgentResponse = async (
     for await (const chunk of resultStream) {
       if (signal?.aborted) break;
       // Accessing .text property from stream chunk
-      finishMetadata = { ...finishMetadata, ...getFinishMetadata(chunk) };
       if (chunk.text) {
-        accumulatedText += chunk.text;
         onChunk(chunk.text);
       }
     }
 
-    onComplete(classifyGenerationResult(accumulatedText, finishMetadata, !!signal?.aborted, Math.round(performance.now() - startedAt)));
+    onComplete();
   } catch (err: any) {
     // A user-initiated stop is not an error; finalize the message as-is
     if (signal?.aborted) {
-      onComplete({ outcome: 'ABORTED', text: '', latencyMs: 0 });
+      onComplete();
       return;
     }
     onError(classifyError(err));

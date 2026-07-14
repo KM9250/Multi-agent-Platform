@@ -32,7 +32,7 @@ It is a prototype environment for testing how a network of AI agents can functio
 
 ## Getting started
 
-Requirements: Node.js 22.7+ and a Google Gemini API key ([Google AI Studio](https://aistudio.google.com/apikey)).
+Requirements: Node.js 20+ and a Google Gemini API key ([Google AI Studio](https://aistudio.google.com/apikey)).
 
 ```bash
 npm install
@@ -40,13 +40,13 @@ npm install
 
 ### Gemini API key setup
 
-Create `.env.local` in the project root (the same directory as `package.json`) and add your Gemini API key in this format:
+Create `.env.local` in the project root (the same directory as `package.json`) and write your Gemini API key in this format:
 
 ```env
 GEMINI_API_KEY=your_actual_gemini_api_key
 ```
 
-Never commit a real API key. `.env.local` is covered by the `*.local` rule in `.gitignore`.
+Save `.env.local` as UTF-8 no BOM, and never put a real API key in README files, issues, pull requests, or any GitHub commit.
 
 After creating or editing `.env.local`, restart the Vite dev server so the environment variable is reloaded:
 
@@ -54,15 +54,15 @@ After creating or editing `.env.local`, restart the Vite dev server so the envir
 npm run dev
 ```
 
-#### Windows PowerShell encoding note
+#### Windows PowerShell / VSCode terminal note
 
-On Windows, avoid creating `.env.local` with PowerShell commands such as `echo ... > .env.local` or `Out-File`: depending on the environment, they can save the file as UTF-16 LE. Vite may then fail to read `GEMINI_API_KEY`, which can cause this app error:
+On Windows, do not use PowerShell commands such as `echo ... > .env.local` or `Out-File` to create `.env.local`. Depending on the environment, they can create a UTF-16 LE file, and Vite's `loadEnv` may not read `GEMINI_API_KEY`, causing this error:
 
 ```txt
 The API key is missing. Set GEMINI_API_KEY in .env.local and restart the dev server.
 ```
 
-Use an editor that saves `.env.local` as UTF-8 no BOM, or create the file safely from PowerShell with UTF-8 no BOM:
+Use an editor that saves UTF-8 no BOM, or create `.env.local` safely from PowerShell with .NET:
 
 ```powershell
 $apiKey = "your_actual_gemini_api_key"
@@ -74,13 +74,13 @@ $content = "GEMINI_API_KEY=$apiKey`n"
 )
 ```
 
-If needed, inspect the first bytes of `.env.local`:
+To check the file encoding, inspect the first bytes with a PowerShell-version-independent command:
 
 ```powershell
-Format-Hex .env.local -Count 16
+Format-Hex .env.local
 ```
 
-If the file starts with `FF FE`, it is likely UTF-16 LE and Vite may not read it correctly. A normal UTF-8 file should begin with the bytes for `GEMINI...`, for example `47 45 4D 49 4E 49 ...`.
+If the first bytes are `FF FE`, the file is likely UTF-16 LE and should be recreated as UTF-8 no BOM. A normal UTF-8 file should begin with the bytes for `GEMINI...`, for example `47 45 4D 49 4E 49 ...`.
 
 ```bash
 # Development server (http://localhost:3000)

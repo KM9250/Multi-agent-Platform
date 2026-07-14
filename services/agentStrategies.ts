@@ -1,5 +1,5 @@
 
-import type { AgentFramework } from '../types';
+import { AgentFramework } from '../types';
 
 /**
  * Interface for Agent Strategies.

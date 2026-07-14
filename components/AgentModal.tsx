@@ -1,11 +1,9 @@
 
 import React, { useState, useEffect, useRef } from 'react';
-import { X, Shuffle, Brain, Upload, Image as ImageIcon, Smile, Cpu, History } from 'lucide-react';
-import { Agent, ModelType, AgentFramework, AgentContextFile } from '../types';
+import { X, Shuffle, Brain, Upload, Image as ImageIcon, Smile, FileText, Trash2, Cpu, History } from 'lucide-react';
+import { Agent, ModelType, AgentFramework } from '../types';
 import { AVATAR_COLORS, MODEL_OPTIONS, FRAMEWORK_OPTIONS } from '../constants';
 import { getStrategy } from '../services/agentStrategies';
-import AgentContextFileList from './AgentContextFileList';
-import { createAgentContextFile, normalizeAgent, normalizeContextFileOrder } from '../utils/contextFiles';
 
 interface AgentModalProps {
   isOpen: boolean;
@@ -21,8 +19,9 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
   const [model, setModel] = useState<string>(ModelType.GEMINI_2_5_FLASH);
   const [framework, setFramework] = useState<AgentFramework>('standard');
   
-  const [additionalContextFiles, setAdditionalContextFiles] = useState<AgentContextFile[]>([]);
-  const [contextUploadErrors, setContextUploadErrors] = useState<string[]>([]);
+  // Imported System Instruction State
+  const [importedInstruction, setImportedInstruction] = useState<string>('');
+  const [importedFileName, setImportedFileName] = useState<string>('');
 
   // Avatar state
   const [avatarType, setAvatarType] = useState<'emoji' | 'image'>('emoji');
@@ -42,8 +41,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       setName(editingAgent.name);
       setDescription(editingAgent.description);
       setSystemInstruction(editingAgent.systemInstruction);
-      setAdditionalContextFiles(normalizeAgent(editingAgent).additionalContextFiles || []);
-      setContextUploadErrors([]);
+      setImportedInstruction(editingAgent.importedSystemInstruction || '');
+      setImportedFileName(editingAgent.importedSystemInstructionFileName || '');
       setModel(editingAgent.model);
       setFramework(editingAgent.framework || 'standard');
       setColor(editingAgent.color);
@@ -69,8 +68,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
     setName('');
     setDescription('');
     setSystemInstruction('You are a helpful AI assistant.');
-    setAdditionalContextFiles([]);
-    setContextUploadErrors([]);
+    setImportedInstruction('');
+    setImportedFileName('');
     setModel(ModelType.GEMINI_2_5_FLASH);
     setFramework('standard');
     setAvatarType('emoji');
@@ -93,7 +92,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       name: name || 'Unnamed Agent',
       description,
       systemInstruction,
-      additionalContextFiles: normalizeContextFileOrder(additionalContextFiles),
+      importedSystemInstruction: importedInstruction,
+      importedSystemInstructionFileName: importedFileName,
       model,
       framework,
       color,
@@ -144,40 +144,24 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
     reader.readAsDataURL(file);
   };
 
-  const handleMdUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected: File[] = Array.from(e.target.files ?? []);
-    if (selected.length === 0) return;
+  const handleMdUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
 
-    const results = await Promise.all(selected.map(async (file, index) => {
-      try {
-        const text = await file.text();
-        return { file: createAgentContextFile(file, text, additionalContextFiles.length + index) };
-      } catch {
-        return { error: `Failed to read ${file.name}` };
-      }
-    }));
-
-    const newFiles = results.flatMap(r => r.file ? [r.file] : []);
-    const errors = results.flatMap(r => r.error ? [r.error] : []);
-    setAdditionalContextFiles(prev => normalizeContextFileOrder([...prev, ...newFiles]));
-    setContextUploadErrors(errors);
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const text = event.target?.result as string;
+      setImportedInstruction(text);
+      setImportedFileName(file.name);
+    };
+    reader.readAsText(file);
+    // Reset value so same file can be selected again if needed
     if (mdInputRef.current) mdInputRef.current.value = '';
   };
 
-  const deleteContextFile = (id: string) => {
-    setAdditionalContextFiles(prev => normalizeContextFileOrder(prev.filter(file => file.id !== id)));
-  };
-
-  const moveContextFile = (id: string, dir: -1 | 1) => {
-    setAdditionalContextFiles(prev => {
-      const sorted = normalizeContextFileOrder(prev);
-      const index = sorted.findIndex(file => file.id === id);
-      const target = index + dir;
-      if (index < 0 || target < 0 || target >= sorted.length) return sorted;
-      const next = sorted.slice();
-      [next[index], next[target]] = [next[target], next[index]];
-      return normalizeContextFileOrder(next);
-    });
+  const clearImportedFile = () => {
+    setImportedInstruction('');
+    setImportedFileName('');
   };
 
   if (!isOpen) return null;
@@ -429,22 +413,46 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
               placeholder="How should this agent behave?"
             />
             
-            {/* Additional Context File Upload */}
+            {/* Markdown File Upload */}
             <div className="mt-4">
-              <AgentContextFileList
-                files={additionalContextFiles}
-                errors={contextUploadErrors}
-                onAdd={() => mdInputRef.current?.click()}
-                onDelete={deleteContextFile}
-                onMove={moveContextFile}
-              />
-              <input
-                type="file"
-                multiple
-                accept=".md,.markdown,.txt"
-                className="hidden"
-                ref={mdInputRef}
-                onChange={handleMdUpload}
+              <label className="block text-sm font-medium text-zinc-300 mb-2">Additional Context (.md file)</label>
+              {importedFileName ? (
+                <div className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-lg border border-zinc-700/50">
+                   <div className="flex items-center gap-3 overflow-hidden">
+                      <div className="p-2 bg-zinc-800 rounded border border-zinc-700">
+                        <FileText className="w-4 h-4 text-blue-400" />
+                      </div>
+                      <div className="flex flex-col min-w-0">
+                        <span className="text-sm text-zinc-200 truncate font-medium">{importedFileName}</span>
+                        <span className="text-[10px] text-zinc-500">
+                          {importedInstruction.length} characters loaded
+                        </span>
+                      </div>
+                   </div>
+                   <button 
+                     type="button"
+                     onClick={clearImportedFile} 
+                     className="p-2 hover:bg-red-500/10 hover:text-red-400 text-zinc-500 rounded-lg transition-colors"
+                     title="Remove file"
+                   >
+                      <Trash2 className="w-4 h-4" />
+                   </button>
+                </div>
+              ) : (
+                <div 
+                   onClick={() => mdInputRef.current?.click()}
+                   className="border border-dashed border-zinc-700 rounded-lg p-4 flex flex-col items-center justify-center text-zinc-500 hover:text-zinc-300 hover:border-zinc-500 hover:bg-zinc-800/50 transition-all cursor-pointer group"
+                >
+                   <Upload className="w-5 h-5 mb-2 group-hover:-translate-y-0.5 transition-transform" />
+                   <span className="text-xs font-medium">Click to upload .md file</span>
+                </div>
+              )}
+              <input 
+                type="file" 
+                accept=".md, .txt, .markdown" 
+                className="hidden" 
+                ref={mdInputRef} 
+                onChange={handleMdUpload} 
               />
             </div>
           </div>
