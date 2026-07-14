@@ -36,10 +36,53 @@ Requirements: Node.js 22.7+ and a Google Gemini API key ([Google AI Studio](http
 
 ```bash
 npm install
+```
 
-# Configure the API key
-echo "GEMINI_API_KEY=your-api-key-here" > .env.local
+### Gemini API key setup
 
+Create `.env.local` in the project root (the same directory as `package.json`) and write your Gemini API key in this format:
+
+```env
+GEMINI_API_KEY=your_actual_gemini_api_key
+```
+
+Save `.env.local` as UTF-8 no BOM, and never put a real API key in README files, issues, pull requests, or any GitHub commit.
+
+After creating or editing `.env.local`, restart the Vite dev server so the environment variable is reloaded:
+
+```bash
+npm run dev
+```
+
+#### Windows PowerShell / VSCode terminal note
+
+On Windows, do not use PowerShell commands such as `echo ... > .env.local` or `Out-File` to create `.env.local`. Depending on the environment, they can create a UTF-16 LE file, and Vite's `loadEnv` may not read `GEMINI_API_KEY`, causing this error:
+
+```txt
+The API key is missing. Set GEMINI_API_KEY in .env.local and restart the dev server.
+```
+
+Use an editor that saves UTF-8 no BOM, or create `.env.local` safely from PowerShell with .NET:
+
+```powershell
+$apiKey = "your_actual_gemini_api_key"
+$content = "GEMINI_API_KEY=$apiKey`n"
+[System.IO.File]::WriteAllText(
+  (Join-Path (Get-Location) ".env.local"),
+  $content,
+  [System.Text.UTF8Encoding]::new($false)
+)
+```
+
+To check the file encoding, inspect the first bytes with a PowerShell-version-independent command:
+
+```powershell
+Format-Hex .env.local
+```
+
+If the first bytes are `FF FE`, the file is likely UTF-16 LE and should be recreated as UTF-8 no BOM. A normal UTF-8 file should begin with the bytes for `GEMINI...`, for example `47 45 4D 49 4E 49 ...`.
+
+```bash
 # Development server (http://localhost:3000)
 npm run dev
 
