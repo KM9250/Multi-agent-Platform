@@ -1,6 +1,7 @@
 
 import { ModelType } from './types';
 import type { Agent, Message, Room, RoomTag, AgentFramework } from './types';
+import { DEFAULT_INTERNAL_STATE_SETTINGS, getPublicMessageContent } from './utils/messageVisibility';
 
 // Emotion instruction provided by user
 export const EMOTION_INSTRUCTION = `
@@ -92,7 +93,8 @@ export const calculateRelationshipWeights = (rooms: Room[]) => {
       const curr = room.messages[i];
       const prev = room.messages[i-1];
       
-      if (!curr.content) continue;
+      const publicContent = getPublicMessageContent(curr, !!room.internalStateSettings?.enabled);
+      if (!publicContent) continue;
 
       const sourceId = curr.role === 'model' ? (curr.agentId || 'unknown') : 'user';
       const targetId = prev.role === 'model' ? (prev.agentId || 'unknown') : 'user';
@@ -102,7 +104,7 @@ export const calculateRelationshipWeights = (rooms: Room[]) => {
       const key = `${sourceId}->${targetId}`;
       const existing = interactionMap.get(key) || { count: 0, posSum: 0, negSum: 0 };
       
-      const { posAvg, negAvg } = extractEmotions(curr.content);
+      const { posAvg, negAvg } = extractEmotions(publicContent);
       
       interactionMap.set(key, {
         count: existing.count + 1,
@@ -281,7 +283,8 @@ export const createNewRoom = (title: string, description: string, type: RoomTag,
     type,
     agents: JSON.parse(JSON.stringify(DEFAULT_AGENTS)), // Deep copy defaults
     messages: [],
-    updatedAt: Date.now()
+    updatedAt: Date.now(),
+    internalStateSettings: { ...DEFAULT_INTERNAL_STATE_SETTINGS }
   };
 };
 

@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/decision-context.test.ts",
+    "test": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

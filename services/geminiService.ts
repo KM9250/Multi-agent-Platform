@@ -1,7 +1,7 @@
 import { GoogleGenAI } from "@google/genai";
 import type { Content, Part } from "@google/genai";
 import { ModelType } from "../types";
-import type { Message, Agent, ResponseDecision } from "../types";
+import type { Message, Agent, ResponseDecision, InternalStateSettings } from "../types";
 import { DECISION_SYSTEM_INSTRUCTION } from "../constants";
 import { getStrategy } from "./agentStrategies";
 import { buildAdditionalContext } from "../utils/contextFiles";
@@ -9,6 +9,8 @@ import { normalizeDecisionHistory, normalizeGenerationHistory, createRegenerateP
 import { classifyGenerationResult, getFinishMetadata } from "../utils/generationResult";
 import type { GenerationResult } from "../utils/generationResult";
 import { parseDecisionText } from "../utils/decisionDiagnostics";
+import { buildVisibleHistoryForAgent } from "../utils/messageVisibility";
+import { structuredOutputInstruction } from "../utils/structuredAgentOutput";
 
 export const hasApiKey = (): boolean => !!process.env.API_KEY;
 
@@ -108,7 +110,7 @@ export const buildHistoryForDecision = (
   });
 };
 
-export const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction?: string): string => {
+export const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction?: string, separationEnabled = false, memoryRequest = false): string => {
   const parts = [];
 
   parts.push(
@@ -140,7 +142,7 @@ export const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction
 
   const strategy = getStrategy(agent.framework);
   const baseInstruction = parts.join('\n');
-  return strategy.injectSystemPrompt(baseInstruction);
+  return strategy.injectSystemPrompt(baseInstruction) + (separationEnabled ? structuredOutputInstruction(memoryRequest) : '');
 };
 
 const resolveModel = (selectedModel: string): string => {
@@ -259,6 +261,8 @@ export interface AgentCallOptions {
   agents?: Agent[];        // Room agents, used to label speakers in history
   signal?: AbortSignal;    // Aborts the underlying API request (Stop button)
   mode?: 'normal' | 'retry' | 'regenerate';
+  internalStateSettings?: InternalStateSettings;
+  memoryRequest?: boolean;
 }
 
 export const evaluateShouldRespond = async (
@@ -281,7 +285,8 @@ export const evaluateShouldRespond = async (
         if (roomSystemInstruction) {
              systemPrompt = `=== ROOM CONTEXT ===\n${roomSystemInstruction}\n=== END ROOM CONTEXT ===\n\n` + systemPrompt;
         }
-        const visibleHistory = applyHistoryWindow(allMessages.filter(isSendableMessage), agent).slice(-10);
+        const recipientHistory = buildVisibleHistoryForAgent(allMessages, agent.id, options?.internalStateSettings);
+        const visibleHistory = applyHistoryWindow(recipientHistory.filter(isSendableMessage), agent).slice(-10);
         const history = normalizeDecisionHistory(buildHistoryForDecision(visibleHistory, makeNameResolver(options?.agents)));
         const response = await ai.models.generateContent({
             model: decisionModel,
@@ -322,7 +327,8 @@ export const streamAgentResponse = async (
 
   try {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const messagesToUse = applyHistoryWindow(allMessages.filter(isSendableMessage), agent);
+    const recipientHistory = buildVisibleHistoryForAgent(allMessages, agent.id, options?.internalStateSettings);
+    const messagesToUse = applyHistoryWindow(recipientHistory.filter(isSendableMessage), agent);
 
     if (messagesToUse.length === 0) {
         throw new Error("No messages to respond to");
@@ -333,7 +339,7 @@ export const streamAgentResponse = async (
     const contents = options?.mode === 'regenerate'
       ? [...normalizedHistory.contents, createRegeneratePrompt()]
       : normalizedHistory.contents;
-    const combinedSystemInstruction = getCombinedSystemInstruction(agent, roomSystemInstruction);
+    const combinedSystemInstruction = getCombinedSystemInstruction(agent, roomSystemInstruction, !!options?.internalStateSettings?.enabled, !!options?.memoryRequest);
     const actualModel = resolveModel(agent.model);
 
     const config: any = {

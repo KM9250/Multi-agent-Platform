@@ -86,6 +86,24 @@ export interface GenerationContext {
   modelId: string;
 }
 
+export type MessageChannel = 'public_message' | 'private_state' | 'shared_summary' | 'debug_thoughts' | 'gm_log' | 'memory_export';
+export type MessageVisibility = 'public' | 'self_only' | 'self_and_gm' | 'gm_only' | 'developer_only';
+
+export interface MessageSegment {
+  id: string;
+  channel: MessageChannel;
+  visibility: MessageVisibility;
+  content: string;
+}
+
+export interface InternalStateSettings {
+  enabled: boolean;
+  showPrivateState: boolean;
+  showDebugThoughts: boolean;
+  showGmLog: boolean;
+  showMemoryExport: boolean;
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'model';
@@ -99,6 +117,8 @@ export interface Message {
   errorDetail?: string; // Technical details or suggestions
   turnId?: string;
   generationContext?: GenerationContext;
+  segments?: MessageSegment[];
+  separationVersion?: 1;
 }
 
 export type RoomTag = 'Sandbox' | 'Recreation' | 'Hard';
@@ -112,5 +132,6 @@ export interface Room {
   agents: Agent[];
   messages: Message[];
   decisionEvents?: AgentDecisionEvent[];
+  internalStateSettings?: InternalStateSettings;
   updatedAt: number;
 }

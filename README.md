@@ -109,3 +109,13 @@ In short:
 
 Work in progress.  
 The goal is to build a foundation for AI systems where intelligence emerges from **coordination, structure, and controlled interaction**, not only from model size.
+
+## Internal-state separation
+
+Room Settings can opt a room into **Internal State Separation**. It is off by default for existing and new rooms, preserving legacy streaming and history behavior. When enabled, model output is buffered until completion and parsed as structured JSON; only `public_message` is mirrored into `Message.content`. Canonical `segments` distinguish public messages, private state, shared summaries, debug summaries, GM logs, and memory exports with explicit visibility.
+
+Recipient history is fail-closed: another agent receives public messages and safe shared summaries only. An agent additionally receives its own private state and self-visible memory. Debug summaries, GM logs, another agent's private state, and private memory never enter decision or generation history. CoT/ReAct debug fields are application-requested concise summaries only; the application does not request or access provider-hidden chain of thought.
+
+Separated streaming buffers raw JSON only in memory and does not render or persist chunks. Parsing failures show `STRUCTURED_OUTPUT_PARSE_ERROR` without publishing the raw response. Retry and regenerate replace every old segment. An exact `/memory` input creates a memory-export event with no public reply.
+
+The collapsible operator panel can display selected internal categories. These switches are presentation controls, not authentication or access control. Segments remain in browser `localStorage`; hiding them does **not** encrypt or cryptographically protect secrets from someone with access to the browser profile or developer tools.

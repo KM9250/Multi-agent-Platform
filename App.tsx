@@ -14,8 +14,10 @@ import { appendDecisionEvents, createDecisionEvent, fixedDecision } from './util
 import { classifyStreamCompletion } from './utils/streamCompletion';
 import { GenerationMode, GenerationSession, isSameGenerationSession, shouldAcceptStreamChunk } from './utils/generationSession';
 import { canRegenerateGeneration, canRetryGeneration } from './utils/retryPolicy';
+import { parseStructuredAgentOutput, STRUCTURED_OUTPUT_PARSE_ERROR } from './utils/structuredAgentOutput';
+import { DEFAULT_INTERNAL_STATE_SETTINGS, replaceStructuredMessage } from './utils/messageVisibility';
 import { applyInitialUserTurnFallback } from './utils/responseFallback';
-import { Agent, Message, Room, Attachment, RoomTag, AgentDecisionEvent, GenerationContext } from './types';
+import { Agent, Message, Room, Attachment, RoomTag, AgentDecisionEvent, GenerationContext, InternalStateSettings, MessageSegment } from './types';
 
 export default function App() {
   // --- State ---
@@ -171,12 +173,12 @@ export default function App() {
     setRooms(prev => prev.map(r => r.id === roomId ? { ...appendDecisionEvents(r, events), updatedAt: Date.now() } : r));
   };
 
-  const updateLocalHistory = (roomId: string, msgId: string, content: string, streaming: boolean, error: boolean = false, errorCode?: string, errorDetail?: string) => {
+  const updateLocalHistory = (roomId: string, msgId: string, content: string, streaming: boolean, error: boolean = false, errorCode?: string, errorDetail?: string, segments?: MessageSegment[]) => {
     setRooms(prev => prev.map(r => {
        if (r.id !== roomId) return r;
        return {
            ...r,
-           messages: r.messages.map(m => m.id === msgId ? { ...m, content, isStreaming: streaming, error, errorCode, errorDetail } : m)
+           messages: r.messages.map(m => m.id === msgId ? { ...m, content, isStreaming: streaming, error, errorCode, errorDetail, ...(segments ? { segments, separationVersion: 1 as const } : {}) } : m)
        };
     }));
   };
@@ -217,6 +219,8 @@ export default function App() {
 
     const roomAgents = targetRoom.agents;
     const roomSystemInstruction = targetRoom.systemInstruction;
+    const internalStateSettings = { ...DEFAULT_INTERNAL_STATE_SETTINGS, ...targetRoom.internalStateSettings };
+    const memoryRequest = currentHistory[currentHistory.length - 1]?.role === 'user' && currentHistory[currentHistory.length - 1].content.trim() === '/memory';
     const requestSignal = generationSessionRef.current?.controller.signal;
 
     const activeAgents = roomAgents.filter(a => a.isEnabled);
@@ -264,12 +268,15 @@ export default function App() {
         
         const decision = await evaluateShouldRespond(agent, currentHistory, roomSystemInstruction, {
           agents: roomAgents,
-          signal: requestSignal
+          signal: requestSignal,
+          internalStateSettings
         });
         return { agent, decision };
     }));
     
-    const finalDecisions = applyInitialUserTurnFallback(decisions, currentHistory, turnDepth);
+    const finalDecisions = memoryRequest
+      ? decisions.map(({ agent }) => ({ agent, decision: fixedDecision('RESPOND', 'broadcast') }))
+      : applyInitialUserTurnFallback(decisions, currentHistory, turnDepth);
     const decisionEvents = finalDecisions.map(d => createDecisionEvent(turnId, d.agent, d.decision));
     addDecisionEvents(roomId, decisionEvents);
 
@@ -329,15 +336,28 @@ export default function App() {
           (chunk) => {
             if (!shouldAcceptStreamChunk(isCurrentGenerationSession(sessionId, turnId, roomId), !!requestSignal?.aborted)) return;
             accumulatedText += chunk;
-            updateLocalHistory(roomId, msgId, accumulatedText, true);
+            if (!internalStateSettings.enabled) updateLocalHistory(roomId, msgId, accumulatedText, true);
           },
           (result) => {
             const completionKind = classifyStreamCompletion(accumulatedText, !!requestSignal?.aborted);
-            if (completionKind === 'aborted_empty') {
+            if (completionKind === 'aborted_empty' || (internalStateSettings.enabled && result.outcome === 'ABORTED')) {
               removeMessageFromRoom(roomId, msgId);
               nextHistory = nextHistory.filter(m => m.id !== msgId);
               resolve();
               return;
+            }
+            if (internalStateSettings.enabled && completionKind === 'complete' && result.outcome === 'SUCCESS') {
+              try {
+                const parsed = parseStructuredAgentOutput(result.text, memoryRequest);
+                updateLocalHistory(roomId, msgId, parsed.publicMessage, false, false, undefined, undefined, parsed.segments);
+                nextHistory = nextHistory.map(m => m.id === msgId ? replaceStructuredMessage(m, parsed.publicMessage, parsed.segments) : m);
+              } catch (error) {
+                hadGenerationError = true;
+                const detail = error instanceof Error ? error.message : 'Structured response could not be parsed.';
+                updateLocalHistory(roomId, msgId, 'Structured response could not be parsed.', false, true, STRUCTURED_OUTPUT_PARSE_ERROR, detail, []);
+                nextHistory = nextHistory.map(m => m.id === msgId ? { ...m, content: 'Structured response could not be parsed.', segments: [], separationVersion: 1, isStreaming: false, error: true, errorCode: STRUCTURED_OUTPUT_PARSE_ERROR, errorDetail: detail } : m);
+              }
+              resolve(); return;
             }
             if (completionKind === 'aborted_partial' || (completionKind === 'complete' && result.outcome === 'SUCCESS')) {
               updateLocalHistory(roomId, msgId, accumulatedText, false);
@@ -367,7 +387,9 @@ export default function App() {
           {
             agents: roomAgents,
             signal: requestSignal,
-            mode: generationSessionRef.current?.mode || 'normal'
+            mode: generationSessionRef.current?.mode || 'normal',
+            internalStateSettings,
+            memoryRequest
           }
         );
       });
@@ -375,6 +397,10 @@ export default function App() {
 
     await Promise.all(agentPromises);
     if (hadGenerationError) {
+        finishGenerationSession(sessionId, turnId, roomId);
+        return;
+    }
+    if (memoryRequest) {
         finishGenerationSession(sessionId, turnId, roomId);
         return;
     }
@@ -387,12 +413,13 @@ export default function App() {
   };
 
   // --- Handlers ---
-  const handleSaveRoom = (title: string, description: string, type: RoomTag, systemInstruction: string) => {
+  const handleSaveRoom = (title: string, description: string, type: RoomTag, systemInstruction: string, internalStateSettings: InternalStateSettings) => {
     if (editingRoom) {
-      setRooms(prev => prev.map(r => r.id === editingRoom.id ? { ...r, title, description, type, systemInstruction, updatedAt: Date.now() } : r));
+      setRooms(prev => prev.map(r => r.id === editingRoom.id ? { ...r, title, description, type, systemInstruction, internalStateSettings, updatedAt: Date.now() } : r));
       setEditingRoom(null);
     } else {
       const newRoom = createNewRoom(title, description, type, systemInstruction);
+      newRoom.internalStateSettings = internalStateSettings;
       setRooms(prev => [newRoom, ...prev]);
       setActiveRoomId(newRoom.id);
     }
@@ -470,9 +497,11 @@ export default function App() {
       attempt: targetMessage.generationContext.attempt + 1,
       modelId: agent.model
     };
+    const internalStateSettings = { ...DEFAULT_INTERNAL_STATE_SETTINGS, ...room.internalStateSettings };
+    const memoryRequest = history[history.length - 1]?.role === 'user' && history[history.length - 1].content.trim() === '/memory';
     setRooms(prev => prev.map(r => r.id === room.id ? {
       ...r,
-      messages: r.messages.map(m => m.id === messageId ? { ...m, content: '', error: false, errorCode: undefined, errorDetail: undefined, isStreaming: true, generationContext: nextContext } : m),
+      messages: r.messages.map(m => m.id === messageId ? { ...m, content: '', segments: internalStateSettings.enabled ? [] : m.segments, error: false, errorCode: undefined, errorDetail: undefined, isStreaming: true, generationContext: nextContext } : m),
       updatedAt: Date.now()
     } : r));
 
@@ -486,14 +515,23 @@ export default function App() {
         (chunk) => {
           if (!shouldAcceptStreamChunk(isCurrentGenerationSession(sessionId, turnId, room.id), requestSignal.aborted)) return;
           accumulatedText += chunk;
-          updateLocalHistory(room.id, messageId, accumulatedText, true);
+          if (!internalStateSettings.enabled) updateLocalHistory(room.id, messageId, accumulatedText, true);
         },
         (result) => {
           const completionKind = classifyStreamCompletion(accumulatedText, requestSignal.aborted);
-          if (completionKind === 'aborted_empty') {
+          if (completionKind === 'aborted_empty' || (internalStateSettings.enabled && result.outcome === 'ABORTED')) {
             removeMessageFromRoom(room.id, messageId);
             resolve();
             return;
+          }
+          if (internalStateSettings.enabled && completionKind === 'complete' && result.outcome === 'SUCCESS') {
+            try {
+              const parsed = parseStructuredAgentOutput(result.text, memoryRequest);
+              updateLocalHistory(room.id, messageId, parsed.publicMessage, false, false, undefined, undefined, parsed.segments);
+            } catch (error) {
+              updateLocalHistory(room.id, messageId, 'Structured response could not be parsed.', false, true, STRUCTURED_OUTPUT_PARSE_ERROR, error instanceof Error ? error.message : 'Structured response could not be parsed.', []);
+            }
+            resolve(); return;
           }
           if (completionKind === 'aborted_partial' || (completionKind === 'complete' && result.outcome === 'SUCCESS')) {
             updateLocalHistory(room.id, messageId, accumulatedText, false);
@@ -510,7 +548,7 @@ export default function App() {
           updateLocalHistory(room.id, messageId, errorInfo.message, false, true, errorInfo.code, errorInfo.detail);
           resolve();
         },
-        { agents: room.agents, signal: requestSignal, mode }
+        { agents: room.agents, signal: requestSignal, mode, internalStateSettings, memoryRequest }
       );
     });
     finishGenerationSession(sessionId, turnId, room.id);
@@ -636,6 +674,7 @@ export default function App() {
                       agent={msg.role === 'model' && msg.agentId ? agents.find(a => a.id === msg.agentId) : undefined}
                       onRetry={msg.error && canRetryGeneration(msg.errorCode) ? handleRetryMessage : undefined}
                       onRegenerate={msg.role === 'model' && !msg.isStreaming && canRegenerateGeneration(msg.errorCode) ? handleRegenerateMessage : undefined}
+                      internalStateSettings={{ ...DEFAULT_INTERNAL_STATE_SETTINGS, ...activeRoom.internalStateSettings }}
                     />
                   ))
                 )}
