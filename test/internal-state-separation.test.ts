@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import type { Message, Room } from '../types.ts';
+import type { Agent, Message, Room } from '../types.ts';
 import { normalizeRoom } from '../utils/persistenceMigration.ts';
 import { buildVisibleHistoryForAgent, DEFAULT_INTERNAL_STATE_SETTINGS, deriveLegacySegments, getPublicMessageContent, isMemoryExportRequest, replaceStructuredMessage } from '../utils/messageVisibility.ts';
 import { parseStructuredAgentOutput, StructuredOutputError } from '../utils/structuredAgentOutput.ts';
 import { finalizeLegacyGeneration, finalizeSeparatedFailure, finalizeSeparatedSuccess, prepareMessageForRegeneration, restoreMessageAfterAbort, SAFE_SEPARATED_ERROR_MESSAGE } from '../utils/generationFinalization.ts';
 import { canRetryGeneration } from '../utils/retryPolicy.ts';
 import { STRATEGIES } from '../services/agentStrategies.ts';
+import { resolveTurnDecisions } from '../utils/turnDecisions.ts';
 
 const settings = { ...DEFAULT_INTERNAL_STATE_SETTINGS, enabled: true };
 const ids = () => { let n = 0; return () => `s${++n}`; };
@@ -144,4 +145,47 @@ test('CoT and ReAct retain legacy tags only when separation is off', () => {
   assert.doesNotMatch(reactSeparated, /following format[\s\S]*\[ACTION\]/);
   assert.match(cotSeparated, /debug_thoughts/);
   assert.match(reactSeparated, /gm_log/);
+});
+
+test('/memory broadcasts without calling the decision evaluator', async () => {
+  const agents = [
+    { id: 'a', name: 'Alpha', isEnabled: true },
+    { id: 'b', name: 'Beta', isEnabled: true },
+  ] as Agent[];
+  let calls = 0;
+  const decisions = await resolveTurnDecisions({
+    activeAgents: agents,
+    history: [{ id: 'u', role: 'user', content: '/memory', timestamp: 1 }],
+    turnDepth: 0,
+    memoryRequest: true,
+    evaluateDecision: async () => {
+      calls++;
+      return { outcome: 'IGNORE', source: 'llm_decision', latencyMs: 1 };
+    },
+  });
+  assert.equal(calls, 0);
+  assert.deepEqual(decisions.map(result => [result.agent.id, result.decision.outcome, result.decision.source]), [
+    ['a', 'RESPOND', 'broadcast'],
+    ['b', 'RESPOND', 'broadcast'],
+  ]);
+});
+
+test('ordinary turns retain mention, turn-limit, and evaluator behavior', async () => {
+  const mentioned = { id: 'a', name: 'Alpha', isEnabled: true } as Agent;
+  const limited = { id: 'b', name: 'Beta', isEnabled: true } as Agent;
+  const evaluated = { id: 'c', name: 'Gamma', isEnabled: true } as Agent;
+  const history: Message[] = [
+    ...Array.from({ length: 3 }, (_, index) => ({ id: `b${index}`, role: 'model' as const, agentId: 'b', content: 'old', timestamp: index })),
+    { id: 'u', role: 'user', content: 'hello @Alpha', timestamp: 4 },
+  ];
+  const calls: string[] = [];
+  const decisions = await resolveTurnDecisions({
+    activeAgents: [mentioned, limited, evaluated], history, turnDepth: 1, memoryRequest: false,
+    evaluateDecision: async agent => {
+      calls.push(agent.id);
+      return { outcome: 'IGNORE', source: 'llm_decision', latencyMs: 1 };
+    },
+  });
+  assert.deepEqual(calls, ['c']);
+  assert.deepEqual(decisions.map(result => result.decision.source), ['mentioned', 'turn_limit', 'llm_decision']);
 });

@@ -10,13 +10,13 @@ import DecisionDiagnosticsPanel from './components/DecisionDiagnosticsPanel';
 import { streamAgentResponse, evaluateShouldRespond, hasApiKey } from './services/geminiService';
 import { INITIAL_ROOMS, createNewRoom, calculateRelationshipWeights, ROOM_TAGS } from './constants';
 import { normalizePersistedRooms } from './utils/persistenceMigration';
-import { appendDecisionEvents, createDecisionEvent, fixedDecision } from './utils/decisionDiagnostics';
+import { appendDecisionEvents, createDecisionEvent } from './utils/decisionDiagnostics';
 import { classifyStreamCompletion } from './utils/streamCompletion';
 import { GenerationMode, GenerationSession, isSameGenerationSession, shouldAcceptStreamChunk } from './utils/generationSession';
 import { canRegenerateGeneration, canRetryGeneration } from './utils/retryPolicy';
 import { DEFAULT_INTERNAL_STATE_SETTINGS, isMemoryExportRequest } from './utils/messageVisibility';
 import { finalizeLegacyGeneration, finalizeSeparatedFailure, finalizeSeparatedSuccess, prepareMessageForRegeneration, restoreMessageAfterAbort } from './utils/generationFinalization';
-import { applyInitialUserTurnFallback } from './utils/responseFallback';
+import { resolveTurnDecisions } from './utils/turnDecisions';
 import { Agent, Message, Room, Attachment, RoomTag, AgentDecisionEvent, GenerationContext, InternalStateSettings } from './types';
 
 export default function App() {
@@ -259,30 +259,17 @@ export default function App() {
     }
     const relationshipWeights = calculateRelationshipWeights(rooms);
 
-    const decisions = await Promise.all(activeAgents.map(async (agent) => {
-        const lastMsg = currentHistory[currentHistory.length - 1];
-        const normalize = (s: string) => s.toLowerCase().replace(/\s/g, '');
-        const isMentioned = lastMsg.content ? normalize(lastMsg.content).includes(`@${normalize(agent.name)}`) : false;
-        
-        if (!isMentioned) {
-          const recentHistory = currentHistory.slice(-8);
-          // Fixed: changed 'agentId' to 'agent.id' to fix reference error
-          const myCount = recentHistory.filter(m => m.agentId === agent.id).length;
-          if (myCount >= 3) return { agent, decision: fixedDecision('IGNORE', 'turn_limit') };
-        }
-        if (isMentioned) return { agent, decision: fixedDecision('RESPOND', 'mentioned') };
-        
-        const decision = await evaluateShouldRespond(agent, currentHistory, roomSystemInstruction, {
+    const finalDecisions = await resolveTurnDecisions({
+      activeAgents,
+      history: currentHistory,
+      turnDepth,
+      memoryRequest,
+      evaluateDecision: agent => evaluateShouldRespond(agent, currentHistory, roomSystemInstruction, {
           agents: roomAgents,
           signal: requestSignal,
           internalStateSettings
-        });
-        return { agent, decision };
-    }));
-    
-    const finalDecisions = memoryRequest
-      ? decisions.map(({ agent }) => ({ agent, decision: fixedDecision('RESPOND', 'broadcast') }))
-      : applyInitialUserTurnFallback(decisions, currentHistory, turnDepth);
+      })
+    });
     const decisionEvents = finalDecisions.map(d => createDecisionEvent(turnId, d.agent, d.decision));
     addDecisionEvents(roomId, decisionEvents);
 
