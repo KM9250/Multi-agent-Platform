@@ -142,7 +142,7 @@ export const getCombinedSystemInstruction = (agent: Agent, roomSystemInstruction
 
   const strategy = getStrategy(agent.framework);
   const baseInstruction = parts.join('\n');
-  return strategy.injectSystemPrompt(baseInstruction) + (separationEnabled ? structuredOutputInstruction(memoryRequest) : '');
+  return strategy.injectSystemPrompt(baseInstruction, { separationEnabled, memoryRequest }) + (separationEnabled ? structuredOutputInstruction(memoryRequest) : '');
 };
 
 const resolveModel = (selectedModel: string): string => {

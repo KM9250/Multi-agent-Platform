@@ -9,7 +9,7 @@ interface FrameworkStrategy {
   id: AgentFramework;
   name: string;
   description: string;
-  injectSystemPrompt: (baseInstruction: string) => string;
+  injectSystemPrompt: (baseInstruction: string, options?: { separationEnabled?: boolean; memoryRequest?: boolean }) => string;
 }
 
 export const STRATEGIES: Record<AgentFramework, FrameworkStrategy> = {
@@ -23,7 +23,8 @@ export const STRATEGIES: Record<AgentFramework, FrameworkStrategy> = {
     id: 'cot',
     name: 'Chain of Thought (CoT)',
     description: 'Encourages step-by-step reasoning before answering.',
-    injectSystemPrompt: (base) => {
+    injectSystemPrompt: (base, options) => {
+      if (options?.separationEnabled) return `${base}\n\nFor CoT, put only a brief, explicit reasoning summary in debug_thoughts. Put the final answer in public_message. Do not output [THOUGHT] tags or hidden reasoning.`;
       return `${base}\n\n` +
         `=== FRAMEWORK: CHAIN OF THOUGHT ===\n` +
         `Before answering, you must break down the user's request into logical steps.\n` +
@@ -40,7 +41,8 @@ export const STRATEGIES: Record<AgentFramework, FrameworkStrategy> = {
     id: 'react',
     name: 'ReAct (Reasoning + Acting)',
     description: 'Simulated ReAct loop. Agent thinks, plans actions, and observes variables.',
-    injectSystemPrompt: (base) => {
+    injectSystemPrompt: (base, options) => {
+      if (options?.separationEnabled) return `${base}\n\nFor ReAct, put only a brief summary of the goal, plan, and simulated action in debug_thoughts; use gm_log only for matters requiring GM attention. Put the final answer in public_message. Do not output [THOUGHT], [ACTION], or Final Response tags.`;
       return `${base}\n\n` +
         `=== FRAMEWORK: ReAct (Reason+Act) ===\n` +
         `You are operating under a ReAct framework. Do not answer immediately. \n` +

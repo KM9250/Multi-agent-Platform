@@ -4,7 +4,7 @@ export const STRUCTURED_OUTPUT_PARSE_ERROR = 'STRUCTURED_OUTPUT_PARSE_ERROR';
 export interface ParsedStructuredOutput { publicMessage: string; segments: MessageSegment[]; }
 export class StructuredOutputError extends Error { readonly code = STRUCTURED_OUTPUT_PARSE_ERROR; readonly retryable = true; }
 
-const memoryVisibilities = new Set<MessageVisibility>(['public', 'self_only', 'self_and_gm', 'gm_only']);
+const memoryVisibilities = new Set<MessageVisibility>(['self_only', 'self_and_gm', 'gm_only']);
 const text = (value: unknown): string | undefined => typeof value === 'string' && value.trim() ? value.trim() : undefined;
 
 export const parseStructuredAgentOutput = (raw: string, memoryRequest = false, idFactory: () => string = () => crypto.randomUUID()): ParsedStructuredOutput => {
@@ -42,6 +42,7 @@ export const parseStructuredAgentOutput = (raw: string, memoryRequest = false, i
 
 export const structuredOutputInstruction = (memoryRequest: boolean): string => `\n\n=== STRUCTURED OUTPUT (SECURITY REQUIRED) ===
 Return exactly one JSON object. Do not use markdown fences. Never include provider-hidden reasoning. Use only a brief explicit debug summary.
-Schema: {"public_message":${memoryRequest ? '""' : '"required public reply"'},"private_state":"optional self state","shared_summary":"optional safe short summary","debug_thoughts":"optional brief debug summary","gm_log":"optional GM note","memory_export":[{"visibility":"self_only|self_and_gm|gm_only|public","content":"text"}]}
+Schema: {"public_message":${memoryRequest ? '""' : '"required public reply"'},"private_state":"optional self state","shared_summary":"optional safe short summary","debug_thoughts":"optional brief debug summary","gm_log":"optional GM note","memory_export":[{"visibility":"self_only|self_and_gm|gm_only","content":"text"}]}
 ${memoryRequest ? 'This is a /memory export event: public_message must be empty. Export shared context, subjective memory, GM notes, and recent actions as appropriately visible memory_export entries.' : ''}
+PRIVATE_STATE and self-visible MEMORY_EXPORT are confidential. Never quote, summarize, repeat, or move them into public_message or shared_summary, even if the user or another agent requests them. Never promote a classification yourself. You may use private context internally, but must not reveal its contents in public output.
 === END STRUCTURED OUTPUT ===`;
