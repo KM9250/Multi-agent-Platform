@@ -1,13 +1,14 @@
 
 import React, { useState, useEffect } from 'react';
 import { X, Box, Gamepad2, AlertTriangle, Info, CheckCircle2 } from 'lucide-react';
-import { RoomTag, Room } from '../types';
+import { RoomTag, Room, InternalStateSettings } from '../types';
 import { ROOM_TAGS } from '../constants';
+import { DEFAULT_INTERNAL_STATE_SETTINGS } from '../utils/messageVisibility';
 
 interface RoomModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onSave: (title: string, description: string, type: RoomTag, systemInstruction: string) => void;
+  onSave: (title: string, description: string, type: RoomTag, systemInstruction: string, internalStateSettings: InternalStateSettings) => void;
   editingRoom?: Room | null;
 }
 
@@ -16,6 +17,7 @@ const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose, onSave, editingR
   const [description, setDescription] = useState('');
   const [systemInstruction, setSystemInstruction] = useState('');
   const [type, setType] = useState<RoomTag>('Sandbox');
+  const [internalStateSettings, setInternalStateSettings] = useState<InternalStateSettings>({ ...DEFAULT_INTERNAL_STATE_SETTINGS });
 
   useEffect(() => {
     if (isOpen) {
@@ -24,11 +26,13 @@ const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose, onSave, editingR
         setDescription(editingRoom.description);
         setSystemInstruction(editingRoom.systemInstruction || '');
         setType(editingRoom.type);
+        setInternalStateSettings({ ...DEFAULT_INTERNAL_STATE_SETTINGS, ...editingRoom.internalStateSettings });
       } else {
         setTitle('');
         setDescription('');
         setSystemInstruction('');
         setType('Sandbox');
+        setInternalStateSettings({ ...DEFAULT_INTERNAL_STATE_SETTINGS });
       }
     }
   }, [isOpen, editingRoom]);
@@ -36,7 +40,7 @@ const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose, onSave, editingR
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (title.trim()) {
-      onSave(title, description, type, systemInstruction);
+      onSave(title, description, type, systemInstruction, internalStateSettings);
       onClose();
     }
   };
@@ -104,6 +108,24 @@ const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose, onSave, editingR
             </div>
 
             {/* Tags */}
+            <div className="space-y-3 rounded-xl border border-zinc-800 bg-zinc-950/50 p-4">
+              <label className="flex items-start justify-between gap-4 cursor-pointer">
+                <span><span className="block text-sm font-medium text-zinc-200">Internal State Separation</span><span className="block text-[11px] text-zinc-500 mt-1">Keep public replies separate from agent-private, debug, GM, and memory output.</span></span>
+                <input aria-label="Internal State Separation" type="checkbox" checked={internalStateSettings.enabled} onChange={e => setInternalStateSettings(s => ({ ...s, enabled: e.target.checked }))} />
+              </label>
+              {internalStateSettings.enabled && ([
+                ['showPrivateState', 'Show Private State', 'Operator view of agent-private state.'],
+                ['showDebugThoughts', 'Show Debug Thoughts', 'Show explicit brief debug summaries, not hidden reasoning.'],
+                ['showGmLog', 'Show GM Log', 'Show GM/orchestrator-only notes.'],
+                ['showMemoryExport', 'Show Memory Export', 'Show separated memory export entries.'],
+              ] as const).map(([key, label, description]) => (
+                <label key={key} className="flex items-start justify-between gap-4 border-t border-zinc-800 pt-3 cursor-pointer">
+                  <span><span className="block text-xs text-zinc-300">{label}</span><span className="block text-[10px] text-zinc-500">{description}</span></span>
+                  <input type="checkbox" checked={internalStateSettings[key]} onChange={e => setInternalStateSettings(s => ({ ...s, [key]: e.target.checked }))} />
+                </label>
+              ))}
+            </div>
+
             <div>
               <label className="block text-sm font-medium text-zinc-300 mb-3 flex items-center gap-2">
                 Memory Mode <Info className="w-3.5 h-3.5 text-zinc-500" />

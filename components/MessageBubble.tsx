@@ -1,13 +1,16 @@
 
 import React, { useMemo, useState } from 'react';
 import { User, Copy, AlertCircle, FileText, ChevronDown, ChevronRight, Brain, Info, AlertTriangle, Terminal, RotateCcw, RefreshCw } from 'lucide-react';
-import { Message, Agent } from '../types';
+import { Message, Agent, InternalStateSettings } from '../types';
+import InternalStatePanel from './InternalStatePanel';
+import { getPublicMessageContent } from '../utils/messageVisibility';
 
 interface MessageBubbleProps {
   message: Message;
   agent?: Agent; // Undefined if user
   onRetry?: (messageId: string) => void;
   onRegenerate?: (messageId: string) => void;
+  internalStateSettings?: InternalStateSettings;
 }
 
 interface Emotion {
@@ -28,7 +31,7 @@ const getEmotionColor = (name: string): string => {
   return colors[Math.abs(hash) % colors.length];
 };
 
-const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent, onRetry, onRegenerate }) => {
+const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent, onRetry, onRegenerate, internalStateSettings }) => {
   const [isThoughtOpen, setIsThoughtOpen] = useState(false);
   const [isErrorDetailOpen, setIsErrorDetailOpen] = useState(false);
   const isUser = message.role === 'user';
@@ -42,7 +45,7 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent, onRetry, 
       return { emotions: [], cleanContent: message.content, thoughtContent: null, actionContent: null };
     }
 
-    let currentContent = message.content;
+    let currentContent = getPublicMessageContent(message, !!internalStateSettings?.enabled);
     const emotions: Emotion[] = [];
 
     // 1. Extract Emotions (at start)
@@ -89,7 +92,7 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent, onRetry, 
         thoughtContent,
         actionContent
     };
-  }, [message.content, isUser, message.error]);
+  }, [message, isUser, message.error, internalStateSettings?.enabled]);
 
   return (
     <div className={`flex w-full mb-6 ${isUser ? 'justify-end' : 'justify-start'}`}>
@@ -286,6 +289,7 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent, onRetry, 
                 </button>
             </div>
           </div>
+          {!isUser && internalStateSettings && <InternalStatePanel message={message} settings={internalStateSettings} />}
         </div>
       </div>
     </div>

@@ -109,3 +109,15 @@ In short:
 
 Work in progress.  
 The goal is to build a foundation for AI systems where intelligence emerges from **coordination, structure, and controlled interaction**, not only from model size.
+
+## Internal-state separation
+
+Room Settings can opt a room into **Internal State Separation**. It is off by default for existing and new rooms, preserving legacy streaming and history behavior. When enabled, model output is buffered until completion and parsed as structured JSON; only `public_message` is mirrored into `Message.content`. Canonical `segments` distinguish public messages, private state, shared summaries, debug summaries, GM logs, and memory exports with explicit visibility.
+
+Recipient history is fail-closed and channel-labeled: another agent receives labeled public messages and safe shared summaries only. An agent additionally receives clearly marked confidential labels for its own private state and self-visible memory. Debug summaries, GM logs, another agent's private state, and private memory never enter decision or generation history. CoT/ReAct debug fields are application-requested concise summaries only; the application does not request or access provider-hidden chain of thought. Memory exports allow only `self_only`, `self_and_gm`, or `gm_only`; shareable information must use `shared_summary`, and legacy public memory is retained for operator display but never promoted into AI history.
+
+Separated streaming buffers raw JSON only in memory and does not render or persist chunks. Every non-success result, including partial and blocked output, fails closed without storing raw text; abort restores a retry/regenerate target or removes a new unfinished message. Parsing failures show `STRUCTURED_OUTPUT_PARSE_ERROR` without publishing the raw response and can be retried. Retry and regenerate replace every old segment, while a separation-off regeneration explicitly removes old segments and its separation version. An exact `/memory` input creates a memory-export event with no public reply only while separation is enabled; with separation off it remains an ordinary message.
+
+When separation is enabled, `/memory` bypasses the decision model and directly requests an export from every enabled agent. With separation disabled it neither bypasses decisions nor forces every agent to respond.
+
+The collapsible operator panel can display selected internal categories. These switches are presentation controls, not authentication or access control. Segments remain in browser `localStorage`; hiding them does **not** encrypt or cryptographically protect secrets from someone with access to the browser profile or developer tools.
