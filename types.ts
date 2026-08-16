@@ -32,6 +32,21 @@ export interface AgentContextFile {
   addedAt: number;
 }
 
+/** A private task worker owned by a persona Agent (never a Room participant). */
+export interface SubAgentDefinition {
+  id: string;
+  name: string;
+  description?: string;
+  provider: string;
+  model: string;
+  systemInstruction: string;
+  capabilities?: string[];
+  isEnabled: boolean;
+  thinkingBudget?: number;
+  maxOutputTokens?: number;
+  maxCallsPerTurn?: number;
+}
+
 export type DecisionOutcome = 'RESPOND' | 'IGNORE' | 'ERROR';
 export type DecisionSource = 'mentioned' | 'llm_decision' | 'turn_limit' | 'broadcast' | 'fallback' | 'api_error' | 'invalid_decision' | 'timeout' | 'empty_response';
 
@@ -70,6 +85,7 @@ export interface Agent {
   thinkingBudget: number; // 0 to disable
   historyWindow?: number; // Max recent messages sent to the API; 0/undefined = unlimited
   pinFirstMessage?: boolean; // Keep the first user message even when the window cuts it off
+  subAgents?: SubAgentDefinition[]; // Private workers; not members of Room.agents
 }
 
 export interface Attachment {

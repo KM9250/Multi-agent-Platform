@@ -102,7 +102,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       isEnabled: editingAgent ? editingAgent.isEnabled : true,
       thinkingBudget,
       historyWindow,
-      pinFirstMessage
+      pinFirstMessage,
+      subAgents: editingAgent?.subAgents
     });
     onClose();
   };

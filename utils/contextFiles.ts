@@ -35,17 +35,18 @@ export const normalizeModelId = (model: string): string => {
 export const normalizeAgent = (agent: Agent, now = Date.now()): Agent => {
   const normalizedModel = normalizeModelId(agent.model);
   if (Array.isArray(agent.additionalContextFiles)) {
-    return { ...agent, model: normalizedModel, additionalContextFiles: normalizeContextFileOrder(agent.additionalContextFiles) };
+    return { ...agent, model: normalizedModel, additionalContextFiles: normalizeContextFileOrder(agent.additionalContextFiles), subAgents: agent.subAgents ?? [] };
   }
 
   if (!agent.importedSystemInstruction) {
-    return { ...agent, model: normalizedModel, additionalContextFiles: [] };
+    return { ...agent, model: normalizedModel, additionalContextFiles: [], subAgents: agent.subAgents ?? [] };
   }
 
   const content = agent.importedSystemInstruction;
   return {
     ...agent,
     model: normalizedModel,
+    subAgents: agent.subAgents ?? [],
     additionalContextFiles: [{
       id: `legacy-${agent.id}-${byteSize(content)}-${content.length}`,
       name: agent.importedSystemInstructionFileName || 'legacy-context.md',
