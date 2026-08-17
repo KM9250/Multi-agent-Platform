@@ -1,11 +1,12 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { X, Shuffle, Brain, Upload, Image as ImageIcon, Smile, Cpu, History } from 'lucide-react';
-import { Agent, ModelType, AgentFramework, AgentContextFile } from '../types';
+import { Agent, ModelType, AgentFramework, AgentContextFile, SubAgentDefinition, SubAgentExecutionPolicy } from '../types';
 import { AVATAR_COLORS, MODEL_OPTIONS, FRAMEWORK_OPTIONS } from '../constants';
 import { getStrategy } from '../services/agentStrategies';
 import AgentContextFileList from './AgentContextFileList';
 import { createAgentContextFile, normalizeAgent, normalizeContextFileOrder } from '../utils/contextFiles';
+import SubAgentConfigPanel from './SubAgentConfigPanel';
 
 interface AgentModalProps {
   isOpen: boolean;
@@ -33,6 +34,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
   const [thinkingBudget, setThinkingBudget] = useState<number>(0);
   const [historyWindow, setHistoryWindow] = useState<number>(0);
   const [pinFirstMessage, setPinFirstMessage] = useState<boolean>(true);
+  const [subAgents, setSubAgents] = useState<SubAgentDefinition[]>([]);
+  const [subAgentPolicy, setSubAgentPolicy] = useState<SubAgentExecutionPolicy>({ mode: 'off' });
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mdInputRef = useRef<HTMLInputElement>(null);
@@ -50,6 +53,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       setThinkingBudget(editingAgent.thinkingBudget);
       setHistoryWindow(editingAgent.historyWindow ?? 0);
       setPinFirstMessage(editingAgent.pinFirstMessage ?? true);
+      setSubAgents(editingAgent.subAgents ?? []);
+      setSubAgentPolicy(editingAgent.subAgentPolicy ?? { mode: 'off' });
       
       if (editingAgent.avatarType === 'image') {
         setAvatarType('image');
@@ -80,6 +85,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
     setThinkingBudget(0);
     setHistoryWindow(0);
     setPinFirstMessage(true);
+    setSubAgents([]);
+    setSubAgentPolicy({ mode: 'off' });
   };
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -103,7 +110,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       thinkingBudget,
       historyWindow,
       pinFirstMessage,
-      subAgents: editingAgent?.subAgents
+      subAgents,
+      subAgentPolicy
     });
     onClose();
   };
@@ -449,6 +457,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
               />
             </div>
           </div>
+
+          <SubAgentConfigPanel policy={subAgentPolicy} workers={subAgents} onPolicyChange={setSubAgentPolicy} onWorkersChange={setSubAgents} />
 
           <div className="pt-2">
             <button

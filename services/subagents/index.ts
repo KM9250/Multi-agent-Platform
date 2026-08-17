@@ -19,3 +19,7 @@ export {
   subAgentProviderRegistry,
 } from './providers/providerRegistry';
 export { GoogleSubAgentProvider, registerGoogleProvider } from './providers/googleProvider';
+export * from './fixedSerialPipeline';
+export * from './privateContext';
+export * from './presets';
+export * from './runtimeProviders';
