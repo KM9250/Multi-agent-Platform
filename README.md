@@ -125,3 +125,5 @@ The collapsible operator panel can display selected internal categories. These s
 ## SubAgent execution foundation (Phase SA-0)
 
 Persona Agents are conversation participants. SubAgents are private task workers owned by a Persona Agent. SubAgent output never enters public Room history directly. The model-independent task boundary, provider registry, and independent run lifecycle are documented in [the SubAgent architecture](docs/subagent-architecture.md).
+
+Phase SA-1 adds an optional fixed serial private SubAgent pipeline. Validated worker reports are injected only into the owning Persona's current generation and are not persisted to Room history.

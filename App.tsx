@@ -7,6 +7,7 @@ import RelationshipGraphModal from './components/RelationshipGraphModal';
 import RoomModal from './components/RoomModal';
 import SceneView from './components/SceneView';
 import DecisionDiagnosticsPanel from './components/DecisionDiagnosticsPanel';
+import SubAgentDiagnosticsPanel from './components/SubAgentDiagnosticsPanel';
 import { streamAgentResponse, evaluateShouldRespond, hasApiKey } from './services/geminiService';
 import { INITIAL_ROOMS, createNewRoom, calculateRelationshipWeights, ROOM_TAGS } from './constants';
 import { normalizePersistedRooms } from './utils/persistenceMigration';
@@ -18,6 +19,7 @@ import { DEFAULT_INTERNAL_STATE_SETTINGS, isMemoryExportRequest } from './utils/
 import { finalizeLegacyGeneration, finalizeSeparatedFailure, finalizeSeparatedSuccess, prepareMessageForRegeneration, restoreMessageAfterAbort } from './utils/generationFinalization';
 import { resolveTurnDecisions } from './utils/turnDecisions';
 import { Agent, Message, Room, Attachment, RoomTag, AgentDecisionEvent, GenerationContext, InternalStateSettings } from './types';
+import { GenerationSubAgentCache, extractPublicTaskInputs, formatPrivateSubAgentContext, createRuntimeSubAgentProviderRegistry, type SubAgentRunDiagnostic } from './services/subagents';
 
 export default function App() {
   // --- State ---
@@ -60,9 +62,12 @@ export default function App() {
   const [planningAgents, setPlanningAgents] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
+  const [subAgentDiagnostics, setSubAgentDiagnostics] = useState<SubAgentRunDiagnostic[]>([]);
   
   const isGeneratingRef = useRef(false);
   const generationSessionRef = useRef<GenerationSession | null>(null);
+  const subAgentCacheRef = useRef(new GenerationSubAgentCache());
+  const subAgentRegistryRef = useRef(createRuntimeSubAgentProviderRegistry());
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -206,6 +211,7 @@ export default function App() {
     isGeneratingRef.current = false;
     setPlanningAgents([]);
     generationSessionRef.current = null;
+    subAgentCacheRef.current.clear();
   };
 
   // --- Conversation Loop ---
@@ -319,9 +325,17 @@ export default function App() {
     setRooms(prev => prev.map(r => r.id === roomId ? { ...r, messages: nextHistory, updatedAt: Date.now() } : r));
 
     let hadGenerationError = false;
-    const agentPromises = sortedAgents.map(agent => {
+    const agentPromises = sortedAgents.map(async agent => {
+      const pipeline = memoryRequest ? { status: 'not_configured' as const, reports: [], diagnostics: [] } : await subAgentCacheRef.current.prepare(agent, { sessionId, inputs: extractPublicTaskInputs(currentHistory), signal: requestSignal, registry: subAgentRegistryRef.current });
+      setSubAgentDiagnostics(previous => [...previous, ...pipeline.diagnostics]);
+      const msgId = agentMessageIds[agent.id];
+      if (pipeline.status === 'aborted' || requestSignal?.aborted) {
+        removeMessageFromRoom(roomId, msgId);
+        nextHistory = nextHistory.filter(message => message.id !== msgId);
+        return;
+      }
+      const privateSubAgentContext = formatPrivateSubAgentContext(pipeline.reports, pipeline.status === 'failed' || pipeline.status === 'partial');
       return new Promise<void>((resolve) => {
-        const msgId = agentMessageIds[agent.id];
         let accumulatedText = "";
         streamAgentResponse(
           agent,
@@ -388,7 +402,8 @@ export default function App() {
             signal: requestSignal,
             mode: generationSessionRef.current?.mode || 'normal',
             internalStateSettings,
-            memoryRequest
+            memoryRequest,
+            privateSubAgentContext
           }
         );
       });
@@ -449,6 +464,8 @@ export default function App() {
     const roomId = activeRoom.id;
     const sessionId = crypto.randomUUID();
     const controller = new AbortController();
+    subAgentCacheRef.current.clear();
+    setSubAgentDiagnostics([]);
     generationSessionRef.current = { sessionId, turnId, roomId, controller, mode: 'normal' };
     setIsGenerating(true);
     isGeneratingRef.current = true;
@@ -506,6 +523,10 @@ export default function App() {
 
     let accumulatedText = '';
     const requestSignal = controller.signal;
+    const pipeline = memoryRequest ? { status: 'not_configured' as const, reports: [], diagnostics: [] } : await new GenerationSubAgentCache().prepare(agent, { sessionId, inputs: extractPublicTaskInputs(history), signal: requestSignal, registry: subAgentRegistryRef.current });
+    setSubAgentDiagnostics(pipeline.diagnostics);
+    if (pipeline.status === 'aborted' || requestSignal.aborted) { replaceLocalMessage(room.id, messageId, () => restoreMessageAfterAbort(targetMessage)); finishGenerationSession(sessionId, turnId, room.id); return; }
+    const privateSubAgentContext = formatPrivateSubAgentContext(pipeline.reports, pipeline.status === 'failed' || pipeline.status === 'partial');
     await new Promise<void>((resolve) => {
       streamAgentResponse(
         { ...agent, model: nextContext.modelId },
@@ -550,7 +571,7 @@ export default function App() {
           }
           resolve();
         },
-        { agents: room.agents, signal: requestSignal, mode, internalStateSettings, memoryRequest }
+        { agents: room.agents, signal: requestSignal, mode, internalStateSettings, memoryRequest, privateSubAgentContext }
       );
     });
     finishGenerationSession(sessionId, turnId, room.id);
@@ -568,6 +589,7 @@ export default function App() {
     generationSessionRef.current = null;
     setIsGenerating(false);
     isGeneratingRef.current = false;
+    subAgentCacheRef.current.clear();
     setPlanningAgents([]);
   };
 
@@ -655,6 +677,7 @@ export default function App() {
             </div>
           )}
           <DecisionDiagnosticsPanel events={activeRoom.decisionEvents || []} />
+          <SubAgentDiagnosticsPanel diagnostics={subAgentDiagnostics} />
           {is3DMode && (
             <div className="h-1/2 min-h-[300px] border-b border-zinc-800 relative animate-in fade-in slide-in-from-top-4 duration-300">
                <SceneView agents={agents} speakingAgentId={currentSpeakingAgentId} />

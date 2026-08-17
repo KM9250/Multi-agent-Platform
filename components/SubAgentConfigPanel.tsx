@@ -1,0 +1,22 @@
+import React from 'react';
+import type { SubAgentDefinition, SubAgentExecutionPolicy } from '../types';
+import { ModelType } from '../types';
+import { createBlankSubAgent, createCheckerPreset, createTaskAnalystPreset } from '../services/subagents/presets';
+
+const GOOGLE_MODELS = [ModelType.GEMINI_3_PRO, ModelType.GEMINI_3_FLASH, ModelType.GEMINI_2_5_PRO, ModelType.GEMINI_2_5_FLASH, ModelType.GEMINI_2_5_FLASH_LITE];
+export default function SubAgentConfigPanel({ policy, workers, onPolicyChange, onWorkersChange }: { policy?: SubAgentExecutionPolicy; workers: SubAgentDefinition[]; onPolicyChange: (value: SubAgentExecutionPolicy) => void; onWorkersChange: (value: SubAgentDefinition[]) => void }) {
+  const update = (index: number, patch: Partial<SubAgentDefinition>) => onWorkersChange(workers.map((worker, i) => i === index ? { ...worker, ...patch } : worker));
+  const move = (index: number, delta: number) => { const target = index + delta; if (target < 0 || target >= workers.length) return; const next = [...workers]; [next[index], next[target]] = [next[target], next[index]]; onWorkersChange(next); };
+  return <details className="border border-slate-700 rounded-lg p-3 mt-4"><summary className="font-semibold cursor-pointer">Private SubAgents (Experimental)</summary>
+    <label className="block mt-3 text-sm">SubAgent mode<select className="w-full bg-slate-800 p-2 rounded" value={policy?.mode ?? 'off'} onChange={e => onPolicyChange({ mode: e.target.value as 'off' | 'fixed_serial' })}><option value="off">Off</option><option value="fixed_serial">Fixed serial</option></select></label>
+    <div className="flex flex-wrap gap-2 my-3"><button type="button" onClick={() => onWorkersChange([...workers, createTaskAnalystPreset()])}>+ Task Analyst</button><button type="button" onClick={() => onWorkersChange([...workers, createCheckerPreset()])}>+ Checker</button><button type="button" onClick={() => onWorkersChange([...workers, createBlankSubAgent()])}>+ Blank worker</button></div>
+    {workers.map((worker, index) => <div key={worker.id} className="border border-slate-700 rounded p-3 mb-3 space-y-2">
+      <div className="flex gap-2 items-center"><input type="checkbox" checked={worker.isEnabled} onChange={e => update(index, { isEnabled: e.target.checked })}/><input className="flex-1 bg-slate-800 p-2" value={worker.name} onChange={e => update(index, { name: e.target.value })}/><button type="button" onClick={() => move(index, -1)} disabled={!index}>↑</button><button type="button" onClick={() => move(index, 1)} disabled={index === workers.length - 1}>↓</button><button type="button" onClick={() => onWorkersChange(workers.filter((_, i) => i !== index))}>Delete</button></div>
+      <input className="w-full bg-slate-800 p-2" placeholder="Description" value={worker.description ?? ''} onChange={e => update(index, { description: e.target.value })}/>
+      <div className="grid grid-cols-2 gap-2"><label>Provider<select disabled className="w-full bg-slate-800 p-2"><option>Google</option></select></label><label>Gemini model<select className="w-full bg-slate-800 p-2" value={worker.model} onChange={e => update(index, { model: e.target.value })}>{GOOGLE_MODELS.map(model => <option key={model}>{model}</option>)}</select></label></div>
+      <input className="w-full bg-slate-800 p-2" placeholder="Capability / task type" value={worker.capabilities?.[0] ?? ''} onChange={e => update(index, { capabilities: [e.target.value] })}/>
+      <textarea className="w-full bg-slate-800 p-2" rows={4} value={worker.systemInstruction} onChange={e => update(index, { systemInstruction: e.target.value })}/>
+      <div className="grid grid-cols-2 gap-2"><label>Thinking budget<input type="number" className="w-full bg-slate-800 p-2" value={worker.thinkingBudget ?? 0} onChange={e => update(index, { thinkingBudget: Number(e.target.value) })}/></label><label>Max output tokens<input type="number" className="w-full bg-slate-800 p-2" value={worker.maxOutputTokens ?? 2048} onChange={e => update(index, { maxOutputTokens: Number(e.target.value) })}/></label></div>
+    </div>)}
+  </details>;
+}

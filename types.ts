@@ -47,6 +47,9 @@ export interface SubAgentDefinition {
   maxCallsPerTurn?: number;
 }
 
+export type SubAgentExecutionMode = 'off' | 'fixed_serial';
+export interface SubAgentExecutionPolicy { mode: SubAgentExecutionMode }
+
 export type DecisionOutcome = 'RESPOND' | 'IGNORE' | 'ERROR';
 export type DecisionSource = 'mentioned' | 'llm_decision' | 'turn_limit' | 'broadcast' | 'fallback' | 'api_error' | 'invalid_decision' | 'timeout' | 'empty_response';
 
@@ -86,6 +89,7 @@ export interface Agent {
   historyWindow?: number; // Max recent messages sent to the API; 0/undefined = unlimited
   pinFirstMessage?: boolean; // Keep the first user message even when the window cuts it off
   subAgents?: SubAgentDefinition[]; // Private workers; not members of Room.agents
+  subAgentPolicy?: SubAgentExecutionPolicy; // undefined is backward-compatible "off"
 }
 
 export interface Attachment {

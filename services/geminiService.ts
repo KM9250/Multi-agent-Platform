@@ -11,6 +11,7 @@ import type { GenerationResult } from "../utils/generationResult";
 import { parseDecisionText } from "../utils/decisionDiagnostics";
 import { buildVisibleHistoryForAgent } from "../utils/messageVisibility";
 import { structuredOutputInstruction } from "../utils/structuredAgentOutput";
+import { injectPrivateContextIntoContents } from './subagents/privateContext';
 
 export const hasApiKey = (): boolean => !!process.env.API_KEY;
 
@@ -263,6 +264,7 @@ export interface AgentCallOptions {
   mode?: 'normal' | 'retry' | 'regenerate';
   internalStateSettings?: InternalStateSettings;
   memoryRequest?: boolean;
+  privateSubAgentContext?: string;
 }
 
 export const evaluateShouldRespond = async (
@@ -336,9 +338,8 @@ export const streamAgentResponse = async (
 
     const baseContents = buildHistoryForAgent(messagesToUse, agent.id, makeNameResolver(options?.agents));
     const normalizedHistory = normalizeGenerationHistory(baseContents, agent.name);
-    const contents = options?.mode === 'regenerate'
-      ? [...normalizedHistory.contents, createRegeneratePrompt()]
-      : normalizedHistory.contents;
+    const privateContents = injectPrivateContextIntoContents(normalizedHistory.contents, options?.privateSubAgentContext);
+    const contents = options?.mode === 'regenerate' ? [...privateContents, createRegeneratePrompt()] : privateContents;
     const combinedSystemInstruction = getCombinedSystemInstruction(agent, roomSystemInstruction, !!options?.internalStateSettings?.enabled, !!options?.memoryRequest);
     const actualModel = resolveModel(agent.model);
 

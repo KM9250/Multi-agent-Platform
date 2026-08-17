@@ -1,0 +1,3 @@
+import React from 'react';
+import type { SubAgentRunDiagnostic } from '../services/subagents/fixedSerialPipeline';
+export default function SubAgentDiagnosticsPanel({ diagnostics }: { diagnostics: SubAgentRunDiagnostic[] }) { if (!diagnostics.length) return null; return <details className="border border-slate-700 rounded p-3"><summary className="font-semibold cursor-pointer">Private Worker Runs</summary>{diagnostics.map((item, index) => <div key={`${item.parentAgentName}-${item.workerName}-${index}`} className="text-sm py-1"><b>{item.parentAgentName}</b> · {item.workerName} · {item.status} · {item.latencyMs} ms{item.confidence !== undefined ? ` · confidence ${item.confidence}` : ''}{item.errorCode ? ` · ${item.errorCode}` : ''}</div>)}</details>; }
