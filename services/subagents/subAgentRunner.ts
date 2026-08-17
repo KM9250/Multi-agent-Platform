@@ -11,19 +11,30 @@ const failed = (task: SubAgentTaskContract, code: string, detail: string): SubAg
   taskId: task.taskId, subAgentId: task.subAgentId, status: 'failed', summary: 'SubAgent task failed', errorCode: code, errorDetail: detail,
 });
 
+const aborted = (task: SubAgentTaskContract): SubAgentTaskResult => ({
+  taskId: task.taskId, subAgentId: task.subAgentId, status: 'aborted', summary: 'SubAgent task aborted', errorCode: 'ABORTED', errorDetail: 'Task was aborted',
+});
+
 export async function executeSubAgentTask(definition: SubAgentDefinition, task: SubAgentTaskContract, options: ExecuteSubAgentTaskOptions = {}): Promise<SubAgentTaskResult> {
   if (definition.id !== task.subAgentId || !task.taskId || !task.parentAgentId) return failed(task, 'INVALID_TASK_CONTRACT', 'Task ownership or identifiers are invalid');
   if (!definition.isEnabled) return failed(task, 'SUBAGENT_DISABLED', 'SubAgent is disabled');
-  if (options.signal?.aborted) return { ...failed(task, 'ABORTED', 'Task was aborted'), status: 'aborted', summary: 'SubAgent task aborted' };
+  if (options.signal?.aborted) return aborted(task);
+  if (options.provider && options.provider.id !== definition.provider) {
+    return failed(task, 'PROVIDER_MISMATCH', `Configured provider ${definition.provider} does not match injected provider ${options.provider.id}`);
+  }
   let provider: SubAgentProvider;
   try { provider = options.provider ?? (options.registry ?? subAgentProviderRegistry).getProvider(definition.provider); }
   catch (error) { return failed(task, error instanceof ProviderNotConfiguredError ? error.code : 'PROVIDER_ERROR', error instanceof Error ? error.message : String(error)); }
   try {
     const response = await provider.generate({ model: definition.model, systemInstruction: definition.systemInstruction, prompt: buildSubAgentPrompt(task), thinkingBudget: definition.thinkingBudget, maxOutputTokens: definition.maxOutputTokens, signal: options.signal });
+    if (options.signal?.aborted) return aborted(task);
+    if (response.provider !== provider.id || response.model !== definition.model || !Number.isFinite(response.latencyMs) || response.latencyMs < 0) {
+      return failed(task, 'PROVIDER_RESPONSE_MISMATCH', 'Provider response identity, model, or latency does not match the configured execution');
+    }
     const result = parseSubAgentResult(response.text, task);
-    return { ...result, metadata: { ...result.metadata, provider: response.provider, model: response.model, latencyMs: response.latencyMs } };
+    return { ...result, metadata: { provider: provider.id, model: definition.model, latencyMs: response.latencyMs } };
   } catch (error) {
-    if (options.signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) return { ...failed(task, 'ABORTED', 'Task was aborted'), status: 'aborted', summary: 'SubAgent task aborted' };
+    if (options.signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) return aborted(task);
     return failed(task, error instanceof InvalidSubAgentResultError ? error.code : 'PROVIDER_ERROR', error instanceof Error ? error.message : String(error));
   }
 }

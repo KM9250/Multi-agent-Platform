@@ -38,6 +38,36 @@ test('runner fails closed for missing provider and malformed or mismatched outpu
   assert.equal((await executeSubAgentTask(definition, task, { provider: mismatch })).status, 'failed');
 });
 
+test('runner validates optional result fields and strips unknown fields', async () => {
+  const invalidValues = [
+    { confidence: 'HIGH' },
+    { confidence: 1.5 },
+    { unresolved: 'none' },
+    { evidence: 123 },
+    { metadata: { latencyMs: 'fast' } },
+  ];
+  for (const invalidValue of invalidValues) {
+    const provider: SubAgentProvider = { id: 'fake', async generate(req) { return { text: response(invalidValue), provider: 'fake', model: req.model, latencyMs: 0 }; } };
+    const result = await executeSubAgentTask(definition, task, { provider });
+    assert.equal(result.errorCode, 'INVALID_TASK_RESULT');
+  }
+
+  const provider: SubAgentProvider = { id: 'fake', async generate(req) { return { text: response({ unexpected_private_data: 'secret' }), provider: 'fake', model: req.model, latencyMs: 0 }; } };
+  const result = await executeSubAgentTask(definition, task, { provider });
+  assert.equal('unexpected_private_data' in result, false);
+});
+
+test('runner rejects injected provider and provider response identity mismatches', async () => {
+  const google: SubAgentProvider = { id: 'google', async generate(req) { return { text: response(), provider: 'google', model: req.model, latencyMs: 0 }; } };
+  const injectedMismatch = await executeSubAgentTask(definition, task, { provider: google });
+  assert.equal(injectedMismatch.errorCode, 'PROVIDER_MISMATCH');
+
+  const wrongProvider: SubAgentProvider = { id: 'fake', async generate(req) { return { text: response(), provider: 'other', model: req.model, latencyMs: 0 }; } };
+  assert.equal((await executeSubAgentTask(definition, task, { provider: wrongProvider })).errorCode, 'PROVIDER_RESPONSE_MISMATCH');
+  const wrongModel: SubAgentProvider = { id: 'fake', async generate() { return { text: response(), provider: 'fake', model: 'other-model', latencyMs: 0 }; } };
+  assert.equal((await executeSubAgentTask(definition, task, { provider: wrongModel })).errorCode, 'PROVIDER_RESPONSE_MISMATCH');
+});
+
 test('prompt contains only the contract, not ambient Room or internal state', () => {
   const prompt = buildSubAgentPrompt(task);
   assert.match(prompt, /safe explicit input/);
@@ -75,6 +105,22 @@ test('parent abort reaches provider and produces aborted lifecycle', async () =>
   parent.abort();
   const result = await pending;
   assert.equal(observedSignal?.aborted, true);
+  assert.equal(result.status, 'aborted');
+  assert.equal(handle.run.status, 'aborted');
+});
+
+test('runner reports aborted when provider ignores abort and resolves normally', async () => {
+  const parent = new AbortController();
+  let resolveProvider!: () => void;
+  const provider: SubAgentProvider = { id: 'fake', async generate(req) {
+    await new Promise<void>(resolve => { resolveProvider = resolve; });
+    return { text: response(), provider: 'fake', model: req.model, latencyMs: 1 };
+  } };
+  const handle = createSubAgentRun(definition, task, { provider, signal: parent.signal });
+  const pending = handle.execute();
+  parent.abort();
+  resolveProvider();
+  const result = await pending;
   assert.equal(result.status, 'aborted');
   assert.equal(handle.run.status, 'aborted');
 });
