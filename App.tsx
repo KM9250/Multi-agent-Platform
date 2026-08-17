@@ -326,8 +326,9 @@ export default function App() {
 
     let hadGenerationError = false;
     const agentPromises = sortedAgents.map(async agent => {
-      const pipeline = memoryRequest ? { status: 'not_configured' as const, reports: [], diagnostics: [] } : await subAgentCacheRef.current.prepare(agent, { sessionId, inputs: extractPublicTaskInputs(currentHistory), signal: requestSignal, registry: subAgentRegistryRef.current });
-      setSubAgentDiagnostics(previous => [...previous, ...pipeline.diagnostics]);
+      const prepared = memoryRequest ? { outcome: { status: 'not_configured' as const, reports: [], diagnostics: [] }, diagnosticsToDisplay: [] } : await subAgentCacheRef.current.prepareForDiagnostics(agent, { sessionId, inputs: extractPublicTaskInputs(currentHistory), signal: requestSignal, registry: subAgentRegistryRef.current });
+      const pipeline = prepared.outcome;
+      setSubAgentDiagnostics(previous => [...previous, ...prepared.diagnosticsToDisplay]);
       const msgId = agentMessageIds[agent.id];
       if (pipeline.status === 'aborted' || requestSignal?.aborted) {
         removeMessageFromRoom(roomId, msgId);

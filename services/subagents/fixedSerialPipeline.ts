@@ -29,6 +29,14 @@ export async function runFixedSerialPipeline(agent: Agent, options: PipelineOpti
 
 export class GenerationSubAgentCache {
   private cache = new Map<string, Promise<FixedSubAgentPipelineOutcome>>();
+  private diagnosticsEmitted = new Set<string>();
   prepare(agent: Agent, options: PipelineOptions) { const key = `${options.sessionId}:${agent.id}`; const found = this.cache.get(key); if (found) return found; const value = runFixedSerialPipeline(agent, options); this.cache.set(key, value); return value; }
-  clear() { this.cache.clear(); }
+  async prepareForDiagnostics(agent: Agent, options: PipelineOptions): Promise<{ outcome: FixedSubAgentPipelineOutcome; diagnosticsToDisplay: SubAgentRunDiagnostic[] }> {
+    const key = `${options.sessionId}:${agent.id}`;
+    const outcome = await this.prepare(agent, options);
+    if (this.diagnosticsEmitted.has(key)) return { outcome, diagnosticsToDisplay: [] };
+    this.diagnosticsEmitted.add(key);
+    return { outcome, diagnosticsToDisplay: outcome.diagnostics };
+  }
+  clear() { this.cache.clear(); this.diagnosticsEmitted.clear(); }
 }
