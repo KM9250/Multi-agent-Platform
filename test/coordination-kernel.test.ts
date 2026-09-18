@@ -61,6 +61,38 @@ test('terminal workflows reject new events but accept exact event retries', () =
   assert.throws(() => appendEvent(resolved, event(4, 'SessionStarted', session({ sessionId: 'next' }), { sessionId: 'next' })), /already terminal: RESOLVED/);
 });
 
+test('suspended workflows reject coordination work but permit cancellation', () => {
+  let state = withSession();
+  state = appendEvent(state, event(3, 'WorkflowSuspended', { reason: 'NEEDS_USER' }));
+  assert.throws(() => appendEvent(state, event(4, 'TaskAssigned', {}, { sessionId: 'task' })), /Workflow is suspended/);
+  state = appendEvent(state, event(4, 'WorkflowCancelled'));
+  assert.equal(state.run.status, 'CANCELLED');
+  assert.equal(state.sessions.task.state, 'CANCELLED');
+
+  let withoutSession = workflow();
+  withoutSession = appendEvent(withoutSession, event(2, 'WorkflowSuspended'));
+  assert.throws(() => appendEvent(withoutSession, event(3, 'SessionStarted', session())), /Workflow is suspended/);
+});
+
+test('event IDs allow exact retries and reject semantic collisions', () => {
+  const state = withSession();
+  const assigned = { ...event(3, 'TaskAssigned', { task: 'draft' }, { sessionId: 'task' }), eventId: 'shared-id' };
+  const recorded = appendEvent(state, assigned);
+  assert.equal(appendEvent(recorded, { ...assigned, sequence: 4, timestamp: 99 }), recorded);
+  assert.equal(recorded.events.length, 3);
+  assert.throws(() => appendEvent(recorded, { ...event(4, 'TaskCompleted', { task: 'draft' }, { sessionId: 'task' }), eventId: 'shared-id' }), /Event ID collision/);
+});
+
+test('final commitment rejects other unresolved sessions', () => {
+  let state = withSession();
+  const review = session({ sessionId: 'review', mode: 'map.coord.decision.v1', goal: 'review' });
+  state = appendEvent(state, event(3, 'SessionStarted', review, { sessionId: 'review', actorAgentId: 'supervisor' }));
+  assert.throws(() => appendEvent(state, event(4, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /other sessions remain unresolved/);
+  assert.equal(state.run.status, 'RUNNING');
+  assert.equal(state.sessions.task.state, 'OPEN');
+  assert.equal(state.sessions.review.state, 'OPEN');
+});
+
 test('CommitmentAccepted requires an existing open session', () => {
   assert.throws(() => appendEvent(workflow(), event(2, 'CommitmentAccepted', {}, { sessionId: 'missing', actorAgentId: 'supervisor' })), /does not exist/);
   let state = withSession();

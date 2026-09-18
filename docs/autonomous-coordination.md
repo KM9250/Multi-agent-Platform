@@ -20,6 +20,8 @@ The initial kernel is **MACP-Coord Level 1 adapter-ready**, not wire-compatible.
 - Only the configured Supervisor can accept a commitment, and only against an existing, open Session belonging to that Workflow. Full commitment-policy evaluation and acceptance-criteria enforcement are deferred to COORD-2.
 - New Sessions must be open, policy-bound, owned and initiated by Workflow participants, and include the configured Supervisor; duplicate Session IDs are rejected.
 - Terminal Workflows (`RESOLVED`, `CANCELLED`, and `FAILED`) reject all later events except an exact idempotent retry. `BLOCKED` remains non-terminal for a future explicit resume path.
+- A `SUSPENDED` Workflow performs no further coordination work. Only cancellation and error/audit recording are accepted until a future explicit resume event is introduced; suspension never implicitly returns to `RUNNING`.
+- In this foundation kernel, `CommitmentAccepted` is the final Workflow-level commitment and is rejected while any other Session remains open or suspended. Intermediate Session commitment and resolution semantics are deferred to COORD-2.
 - Suspension and cancellation are explicit durable events. Cancellation closes all open or suspended sessions.
 
 ## Delivery roadmap
@@ -35,3 +37,5 @@ The initial kernel is **MACP-Coord Level 1 adapter-ready**, not wire-compatible.
 Browser hosting is only a PoC. Formal unattended operation requires the durable runtime because reloads, OS sleep, browser crashes, and background throttling cannot be controlled by React state or `localStorage`.
 
 Before COORD-5 durable restart support, persist either the immutable policy snapshot or a canonical policy hash with each Workflow. A policy ID and version alone cannot prove which policy content was used after recovery.
+
+Before durable persistence, also establish an immutable journal serialization boundary so later caller mutation cannot alter an already-recorded event or payload.

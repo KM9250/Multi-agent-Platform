@@ -6,6 +6,7 @@ const emptyUsage = () => ({ rounds: 0, llmCalls: 0, inputTokens: 0, outputTokens
 // BLOCKED is intentionally non-terminal because a future explicit user action may resume it.
 // This foundation rejects every new event after the irreversible terminal states below.
 const TERMINAL_WORKFLOW_STATUSES = new Set<WorkflowStatus>(['RESOLVED', 'CANCELLED', 'FAILED']);
+const ALLOWED_WHILE_SUSPENDED = new Set<CoordinationEventType>(['WorkflowCancelled', 'ErrorRecorded']);
 const SESSION_SCOPED_EVENTS = new Set<CoordinationEventType>([
   'TaskAssigned', 'TaskCompleted', 'EvaluationAdded', 'PolicyEvaluated',
   'CommitmentRequested', 'CommitmentAccepted',
@@ -63,7 +64,11 @@ export const createWorkflow = (input: CreateWorkflowInput): CoordinationSnapshot
 /** Append-only journal insertion with sequence and idempotency enforcement. */
 export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationEvent): CoordinationSnapshot => {
   if (event.workflowRunId !== snapshot.run.runId) throw new Error('Event belongs to another workflow.');
-  if (snapshot.events.some(existing => existing.eventId === event.eventId)) return snapshot;
+  const existingById = snapshot.events.find(existing => existing.eventId === event.eventId);
+  if (existingById) {
+    if (isSameSemanticEvent(existingById, event)) return snapshot;
+    throw new Error('Event ID collision.');
+  }
   if (event.idempotencyKey) {
     const existing = snapshot.events.find(candidate => candidate.idempotencyKey === event.idempotencyKey);
     if (existing) {
@@ -73,6 +78,10 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
   }
   if (TERMINAL_WORKFLOW_STATUSES.has(snapshot.run.status)) {
     throw new Error(`Workflow is already terminal: ${snapshot.run.status}`);
+  }
+  // SUSPENDED is a hard stop until a future explicit WorkflowResumed event exists.
+  if (snapshot.run.status === 'SUSPENDED' && !ALLOWED_WHILE_SUSPENDED.has(event.type)) {
+    throw new Error('Workflow is suspended.');
   }
   const expected = snapshot.events.length ? snapshot.events.at(-1)!.sequence + 1 : 1;
   if (event.sequence !== expected) throw new Error(`Expected event sequence ${expected}.`);
@@ -108,6 +117,12 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
     if (session.state !== 'OPEN') throw new Error(`Session is not commit-ready: ${session.state}`);
     if (session.supervisor !== run.supervisorAgentId) throw new Error('Session supervisor must match the workflow supervisor.');
     if (session.workflowRunId !== run.runId) throw new Error('Session belongs to another workflow.');
+    const hasUnresolvedOtherSession = Object.values(sessions).some(candidate =>
+      candidate.sessionId !== session.sessionId
+      && (candidate.state === 'OPEN' || candidate.state === 'SUSPENDED'));
+    if (hasUnresolvedOtherSession) {
+      throw new Error('Cannot resolve workflow while other sessions remain unresolved.');
+    }
     run.status = 'RESOLVED'; delete run.statusReason;
     sessions[event.sessionId!] = { ...session, state: 'RESOLVED', updatedAt: event.timestamp };
   } else if (SESSION_SCOPED_EVENTS.has(event.type)) {
