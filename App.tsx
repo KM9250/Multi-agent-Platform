@@ -20,6 +20,7 @@ import { finalizeLegacyGeneration, finalizeSeparatedFailure, finalizeSeparatedSu
 import { resolveTurnDecisions } from './utils/turnDecisions';
 import { Agent, Message, Room, Attachment, RoomTag, AgentDecisionEvent, GenerationContext, InternalStateSettings } from './types';
 import { GenerationSubAgentCache, extractPublicTaskInputs, formatPrivateSubAgentContext, createRuntimeSubAgentProviderRegistry, type SubAgentRunDiagnostic } from './services/subagents';
+import { RequestScheduler } from './services/scheduler';
 
 export default function App() {
   // --- State ---
@@ -67,7 +68,10 @@ export default function App() {
   const isGeneratingRef = useRef(false);
   const generationSessionRef = useRef<GenerationSession | null>(null);
   const subAgentCacheRef = useRef(new GenerationSubAgentCache());
-  const subAgentRegistryRef = useRef(createRuntimeSubAgentProviderRegistry());
+  const schedulerRef = useRef<RequestScheduler | null>(null);
+  if (!schedulerRef.current) schedulerRef.current = new RequestScheduler();
+  const subAgentRegistryRef = useRef<ReturnType<typeof createRuntimeSubAgentProviderRegistry> | null>(null);
+  if (!subAgentRegistryRef.current) subAgentRegistryRef.current = createRuntimeSubAgentProviderRegistry(process.env.API_KEY, schedulerRef.current);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -273,7 +277,8 @@ export default function App() {
       evaluateDecision: agent => evaluateShouldRespond(agent, currentHistory, roomSystemInstruction, {
           agents: roomAgents,
           signal: requestSignal,
-          internalStateSettings
+          internalStateSettings,
+          scheduler: schedulerRef.current!
       })
     });
     const decisionEvents = finalDecisions.map(d => createDecisionEvent(turnId, d.agent, d.decision));
@@ -326,7 +331,7 @@ export default function App() {
 
     let hadGenerationError = false;
     const agentPromises = sortedAgents.map(async agent => {
-      const prepared = memoryRequest ? { outcome: { status: 'not_configured' as const, reports: [], diagnostics: [] }, diagnosticsToDisplay: [] } : await subAgentCacheRef.current.prepareForDiagnostics(agent, { sessionId, inputs: extractPublicTaskInputs(currentHistory), signal: requestSignal, registry: subAgentRegistryRef.current });
+      const prepared = memoryRequest ? { outcome: { status: 'not_configured' as const, reports: [], diagnostics: [] }, diagnosticsToDisplay: [] } : await subAgentCacheRef.current.prepareForDiagnostics(agent, { sessionId, inputs: extractPublicTaskInputs(currentHistory), signal: requestSignal, registry: subAgentRegistryRef.current! });
       const pipeline = prepared.outcome;
       setSubAgentDiagnostics(previous => [...previous, ...prepared.diagnosticsToDisplay]);
       const msgId = agentMessageIds[agent.id];
@@ -404,7 +409,8 @@ export default function App() {
             mode: generationSessionRef.current?.mode || 'normal',
             internalStateSettings,
             memoryRequest,
-            privateSubAgentContext
+            privateSubAgentContext,
+            scheduler: schedulerRef.current!
           }
         );
       });
@@ -524,7 +530,7 @@ export default function App() {
 
     let accumulatedText = '';
     const requestSignal = controller.signal;
-    const pipeline = memoryRequest ? { status: 'not_configured' as const, reports: [], diagnostics: [] } : await new GenerationSubAgentCache().prepare(agent, { sessionId, inputs: extractPublicTaskInputs(history), signal: requestSignal, registry: subAgentRegistryRef.current });
+    const pipeline = memoryRequest ? { status: 'not_configured' as const, reports: [], diagnostics: [] } : await new GenerationSubAgentCache().prepare(agent, { sessionId, inputs: extractPublicTaskInputs(history), signal: requestSignal, registry: subAgentRegistryRef.current! });
     setSubAgentDiagnostics(pipeline.diagnostics);
     if (pipeline.status === 'aborted' || requestSignal.aborted) { replaceLocalMessage(room.id, messageId, () => restoreMessageAfterAbort(targetMessage)); finishGenerationSession(sessionId, turnId, room.id); return; }
     const privateSubAgentContext = formatPrivateSubAgentContext(pipeline.reports, pipeline.status === 'failed' || pipeline.status === 'partial');
@@ -572,7 +578,7 @@ export default function App() {
           }
           resolve();
         },
-        { agents: room.agents, signal: requestSignal, mode, internalStateSettings, memoryRequest, privateSubAgentContext }
+        { agents: room.agents, signal: requestSignal, mode, internalStateSettings, memoryRequest, privateSubAgentContext, scheduler: schedulerRef.current! }
       );
     });
     finishGenerationSession(sessionId, turnId, room.id);
