@@ -127,3 +127,7 @@ The collapsible operator panel can display selected internal categories. These s
 Persona Agents are conversation participants. SubAgents are private task workers owned by a Persona Agent. SubAgent output never enters public Room history directly. The model-independent task boundary, provider registry, and independent run lifecycle are documented in [the SubAgent architecture](docs/subagent-architecture.md).
 
 Phase SA-1 adds an optional fixed serial private SubAgent pipeline. Validated worker reports are injected only into the owning Persona's current generation and are not persisted to Room history.
+
+## Autonomous coordination foundation
+
+The UI-independent coordination domain model establishes bounded WorkflowRun and CoordinationSession lifecycles, immutable policy identity, finite budgets, fail-closed risk decisions, an append-only idempotent journal, and commitment-only completion semantics. See [the autonomous coordination architecture](docs/autonomous-coordination.md).
