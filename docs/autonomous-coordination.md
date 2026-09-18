@@ -17,7 +17,9 @@ The initial kernel is **MACP-Coord Level 1 adapter-ready**, not wire-compatible.
 - Only Persona IDs listed on the workflow may participate in a coordination session. Private SubAgents remain invisible to this layer.
 - The journal is append-only, ordered, and idempotent for repeated external actions.
 - `TaskCompleted` is evidence, not terminal state. Only an accepted `Commitment` resolves a workflow/session.
-- Only the configured Supervisor can accept a commitment; the Supervisor cannot bypass policy evaluation.
+- Only the configured Supervisor can accept a commitment, and only against an existing, open Session belonging to that Workflow. Full commitment-policy evaluation and acceptance-criteria enforcement are deferred to COORD-2.
+- New Sessions must be open, policy-bound, owned and initiated by Workflow participants, and include the configured Supervisor; duplicate Session IDs are rejected.
+- Terminal Workflows (`RESOLVED`, `CANCELLED`, and `FAILED`) reject all later events except an exact idempotent retry. `BLOCKED` remains non-terminal for a future explicit resume path.
 - Suspension and cancellation are explicit durable events. Cancellation closes all open or suspended sessions.
 
 ## Delivery roadmap
@@ -31,3 +33,5 @@ The initial kernel is **MACP-Coord Level 1 adapter-ready**, not wire-compatible.
 - **COORD-6:** SA-2 private-worker routing and risk-classified tools.
 
 Browser hosting is only a PoC. Formal unattended operation requires the durable runtime because reloads, OS sleep, browser crashes, and background throttling cannot be controlled by React state or `localStorage`.
+
+Before COORD-5 durable restart support, persist either the immutable policy snapshot or a canonical policy hash with each Workflow. A policy ID and version alone cannot prove which policy content was used after recovery.
