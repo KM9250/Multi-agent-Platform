@@ -3,10 +3,11 @@ import { validatePolicy } from './policy';
 
 const emptyUsage = () => ({ rounds: 0, llmCalls: 0, inputTokens: 0, outputTokens: 0, estimatedCost: 0, consecutiveErrors: 0, noProgressCycles: 0 });
 
-// BLOCKED is intentionally non-terminal because a future explicit user action may resume it.
-// This foundation rejects every new event after the irreversible terminal states below.
+// BLOCKED and SUSPENDED remain non-terminal for a future explicit resume transition,
+// but both are hard stops until that transition exists.
 const TERMINAL_WORKFLOW_STATUSES = new Set<WorkflowStatus>(['RESOLVED', 'CANCELLED', 'FAILED']);
-const ALLOWED_WHILE_SUSPENDED = new Set<CoordinationEventType>(['WorkflowCancelled', 'ErrorRecorded']);
+const STOPPED_WORKFLOW_STATUSES = new Set<WorkflowStatus>(['SUSPENDED', 'BLOCKED']);
+const ALLOWED_WHILE_STOPPED = new Set<CoordinationEventType>(['WorkflowCancelled', 'ErrorRecorded']);
 const SESSION_SCOPED_EVENTS = new Set<CoordinationEventType>([
   'TaskAssigned', 'TaskCompleted', 'EvaluationAdded', 'PolicyEvaluated',
   'CommitmentRequested', 'CommitmentAccepted',
@@ -79,9 +80,8 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
   if (TERMINAL_WORKFLOW_STATUSES.has(snapshot.run.status)) {
     throw new Error(`Workflow is already terminal: ${snapshot.run.status}`);
   }
-  // SUSPENDED is a hard stop until a future explicit WorkflowResumed event exists.
-  if (snapshot.run.status === 'SUSPENDED' && !ALLOWED_WHILE_SUSPENDED.has(event.type)) {
-    throw new Error('Workflow is suspended.');
+  if (STOPPED_WORKFLOW_STATUSES.has(snapshot.run.status) && !ALLOWED_WHILE_STOPPED.has(event.type)) {
+    throw new Error(`Workflow is stopped: ${snapshot.run.status}`);
   }
   const expected = snapshot.events.length ? snapshot.events.at(-1)!.sequence + 1 : 1;
   if (event.sequence !== expected) throw new Error(`Expected event sequence ${expected}.`);
@@ -93,6 +93,9 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
     if (!session || typeof session !== 'object') throw new Error('SessionStarted requires a session payload.');
     if (!session.sessionId.trim()) throw new Error('Session ID is required.');
     if (sessions[session.sessionId]) throw new Error(`Duplicate session ID: ${session.sessionId}`);
+    const hasActiveSession = Object.values(sessions).some(existing =>
+      existing.state === 'OPEN' || existing.state === 'SUSPENDED');
+    if (hasActiveSession) throw new Error('Only one active session is supported before COORD-2.');
     if (event.sessionId && event.sessionId !== session.sessionId) throw new Error('Event and payload session IDs must match.');
     if (session.workflowRunId !== run.runId) throw new Error('Session belongs to another workflow.');
     if (session.policyId !== run.policyId || session.policyVersion !== run.policyVersion) throw new Error('Session policy must match the workflow policy.');

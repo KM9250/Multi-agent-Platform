@@ -64,14 +64,28 @@ test('terminal workflows reject new events but accept exact event retries', () =
 test('suspended workflows reject coordination work but permit cancellation', () => {
   let state = withSession();
   state = appendEvent(state, event(3, 'WorkflowSuspended', { reason: 'NEEDS_USER' }));
-  assert.throws(() => appendEvent(state, event(4, 'TaskAssigned', {}, { sessionId: 'task' })), /Workflow is suspended/);
+  assert.throws(() => appendEvent(state, event(4, 'TaskAssigned', {}, { sessionId: 'task' })), /Workflow is stopped: SUSPENDED/);
   state = appendEvent(state, event(4, 'WorkflowCancelled'));
   assert.equal(state.run.status, 'CANCELLED');
   assert.equal(state.sessions.task.state, 'CANCELLED');
 
   let withoutSession = workflow();
   withoutSession = appendEvent(withoutSession, event(2, 'WorkflowSuspended'));
-  assert.throws(() => appendEvent(withoutSession, event(3, 'SessionStarted', session())), /Workflow is suspended/);
+  assert.throws(() => appendEvent(withoutSession, event(3, 'SessionStarted', session())), /Workflow is stopped: SUSPENDED/);
+});
+
+test('blocked workflows reject coordination work but permit cancellation and error recording', () => {
+  const running = withSession();
+  const blocked = { ...running, run: { ...running.run, status: 'BLOCKED' as const } };
+  assert.throws(() => appendEvent(blocked, event(3, 'TaskAssigned', {}, { sessionId: 'task' })), /Workflow is stopped: BLOCKED/);
+  assert.throws(() => appendEvent(blocked, event(3, 'SessionStarted', session({ sessionId: 'next' }))), /Workflow is stopped: BLOCKED/);
+
+  const cancelled = appendEvent(blocked, event(3, 'WorkflowCancelled'));
+  assert.equal(cancelled.run.status, 'CANCELLED');
+
+  const recorded = appendEvent(blocked, event(3, 'ErrorRecorded', { message: 'waiting for input' }));
+  assert.equal(recorded.run.status, 'BLOCKED');
+  assert.equal(recorded.events.at(-1)?.type, 'ErrorRecorded');
 });
 
 test('event IDs allow exact retries and reject semantic collisions', () => {
@@ -84,13 +98,37 @@ test('event IDs allow exact retries and reject semantic collisions', () => {
 });
 
 test('final commitment rejects other unresolved sessions', () => {
-  let state = withSession();
+  const state = withSession();
   const review = session({ sessionId: 'review', mode: 'map.coord.decision.v1', goal: 'review' });
-  state = appendEvent(state, event(3, 'SessionStarted', review, { sessionId: 'review', actorAgentId: 'supervisor' }));
-  assert.throws(() => appendEvent(state, event(4, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /other sessions remain unresolved/);
+  state.sessions.review = review;
+  assert.throws(() => appendEvent(state, event(3, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /other sessions remain unresolved/);
   assert.equal(state.run.status, 'RUNNING');
   assert.equal(state.sessions.task.state, 'OPEN');
   assert.equal(state.sessions.review.state, 'OPEN');
+});
+
+test('SessionStarted rejects a second open or suspended session', () => {
+  const open = withSession();
+  assert.throws(
+    () => appendEvent(open, event(3, 'SessionStarted', session({ sessionId: 'next' }))),
+    /Only one active session is supported/,
+  );
+
+  const suspended = { ...open, sessions: { task: { ...open.sessions.task, state: 'SUSPENDED' as const } } };
+  assert.throws(
+    () => appendEvent(suspended, event(3, 'SessionStarted', session({ sessionId: 'next' }))),
+    /Only one active session is supported/,
+  );
+});
+
+test('SessionStarted permits a new session after an inactive session', () => {
+  for (const inactiveState of ['RESOLVED', 'CANCELLED', 'EXPIRED'] as const) {
+    const existing = withSession();
+    const inactive = { ...existing, sessions: { task: { ...existing.sessions.task, state: inactiveState } } };
+    const started = appendEvent(inactive, event(3, 'SessionStarted', session({ sessionId: `next-${inactiveState}` })));
+    assert.equal(started.run.currentSessionId, `next-${inactiveState}`);
+    assert.equal(started.sessions[`next-${inactiveState}`].state, 'OPEN');
+  }
 });
 
 test('CommitmentAccepted requires an existing open session', () => {
