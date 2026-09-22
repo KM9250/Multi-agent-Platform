@@ -325,6 +325,25 @@ export const evaluateShouldRespond = async (
     }
 }
 
+/** Consumes one stream attempt; callers only receive metadata after full success. */
+export const consumeGenerationStreamAttempt = async (
+  resultStream: AsyncIterable<any>,
+  signal: AbortSignal | undefined,
+  context: { markOutputStarted(): void },
+  onText: (text: string) => void
+): Promise<ReturnType<typeof getFinishMetadata>> => {
+  let attemptFinishMetadata: ReturnType<typeof getFinishMetadata> = {};
+  for await (const chunk of resultStream) {
+    if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
+    attemptFinishMetadata = { ...attemptFinishMetadata, ...getFinishMetadata(chunk) };
+    if (chunk.text) {
+      context.markOutputStarted();
+      onText(chunk.text);
+    }
+  }
+  return attemptFinishMetadata;
+};
+
 export const streamAgentResponse = async (
   agent: Agent,
   allMessages: Message[],
@@ -381,15 +400,12 @@ export const streamAgentResponse = async (
 
     const execute = async (context: { markOutputStarted(): void }) => {
       const resultStream = await ai.models.generateContentStream({ model: actualModel, contents, config });
-      for await (const chunk of resultStream) {
-        if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
-        finishMetadata = { ...finishMetadata, ...getFinishMetadata(chunk) };
-        if (chunk.text) {
-          context.markOutputStarted();
-          accumulatedText += chunk.text;
-          onChunk(chunk.text);
-        }
-      }
+      const attemptFinishMetadata = await consumeGenerationStreamAttempt(resultStream, signal, context, text => {
+        accumulatedText += text;
+        onChunk(text);
+      });
+      // Only a fully consumed attempt may contribute completion metadata.
+      finishMetadata = attemptFinishMetadata;
     };
     if (options?.scheduler) {
       await options.scheduler.schedule({ provider: 'google', model: actualModel, kind: 'generation', signal, execute });

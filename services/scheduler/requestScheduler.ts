@@ -6,10 +6,39 @@ type KeyState = { running: number; queue: Queued[] };
 
 const abortError = (): DOMException => new DOMException('The operation was aborted', 'AbortError');
 const wait = (ms: number, signal?: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
-  if (signal?.aborted) return reject(abortError());
-  const timer = setTimeout(resolve, ms);
-  signal?.addEventListener('abort', () => { clearTimeout(timer); reject(abortError()); }, { once: true });
+  if (signal?.aborted) {
+    reject(abortError());
+    return;
+  }
+  const onAbort = () => {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+    reject(abortError());
+  };
+  const timer = setTimeout(() => {
+    signal?.removeEventListener('abort', onAbort);
+    resolve();
+  }, ms);
+  signal?.addEventListener('abort', onAbort, { once: true });
 });
+
+const isFiniteIntegerAtLeast = (value: number, minimum: number): boolean =>
+  Number.isFinite(value) && Number.isInteger(value) && value >= minimum;
+
+const validateConfig = (config: RequestSchedulerConfig): void => {
+  if (!isFiniteIntegerAtLeast(config.defaultConcurrencyPerModel, 1))
+    throw new Error('Scheduler concurrency must be a finite integer of at least 1');
+  if (!isFiniteIntegerAtLeast(config.retry.maxAttempts, 1))
+    throw new Error('Scheduler maxAttempts must be a finite integer of at least 1');
+  if (!Number.isFinite(config.retry.baseDelayMs) || config.retry.baseDelayMs < 0)
+    throw new Error('Scheduler baseDelayMs must be finite and non-negative');
+  if (!Number.isFinite(config.retry.maxDelayMs) || config.retry.maxDelayMs < config.retry.baseDelayMs)
+    throw new Error('Scheduler maxDelayMs must be finite and at least baseDelayMs');
+  if (!Number.isFinite(config.retry.jitterRatio) || config.retry.jitterRatio < 0 || config.retry.jitterRatio > 1)
+    throw new Error('Scheduler jitterRatio must be finite and between 0 and 1');
+  if (config.diagnosticsLimit !== undefined && !isFiniteIntegerAtLeast(config.diagnosticsLimit, 0))
+    throw new Error('Scheduler diagnosticsLimit must be a finite non-negative integer');
+};
 
 export const DEFAULT_SCHEDULER_CONFIG: RequestSchedulerConfig = {
   defaultConcurrencyPerModel: 2,
@@ -23,10 +52,9 @@ export class RequestScheduler {
   private sequence = 0;
   private readonly config: RequestSchedulerConfig;
 
-  constructor(config: Partial<RequestSchedulerConfig> & { retry?: Partial<RequestSchedulerConfig['retry']> } = {}) {
+  constructor(config: Omit<Partial<RequestSchedulerConfig>, 'retry'> & { retry?: Partial<RequestSchedulerConfig['retry']> } = {}) {
     this.config = { ...DEFAULT_SCHEDULER_CONFIG, ...config, retry: { ...DEFAULT_SCHEDULER_CONFIG.retry, ...config.retry } };
-    if (this.config.defaultConcurrencyPerModel < 1) throw new Error('Scheduler concurrency must be at least 1');
-    if (this.config.retry.maxAttempts < 1) throw new Error('Scheduler maxAttempts must be at least 1');
+    validateConfig(this.config);
   }
 
   schedule<T>(job: SchedulerJob<T>): Promise<T> {
@@ -105,6 +133,12 @@ export class RequestScheduler {
     const event = { id, timestamp: Date.now(), kind: job.kind, provider: job.provider, model: job.model, state, attempt, queueWaitMs, errorCode };
     this.events.push(event);
     if (this.events.length > (this.config.diagnosticsLimit ?? 100)) this.events.shift();
-    this.listeners.forEach(listener => listener(event));
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+        // Diagnostic observers must never affect request execution semantics.
+      }
+    }
   }
 }

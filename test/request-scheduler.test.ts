@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { RequestScheduler, isTransientSchedulerError } from '../services/scheduler/index.ts';
+import { consumeGenerationStreamAttempt } from '../services/geminiService.ts';
+import { GoogleSubAgentProvider } from '../services/subagents/providers/googleProvider.ts';
 
 const deferred = <T = void>() => { let resolve!: (value: T | PromiseLike<T>) => void; let reject!: (error: unknown) => void; const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; }); return { promise, resolve, reject }; };
 const tick = () => new Promise(resolve => setTimeout(resolve, 0));
@@ -70,4 +72,75 @@ test('stream errors before output may retry and diagnostics are bounded and prom
   const subject = new RequestScheduler({ defaultConcurrencyPerModel: 1, diagnosticsLimit: 3, retry: { maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0, jitterRatio: 0 } }); let attempts = 0;
   await subject.schedule({ provider: 'google', model: 'flash', kind: 'generation', execute: async () => { if (++attempts === 1) throw Object.assign(new Error('503 private prompt'), { status: 503 }); } });
   assert.equal(attempts, 2); assert.equal(subject.getDiagnostics().length, 3); assert.equal(JSON.stringify(subject.getDiagnostics()).includes('private prompt'), false);
+});
+
+test('diagnostic observer failures cannot synchronously break scheduling or retry a completed request', async () => {
+  const subject = scheduler(); let executions = 0;
+  subject.subscribe(event => {
+    if (event.state === 'queued' || event.state === 'completed') throw new Error('observer failed');
+  });
+  let scheduled: Promise<string> | undefined;
+  assert.doesNotThrow(() => {
+    scheduled = subject.schedule({ provider: 'google', model: 'flash', kind: 'decision', execute: async () => { executions++; return 'ok'; } });
+  });
+  assert.equal(await scheduled, 'ok');
+  assert.equal(executions, 1);
+});
+
+test('invalid scheduler configuration is rejected eagerly', () => {
+  for (const value of [NaN, Infinity, 1.5, 0]) {
+    assert.throws(() => new RequestScheduler({ defaultConcurrencyPerModel: value }));
+    assert.throws(() => new RequestScheduler({ retry: { maxAttempts: value } }));
+  }
+  assert.throws(() => new RequestScheduler({ retry: { baseDelayMs: -1 } }));
+  assert.throws(() => new RequestScheduler({ retry: { baseDelayMs: 10, maxDelayMs: 9 } }));
+  assert.throws(() => new RequestScheduler({ retry: { jitterRatio: -0.1 } }));
+  assert.throws(() => new RequestScheduler({ retry: { jitterRatio: 1.1 } }));
+  for (const value of [NaN, Infinity, 1.5, -1]) assert.throws(() => new RequestScheduler({ diagnosticsLimit: value }));
+  assert.doesNotThrow(() => new RequestScheduler({ diagnosticsLimit: 0 }));
+});
+
+test('failed stream attempt metadata is discarded before retry', async () => {
+  const subject = scheduler(1, 2); let attempt = 0; let finalMetadata = {};
+  await subject.schedule({
+    provider: 'google', model: 'flash', kind: 'generation',
+    execute: async context => {
+      attempt++;
+      const stream = attempt === 1
+        ? (async function* () { yield { finishReason: 'SAFETY' }; throw Object.assign(new Error('503'), { status: 503 }); })()
+        : (async function* () { yield { finishReason: 'STOP' }; })();
+      finalMetadata = await consumeGenerationStreamAttempt(stream, undefined, context, () => {});
+    },
+  });
+  assert.deepEqual(finalMetadata, { finishReason: 'STOP', finishMessage: undefined, safetyRatings: undefined, promptFeedback: undefined });
+});
+
+test('Google SubAgent provider shares scheduler concurrency at the provider boundary', async () => {
+  const subject = scheduler(1); const gates = [deferred(), deferred()];
+  let running = 0; let maximum = 0; let calls = 0;
+  const fakeClient = { models: { generateContent: async () => {
+    const index = calls++; maximum = Math.max(maximum, ++running);
+    await gates[index].promise; running--;
+    return { text: `{ "summary": "${index}" }` };
+  } } };
+  const provider = new GoogleSubAgentProvider('fake', fakeClient as any, subject);
+  const request = { model: 'flash', systemInstruction: 'system', prompt: 'prompt' };
+  const first = provider.generate(request); const second = provider.generate(request);
+  await tick(); assert.equal(calls, 1); assert.equal(maximum, 1);
+  gates[0].resolve(); await tick(); assert.equal(calls, 2); assert.equal(maximum, 1);
+  gates[1].resolve(); await Promise.all([first, second]);
+});
+
+test('a completed retry wait removes its abort listener', async () => {
+  const subject = new RequestScheduler({ defaultConcurrencyPerModel: 1, retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1, jitterRatio: 0 } });
+  const controller = new AbortController(); let added = 0; let removed = 0; let attempts = 0;
+  const add = controller.signal.addEventListener.bind(controller.signal);
+  const remove = controller.signal.removeEventListener.bind(controller.signal);
+  controller.signal.addEventListener = ((...args: Parameters<AbortSignal['addEventListener']>) => { added++; return add(...args); }) as AbortSignal['addEventListener'];
+  controller.signal.removeEventListener = ((...args: Parameters<AbortSignal['removeEventListener']>) => { removed++; return remove(...args); }) as AbortSignal['removeEventListener'];
+  await subject.schedule({ provider: 'google', model: 'flash', kind: 'decision', signal: controller.signal, execute: async () => {
+    if (++attempts === 1) throw Object.assign(new Error('503'), { status: 503 });
+  } });
+  // One queue listener and one retry-wait listener are both removed normally.
+  assert.equal(added, removed);
 });
