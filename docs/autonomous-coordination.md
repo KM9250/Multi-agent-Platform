@@ -19,7 +19,8 @@ The initial kernel is **MACP-Coord Level 1 adapter-ready**, not wire-compatible.
 - `TaskCompleted` is evidence, not terminal state. Only an accepted `Commitment` resolves a workflow/session.
 - Only the configured Supervisor can accept a commitment, and only against an existing, open Session belonging to that Workflow. Full commitment-policy evaluation and acceptance-criteria enforcement are deferred to COORD-2.
 - New Sessions must be open, policy-bound, owned and initiated by Workflow participants, and include the configured Supervisor; duplicate Session IDs are rejected.
-- Terminal Workflows (`RESOLVED`, `CANCELLED`, and `FAILED`) reject all later events except an exact idempotent retry. `BLOCKED` remains non-terminal for a future explicit resume path.
+- Before COORD-2 introduces intermediate Session resolution, a Workflow may have at most one open or suspended Session. This prevents multiple unresolved Sessions from blocking the final Workflow-level commitment.
+- Terminal Workflows (`RESOLVED`, `CANCELLED`, and `FAILED`) reject all later events except an exact idempotent retry. `BLOCKED` remains non-terminal, but it is a stopped state: no coordination work proceeds until a future explicit resume transition is introduced.
 - A `SUSPENDED` Workflow performs no further coordination work. Only cancellation and error/audit recording are accepted until a future explicit resume event is introduced; suspension never implicitly returns to `RUNNING`.
 - In this foundation kernel, `CommitmentAccepted` is the final Workflow-level commitment and is rejected while any other Session remains open or suspended. Intermediate Session commitment and resolution semantics are deferred to COORD-2.
 - Suspension and cancellation are explicit durable events. Cancellation closes all open or suspended sessions.
