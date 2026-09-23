@@ -18,10 +18,18 @@ const lastSpokenDistance = (history: Message[], agentId: string): number => {
   return idx === -1 ? Number.POSITIVE_INFINITY : history.length - idx;
 };
 
+export const allowsStampOnly = (message: Message): boolean => {
+  if (message.role !== 'user' || (message.attachments?.length ?? 0) > 0) return false;
+  const content = message.content.trim().replace(/[。.!！]+$/u, '').trim();
+  return /^(?:了解(?:です)?|ありがとう(?:ございます)?|承知しました|okです|では.+で進めます|それでお願いします)$/iu.test(content);
+};
+
 export const requiresTextFallback = (message: Message): boolean => {
   if (message.role !== 'user') return false;
-  if (!message.content.trim() && (message.attachments?.length ?? 0) > 0) return true;
-  return /[?？]|\b(?:what|why|how|when|where|who|please|explain|review|create|write)\b|何|なぜ|どう|どれ|いつ|どこ|誰|教えて|説明|レビュー|作って|書いて|してください|お願いします/i.test(message.content);
+  if (allowsStampOnly(message)) return false;
+  // Fail safe: only known acknowledgements and confirmations may end with a
+  // STAMP. Questions, requests, attachments, and ambiguous text require prose.
+  return true;
 };
 
 export const selectFallbackAgent = (candidates: Agent[], history: Message[], decisions: AgentDecisionResult[] = []): Agent | null => {

@@ -1,4 +1,4 @@
-import type { Agent, Message, ResponseDecision } from '../types';
+import type { Agent, Message, MessageRecipientTarget, ResponseDecision } from '../types';
 import { fixedDecision } from './decisionDiagnostics';
 import { applyInitialUserTurnFallback, type AgentDecisionResult } from './responseFallback';
 
@@ -13,6 +13,12 @@ export interface ResolveTurnDecisionsOptions {
 export interface ParticipationDecisionContext {
   recentMessageCount: number;
   lastSpokenDistance?: number;
+  recipient: {
+    type: MessageRecipientTarget['type'];
+    isExplicitRecipient: boolean;
+    isExplicitlyTargeted: boolean;
+    groupId?: string;
+  };
 }
 
 export const partitionTurnDecisions = (decisions: AgentDecisionResult[]) => ({
@@ -49,6 +55,12 @@ export const resolveTurnDecisions = async ({
     return { agent, decision: await evaluateDecision(agent, {
       recentMessageCount: recentHistory.filter(message => message.agentId === agent.id).length,
       lastSpokenDistance: lastIndex < 0 ? undefined : history.length - lastIndex,
+      recipient: {
+        type: structured?.type ?? 'auto',
+        isExplicitRecipient: !!structured && structured.type !== 'auto',
+        isExplicitlyTargeted: !!structured && structured.type !== 'auto' && structured.agentIds.includes(agent.id),
+        ...(structured?.type === 'group' ? { groupId: structured.groupId } : {}),
+      },
     }) };
   }));
 

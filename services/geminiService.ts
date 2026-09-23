@@ -281,7 +281,14 @@ export interface AgentCallOptions {
 
 export const buildParticipationDecisionPrompt = (agent: Agent, context: ParticipationDecisionContext): string => {
   const lastSpoke = context.lastSpokenDistance === undefined ? 'never' : `${context.lastSpokenDistance} messages ago`;
-  return `あなたは「${agent.name}」という名前のエージェントです。\n役割: ${agent.description}\nParticipation Profile: ${agent.participationProfile || '(not specified)'}\nRecent activity:\n- messages in last 8: ${context.recentMessageCount}\n- last spoke: ${lastSpoke}\n\n${DECISION_SYSTEM_INSTRUCTION}`;
+  const recipientContext = [
+    'Latest recipient context:',
+    `- explicit recipient: ${context.recipient.isExplicitRecipient ? 'yes' : 'no'}`,
+    `- you are explicitly targeted: ${context.recipient.isExplicitlyTargeted ? 'yes' : 'no'}`,
+    `- recipient type: ${context.recipient.type}`,
+    ...(context.recipient.groupId ? [`- recipient group: ${context.recipient.groupId}`] : []),
+  ].join('\n');
+  return `あなたは「${agent.name}」という名前のエージェントです。\n役割: ${agent.description}\nParticipation Profile: ${agent.participationProfile || '(not specified)'}\nRecent activity:\n- messages in last 8: ${context.recentMessageCount}\n- last spoke: ${lastSpoke}\n${recipientContext}\n\n${DECISION_SYSTEM_INSTRUCTION}`;
 };
 
 export const evaluateShouldRespond = async (
@@ -289,7 +296,10 @@ export const evaluateShouldRespond = async (
   allMessages: Message[],
   roomSystemInstruction?: string,
   options?: AgentCallOptions,
-  participationContext: ParticipationDecisionContext = { recentMessageCount: 0 }
+  participationContext: ParticipationDecisionContext = {
+    recentMessageCount: 0,
+    recipient: { type: 'auto', isExplicitRecipient: false, isExplicitlyTargeted: false },
+  }
 ): Promise<ResponseDecision> => {
     const decisionModel = ModelType.GEMINI_2_5_FLASH;
     const startedAt = performance.now();

@@ -519,7 +519,6 @@ export default function App() {
     if (!room) return;
     const targetMessage = room.messages.find(m => m.id === messageId);
     if (!targetMessage?.agentId || !targetMessage.generationContext) return;
-    setRooms(prev => prev.map(candidate => candidate.id === room.id ? { ...candidate, reactions: clearMessageReactions(candidate.reactions ?? [], messageId) } : candidate));
     const agent = room.agents.find(a => a.id === targetMessage.agentId);
     if (!agent) return;
     const history = targetMessage.generationContext.historyMessageIds
@@ -529,6 +528,8 @@ export default function App() {
       updateLocalHistory(room.id, messageId, 'Cannot regenerate because some source history messages were deleted.', false, true, 'HISTORY_MISSING', 'One or more messages used for the original generation no longer exist.');
       return;
     }
+
+    setRooms(prev => prev.map(candidate => candidate.id === room.id ? { ...candidate, reactions: clearMessageReactions(candidate.reactions ?? [], messageId) } : candidate));
 
     const turnId = targetMessage.turnId || crypto.randomUUID();
     const sessionId = crypto.randomUUID();
