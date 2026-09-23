@@ -4,7 +4,7 @@ import { AgentDecisionEvent } from '../types';
 
 interface Props { events: AgentDecisionEvent[]; }
 
-const statusClass = (outcome: string) => outcome === 'RESPOND' ? 'text-emerald-400' : outcome === 'IGNORE' ? 'text-zinc-400' : 'text-red-400';
+const statusClass = (outcome: string) => outcome === 'RESPOND' ? 'text-emerald-400' : outcome === 'STAMP' ? 'text-amber-400' : outcome === 'IGNORE' ? 'text-zinc-400' : 'text-red-400';
 
 const DecisionDiagnosticsPanel: React.FC<Props> = ({ events }) => {
   const [open, setOpen] = useState(false);

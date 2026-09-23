@@ -34,17 +34,22 @@ export const normalizeModelId = (model: string): string => {
 
 export const normalizeAgent = (agent: Agent, now = Date.now()): Agent => {
   const normalizedModel = normalizeModelId(agent.model);
+  const participation = {
+    groups: [...new Set((agent.groups ?? []).map(value => value.trim()).filter(Boolean))],
+    participationProfile: typeof agent.participationProfile === 'string' ? agent.participationProfile.trim() : '',
+  };
   if (Array.isArray(agent.additionalContextFiles)) {
-    return { ...agent, model: normalizedModel, additionalContextFiles: normalizeContextFileOrder(agent.additionalContextFiles), subAgents: agent.subAgents ?? [] };
+    return { ...agent, ...participation, model: normalizedModel, additionalContextFiles: normalizeContextFileOrder(agent.additionalContextFiles), subAgents: agent.subAgents ?? [] };
   }
 
   if (!agent.importedSystemInstruction) {
-    return { ...agent, model: normalizedModel, additionalContextFiles: [], subAgents: agent.subAgents ?? [] };
+    return { ...agent, ...participation, model: normalizedModel, additionalContextFiles: [], subAgents: agent.subAgents ?? [] };
   }
 
   const content = agent.importedSystemInstruction;
   return {
     ...agent,
+    ...participation,
     model: normalizedModel,
     subAgents: agent.subAgents ?? [],
     additionalContextFiles: [{

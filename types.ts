@@ -50,8 +50,9 @@ export interface SubAgentDefinition {
 export type SubAgentExecutionMode = 'off' | 'fixed_serial';
 export interface SubAgentExecutionPolicy { mode: SubAgentExecutionMode }
 
-export type DecisionOutcome = 'RESPOND' | 'IGNORE' | 'ERROR';
-export type DecisionSource = 'mentioned' | 'llm_decision' | 'turn_limit' | 'broadcast' | 'fallback' | 'api_error' | 'invalid_decision' | 'timeout' | 'empty_response';
+export type DecisionOutcome = 'RESPOND' | 'STAMP' | 'IGNORE' | 'ERROR';
+export type DecisionSource = 'recipient_target' | 'mentioned' | 'llm_decision' | 'turn_limit' | 'broadcast' | 'fallback' | 'api_error' | 'invalid_decision' | 'timeout' | 'empty_response';
+export type ReactionSemantic = 'ACK' | 'AGREE' | 'THINK' | 'AMUSED' | 'CARE' | 'DISAGREE';
 
 export interface ResponseDecision {
   outcome: DecisionOutcome;
@@ -61,6 +62,7 @@ export interface ResponseDecision {
   rawDecision?: string;
   errorCode?: string;
   errorDetail?: string;
+  reaction?: ReactionSemantic;
 }
 
 export interface AgentDecisionEvent extends ResponseDecision {
@@ -90,6 +92,8 @@ export interface Agent {
   pinFirstMessage?: boolean; // Keep the first user message even when the window cuts it off
   subAgents?: SubAgentDefinition[]; // Private workers; not members of Room.agents
   subAgentPolicy?: SubAgentExecutionPolicy; // undefined is backward-compatible "off"
+  groups?: string[];
+  participationProfile?: string;
 }
 
 export interface Attachment {
@@ -139,6 +143,22 @@ export interface Message {
   generationContext?: GenerationContext;
   segments?: MessageSegment[];
   separationVersion?: 1;
+  recipientTarget?: MessageRecipientTarget;
+}
+
+export type MessageRecipientTarget =
+  | { type: 'auto' }
+  | { type: 'agent'; agentIds: string[] }
+  | { type: 'group'; groupId: string; agentIds: string[] }
+  | { type: 'all'; agentIds: string[] };
+
+export interface MessageReaction {
+  id: string;
+  messageId: string;
+  agentId: string;
+  semantic: ReactionSemantic;
+  timestamp: number;
+  turnId: string;
 }
 
 export type RoomTag = 'Sandbox' | 'Recreation' | 'Hard';
@@ -152,6 +172,7 @@ export interface Room {
   agents: Agent[];
   messages: Message[];
   decisionEvents?: AgentDecisionEvent[];
+  reactions?: MessageReaction[];
   internalStateSettings?: InternalStateSettings;
   updatedAt: number;
 }

@@ -8,6 +8,7 @@ export const normalizeRoom = (room: Room): Room => ({
   agents: (room.agents || []).map(agent => normalizeAgent(agent)),
   messages: (room.messages || []).map(m => m.isStreaming ? { ...m, isStreaming: false } : m),
   decisionEvents: (room.decisionEvents || []).slice(-MAX_DECISION_EVENTS),
+  reactions: room.reactions ?? [],
   internalStateSettings: { ...DEFAULT_INTERNAL_STATE_SETTINGS, ...(room.internalStateSettings || {}) },
 });
 

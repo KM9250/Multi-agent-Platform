@@ -17,10 +17,12 @@ import { GenerationMode, GenerationSession, isSameGenerationSession, shouldAccep
 import { canRegenerateGeneration, canRetryGeneration } from './utils/retryPolicy';
 import { DEFAULT_INTERNAL_STATE_SETTINGS, isMemoryExportRequest } from './utils/messageVisibility';
 import { finalizeLegacyGeneration, finalizeSeparatedFailure, finalizeSeparatedSuccess, prepareMessageForRegeneration, restoreMessageAfterAbort } from './utils/generationFinalization';
-import { resolveTurnDecisions } from './utils/turnDecisions';
+import { partitionTurnDecisions, resolveTurnDecisions } from './utils/turnDecisions';
 import { Agent, Message, Room, Attachment, RoomTag, AgentDecisionEvent, GenerationContext, InternalStateSettings } from './types';
 import { GenerationSubAgentCache, extractPublicTaskInputs, formatPrivateSubAgentContext, createRuntimeSubAgentProviderRegistry, type SubAgentRunDiagnostic } from './services/subagents';
 import { RequestScheduler } from './services/scheduler';
+import { createRecipientSnapshot, type RecipientSelection } from './utils/recipientTargets';
+import { clearMessageReactions, upsertMessageReaction } from './utils/messageReactions';
 
 export default function App() {
   // --- State ---
@@ -48,6 +50,7 @@ export default function App() {
 
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [recipientSelection, setRecipientSelection] = useState<RecipientSelection>('auto');
   
   // UI Toggles
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
@@ -79,6 +82,7 @@ export default function App() {
   const activeRoom = rooms.find(r => r.id === activeRoomId) || rooms[0];
   const messages = activeRoom?.messages || [];
   const agents = activeRoom?.agents || [];
+  const recipientGroups = [...new Set(agents.flatMap(agent => agent.groups ?? []))].sort();
 
   const generatingAgentIds = messages
     .filter(m => m.isStreaming && m.role === 'model' && m.agentId)
@@ -98,6 +102,12 @@ export default function App() {
       setStorageWarning('Some data could not be saved locally. The current session will continue, but recent changes may be lost after reload.');
     }
   }, [rooms]);
+
+  useEffect(() => { setRecipientSelection('auto'); }, [activeRoomId]);
+  useEffect(() => {
+    if (recipientSelection.startsWith('agent:') && !agents.some(agent => agent.isEnabled && agent.id === recipientSelection.slice(6))) setRecipientSelection('auto');
+    if (recipientSelection.startsWith('group:') && !recipientGroups.includes(recipientSelection.slice(6))) setRecipientSelection('auto');
+  }, [agents, recipientGroups.join('|'), recipientSelection]);
 
   useEffect(() => {
     localStorage.setItem('activeRoomId', activeRoomId);
@@ -274,20 +284,30 @@ export default function App() {
       history: currentHistory,
       turnDepth,
       memoryRequest,
-      evaluateDecision: agent => evaluateShouldRespond(agent, currentHistory, roomSystemInstruction, {
+      evaluateDecision: (agent, participationContext) => evaluateShouldRespond(agent, currentHistory, roomSystemInstruction, {
           agents: roomAgents,
           signal: requestSignal,
           internalStateSettings,
           scheduler: schedulerRef.current!
-      })
+      }, participationContext)
     });
     const decisionEvents = finalDecisions.map(d => createDecisionEvent(turnId, d.agent, d.decision));
     addDecisionEvents(roomId, decisionEvents);
+    const reactionTarget = currentHistory.at(-1);
+    if (reactionTarget) {
+      setRooms(prev => prev.map(room => {
+        if (room.id !== roomId) return room;
+        const reactions = finalDecisions.reduce((all, result) => result.decision.outcome === 'STAMP' && result.decision.reaction
+          ? upsertMessageReaction(all, { messageId: reactionTarget.id, agentId: result.agent.id, semantic: result.decision.reaction, turnId })
+          : all, room.reactions ?? []);
+        return { ...room, reactions };
+      }));
+    }
 
     if (!isCurrentGenerationSession(sessionId, turnId, roomId)) return;
     setPlanningAgents([]);
 
-    const respondingAgents = finalDecisions.filter(d => d.decision.outcome === 'RESPOND').map(d => d.agent);
+    const respondingAgents = partitionTurnDecisions(finalDecisions).responding.map(d => d.agent);
     if (respondingAgents.length === 0) {
         finishGenerationSession(sessionId, turnId, roomId);
         return; 
@@ -482,12 +502,14 @@ export default function App() {
       content: input,
       attachments: [...attachments],
       timestamp: Date.now(),
-      turnId
+      turnId,
+      recipientTarget: createRecipientSnapshot(recipientSelection, agents)
     };
     const updatedMessages = [...messages, newUserMessage];
     updateActiveRoom({ messages: updatedMessages });
     setInput('');
     setAttachments([]);
+    setRecipientSelection('auto');
     await processConversationTurn(updatedMessages, 0, turnId, roomId, sessionId);
   };
 
@@ -497,6 +519,7 @@ export default function App() {
     if (!room) return;
     const targetMessage = room.messages.find(m => m.id === messageId);
     if (!targetMessage?.agentId || !targetMessage.generationContext) return;
+    setRooms(prev => prev.map(candidate => candidate.id === room.id ? { ...candidate, reactions: clearMessageReactions(candidate.reactions ?? [], messageId) } : candidate));
     const agent = room.agents.find(a => a.id === targetMessage.agentId);
     if (!agent) return;
     const history = targetMessage.generationContext.historyMessageIds
@@ -602,7 +625,7 @@ export default function App() {
 
   const handleClearChat = () => {
     if (confirm("Are you sure you want to clear the conversation for this room?")) {
-        updateActiveRoom({ messages: [], decisionEvents: [] });
+        updateActiveRoom({ messages: [], decisionEvents: [], reactions: [] });
     }
   };
 
@@ -707,6 +730,8 @@ export default function App() {
                       onRetry={msg.error && canRetryGeneration(msg.errorCode) ? handleRetryMessage : undefined}
                       onRegenerate={msg.role === 'model' && !msg.isStreaming && canRegenerateGeneration(msg.errorCode) ? handleRegenerateMessage : undefined}
                       internalStateSettings={{ ...DEFAULT_INTERNAL_STATE_SETTINGS, ...activeRoom.internalStateSettings }}
+                      reactions={(activeRoom.reactions ?? []).filter(reaction => reaction.messageId === msg.id)}
+                      agents={agents}
                     />
                   ))
                 )}
@@ -721,6 +746,15 @@ export default function App() {
               </div>
             </div>
             <div className="p-4 border-t border-zinc-800 bg-zinc-950 shrink-0">
+              <div className="max-w-4xl mx-auto mb-2 flex items-center gap-2 text-xs text-zinc-400">
+                <label htmlFor="recipient">To:</label>
+                <select id="recipient" value={recipientSelection} onChange={event => setRecipientSelection(event.target.value as RecipientSelection)} disabled={isGenerating} className="bg-zinc-900 border border-zinc-800 rounded-md px-2 py-1 text-zinc-200">
+                  <option value="auto">Auto</option>
+                  <option value="all">All</option>
+                  {agents.filter(agent => agent.isEnabled).map(agent => <option key={agent.id} value={`agent:${agent.id}`}>{agent.name}</option>)}
+                  {recipientGroups.map(group => <option key={group} value={`group:${group}`}>{group}</option>)}
+                </select>
+              </div>
               <div className={`max-w-4xl mx-auto relative bg-zinc-900 border rounded-xl transition-all duration-200 ${isDragging ? 'border-blue-500 bg-zinc-800' : 'border-zinc-800'}`} onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}>
                 {attachments.length > 0 && (
                   <div className="flex gap-2 p-3 pb-0 overflow-x-auto">
