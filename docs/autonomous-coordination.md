@@ -11,25 +11,28 @@ The initial kernel is **MACP-Coord Level 1 adapter-ready**, not wire-compatible.
 
 ## Invariants implemented by the domain kernel
 
-- Every workflow binds one policy ID and version; a session must bind the same pair.
+- Every Workflow owns an immutable policy snapshot captured at creation time. Its policy ID and version remain an identity projection, while decisions use the captured content; every Session must bind the same identity.
 - Autonomous budgets contain only finite, positive limits. Zero never means unlimited.
 - Unknown action classes evaluate to `NEEDS_USER`.
-- Only Persona IDs listed on the workflow may participate in a coordination session. Private SubAgents remain invisible to this layer.
-- The journal is append-only, ordered, and idempotent for repeated external actions.
-- `TaskCompleted` is evidence, not terminal state. Only an accepted `Commitment` resolves a workflow/session.
+- Only Persona IDs listed on the Workflow may participate in a coordination Session or receive a Coordination Task. Private SubAgent execution remains private to its owning Persona. SubAgent output may become Task evidence, but a SubAgent never becomes a Coordination participant.
+- The journal is append-only, ordered, idempotent for repeated external actions, and insulated from mutation of caller-owned event payloads.
+- A Workflow may own multiple active Sessions. Each Session is suspended, resumed, cancelled, expired, or resolved independently.
+- Tasks are first-class Session state and move from `ASSIGNED` to `COMPLETED`, `FAILED`, or `CANCELLED`. `TaskCompleted` supplies evidence but never resolves its Session or Workflow.
+- `Session.state = RESOLVED` means that the Session lifecycle is complete. `Session.resolution.outcome` describes whether its result `SUCCEEDED` or `FAILED`; a failed outcome does not automatically fail the Workflow, so a later Session may retry the work.
+- Task-mode Session resolution requires at least one Task and requires every Task to be terminal. A successful result additionally requires at least one completed Task. Decision and quorum resolution remain deferred to COORD-2B.
 - Only the configured Supervisor can accept a commitment, and only against an existing, open Session belonging to that Workflow. Full commitment-policy evaluation and acceptance-criteria enforcement are deferred to COORD-2.
 - New Sessions must be open, policy-bound, owned and initiated by Workflow participants, and include the configured Supervisor; duplicate Session IDs are rejected.
-- Before COORD-2 introduces intermediate Session resolution, a Workflow may have at most one open or suspended Session. This prevents multiple unresolved Sessions from blocking the final Workflow-level commitment.
-- Terminal Workflows (`RESOLVED`, `CANCELLED`, and `FAILED`) reject all later events except an exact idempotent retry. `BLOCKED` remains non-terminal, but it is a stopped state: no coordination work proceeds until a future explicit resume transition is introduced.
-- A `SUSPENDED` Workflow performs no further coordination work. Only cancellation and error/audit recording are accepted until a future explicit resume event is introduced; suspension never implicitly returns to `RUNNING`.
+- Terminal Workflows (`RESOLVED`, `CANCELLED`, and `FAILED`) reject all later events except an exact idempotent retry. `BLOCKED` and `SUSPENDED` are non-terminal stopped states in which no coordination work proceeds.
+- A `SUSPENDED` or `BLOCKED` Workflow never resumes implicitly. `WorkflowResumed` requires an explicit user authorization carried by a Supervisor event. Stopping suspends every open Session, and resuming reopens suspended Sessions without changing terminal Sessions.
 - In this foundation kernel, `CommitmentAccepted` is the final Workflow-level commitment and is rejected while any other Session remains open or suspended. Intermediate Session commitment and resolution semantics are deferred to COORD-2.
-- Suspension and cancellation are explicit durable events. Cancellation closes all open or suspended sessions.
+- Suspension, blocking, resumption, and cancellation are explicit durable events. Cancellation closes all active Sessions and assigned Tasks while preserving already-terminal Tasks.
 
 ## Delivery roadmap
 
 - **COORD-0:** typed conversation recipients, participation profiles, and non-triggering STAMP outcomes.
 - **COORD-1:** provider/model scheduler, backpressure, bounded retry with jitter, and queue cancellation.
-- **COORD-2:** extend this kernel with Task, Decision, Quorum, commitment-policy evaluation, snapshots, and audit views.
+- **COORD-2A:** multiple Session and Task lifecycles, immutable policy snapshots, explicit stop/resume, snapshot validation, and journal mutation protection.
+- **COORD-2B+:** Decision, Quorum, acceptance-criterion evaluation, and the Workflow-level commitment gate.
 - **COORD-3:** browser PoC for the bounded PLAN/ASSIGN/EXECUTE/COLLECT/VERIFY/DECIDE recipe.
 - **COORD-4:** terminal and `NEEDS_USER` notifications through MACP-Command.
 - **COORD-5:** UI-independent durable runtime, checkpoint recovery, and idempotent restart.
@@ -37,6 +40,4 @@ The initial kernel is **MACP-Coord Level 1 adapter-ready**, not wire-compatible.
 
 Browser hosting is only a PoC. Formal unattended operation requires the durable runtime because reloads, OS sleep, browser crashes, and background throttling cannot be controlled by React state or `localStorage`.
 
-Before COORD-5 durable restart support, persist either the immutable policy snapshot or a canonical policy hash with each Workflow. A policy ID and version alone cannot prove which policy content was used after recovery.
-
-Before durable persistence, also establish an immutable journal serialization boundary so later caller mutation cannot alter an already-recorded event or payload.
+Full replay, persistent stores, checkpoint restore, autonomous runners, browser execution, MACP bridges, and durable runtime remain future responsibilities.

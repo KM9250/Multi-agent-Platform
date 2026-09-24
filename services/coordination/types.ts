@@ -4,6 +4,14 @@ export type WorkflowStatus = 'RUNNING' | 'SUSPENDED' | 'RESOLVED' | 'CANCELLED' 
 export type SessionState = 'OPEN' | 'SUSPENDED' | 'RESOLVED' | 'CANCELLED' | 'EXPIRED';
 export type CoordinationMode = 'map.coord.task.v1' | 'map.coord.decision.v1' | 'map.coord.quorum.v1';
 export type RiskDecision = 'ALLOW' | 'NEEDS_USER' | 'DENY';
+export type SessionOutcome = 'SUCCEEDED' | 'FAILED';
+export type CoordinationTaskStatus = 'ASSIGNED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+
+export interface SessionResolution {
+  outcome: SessionOutcome;
+  summary?: string;
+  evidenceRefs?: string[];
+}
 
 export interface WorkflowBudget {
   maxWallTimeMs: number;
@@ -57,6 +65,31 @@ export interface WorkflowRun {
   updatedAt: number;
 }
 
+export interface CoordinationTask {
+  taskId: string;
+  workflowRunId: string;
+  sessionId: string;
+  title: string;
+  goal: string;
+  assigneeAgentId: string;
+  assignedByAgentId: string;
+  inputRefs?: string[];
+  status: CoordinationTaskStatus;
+  resultRef?: string;
+  evidenceRefs?: string[];
+  failureReason?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface TaskCompletedPayload { resultRef?: string; evidenceRefs?: string[] }
+export interface TaskFailedPayload { failureReason: string; evidenceRefs?: string[] }
+export interface WorkflowBlockedPayload { reason: string }
+export interface WorkflowResumePayload {
+  authorization: { type: 'user'; reference?: string };
+  reason?: string;
+}
+
 export interface CoordinationSession {
   sessionId: string;
   workflowRunId: string;
@@ -71,11 +104,14 @@ export interface CoordinationSession {
   contextRef?: string;
   createdAt: number;
   updatedAt: number;
+  resolution?: SessionResolution;
 }
 
 export type CoordinationEventType =
-  | 'WorkflowRunCreated' | 'SessionStarted' | 'TaskAssigned' | 'TaskCompleted'
-  | 'EvaluationAdded' | 'PolicyEvaluated' | 'WorkflowSuspended'
+  | 'WorkflowRunCreated' | 'SessionStarted' | 'SessionSuspended' | 'SessionResumed'
+  | 'SessionResolved' | 'SessionCancelled' | 'SessionExpired'
+  | 'TaskAssigned' | 'TaskCompleted' | 'TaskFailed' | 'TaskCancelled'
+  | 'EvaluationAdded' | 'PolicyEvaluated' | 'WorkflowSuspended' | 'WorkflowBlocked' | 'WorkflowResumed'
   | 'CommitmentRequested' | 'CommitmentAccepted' | 'WorkflowCancelled' | 'ErrorRecorded';
 
 export interface CoordinationEvent<T = unknown> {
@@ -92,6 +128,8 @@ export interface CoordinationEvent<T = unknown> {
 
 export interface CoordinationSnapshot {
   run: WorkflowRun;
+  policy: CoordinationPolicy;
   sessions: Record<string, CoordinationSession>;
+  tasks: Record<string, CoordinationTask>;
   events: CoordinationEvent[];
 }

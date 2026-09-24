@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { appendEvent, createWorkflow, evaluateRisk, findExhaustedBudget } from '../services/coordination/index.ts';
-import type { CoordinationPolicy, CoordinationSession } from '../services/coordination/index.ts';
+import { appendEvent, createWorkflow, evaluateRisk, findExhaustedBudget, validateCoordinationSnapshot } from '../services/coordination/index.ts';
+import type { CoordinationPolicy, CoordinationSession, CoordinationTask } from '../services/coordination/index.ts';
 
 const policy = (): CoordinationPolicy => ({
   policyId: 'safe', version: '1', schemaVersion: 1,
@@ -10,160 +10,144 @@ const policy = (): CoordinationPolicy => ({
   completionRules: { commitAuthority: 'supervisor', requireAllAcceptanceCriteria: true },
   schedulerRules: { sameModelConcurrency: 2 }, retryRules: { maxAttempts: 3, baseDelayMs: 100, maxDelayMs: 1000 },
 });
-
-const workflow = () => createWorkflow({ runId: 'run', roomId: 'room', goal: 'produce a reviewed answer', acceptanceCriteria: ['reviewed'], supervisorAgentId: 'supervisor', participantAgentIds: ['supervisor', 'worker'], executionMode: 'supervised_autonomous', policy: policy(), now: 1 });
+const workflow = (p = policy()) => createWorkflow({ runId: 'run', roomId: 'room', goal: 'produce a reviewed answer', acceptanceCriteria: [' reviewed '], supervisorAgentId: 'supervisor', participantAgentIds: ['supervisor', 'worker', 'reviewer'], executionMode: 'supervised_autonomous', policy: p, now: 1 });
 const event = (sequence: number, type: Parameters<typeof appendEvent>[1]['type'], payload: unknown = {}, extra = {}) => ({ eventId: `e${sequence}`, sequence, type, workflowRunId: 'run', timestamp: sequence, payload, ...extra });
-const session = (overrides: Partial<CoordinationSession> = {}): CoordinationSession => ({
-  sessionId: 'task', workflowRunId: 'run', mode: 'map.coord.task.v1',
-  participants: ['supervisor', 'worker'], initiator: 'supervisor', supervisor: 'supervisor',
-  state: 'OPEN', policyId: 'safe', policyVersion: '1', goal: 'draft', createdAt: 2, updatedAt: 2,
-  ...overrides,
-});
-const withSession = () => appendEvent(workflow(), event(2, 'SessionStarted', session(), { sessionId: 'task', actorAgentId: 'supervisor' }));
+const session = (overrides: Partial<CoordinationSession> = {}): CoordinationSession => ({ sessionId: 'task', workflowRunId: 'run', mode: 'map.coord.task.v1', participants: ['supervisor', 'worker', 'reviewer'], initiator: 'supervisor', supervisor: 'supervisor', state: 'OPEN', policyId: 'safe', policyVersion: '1', goal: 'draft', createdAt: 2, updatedAt: 2, ...overrides });
+const task = (taskId = 't1', overrides: Partial<CoordinationTask> = {}): CoordinationTask => ({ taskId, workflowRunId: 'run', sessionId: 'task', title: 'Draft', goal: 'Draft answer', assigneeAgentId: 'worker', assignedByAgentId: 'supervisor', status: 'ASSIGNED', createdAt: 3, updatedAt: 3, ...overrides });
+const start = (state = workflow(), value = session()) => appendEvent(state, event(state.events.length + 1, 'SessionStarted', value, { sessionId: value.sessionId, actorAgentId: 'supervisor' }));
+const assign = (state = start(), value = task()) => appendEvent(state, event(state.events.length + 1, 'TaskAssigned', value, { sessionId: value.sessionId, actorAgentId: value.assignedByAgentId }));
+const taskEvent = (state: ReturnType<typeof workflow>, type: 'TaskCompleted' | 'TaskFailed' | 'TaskCancelled', taskId: string, payload: object, actorAgentId = 'worker', sessionId = 'task') => appendEvent(state, event(state.events.length + 1, type, { taskId, ...payload }, { sessionId, actorAgentId }));
 
-test('policies are bounded and unknown actions fail closed', () => {
-  assert.equal(evaluateRisk(policy(), 'read_local_data'), 'ALLOW');
-  assert.equal(evaluateRisk(policy(), 'not_registered'), 'NEEDS_USER');
-  const invalid = policy(); invalid.budgets.maxRounds = 0;
-  assert.throws(() => createWorkflow({ runId: 'x', roomId: 'r', goal: 'g', acceptanceCriteria: [], supervisorAgentId: 's', participantAgentIds: ['s'], executionMode: 'supervised_autonomous', policy: invalid }), /maxRounds/);
+test('policy is bounded, cloned deeply, and unknown risk fails closed', () => {
+  const source = policy(); const state = workflow(source); source.budgets.maxRounds = 999; (source.riskRules as Record<string, string>).read_local_data = 'DENY';
+  assert.equal(state.policy.budgets.maxRounds, 3); assert.equal(state.policy.riskRules.read_local_data, 'ALLOW');
+  assert.equal(state.run.acceptanceCriteria[0], 'reviewed'); assert.equal(evaluateRisk(policy(), 'unknown'), 'NEEDS_USER');
   assert.equal(findExhaustedBudget(policy().budgets, { rounds: 3, llmCalls: 0, inputTokens: 0, outputTokens: 0, estimatedCost: 0, consecutiveErrors: 0, noProgressCycles: 0 }, 0), 'maxRounds');
+  const invalid = policy(); invalid.budgets.maxRounds = 0;
+  assert.throws(() => workflow(invalid), /maxRounds/);
+  assert.throws(() => createWorkflow({ runId: 'x', roomId: 'r', goal: 'g', acceptanceCriteria: [' ', 'x'], supervisorAgentId: 's', participantAgentIds: ['s'], executionMode: 'interactive', policy: policy() }), /cannot be empty/);
+  assert.throws(() => createWorkflow({ runId: 'x', roomId: 'r', goal: 'g', acceptanceCriteria: ['x', ' x '], supervisorAgentId: 's', participantAgentIds: ['s'], executionMode: 'interactive', policy: policy() }), /duplicates/);
 });
 
-test('TaskCompleted is non-terminal; supervisor CommitmentAccepted resolves', () => {
-  let state = withSession();
-  state = appendEvent(state, event(3, 'TaskCompleted', { resultRef: 'artifact:1' }, { sessionId: 'task', actorAgentId: 'worker' }));
-  assert.equal(state.run.status, 'RUNNING'); assert.equal(state.sessions.task.state, 'OPEN');
-  assert.throws(() => appendEvent(state, event(4, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'worker' })), /supervisor/);
-  state = appendEvent(state, event(4, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' }));
-  assert.equal(state.run.status, 'RESOLVED'); assert.equal(state.sessions.task.state, 'RESOLVED');
+test('multiple active sessions are supported and resolved independently', () => {
+  let state = start(); state = start(state, session({ sessionId: 'second', goal: 'review' }));
+  assert.equal(state.sessions.task.state, 'OPEN'); assert.equal(state.sessions.second.state, 'OPEN');
+  state = assign(state); state = taskEvent(state, 'TaskCompleted', 't1', { resultRef: 'artifact:1' });
+  state = appendEvent(state, event(6, 'SessionResolved', { outcome: 'SUCCEEDED', evidenceRefs: ['artifact:1'] }, { sessionId: 'task', actorAgentId: 'supervisor' }));
+  assert.equal(state.sessions.task.state, 'RESOLVED'); assert.equal(state.sessions.second.state, 'OPEN'); assert.equal(state.run.status, 'RUNNING');
 });
 
-test('journal is ordered, idempotent, and excludes non-participant sessions', () => {
-  const state = withSession();
-  assert.throws(() => appendEvent(state, event(4, 'TaskAssigned', {}, { sessionId: 'task' })), /sequence 3/);
-  const repeated = appendEvent(state, { ...event(3, 'TaskAssigned', {}, { sessionId: 'task' }), idempotencyKey: 'assign:1' });
-  // An exact semantic retry may have transport-specific event metadata.
-  assert.equal(appendEvent(repeated, { ...event(4, 'TaskAssigned', {}, { sessionId: 'task' }), eventId: 'other', idempotencyKey: 'assign:1' }), repeated);
-  assert.throws(() => appendEvent(repeated, { ...event(4, 'TaskCompleted', {}, { sessionId: 'task' }), eventId: 'collision', idempotencyKey: 'assign:1' }), /collision/);
-  const badSession = session({ sessionId: 'bad', participants: ['private-subagent'] });
-  assert.throws(() => appendEvent(workflow(), event(2, 'SessionStarted', badSession)), /Persona participants/);
+test('failed session leaves workflow running and permits a retry session', () => {
+  let state = assign(); state = taskEvent(state, 'TaskFailed', 't1', { failureReason: 'unavailable' });
+  state = appendEvent(state, event(5, 'SessionResolved', { outcome: 'FAILED' }, { sessionId: 'task', actorAgentId: 'supervisor' }));
+  state = start(state, session({ sessionId: 'retry' }));
+  assert.equal(state.sessions.task.resolution?.outcome, 'FAILED'); assert.equal(state.sessions.retry.state, 'OPEN'); assert.equal(state.run.status, 'RUNNING');
 });
 
-test('terminal workflows reject new events but accept exact event retries', () => {
-  let cancelled = withSession();
-  const cancellation = event(3, 'WorkflowCancelled');
-  cancelled = appendEvent(cancelled, cancellation);
-  assert.equal(appendEvent(cancelled, cancellation), cancelled);
-  assert.throws(() => appendEvent(cancelled, event(4, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /already terminal: CANCELLED/);
-
-  let resolved = withSession();
-  resolved = appendEvent(resolved, event(3, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' }));
-  assert.throws(() => appendEvent(resolved, event(4, 'SessionStarted', session({ sessionId: 'next' }), { sessionId: 'next' })), /already terminal: RESOLVED/);
+test('task lifecycle enforces assignment and completion authority', () => {
+  let state = assign(); assert.equal(state.tasks.t1.status, 'ASSIGNED');
+  assert.throws(() => taskEvent(state, 'TaskCompleted', 't1', { resultRef: 'x' }, 'reviewer'), /assignee mismatch/);
+  assert.throws(() => taskEvent(state, 'TaskCompleted', 't1', {}, 'worker'), /result or evidence/);
+  state = taskEvent(state, 'TaskCompleted', 't1', { evidenceRefs: ['e:1'] });
+  assert.equal(state.tasks.t1.status, 'COMPLETED'); assert.equal(state.run.status, 'RUNNING'); assert.equal(state.sessions.task.state, 'OPEN');
+  assert.throws(() => taskEvent(state, 'TaskCancelled', 't1', {}, 'supervisor'), /not active/);
 });
 
-test('suspended workflows reject coordination work but permit cancellation', () => {
-  let state = withSession();
-  state = appendEvent(state, event(3, 'WorkflowSuspended', { reason: 'NEEDS_USER' }));
-  assert.throws(() => appendEvent(state, event(4, 'TaskAssigned', {}, { sessionId: 'task' })), /Workflow is stopped: SUSPENDED/);
-  state = appendEvent(state, event(4, 'WorkflowCancelled'));
-  assert.equal(state.run.status, 'CANCELLED');
-  assert.equal(state.sessions.task.state, 'CANCELLED');
-
-  let withoutSession = workflow();
-  withoutSession = appendEvent(withoutSession, event(2, 'WorkflowSuspended'));
-  assert.throws(() => appendEvent(withoutSession, event(3, 'SessionStarted', session())), /Workflow is stopped: SUSPENDED/);
+test('task failure supports assignee or supervisor and cancellation is supervisor-only', () => {
+  let state = assign(); state = taskEvent(state, 'TaskFailed', 't1', { failureReason: 'bad' }); assert.equal(state.tasks.t1.status, 'FAILED');
+  let bySupervisor = assign(undefined, task('t2')); bySupervisor = taskEvent(bySupervisor, 'TaskFailed', 't2', { failureReason: 'stopped' }, 'supervisor'); assert.equal(bySupervisor.tasks.t2.status, 'FAILED');
+  const unrelated = assign(undefined, task('t3')); assert.throws(() => taskEvent(unrelated, 'TaskFailed', 't3', { failureReason: 'no' }, 'reviewer'), /assignee or supervisor/);
+  assert.throws(() => taskEvent(unrelated, 'TaskCancelled', 't3', {}, 'worker'), /supervisor/);
+  const cancelled = taskEvent(unrelated, 'TaskCancelled', 't3', {}, 'supervisor'); assert.equal(cancelled.tasks.t3.status, 'CANCELLED');
 });
 
-test('blocked workflows reject coordination work but permit cancellation and error recording', () => {
-  const running = withSession();
-  const blocked = { ...running, run: { ...running.run, status: 'BLOCKED' as const } };
-  assert.throws(() => appendEvent(blocked, event(3, 'TaskAssigned', {}, { sessionId: 'task' })), /Workflow is stopped: BLOCKED/);
-  assert.throws(() => appendEvent(blocked, event(3, 'SessionStarted', session({ sessionId: 'next' }))), /Workflow is stopped: BLOCKED/);
-
-  const cancelled = appendEvent(blocked, event(3, 'WorkflowCancelled'));
-  assert.equal(cancelled.run.status, 'CANCELLED');
-
-  const recorded = appendEvent(blocked, event(3, 'ErrorRecorded', { message: 'waiting for input' }));
-  assert.equal(recorded.run.status, 'BLOCKED');
-  assert.equal(recorded.events.at(-1)?.type, 'ErrorRecorded');
+test('task events require task-mode open sessions and Persona participants', () => {
+  for (const mode of ['map.coord.decision.v1', 'map.coord.quorum.v1'] as const) {
+    const state = start(workflow(), session({ mode }));
+    assert.throws(() => assign(state), /mode does not accept tasks/);
+  }
+  assert.throws(() => assign(start(), task('x', { assigneeAgentId: 'private-subagent' })), /Persona participant/);
+  assert.throws(() => assign(start(), task('x', { assignedByAgentId: 'worker', inputRefs: ['', 'x'] })), /empty references/);
 });
 
-test('event IDs allow exact retries and reject semantic collisions', () => {
-  const state = withSession();
-  const assigned = { ...event(3, 'TaskAssigned', { task: 'draft' }, { sessionId: 'task' }), eventId: 'shared-id' };
-  const recorded = appendEvent(state, assigned);
-  assert.equal(appendEvent(recorded, { ...assigned, sequence: 4, timestamp: 99 }), recorded);
-  assert.equal(recorded.events.length, 3);
-  assert.throws(() => appendEvent(recorded, { ...event(4, 'TaskCompleted', { task: 'draft' }, { sessionId: 'task' }), eventId: 'shared-id' }), /Event ID collision/);
+test('task session resolution gates terminal tasks and successful evidence', () => {
+  let state = assign(); state = assign(state, task('t2'));
+  state = taskEvent(state, 'TaskCompleted', 't1', { resultRef: 'a' });
+  assert.throws(() => appendEvent(state, event(6, 'SessionResolved', { outcome: 'SUCCEEDED' }, { sessionId: 'task', actorAgentId: 'supervisor' })), /terminal/);
+  state = taskEvent(state, 'TaskCompleted', 't2', { resultRef: 'b' });
+  state = appendEvent(state, event(7, 'SessionResolved', { outcome: 'SUCCEEDED' }, { sessionId: 'task', actorAgentId: 'supervisor' }));
+  assert.equal(state.sessions.task.resolution?.outcome, 'SUCCEEDED');
+
+  let failed = assign(); failed = assign(failed, task('t2')); failed = taskEvent(failed, 'TaskFailed', 't1', { failureReason: 'x' }); failed = taskEvent(failed, 'TaskCancelled', 't2', {}, 'supervisor');
+  assert.throws(() => appendEvent(failed, event(7, 'SessionResolved', { outcome: 'SUCCEEDED' }, { sessionId: 'task', actorAgentId: 'supervisor' })), /completed task/);
+  failed = appendEvent(failed, event(7, 'SessionResolved', { outcome: 'FAILED' }, { sessionId: 'task', actorAgentId: 'supervisor' })); assert.equal(failed.sessions.task.state, 'RESOLVED');
 });
 
-test('final commitment rejects other unresolved sessions', () => {
-  const state = withSession();
-  const review = session({ sessionId: 'review', mode: 'map.coord.decision.v1', goal: 'review' });
-  state.sessions.review = review;
-  assert.throws(() => appendEvent(state, event(3, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /other sessions remain unresolved/);
-  assert.equal(state.run.status, 'RUNNING');
-  assert.equal(state.sessions.task.state, 'OPEN');
-  assert.equal(state.sessions.review.state, 'OPEN');
+test('session lifecycle is supervisor controlled', () => {
+  let state = start();
+  assert.throws(() => appendEvent(state, event(3, 'SessionSuspended', {}, { sessionId: 'task', actorAgentId: 'worker' })), /supervisor/);
+  state = appendEvent(state, event(3, 'SessionSuspended', {}, { sessionId: 'task', actorAgentId: 'supervisor' })); assert.equal(state.sessions.task.state, 'SUSPENDED');
+  assert.throws(() => assign(state), /not open/);
+  state = appendEvent(state, event(4, 'SessionResumed', {}, { sessionId: 'task', actorAgentId: 'supervisor' })); assert.equal(state.sessions.task.state, 'OPEN');
+  state = appendEvent(state, event(5, 'SessionExpired', {}, { sessionId: 'task', actorAgentId: 'supervisor' })); assert.equal(state.sessions.task.state, 'EXPIRED');
+  assert.throws(() => appendEvent(state, event(6, 'SessionCancelled', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /terminal/);
 });
 
-test('SessionStarted rejects a second open or suspended session', () => {
-  const open = withSession();
-  assert.throws(
-    () => appendEvent(open, event(3, 'SessionStarted', session({ sessionId: 'next' }))),
-    /Only one active session is supported/,
-  );
-
-  const suspended = { ...open, sessions: { task: { ...open.sessions.task, state: 'SUSPENDED' as const } } };
-  assert.throws(
-    () => appendEvent(suspended, event(3, 'SessionStarted', session({ sessionId: 'next' }))),
-    /Only one active session is supported/,
-  );
-});
-
-test('SessionStarted permits a new session after an inactive session', () => {
-  for (const inactiveState of ['RESOLVED', 'CANCELLED', 'EXPIRED'] as const) {
-    const existing = withSession();
-    const inactive = { ...existing, sessions: { task: { ...existing.sessions.task, state: inactiveState } } };
-    const started = appendEvent(inactive, event(3, 'SessionStarted', session({ sessionId: `next-${inactiveState}` })));
-    assert.equal(started.run.currentSessionId, `next-${inactiveState}`);
-    assert.equal(started.sessions[`next-${inactiveState}`].state, 'OPEN');
+test('workflow suspension and blocking propagate, and explicit user resume reopens sessions', () => {
+  for (const type of ['WorkflowSuspended', 'WorkflowBlocked'] as const) {
+    let state = start(); state = start(state, session({ sessionId: 'second' }));
+    state = appendEvent(state, event(4, type, { reason: 'wait' }, { actorAgentId: 'supervisor' }));
+    assert.equal(state.run.status, type === 'WorkflowBlocked' ? 'BLOCKED' : 'SUSPENDED'); assert.equal(state.sessions.task.state, 'SUSPENDED'); assert.equal(state.sessions.second.state, 'SUSPENDED');
+    assert.throws(() => assign(state), /Workflow is stopped/);
+    assert.throws(() => appendEvent(state, event(5, 'WorkflowResumed', {}, { actorAgentId: 'supervisor' })), /User authorization/);
+    state = appendEvent(state, event(5, 'WorkflowResumed', { authorization: { type: 'user', reference: 'approval:1' } }, { actorAgentId: 'supervisor' }));
+    assert.equal(state.run.status, 'RUNNING'); assert.equal(state.sessions.task.state, 'OPEN'); assert.equal(state.sessions.second.state, 'OPEN'); assert.equal(state.run.statusReason, undefined);
   }
 });
 
-test('CommitmentAccepted requires an existing open session', () => {
-  assert.throws(() => appendEvent(workflow(), event(2, 'CommitmentAccepted', {}, { sessionId: 'missing', actorAgentId: 'supervisor' })), /does not exist/);
-  let state = withSession();
-  state = { ...state, sessions: { task: { ...state.sessions.task, state: 'SUSPENDED' } } };
-  assert.throws(() => appendEvent(state, event(3, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /not commit-ready/);
+test('resume fails closed for running workflows, invalid authorization, and non-supervisors', () => {
+  assert.throws(() => appendEvent(workflow(), event(2, 'WorkflowResumed', { authorization: { type: 'user' } }, { actorAgentId: 'supervisor' })), /not stopped/);
+  let state = appendEvent(workflow(), event(2, 'WorkflowSuspended', {}, { actorAgentId: 'supervisor' }));
+  assert.throws(() => appendEvent(state, event(3, 'WorkflowResumed', { authorization: { type: 'system' } }, { actorAgentId: 'supervisor' })), /User authorization/);
+  assert.throws(() => appendEvent(state, event(3, 'WorkflowResumed', { authorization: { type: 'user' } }, { actorAgentId: 'worker' })), /supervisor/);
 });
 
-test('SessionStarted validates workflow and supervisor identity', () => {
-  assert.throws(() => appendEvent(workflow(), event(2, 'SessionStarted', session({ workflowRunId: 'other' }))), /another workflow/);
-  assert.throws(() => appendEvent(workflow(), event(2, 'SessionStarted', session({ supervisor: 'worker' }))), /workflow supervisor/);
+test('workflow cancellation closes active sessions and tasks but preserves terminal tasks', () => {
+  let state = assign(); state = assign(state, task('complete')); state = assign(state, task('failed')); state = assign(state, task('active'));
+  state = taskEvent(state, 'TaskCompleted', 'complete', { resultRef: 'x' }); state = taskEvent(state, 'TaskFailed', 'failed', { failureReason: 'x' });
+  state = appendEvent(state, event(9, 'WorkflowCancelled', {}, { actorAgentId: 'supervisor' }));
+  assert.equal(state.sessions.task.state, 'CANCELLED'); assert.equal(state.tasks.active.status, 'CANCELLED'); assert.equal(state.tasks.complete.status, 'COMPLETED'); assert.equal(state.tasks.failed.status, 'FAILED');
 });
 
-test('SessionStarted rejects duplicate IDs and non-open sessions', () => {
-  const state = withSession();
-  assert.throws(() => appendEvent(state, event(3, 'SessionStarted', session(), { eventId: 'duplicate' })), /Duplicate session ID/);
-  assert.throws(() => appendEvent(workflow(), event(2, 'SessionStarted', session({ state: 'RESOLVED' }))), /must be OPEN/);
+test('journal ordering, semantic retries, collisions, and payload isolation are preserved', () => {
+  const state = start(); const payload = task(); const assigned = event(3, 'TaskAssigned', payload, { sessionId: 'task', actorAgentId: 'supervisor', idempotencyKey: 'assign:1' });
+  const recorded = appendEvent(state, assigned);
+  assert.equal(appendEvent(recorded, { ...assigned, sequence: 4, timestamp: 99 }), recorded);
+  assert.equal(appendEvent(recorded, { ...assigned, eventId: 'alternate', sequence: 4, timestamp: 99 }), recorded);
+  payload.goal = 'MUTATED'; assert.equal((recorded.events.at(-1)?.payload as CoordinationTask).goal, 'Draft answer');
+  assert.throws(() => appendEvent(recorded, { ...assigned, payload: { ...payload, goal: 'different' } }), /Event ID collision/);
+  assert.throws(() => appendEvent(recorded, event(5, 'ErrorRecorded')), /sequence 4/);
 });
 
-test('SessionStarted requires valid participants, initiator, supervisor membership, and goal', () => {
-  const base = workflow();
-  assert.throws(() => appendEvent(base, event(2, 'SessionStarted', session({ participants: [] }))), /at least one participant/);
-  assert.throws(() => appendEvent(base, event(2, 'SessionStarted', session({ initiator: 'outsider' }))), /initiator/);
-  assert.throws(() => appendEvent(base, event(2, 'SessionStarted', session({ participants: ['worker'] }))), /include the supervisor/);
-  assert.throws(() => appendEvent(base, event(2, 'SessionStarted', session({ goal: '  ' }))), /goal/);
+test('legacy commitment authority and unresolved-session guard remain intact', () => {
+  let state = start(); state = start(state, session({ sessionId: 'second' }));
+  assert.throws(() => appendEvent(state, event(4, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'worker' })), /supervisor/);
+  assert.throws(() => appendEvent(state, event(4, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /other sessions/);
 });
 
-test('policy validation rejects fractional counts and invalid retry delays', () => {
-  const assertInvalid = (mutate: (candidate: CoordinationPolicy) => void, pattern: RegExp) => {
-    const candidate = policy(); mutate(candidate);
-    assert.throws(() => createWorkflow({ runId: 'x', roomId: 'r', goal: 'g', acceptanceCriteria: [], supervisorAgentId: 's', participantAgentIds: ['s'], executionMode: 'supervised_autonomous', policy: candidate }), pattern);
-  };
-  assertInvalid(candidate => { candidate.budgets.maxRounds = 1.5; }, /maxRounds/);
-  assertInvalid(candidate => { candidate.retryRules.maxAttempts = 0; }, /maxAttempts/);
-  assertInvalid(candidate => { candidate.retryRules.baseDelayMs = -1; }, /baseDelayMs/);
-  assertInvalid(candidate => { candidate.retryRules.maxDelayMs = 99; }, /greater than or equal/);
+test('terminal workflow and stopped workflow guards retain retry and audit behavior', () => {
+  let state = start(); const cancellation = event(3, 'WorkflowCancelled', {}, { actorAgentId: 'supervisor' }); state = appendEvent(state, cancellation);
+  assert.equal(appendEvent(state, cancellation), state); assert.throws(() => appendEvent(state, event(4, 'ErrorRecorded')), /already terminal/);
+  let stopped = appendEvent(workflow(), event(2, 'WorkflowSuspended', {}, { actorAgentId: 'supervisor' })); stopped = appendEvent(stopped, event(3, 'ErrorRecorded', { message: 'waiting' })); assert.equal(stopped.run.status, 'SUSPENDED');
+});
+
+test('snapshot validation rejects broken cross-object invariants', () => {
+  const base = assign(); validateCoordinationSnapshot(base);
+  assert.throws(() => validateCoordinationSnapshot({ ...base, policy: { ...base.policy, version: '2' } }), /policy identity/);
+  assert.throws(() => validateCoordinationSnapshot({ ...base, tasks: { t1: { ...base.tasks.t1, sessionId: 'missing' } } }), /missing session/);
+  assert.throws(() => validateCoordinationSnapshot({ ...base, sessions: { task: { ...base.sessions.task, mode: 'map.coord.decision.v1' } } }), /task mode/);
+  assert.throws(() => validateCoordinationSnapshot({ ...base, tasks: { t1: { ...base.tasks.t1, assigneeAgentId: 'outsider' } } }), /session participant/);
+  assert.throws(() => validateCoordinationSnapshot({ ...base, run: { ...base.run, status: 'CANCELLED' } }), /active session/);
+  const noActiveSession = { ...base, run: { ...base.run, status: 'CANCELLED' as const }, sessions: { task: { ...base.sessions.task, state: 'CANCELLED' as const } } };
+  assert.throws(() => validateCoordinationSnapshot(noActiveSession), /active task/);
 });
