@@ -36,6 +36,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
   const [pinFirstMessage, setPinFirstMessage] = useState<boolean>(true);
   const [subAgents, setSubAgents] = useState<SubAgentDefinition[]>([]);
   const [subAgentPolicy, setSubAgentPolicy] = useState<SubAgentExecutionPolicy>({ mode: 'off' });
+  const [groups, setGroups] = useState('');
+  const [participationProfile, setParticipationProfile] = useState('');
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mdInputRef = useRef<HTMLInputElement>(null);
@@ -55,6 +57,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       setPinFirstMessage(editingAgent.pinFirstMessage ?? true);
       setSubAgents(editingAgent.subAgents ?? []);
       setSubAgentPolicy(editingAgent.subAgentPolicy ?? { mode: 'off' });
+      setGroups((editingAgent.groups ?? []).join(', '));
+      setParticipationProfile(editingAgent.participationProfile ?? '');
       
       if (editingAgent.avatarType === 'image') {
         setAvatarType('image');
@@ -87,6 +91,8 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
     setPinFirstMessage(true);
     setSubAgents([]);
     setSubAgentPolicy({ mode: 'off' });
+    setGroups('');
+    setParticipationProfile('');
   };
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -111,7 +117,9 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       historyWindow,
       pinFirstMessage,
       subAgents,
-      subAgentPolicy
+      subAgentPolicy,
+      groups: [...new Set(groups.split(',').map(value => value.trim()).filter(Boolean))],
+      participationProfile: participationProfile.trim()
     });
     onClose();
   };
@@ -313,6 +321,18 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
           </div>
 
           <div className="border-t border-zinc-800 my-4" />
+
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-zinc-300 mb-1">Groups</label>
+              <input value={groups} onChange={event => setGroups(event.target.value)} className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-white" placeholder="umamusume, supervisor" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-zinc-300 mb-1">Participation Profile</label>
+              <textarea value={participationProfile} onChange={event => setParticipationProfile(event.target.value)} rows={3} className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-white resize-none" placeholder="When should this Persona join the conversation?" />
+              <p className="text-[10px] text-zinc-500 mt-1">Used only to decide whether this Persona should participate in a turn.</p>
+            </div>
+          </div>
 
           {/* Model Config */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

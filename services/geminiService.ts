@@ -9,6 +9,7 @@ import { normalizeDecisionHistory, normalizeGenerationHistory, createRegenerateP
 import { classifyGenerationResult, getFinishMetadata } from "../utils/generationResult";
 import type { GenerationResult } from "../utils/generationResult";
 import { parseDecisionText } from "../utils/decisionDiagnostics";
+import type { ParticipationDecisionContext } from '../utils/turnDecisions';
 import { buildVisibleHistoryForAgent } from "../utils/messageVisibility";
 import { structuredOutputInstruction } from "../utils/structuredAgentOutput";
 import { injectPrivateContextIntoContents } from './subagents/privateContext';
@@ -278,11 +279,27 @@ export interface AgentCallOptions {
   scheduler?: RequestScheduler;
 }
 
+export const buildParticipationDecisionPrompt = (agent: Agent, context: ParticipationDecisionContext): string => {
+  const lastSpoke = context.lastSpokenDistance === undefined ? 'never' : `${context.lastSpokenDistance} messages ago`;
+  const recipientContext = [
+    'Latest recipient context:',
+    `- explicit recipient: ${context.recipient.isExplicitRecipient ? 'yes' : 'no'}`,
+    `- you are explicitly targeted: ${context.recipient.isExplicitlyTargeted ? 'yes' : 'no'}`,
+    `- recipient type: ${context.recipient.type}`,
+    ...(context.recipient.groupId ? [`- recipient group: ${context.recipient.groupId}`] : []),
+  ].join('\n');
+  return `あなたは「${agent.name}」という名前のエージェントです。\n役割: ${agent.description}\nParticipation Profile: ${agent.participationProfile || '(not specified)'}\nRecent activity:\n- messages in last 8: ${context.recentMessageCount}\n- last spoke: ${lastSpoke}\n${recipientContext}\n\n${DECISION_SYSTEM_INSTRUCTION}`;
+};
+
 export const evaluateShouldRespond = async (
   agent: Agent,
   allMessages: Message[],
   roomSystemInstruction?: string,
-  options?: AgentCallOptions
+  options?: AgentCallOptions,
+  participationContext: ParticipationDecisionContext = {
+    recentMessageCount: 0,
+    recipient: { type: 'auto', isExplicitRecipient: false, isExplicitlyTargeted: false },
+  }
 ): Promise<ResponseDecision> => {
     const decisionModel = ModelType.GEMINI_2_5_FLASH;
     const startedAt = performance.now();
@@ -294,7 +311,7 @@ export const evaluateShouldRespond = async (
 
     try {
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        let systemPrompt = `あなたは「${agent.name}」という名前のエージェントです。\n役割: ${agent.description}\n\n${DECISION_SYSTEM_INSTRUCTION}`;
+        let systemPrompt = buildParticipationDecisionPrompt(agent, participationContext);
         if (roomSystemInstruction) {
              systemPrompt = `=== ROOM CONTEXT ===\n${roomSystemInstruction}\n=== END ROOM CONTEXT ===\n\n` + systemPrompt;
         }
@@ -305,12 +322,12 @@ export const evaluateShouldRespond = async (
             model: decisionModel,
             contents: [
                 ...history,
-                { role: 'user', parts: [{ text: "このメッセージに対して返信すべきですか？ 'RESPOND' または 'IGNORE' で答えてください。" }] }
+                { role: 'user', parts: [{ text: 'このメッセージへの参加方法を、許可された出力のいずれか1つで答えてください。' }] }
             ],
             config: {
                 systemInstruction: systemPrompt,
                 temperature: 0.1,
-                maxOutputTokens: 10,
+                maxOutputTokens: 16,
                 thinkingConfig: { thinkingBudget: 0 },
                 abortSignal: options?.signal
             }

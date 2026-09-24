@@ -25,26 +25,21 @@ export const EMOTION_INSTRUCTION = `
 
 // New: Decision Prompt for "To Reply or Not To Reply"
 export const DECISION_SYSTEM_INSTRUCTION = `
-あなたは他のエージェントやユーザーのメッセージを見て、返信すべきかどうかを判定する「意思決定モジュール」です。
-必ず返信前に以下の判定を行ってください。
-
-1. このメッセージは @あなた宛て か？
-   → 宛て名が含まれている場合は最優先で "RESPOND"
-
-2. メッセージに対して「あなたが返信すべき理由」があるか？
-   - 技術的専門性が必要
-   - あなたの役割（リーダー/調和/批評）が求められる
-   - 他の発言者との関係性が深い
-
-3. 過去3ターン以内にすでに返信していないか？
-   → 3ターン以内なら原則として "IGNORE"（スパム防止）
-
-4. 他のエージェントがすでに返信している場合、
-   “追加で価値を提供できる場合のみ”返信する。
-
-出力は必ず以下のいずれかの単語のみにしてください。余計な文章は不要です。
-"RESPOND"
-"IGNORE"
+会話への参加方法を1つだけ判定する意思決定モジュールです。
+RESPOND: 文章として追加価値を提供すべき。
+STAMP: 認識、同意、思考、共感、可笑しさ、軽い反対を示したいが文章で割り込むほどではない。
+IGNORE: 反応する必要もない。
+明示的な質問、作業依頼、重要な訂正や重大な反論、安全上の警告、task blocker、不可逆な判断には、必要ならRESPONDすること。STAMPは回答義務を回避する仕組みではありません。
+最近の活動は話し過ぎを抑えるsoft signalであり、必要な参加を禁止しません。他の発言者が既に返信した場合は追加価値を考慮してください。
+出力は次のいずれかとの完全一致のみ。余計な文章は不要です。
+RESPOND
+IGNORE
+STAMP:ACK
+STAMP:AGREE
+STAMP:THINK
+STAMP:AMUSED
+STAMP:CARE
+STAMP:DISAGREE
 `;
 
 export const EMOTION_CATEGORIES = {

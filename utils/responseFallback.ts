@@ -18,21 +18,25 @@ const lastSpokenDistance = (history: Message[], agentId: string): number => {
   return idx === -1 ? Number.POSITIVE_INFINITY : history.length - idx;
 };
 
-const sourcePriority = (source: string): number => {
-  if (source === 'llm_decision') return 0;
-  if (source === 'turn_limit') return 2;
-  return 1;
+export const allowsStampOnly = (message: Message): boolean => {
+  if (message.role !== 'user' || (message.attachments?.length ?? 0) > 0) return false;
+  const content = message.content.trim().replace(/[。.!！]+$/u, '').trim();
+  return /^(?:了解(?:です)?|ありがとう(?:ございます)?|承知しました|okです|では.+で進めます)$/iu.test(content);
+};
+
+export const requiresTextFallback = (message: Message): boolean => {
+  if (message.role !== 'user') return false;
+  if (allowsStampOnly(message)) return false;
+  // Fail safe: only known acknowledgements and confirmations may end with a
+  // STAMP. Questions, requests, attachments, and ambiguous text require prose.
+  return true;
 };
 
 export const selectFallbackAgent = (candidates: Agent[], history: Message[], decisions: AgentDecisionResult[] = []): Agent | null => {
   if (candidates.length === 0) return null;
   const lastSpeaker = lastSpeakerId(history);
   const order = new Map(candidates.map((agent, index) => [agent.id, index]));
-  const decisionByAgent = new Map(decisions.map(result => [result.agent.id, result.decision]));
-
   return candidates.slice().sort((a, b) => {
-    const sourceDelta = sourcePriority(decisionByAgent.get(a.id)?.source || '') - sourcePriority(decisionByAgent.get(b.id)?.source || '');
-    if (sourceDelta !== 0) return sourceDelta;
     const lastSpeakerDelta = (a.id === lastSpeaker ? 1 : 0) - (b.id === lastSpeaker ? 1 : 0);
     if (lastSpeakerDelta !== 0) return lastSpeakerDelta;
     const countDelta = countAgentMessages(history, a.id) - countAgentMessages(history, b.id);
@@ -51,8 +55,10 @@ export const applyInitialUserTurnFallback = (
   const lastMessage = history[history.length - 1];
   if (turnDepth !== 0 || lastMessage?.role !== 'user') return decisions;
   if (decisions.some(result => result.decision.outcome === 'RESPOND')) return decisions;
-  const ignoreCandidates = decisions.filter(result => result.decision.outcome === 'IGNORE');
-  const fallbackAgent = selectFallbackAgent(ignoreCandidates.map(result => result.agent), history, ignoreCandidates);
+  const candidates = decisions.filter(result => result.decision.outcome === 'IGNORE' || result.decision.outcome === 'STAMP');
+  const hasStamp = candidates.some(result => result.decision.outcome === 'STAMP');
+  if (hasStamp && !requiresTextFallback(lastMessage)) return decisions;
+  const fallbackAgent = selectFallbackAgent(candidates.map(result => result.agent), history, candidates);
   if (!fallbackAgent) return decisions;
 
   return decisions.map(result => result.agent.id === fallbackAgent.id ? {
@@ -61,8 +67,8 @@ export const applyInitialUserTurnFallback = (
       outcome: 'RESPOND',
       source: 'fallback',
       latencyMs: 0,
-      rawDecision: `IGNORE:${result.decision.source}`,
-      errorDetail: 'All enabled agents returned IGNORE. This agent was selected to guarantee a response to the user.'
+      rawDecision: `${result.decision.outcome}:${result.decision.source}`,
+      errorDetail: 'This agent was selected to guarantee a textual response to the user.'
     }
   } : result);
 };

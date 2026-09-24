@@ -1,4 +1,4 @@
-import type { Agent, AgentDecisionEvent, DecisionSource, ResponseDecision, Room } from '../types';
+import type { Agent, AgentDecisionEvent, DecisionOutcome, DecisionSource, ReactionSemantic, ResponseDecision, Room } from '../types';
 
 export const MAX_DECISION_EVENTS = 50;
 
@@ -7,10 +7,12 @@ export const parseDecisionText = (text: string | undefined, latencyMs = 0, decis
   const normalized = text?.trim().toUpperCase();
   if (normalized === 'RESPOND') return { outcome: 'RESPOND', source: 'llm_decision', latencyMs, decisionModel, rawDecision };
   if (normalized === 'IGNORE') return { outcome: 'IGNORE', source: 'llm_decision', latencyMs, decisionModel, rawDecision };
+  const stamp = normalized?.match(/^STAMP:(ACK|AGREE|THINK|AMUSED|CARE|DISAGREE)$/);
+  if (stamp) return { outcome: 'STAMP', reaction: stamp[1] as ReactionSemantic, source: 'llm_decision', latencyMs, decisionModel, rawDecision };
   return { outcome: 'ERROR', source: 'invalid_decision', latencyMs, decisionModel, rawDecision, errorCode: 'INVALID_DECISION', errorDetail: normalized ? `Unexpected decision: ${normalized}` : 'Decision response was empty.' };
 };
 
-export const fixedDecision = (outcome: 'RESPOND' | 'IGNORE', source: DecisionSource): ResponseDecision => ({ outcome, source, latencyMs: 0 });
+export const fixedDecision = (outcome: DecisionOutcome, source: DecisionSource): ResponseDecision => ({ outcome, source, latencyMs: 0 });
 
 export const createDecisionEvent = (turnId: string, agent: Agent, decision: ResponseDecision, timestamp = Date.now()): AgentDecisionEvent => ({
   id: crypto.randomUUID(),

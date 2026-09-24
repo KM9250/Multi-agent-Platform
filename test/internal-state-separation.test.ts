@@ -170,7 +170,7 @@ test('/memory broadcasts without calling the decision evaluator', async () => {
   ]);
 });
 
-test('ordinary turns retain mention, turn-limit, and evaluator behavior', async () => {
+test('ordinary turns retain legacy mention and use recent activity as evaluator context', async () => {
   const mentioned = { id: 'a', name: 'Alpha', isEnabled: true } as Agent;
   const limited = { id: 'b', name: 'Beta', isEnabled: true } as Agent;
   const evaluated = { id: 'c', name: 'Gamma', isEnabled: true } as Agent;
@@ -178,14 +178,14 @@ test('ordinary turns retain mention, turn-limit, and evaluator behavior', async 
     ...Array.from({ length: 3 }, (_, index) => ({ id: `b${index}`, role: 'model' as const, agentId: 'b', content: 'old', timestamp: index })),
     { id: 'u', role: 'user', content: 'hello @Alpha', timestamp: 4 },
   ];
-  const calls: string[] = [];
+  const calls: Array<[string, number]> = [];
   const decisions = await resolveTurnDecisions({
     activeAgents: [mentioned, limited, evaluated], history, turnDepth: 1, memoryRequest: false,
-    evaluateDecision: async agent => {
-      calls.push(agent.id);
+    evaluateDecision: async (agent, context) => {
+      calls.push([agent.id, context.recentMessageCount]);
       return { outcome: 'IGNORE', source: 'llm_decision', latencyMs: 1 };
     },
   });
-  assert.deepEqual(calls, ['c']);
-  assert.deepEqual(decisions.map(result => result.decision.source), ['mentioned', 'turn_limit', 'llm_decision']);
+  assert.deepEqual(calls, [['b', 3], ['c', 0]]);
+  assert.deepEqual(decisions.map(result => result.decision.source), ['mentioned', 'llm_decision', 'llm_decision']);
 });

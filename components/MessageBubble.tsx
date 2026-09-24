@@ -1,9 +1,10 @@
 
 import React, { useMemo, useState } from 'react';
 import { User, Copy, AlertCircle, FileText, ChevronDown, ChevronRight, Brain, Info, AlertTriangle, Terminal, RotateCcw, RefreshCw } from 'lucide-react';
-import { Message, Agent, InternalStateSettings } from '../types';
+import { Message, Agent, InternalStateSettings, MessageReaction, ReactionSemantic } from '../types';
 import InternalStatePanel from './InternalStatePanel';
 import { getPublicMessageContent } from '../utils/messageVisibility';
+import { recipientLabel } from '../utils/recipientTargets';
 
 interface MessageBubbleProps {
   message: Message;
@@ -11,6 +12,8 @@ interface MessageBubbleProps {
   onRetry?: (messageId: string) => void;
   onRegenerate?: (messageId: string) => void;
   internalStateSettings?: InternalStateSettings;
+  reactions?: MessageReaction[];
+  agents?: Agent[];
 }
 
 interface Emotion {
@@ -31,7 +34,9 @@ const getEmotionColor = (name: string): string => {
   return colors[Math.abs(hash) % colors.length];
 };
 
-const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent, onRetry, onRegenerate, internalStateSettings }) => {
+const reactionEmoji: Record<ReactionSemantic, string> = { ACK: '👍', AGREE: '✅', THINK: '🤔', AMUSED: '😂', CARE: '❤️', DISAGREE: '👎' };
+
+const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent, onRetry, onRegenerate, internalStateSettings, reactions = [], agents = [] }) => {
   const [isThoughtOpen, setIsThoughtOpen] = useState(false);
   const [isErrorDetailOpen, setIsErrorDetailOpen] = useState(false);
   const isUser = message.role === 'user';
@@ -120,6 +125,7 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent, onRetry, 
 
         {/* Content Bubble Wrapper */}
         <div className="flex flex-col min-w-0 flex-1">
+          {isUser && recipientLabel(message.recipientTarget, agents) && <div className="text-[10px] text-zinc-500 mb-1 mr-1 text-right">To: {recipientLabel(message.recipientTarget, agents)}</div>}
           {!isUser && agent && (
             <div className="flex items-center gap-2 mb-1 ml-1">
                 <span className="text-xs text-zinc-400 font-medium">
@@ -290,6 +296,11 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, agent, onRetry, 
             </div>
           </div>
           {!isUser && internalStateSettings && <InternalStatePanel message={message} settings={internalStateSettings} />}
+          {reactions.length > 0 && <div className={`flex flex-wrap gap-1 mt-1 ${isUser ? 'justify-end' : 'justify-start'}`}>
+            {reactions.map(reaction => <span key={reaction.id} className="text-[10px] rounded-full border border-zinc-800 bg-zinc-900 px-2 py-0.5 text-zinc-400">
+              {reactionEmoji[reaction.semantic]} {agents.find(item => item.id === reaction.agentId)?.name ?? reaction.agentId}
+            </span>)}
+          </div>}
         </div>
       </div>
     </div>
