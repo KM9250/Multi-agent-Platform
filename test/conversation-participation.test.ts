@@ -33,15 +33,19 @@ test('structured snapshots force only enabled target members while non-targets d
   calls.length = 0;
   const all = await resolveTurnDecisions({ activeAgents: agents.filter(a => a.isEnabled), history: [user('hi', { recipientTarget: { type: 'all', agentIds: ['a', 'b', 'off'] } })], turnDepth: 1, memoryRequest: false, evaluateDecision });
   assert.deepEqual(all.map(item => item.decision.source), ['recipient_target', 'recipient_target']); assert.deepEqual(calls, []);
-  const group = await resolveTurnDecisions({ activeAgents: agents.filter(a => a.isEnabled), history: [user('hi', { recipientTarget: { type: 'group', groupId: 'g', agentIds: ['b'] } })], turnDepth: 1, memoryRequest: false, evaluateDecision });
+  const group = await resolveTurnDecisions({ activeAgents: agents.filter(a => a.isEnabled), history: [user('@A', { recipientTarget: { type: 'group', groupId: 'g', agentIds: ['b'] } })], turnDepth: 1, memoryRequest: false, evaluateDecision });
   assert.deepEqual(group.map(item => item.decision.source), ['llm_decision', 'recipient_target']);
+  assert.deepEqual(calls, ['a']);
   assert.deepEqual(contexts.get('a')?.recipient, { type: 'group', isExplicitRecipient: true, isExplicitlyTargeted: false, groupId: 'g' });
+  calls.length = 0;
   const legacy = await resolveTurnDecisions({ activeAgents: agents.filter(a => a.isEnabled), history: [user('@A')], turnDepth: 1, memoryRequest: false, evaluateDecision });
   assert.equal(legacy[0].decision.source, 'mentioned');
+  assert.deepEqual(calls, ['b']);
   calls.length = 0;
   const auto = await resolveTurnDecisions({ activeAgents: agents.filter(a => a.isEnabled), history: [user('@A', { recipientTarget: { type: 'auto' } })], turnDepth: 1, memoryRequest: false, evaluateDecision });
-  assert.deepEqual(auto.map(item => item.decision.source), ['llm_decision', 'llm_decision']);
-  assert.deepEqual(contexts.get('a')?.recipient, { type: 'auto', isExplicitRecipient: false, isExplicitlyTargeted: false });
+  assert.deepEqual(auto.map(item => item.decision.source), ['mentioned', 'llm_decision']);
+  assert.deepEqual(calls, ['b']);
+  assert.deepEqual(contexts.get('b')?.recipient, { type: 'auto', isExplicitRecipient: false, isExplicitlyTargeted: false });
 });
 
 test('reaction upsert is semantic domain state and clearing is message-scoped', () => {
@@ -61,8 +65,8 @@ test('stamp-only decisions have no normal generation targets', () => {
 
 test('fallback requires text for questions and requests but permits acknowledgement stamps', () => {
   const a = agent('a'), b = agent('b');
-  for (const content of ['A案とB案ならどちらがいいですか？', 'このコードをレビューしてください', 'これ調べて', 'この2つを比較して', 'ここを修正して', '一旦まとめて', '判別不能な入力']) assert.equal(applyInitialUserTurnFallback([stamp(a), ignore(b)], [user(content)], 0).filter(x => x.decision.outcome === 'RESPOND').length, 1);
-  for (const content of ['了解です。', 'ありがとう。', 'ありがとうございます。', '承知しました。', 'OKです。', 'ではA案で進めます。', 'それでお願いします。']) assert.equal(applyInitialUserTurnFallback([stamp(a), ignore(b)], [user(content)], 0).filter(x => x.decision.outcome === 'RESPOND').length, 0);
+  for (const content of ['A案とB案ならどちらがいいですか？', 'このコードをレビューしてください', 'これ調べて', 'この2つを比較して', 'ここを修正して', '一旦まとめて', '判別不能な入力', 'それでお願いします。', 'これでお願いします。', 'その方法でお願いします。', 'これをお願いします。']) assert.equal(applyInitialUserTurnFallback([stamp(a), ignore(b)], [user(content)], 0).filter(x => x.decision.outcome === 'RESPOND').length, 1);
+  for (const content of ['了解', '了解です。', 'ありがとう。', 'ありがとうございます。', '承知しました。', 'OKです。', 'ではA案で進めます。']) assert.equal(applyInitialUserTurnFallback([stamp(a), ignore(b)], [user(content)], 0).filter(x => x.decision.outcome === 'RESPOND').length, 0);
   assert.equal(applyInitialUserTurnFallback([stamp(a), ignore(b)], [user('', { attachments: [{ id: 'x', type: 'text', mimeType: 'text/plain', name: 'x', data: 'x' }] })], 0).filter(x => x.decision.outcome === 'RESPOND').length, 1);
   assert.equal(applyInitialUserTurnFallback([{ agent: a, decision: { outcome: 'ERROR', source: 'api_error', latencyMs: 1 } }], [user('?')], 0).filter(x => x.decision.outcome === 'RESPOND').length, 0);
 });

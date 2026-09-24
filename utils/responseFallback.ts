@@ -21,7 +21,7 @@ const lastSpokenDistance = (history: Message[], agentId: string): number => {
 export const allowsStampOnly = (message: Message): boolean => {
   if (message.role !== 'user' || (message.attachments?.length ?? 0) > 0) return false;
   const content = message.content.trim().replace(/[。.!！]+$/u, '').trim();
-  return /^(?:了解(?:です)?|ありがとう(?:ございます)?|承知しました|okです|では.+で進めます|それでお願いします)$/iu.test(content);
+  return /^(?:了解(?:です)?|ありがとう(?:ございます)?|承知しました|okです|では.+で進めます)$/iu.test(content);
 };
 
 export const requiresTextFallback = (message: Message): boolean => {

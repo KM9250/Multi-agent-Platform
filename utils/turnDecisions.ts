@@ -46,10 +46,11 @@ export const resolveTurnDecisions = async ({
   const recentHistory = history.slice(-8);
   const decisions = await Promise.all(activeAgents.map(async agent => {
     const structured = lastMessage?.recipientTarget;
-    if (structured && structured.type !== 'auto' && structured.agentIds.includes(agent.id)) {
+    const hasExplicitStructuredTarget = !!structured && structured.type !== 'auto';
+    if (hasExplicitStructuredTarget && structured.agentIds.includes(agent.id)) {
       return { agent, decision: fixedDecision('RESPOND', 'recipient_target') };
     }
-    const mentioned = !structured && !!lastMessage?.content && normalizedMention(lastMessage.content, agent.name);
+    const mentioned = !hasExplicitStructuredTarget && !!lastMessage?.content && normalizedMention(lastMessage.content, agent.name);
     if (mentioned) return { agent, decision: fixedDecision('RESPOND', 'mentioned') };
     const lastIndex = history.map(message => message.agentId).lastIndexOf(agent.id);
     return { agent, decision: await evaluateDecision(agent, {
