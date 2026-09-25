@@ -63,6 +63,32 @@ const requireTask = (tasks: Record<string, CoordinationTask>, event: Coordinatio
   return tasks[taskId];
 };
 
+const validateTaskSessionResolution = (
+  session: CoordinationSession,
+  tasks: Record<string, CoordinationTask>,
+  outcome: SessionResolution['outcome'],
+): void => {
+  if (session.mode !== 'map.coord.task.v1') throw new Error('Session mode is not resolvable in COORD-2A.');
+  const sessionTasks = Object.values(tasks).filter(task => task.sessionId === session.sessionId);
+  if (!sessionTasks.length) throw new Error('Session resolution requires at least one task.');
+  if (sessionTasks.some(task => task.status === 'ASSIGNED')) throw new Error('All session tasks must be terminal.');
+  if (outcome === 'SUCCEEDED' && !sessionTasks.some(task => task.status === 'COMPLETED')) {
+    throw new Error('Successful session requires a completed task.');
+  }
+};
+
+const cancelActiveSessionTasks = (
+  tasks: Record<string, CoordinationTask>,
+  sessionId: string,
+  timestamp: number,
+): void => {
+  for (const task of Object.values(tasks)) {
+    if (task.sessionId === sessionId && task.status === 'ASSIGNED') {
+      tasks[task.taskId] = { ...task, status: 'CANCELLED', updatedAt: timestamp };
+    }
+  }
+};
+
 export interface CreateWorkflowInput {
   runId: string; roomId: string; goal: string; acceptanceCriteria: string[];
   supervisorAgentId: string; participantAgentIds: string[];
@@ -148,15 +174,12 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
     } else if (event.type === 'SessionCancelled' || event.type === 'SessionExpired') {
       if (session.state !== 'OPEN' && session.state !== 'SUSPENDED') throw new Error('Session is already terminal.');
       sessions[session.sessionId] = { ...session, state: event.type === 'SessionCancelled' ? 'CANCELLED' : 'EXPIRED', updatedAt: event.timestamp };
+      cancelActiveSessionTasks(tasks, session.sessionId, event.timestamp);
     } else if (event.type === 'SessionResolved') {
       requireOpenSession(session);
       const resolution = event.payload as SessionResolution;
       if (!resolution || (resolution.outcome !== 'SUCCEEDED' && resolution.outcome !== 'FAILED')) throw new Error('Session resolution outcome is invalid.');
-      if (session.mode !== 'map.coord.task.v1') throw new Error('Session mode is not resolvable in COORD-2A.');
-      const sessionTasks = Object.values(tasks).filter(task => task.sessionId === session.sessionId);
-      if (!sessionTasks.length) throw new Error('Session resolution requires at least one task.');
-      if (sessionTasks.some(task => task.status === 'ASSIGNED')) throw new Error('All session tasks must be terminal.');
-      if (resolution.outcome === 'SUCCEEDED' && !sessionTasks.some(task => task.status === 'COMPLETED')) throw new Error('Successful session requires a completed task.');
+      validateTaskSessionResolution(session, tasks, resolution.outcome);
       const evidenceRefs = validateRefs(resolution.evidenceRefs, 'evidenceRefs');
       sessions[session.sessionId] = { ...session, state: 'RESOLVED', resolution: { ...clone(resolution), evidenceRefs }, updatedAt: event.timestamp };
     }
@@ -216,10 +239,11 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
     if (run.status !== 'RUNNING') throw new Error(`Workflow is not commit-ready: ${run.status}`);
     const session = requireExistingSession(sessions, event);
     if (session.state !== 'OPEN') throw new Error(`Session is not commit-ready: ${session.state}`);
+    validateTaskSessionResolution(session, tasks, 'SUCCEEDED');
     const other = Object.values(sessions).some(candidate => candidate.sessionId !== session.sessionId && (candidate.state === 'OPEN' || candidate.state === 'SUSPENDED'));
     if (other) throw new Error('Cannot resolve workflow while other sessions remain unresolved.');
-    run.status = 'RESOLVED'; delete run.statusReason; sessions[session.sessionId] = { ...session, state: 'RESOLVED', updatedAt: event.timestamp };
-    for (const task of Object.values(tasks)) if (task.status === 'ASSIGNED') tasks[task.taskId] = { ...task, status: 'CANCELLED', updatedAt: event.timestamp };
+    run.status = 'RESOLVED'; delete run.statusReason;
+    sessions[session.sessionId] = { ...session, state: 'RESOLVED', resolution: { outcome: 'SUCCEEDED' }, updatedAt: event.timestamp };
   } else if (SESSION_SCOPED_EVENTS.has(event.type)) {
     requireExistingSession(sessions, event);
   }

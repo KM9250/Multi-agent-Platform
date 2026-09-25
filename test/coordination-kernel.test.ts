@@ -93,6 +93,22 @@ test('session lifecycle is supervisor controlled', () => {
   assert.throws(() => appendEvent(state, event(6, 'SessionCancelled', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /terminal/);
 });
 
+test('session cancellation and expiry cancel only assigned tasks', () => {
+  let cancelled = assign();
+  cancelled = assign(cancelled, task('complete'));
+  cancelled = taskEvent(cancelled, 'TaskCompleted', 'complete', { resultRef: 'artifact' });
+  cancelled = appendEvent(cancelled, event(6, 'SessionCancelled', {}, { sessionId: 'task', actorAgentId: 'supervisor' }));
+  assert.equal(cancelled.sessions.task.state, 'CANCELLED');
+  assert.equal(cancelled.tasks.t1.status, 'CANCELLED');
+  assert.equal(cancelled.tasks.complete.status, 'COMPLETED');
+
+  let expired = assign();
+  expired = appendEvent(expired, event(4, 'SessionExpired', {}, { sessionId: 'task', actorAgentId: 'supervisor' }));
+  assert.equal(expired.sessions.task.state, 'EXPIRED');
+  assert.equal(expired.tasks.t1.status, 'CANCELLED');
+  assert.throws(() => taskEvent(expired, 'TaskCompleted', 't1', { resultRef: 'late' }), /not open/);
+});
+
 test('workflow suspension and blocking propagate, and explicit user resume reopens sessions', () => {
   for (const type of ['WorkflowSuspended', 'WorkflowBlocked'] as const) {
     let state = start(); state = start(state, session({ sessionId: 'second' }));
@@ -130,9 +146,26 @@ test('journal ordering, semantic retries, collisions, and payload isolation are 
 });
 
 test('legacy commitment authority and unresolved-session guard remain intact', () => {
-  let state = start(); state = start(state, session({ sessionId: 'second' }));
-  assert.throws(() => appendEvent(state, event(4, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'worker' })), /supervisor/);
-  assert.throws(() => appendEvent(state, event(4, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /other sessions/);
+  let state = assign(); state = taskEvent(state, 'TaskCompleted', 't1', { resultRef: 'done' }); state = start(state, session({ sessionId: 'second' }));
+  assert.throws(() => appendEvent(state, event(6, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'worker' })), /supervisor/);
+  assert.throws(() => appendEvent(state, event(6, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /other sessions/);
+});
+
+test('legacy commitment cannot bypass the task resolution gate', () => {
+  const state = assign();
+  assert.throws(() => appendEvent(state, event(4, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /terminal/);
+  assert.equal(state.run.status, 'RUNNING'); assert.equal(state.sessions.task.state, 'OPEN'); assert.equal(state.tasks.t1.status, 'ASSIGNED');
+});
+
+test('legacy commitment resolves only a successful task session and records resolution', () => {
+  let state = assign(); state = taskEvent(state, 'TaskCompleted', 't1', { resultRef: 'done' });
+  state = appendEvent(state, event(5, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' }));
+  assert.equal(state.run.status, 'RESOLVED'); assert.equal(state.sessions.task.state, 'RESOLVED');
+  assert.equal(state.sessions.task.resolution?.outcome, 'SUCCEEDED'); assert.equal(state.tasks.t1.status, 'COMPLETED');
+  for (const mode of ['map.coord.decision.v1', 'map.coord.quorum.v1'] as const) {
+    const unsupported = start(workflow(), session({ mode }));
+    assert.throws(() => appendEvent(unsupported, event(3, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /not resolvable in COORD-2A/);
+  }
 });
 
 test('terminal workflow and stopped workflow guards retain retry and audit behavior', () => {
@@ -150,4 +183,53 @@ test('snapshot validation rejects broken cross-object invariants', () => {
   assert.throws(() => validateCoordinationSnapshot({ ...base, run: { ...base.run, status: 'CANCELLED' } }), /active session/);
   const noActiveSession = { ...base, run: { ...base.run, status: 'CANCELLED' as const }, sessions: { task: { ...base.sessions.task, state: 'CANCELLED' as const } } };
   assert.throws(() => validateCoordinationSnapshot(noActiveSession), /active task/);
+  for (const state of ['CANCELLED', 'EXPIRED'] as const) {
+    assert.throws(() => validateCoordinationSnapshot({ ...base, sessions: { task: { ...base.sessions.task, state } } }), /Terminal session/);
+  }
+  const completed = { ...base, tasks: { t1: { ...base.tasks.t1, status: 'COMPLETED' as const } }, sessions: { task: { ...base.sessions.task, state: 'RESOLVED' as const } } };
+  assert.throws(() => validateCoordinationSnapshot(completed), /include a resolution/);
+});
+
+test('SessionStarted retains foundation identity and state guards', () => {
+  const base = workflow();
+  assert.throws(() => start(base, session({ workflowRunId: 'other' })), /another workflow/);
+  assert.throws(() => start(base, session({ supervisor: 'worker' })), /workflow supervisor/);
+  assert.throws(() => start(start(base), session()), /Duplicate session ID/);
+  assert.throws(() => start(base, session({ state: 'RESOLVED' })), /must be OPEN/);
+  assert.throws(() => start(base, session({ participants: [] })), /at least one participant/);
+  assert.throws(() => start(base, session({ participants: ['supervisor', 'outsider'] })), /Persona participants/);
+  assert.throws(() => start(base, session({ initiator: 'outsider' })), /initiator/);
+  assert.throws(() => start(base, session({ participants: ['worker'] })), /include the supervisor/);
+  assert.throws(() => start(base, session({ goal: '  ' })), /goal/);
+});
+
+test('policy validation retains integer, attempt, and retry-delay guards', () => {
+  const invalid = (mutate: (candidate: CoordinationPolicy) => void, pattern: RegExp) => {
+    const candidate = policy(); mutate(candidate); assert.throws(() => workflow(candidate), pattern);
+  };
+  invalid(candidate => { candidate.budgets.maxRounds = 1.5; }, /maxRounds/);
+  invalid(candidate => { candidate.retryRules.maxAttempts = 0; }, /maxAttempts/);
+  invalid(candidate => { candidate.retryRules.baseDelayMs = -1; }, /baseDelayMs/);
+  invalid(candidate => { candidate.retryRules.maxDelayMs = 99; }, /greater than or equal/);
+});
+
+test('idempotency keys reject semantic collisions', () => {
+  const state = start();
+  const keyed = appendEvent(state, event(3, 'TaskAssigned', task('one'), { sessionId: 'task', actorAgentId: 'supervisor', idempotencyKey: 'shared' }));
+  assert.throws(() => appendEvent(keyed, event(4, 'TaskAssigned', task('two'), { sessionId: 'task', actorAgentId: 'supervisor', idempotencyKey: 'shared' })), /Idempotency key collision/);
+});
+
+test('commitment requires an existing open session', () => {
+  assert.throws(() => appendEvent(workflow(), event(2, 'CommitmentAccepted', {}, { sessionId: 'missing', actorAgentId: 'supervisor' })), /does not exist/);
+  let state = start(); state = appendEvent(state, event(3, 'SessionSuspended', {}, { sessionId: 'task', actorAgentId: 'supervisor' }));
+  assert.throws(() => appendEvent(state, event(4, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /not commit-ready/);
+});
+
+test('stopped workflows reject work but allow cancellation and audit events', () => {
+  for (const type of ['WorkflowSuspended', 'WorkflowBlocked'] as const) {
+    let state = start(); state = appendEvent(state, event(3, type, { reason: 'wait' }, { actorAgentId: 'supervisor' }));
+    assert.throws(() => assign(state), /Workflow is stopped/);
+    const audited = appendEvent(state, event(4, 'ErrorRecorded', { message: 'waiting' })); assert.equal(audited.run.status, type === 'WorkflowBlocked' ? 'BLOCKED' : 'SUSPENDED');
+    const cancelled = appendEvent(state, event(4, 'WorkflowCancelled', {}, { actorAgentId: 'supervisor' })); assert.equal(cancelled.run.status, 'CANCELLED');
+  }
 });

@@ -28,8 +28,14 @@ export const validateCoordinationSnapshot = (snapshot: CoordinationSnapshot): vo
     if (session.mode !== 'map.coord.task.v1') throw new Error('Task session must use task mode.');
     if (!session.participants.includes(task.assigneeAgentId)) throw new Error('Task assignee must be a session participant.');
     if (!session.participants.includes(task.assignedByAgentId)) throw new Error('Task assigner must be a session participant.');
+    if ((session.state === 'RESOLVED' || session.state === 'CANCELLED' || session.state === 'EXPIRED') && task.status === 'ASSIGNED') {
+      throw new Error('Terminal session cannot contain an active task.');
+    }
     if (TERMINAL_WORKFLOW_STATUSES.has(run.status) && task.status === 'ASSIGNED') {
       throw new Error('Terminal workflow cannot contain an active task.');
     }
+  }
+  for (const session of Object.values(snapshot.sessions)) {
+    if (session.state === 'RESOLVED' && !session.resolution) throw new Error('Resolved session must include a resolution.');
   }
 };
