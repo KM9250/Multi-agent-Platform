@@ -17,6 +17,8 @@ export const validateCoordinationSnapshot = (snapshot: CoordinationSnapshot): vo
     if (session.policyId !== run.policyId || session.policyVersion !== run.policyVersion) throw new Error('Session policy must match the workflow policy.');
     if (session.supervisor !== run.supervisorAgentId) throw new Error('Session supervisor must match the workflow supervisor.');
     if (session.participants.some(id => !run.participantAgentIds.includes(id))) throw new Error('Only workflow Persona participants may join a session.');
+    if (!run.participantAgentIds.includes(session.initiator)) throw new Error('Session initiator must be a workflow participant.');
+    if (!session.participants.includes(run.supervisorAgentId)) throw new Error('Session participants must include the supervisor.');
     if (TERMINAL_WORKFLOW_STATUSES.has(run.status) && (session.state === 'OPEN' || session.state === 'SUSPENDED')) {
       throw new Error('Terminal workflow cannot contain an active session.');
     }
