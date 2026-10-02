@@ -1,9 +1,11 @@
 import type {
   CoordinationEvent, CoordinationEventType, CoordinationPolicy, CoordinationSession,
-  CoordinationSnapshot, CoordinationTask, SessionResolution, TaskCompletedPayload,
+  CoordinationSnapshot, CoordinationTask, CoordinationDecision, CoordinationQuorum, CoordinationEvaluation,
+  DecisionResolvedPayload, QuorumVoteCastPayload, QuorumResolvedPayload, SessionResolution, TaskCompletedPayload,
   TaskFailedPayload, WorkflowBlockedPayload, WorkflowResumePayload, WorkflowRun, WorkflowStatus,
 } from './types';
 import { validatePolicy } from './policy';
+import { evaluateQuorumOutcome, requiredQuorumApprovals } from './quorum';
 
 const emptyUsage = () => ({ rounds: 0, llmCalls: 0, inputTokens: 0, outputTokens: 0, estimatedCost: 0, consecutiveErrors: 0, noProgressCycles: 0 });
 const TERMINAL_WORKFLOW_STATUSES = new Set<WorkflowStatus>(['RESOLVED', 'CANCELLED', 'FAILED']);
@@ -12,6 +14,8 @@ const ALLOWED_WHILE_STOPPED = new Set<CoordinationEventType>(['WorkflowResumed',
 const SESSION_SCOPED_EVENTS = new Set<CoordinationEventType>([
   'SessionSuspended', 'SessionResumed', 'SessionResolved', 'SessionCancelled', 'SessionExpired',
   'TaskAssigned', 'TaskCompleted', 'TaskFailed', 'TaskCancelled', 'EvaluationAdded', 'PolicyEvaluated',
+  'DecisionOpened', 'DecisionResolved', 'DecisionCancelled',
+  'QuorumOpened', 'QuorumVoteCast', 'QuorumResolved', 'QuorumCancelled',
   'CommitmentRequested', 'CommitmentAccepted',
 ]);
 
@@ -47,6 +51,12 @@ const requireSupervisor = (run: WorkflowRun, event: CoordinationEvent): void => 
 const requireTaskSession = (session: CoordinationSession): void => {
   if (session.mode !== 'map.coord.task.v1') throw new Error('Session mode does not accept tasks.');
 };
+const requireDecisionSession = (session: CoordinationSession): void => {
+  if (session.mode !== 'map.coord.decision.v1') throw new Error('Session mode does not accept decisions.');
+};
+const requireQuorumSession = (session: CoordinationSession): void => {
+  if (session.mode !== 'map.coord.quorum.v1') throw new Error('Session mode does not accept quorums.');
+};
 const requireOpenSession = (session: CoordinationSession): void => {
   if (session.state !== 'OPEN') throw new Error('Session is not open.');
 };
@@ -77,6 +87,23 @@ const validateTaskSessionResolution = (
   }
 };
 
+const validateSessionResolution = (session: CoordinationSession, snapshot: Pick<CoordinationSnapshot, 'tasks' | 'decisions' | 'quorums'>, outcome: SessionResolution['outcome']): void => {
+  if (session.mode === 'map.coord.task.v1') return validateTaskSessionResolution(session, snapshot.tasks, outcome);
+  if (session.mode === 'map.coord.decision.v1') {
+    const values = Object.values(snapshot.decisions).filter(value => value.sessionId === session.sessionId);
+    if (!values.length) throw new Error('Session resolution requires at least one decision.');
+    if (values.some(value => value.status === 'OPEN')) throw new Error('All session decisions must be terminal.');
+    if (outcome === 'SUCCEEDED' && !values.some(value => value.status === 'RESOLVED')) throw new Error('Successful session requires a resolved decision.');
+    return;
+  }
+  const values = Object.values(snapshot.quorums).filter(value => value.sessionId === session.sessionId);
+  if (!values.length) throw new Error('Session resolution requires at least one quorum.');
+  if (values.some(value => value.status === 'OPEN')) throw new Error('All session quorums must be terminal.');
+  if (outcome === 'SUCCEEDED' && !values.some(value => value.status === 'RESOLVED' && value.outcome === 'APPROVED')) {
+    throw new Error('Successful session requires an approved quorum.');
+  }
+};
+
 const cancelActiveSessionTasks = (
   tasks: Record<string, CoordinationTask>,
   sessionId: string,
@@ -87,6 +114,10 @@ const cancelActiveSessionTasks = (
       tasks[task.taskId] = { ...task, status: 'CANCELLED', updatedAt: timestamp };
     }
   }
+};
+const cancelOpenPrincipals = (decisions: Record<string, CoordinationDecision>, quorums: Record<string, CoordinationQuorum>, sessionId: string, timestamp: number): void => {
+  for (const value of Object.values(decisions)) if (value.sessionId === sessionId && value.status === 'OPEN') decisions[value.decisionId] = { ...value, status: 'CANCELLED', updatedAt: timestamp };
+  for (const value of Object.values(quorums)) if (value.sessionId === sessionId && value.status === 'OPEN') quorums[value.quorumId] = { ...value, status: 'CANCELLED', updatedAt: timestamp };
 };
 
 export interface CreateWorkflowInput {
@@ -115,7 +146,7 @@ export const createWorkflow = (input: CreateWorkflowInput): CoordinationSnapshot
   };
   const payload = { roomId: run.roomId, goal: run.goal, acceptanceCriteria: [...criteria], supervisorAgentId: run.supervisorAgentId,
     participantAgentIds: [...run.participantAgentIds], executionMode: run.executionMode, policyId: run.policyId, policyVersion: run.policyVersion };
-  return appendEvent({ run, policy, sessions: {}, tasks: {}, events: [] }, {
+  return appendEvent({ run, policy, sessions: {}, tasks: {}, decisions: {}, quorums: {}, evaluations: {}, events: [] }, {
     eventId: `${input.runId}:created`, sequence: 1, type: 'WorkflowRunCreated', workflowRunId: input.runId,
     actorAgentId: input.supervisorAgentId, timestamp: now, payload,
   });
@@ -144,6 +175,9 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
   const run = { ...snapshot.run, updatedAt: event.timestamp };
   const sessions = { ...snapshot.sessions };
   const tasks = { ...snapshot.tasks };
+  const decisions = { ...snapshot.decisions };
+  const quorums = { ...snapshot.quorums };
+  const evaluations = { ...snapshot.evaluations };
 
   if (event.type === 'SessionStarted') {
     const value = event.payload as CoordinationSession;
@@ -175,11 +209,12 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
       if (session.state !== 'OPEN' && session.state !== 'SUSPENDED') throw new Error('Session is already terminal.');
       sessions[session.sessionId] = { ...session, state: event.type === 'SessionCancelled' ? 'CANCELLED' : 'EXPIRED', updatedAt: event.timestamp };
       cancelActiveSessionTasks(tasks, session.sessionId, event.timestamp);
+      cancelOpenPrincipals(decisions, quorums, session.sessionId, event.timestamp);
     } else if (event.type === 'SessionResolved') {
       requireOpenSession(session);
       const resolution = event.payload as SessionResolution;
       if (!resolution || (resolution.outcome !== 'SUCCEEDED' && resolution.outcome !== 'FAILED')) throw new Error('Session resolution outcome is invalid.');
-      validateTaskSessionResolution(session, tasks, resolution.outcome);
+      validateSessionResolution(session, { tasks, decisions, quorums }, resolution.outcome);
       const evidenceRefs = validateRefs(resolution.evidenceRefs, 'evidenceRefs');
       sessions[session.sessionId] = { ...session, state: 'RESOLVED', resolution: { ...clone(resolution), evidenceRefs }, updatedAt: event.timestamp };
     }
@@ -216,6 +251,77 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
     } else {
       requireSupervisor(run, event); tasks[task.taskId] = { ...task, status: 'CANCELLED', updatedAt: event.timestamp };
     }
+  } else if (event.type === 'DecisionOpened') {
+    const session = requireExistingSession(sessions, event); requireOpenSession(session); requireDecisionSession(session); requireSupervisor(run, event);
+    const value = event.payload as CoordinationDecision;
+    if (!value?.decisionId?.trim()) throw new Error('Decision ID is required.');
+    if (decisions[value.decisionId]) throw new Error(`Duplicate decision ID: ${value.decisionId}`);
+    if (value.workflowRunId !== run.runId || value.sessionId !== event.sessionId) throw new Error('Decision ownership does not match the event.');
+    if (!value.question?.trim()) throw new Error('Decision question is required.');
+    if (!session.participants.includes(value.authorityAgentId) || !run.participantAgentIds.includes(value.authorityAgentId)) throw new Error('Decision authority must be a Persona participant.');
+    if (value.status !== 'OPEN') throw new Error('A new decision must be OPEN.');
+    if (value.value !== undefined || value.rationaleRef !== undefined || value.evidenceRefs !== undefined) throw new Error('A new decision cannot contain terminal result fields.');
+    const options = value.options?.map(option => option.trim());
+    if (options && (!options.length || options.some(option => !option) || new Set(options).size !== options.length)) throw new Error('Decision options must be non-empty and unique.');
+    decisions[value.decisionId] = { ...clone(value), question: value.question.trim(), options };
+  } else if (event.type === 'DecisionResolved' || event.type === 'DecisionCancelled') {
+    const session = requireExistingSession(sessions, event); requireOpenSession(session); requireDecisionSession(session);
+    const id = (event.payload as { decisionId?: string })?.decisionId; const value = id ? decisions[id] : undefined;
+    if (!value) throw new Error('Decision does not exist.');
+    if (value.sessionId !== session.sessionId) throw new Error('Decision does not belong to the event session.');
+    if (value.status !== 'OPEN') throw new Error('Decision is not open.');
+    if (event.type === 'DecisionCancelled') { requireSupervisor(run, event); decisions[value.decisionId] = { ...value, status: 'CANCELLED', updatedAt: event.timestamp }; }
+    else {
+      if (event.actorAgentId !== value.authorityAgentId) throw new Error('Decision authority mismatch.');
+      const payload = event.payload as DecisionResolvedPayload; const resolved = payload.value?.trim();
+      if (!resolved) throw new Error('Decision value is required.');
+      if (value.options && !value.options.includes(resolved)) throw new Error('Decision value must match a configured option.');
+      const rationaleRef = payload.rationaleRef?.trim(); if (payload.rationaleRef !== undefined && !rationaleRef) throw new Error('rationaleRef cannot be empty.');
+      decisions[value.decisionId] = { ...value, status: 'RESOLVED', value: resolved, rationaleRef, evidenceRefs: validateRefs(payload.evidenceRefs, 'evidenceRefs'), updatedAt: event.timestamp };
+    }
+  } else if (event.type === 'QuorumOpened') {
+    const session = requireExistingSession(sessions, event); requireOpenSession(session); requireQuorumSession(session); requireSupervisor(run, event);
+    const value = event.payload as CoordinationQuorum;
+    if (!value?.quorumId?.trim()) throw new Error('Quorum ID is required.');
+    if (quorums[value.quorumId]) throw new Error(`Duplicate quorum ID: ${value.quorumId}`);
+    if (value.workflowRunId !== run.runId || value.sessionId !== event.sessionId) throw new Error('Quorum ownership does not match the event.');
+    if (!value.question?.trim()) throw new Error('Quorum question is required.');
+    if (!value.eligibleAgentIds?.length || value.eligibleAgentIds.some(id => !id.trim()) || new Set(value.eligibleAgentIds).size !== value.eligibleAgentIds.length) throw new Error('Eligible agents must be non-empty and unique.');
+    if (value.eligibleAgentIds.some(id => !session.participants.includes(id) || !run.participantAgentIds.includes(id))) throw new Error('Eligible agent must be a Persona participant.');
+    requiredQuorumApprovals(value.threshold, value.eligibleAgentIds.length);
+    if (Object.keys(value.votes ?? {}).length || value.status !== 'OPEN' || value.outcome !== undefined) throw new Error('A new quorum must be OPEN without votes or outcome.');
+    quorums[value.quorumId] = { ...clone(value), question: value.question.trim(), eligibleAgentIds: [...value.eligibleAgentIds], votes: {} };
+  } else if (event.type === 'QuorumVoteCast' || event.type === 'QuorumResolved' || event.type === 'QuorumCancelled') {
+    const session = requireExistingSession(sessions, event); requireOpenSession(session); requireQuorumSession(session);
+    const id = (event.payload as { quorumId?: string })?.quorumId; const value = id ? quorums[id] : undefined;
+    if (!value) throw new Error('Quorum does not exist.');
+    if (value.sessionId !== session.sessionId) throw new Error('Quorum does not belong to the event session.');
+    if (value.status !== 'OPEN') throw new Error('Quorum is not open.');
+    if (event.type === 'QuorumVoteCast') {
+      const payload = event.payload as QuorumVoteCastPayload;
+      if (!event.actorAgentId || !value.eligibleAgentIds.includes(event.actorAgentId)) throw new Error('Agent is not eligible to vote.');
+      if (!['APPROVE', 'REJECT', 'ABSTAIN'].includes(payload.vote)) throw new Error('Quorum vote is invalid.');
+      quorums[value.quorumId] = { ...value, votes: { ...value.votes, [event.actorAgentId]: payload.vote }, updatedAt: event.timestamp };
+    } else if (event.type === 'QuorumCancelled') { requireSupervisor(run, event); quorums[value.quorumId] = { ...value, status: 'CANCELLED', updatedAt: event.timestamp }; }
+    else {
+      requireSupervisor(run, event); const payload = event.payload as QuorumResolvedPayload; const calculated = evaluateQuorumOutcome(value);
+      if (calculated.state === 'PENDING') throw new Error('Quorum outcome is still pending.');
+      if (payload.outcome !== calculated.state) throw new Error('Quorum outcome does not match calculated result.');
+      quorums[value.quorumId] = { ...value, status: 'RESOLVED', outcome: calculated.state, updatedAt: event.timestamp };
+    }
+  } else if (event.type === 'EvaluationAdded') {
+    const session = requireExistingSession(sessions, event); requireOpenSession(session); const value = event.payload as CoordinationEvaluation;
+    if (!value?.evaluationId?.trim()) throw new Error('Evaluation ID is required.');
+    if (evaluations[value.evaluationId]) throw new Error(`Duplicate evaluation ID: ${value.evaluationId}`);
+    if (value.workflowRunId !== run.runId || value.sessionId !== event.sessionId) throw new Error('Evaluation ownership does not match the event.');
+    if (event.actorAgentId !== value.evaluatorAgentId) throw new Error('Evaluation actor must match evaluator.');
+    if (!session.participants.includes(value.evaluatorAgentId)) throw new Error('Evaluator must be a session participant.');
+    if (!['PASS', 'FAIL', 'INCONCLUSIVE'].includes(value.outcome)) throw new Error('Evaluation outcome is invalid.');
+    const target = value.target; let normalizedTarget = clone(target);
+    if (target?.type === 'artifact') { const ref = target.ref?.trim(); if (!ref) throw new Error('Evaluation artifact reference is required.'); normalizedTarget = { ...target, ref }; }
+    else { const entity = target?.type === 'task' ? tasks[target.id] : target?.type === 'decision' ? decisions[target.id] : target?.type === 'quorum' ? quorums[target.id] : undefined; if (!entity) throw new Error('Evaluation target does not exist.'); if (entity.sessionId !== session.sessionId) throw new Error('Evaluation target belongs to another session.'); }
+    const summary = value.summary?.trim(); if (value.summary !== undefined && !summary) throw new Error('Evaluation summary cannot be empty.');
+    evaluations[value.evaluationId] = { ...clone(value), target: normalizedTarget, summary, evidenceRefs: validateRefs(value.evidenceRefs, 'evidenceRefs') };
   } else if (event.type === 'WorkflowSuspended' || event.type === 'WorkflowBlocked') {
     requireSupervisor(run, event);
     if (run.status !== 'RUNNING') throw new Error('Workflow must be running to stop.');
@@ -234,6 +340,7 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
     run.status = 'CANCELLED';
     for (const session of Object.values(sessions)) if (session.state === 'OPEN' || session.state === 'SUSPENDED') sessions[session.sessionId] = { ...session, state: 'CANCELLED', updatedAt: event.timestamp };
     for (const task of Object.values(tasks)) if (task.status === 'ASSIGNED') tasks[task.taskId] = { ...task, status: 'CANCELLED', updatedAt: event.timestamp };
+    for (const session of Object.values(sessions)) cancelOpenPrincipals(decisions, quorums, session.sessionId, event.timestamp);
   } else if (event.type === 'CommitmentAccepted') {
     if (event.actorAgentId !== run.supervisorAgentId) throw new Error('Only the configured supervisor may accept a commitment.');
     if (run.status !== 'RUNNING') throw new Error(`Workflow is not commit-ready: ${run.status}`);
@@ -247,5 +354,5 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
   } else if (SESSION_SCOPED_EVENTS.has(event.type)) {
     requireExistingSession(sessions, event);
   }
-  return { run, policy: snapshot.policy, sessions, tasks, events: [...snapshot.events, clone(event)] };
+  return { run, policy: snapshot.policy, sessions, tasks, decisions, quorums, evaluations, events: [...snapshot.events, clone(event)] };
 };

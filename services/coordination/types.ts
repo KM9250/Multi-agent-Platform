@@ -6,6 +6,14 @@ export type CoordinationMode = 'map.coord.task.v1' | 'map.coord.decision.v1' | '
 export type RiskDecision = 'ALLOW' | 'NEEDS_USER' | 'DENY';
 export type SessionOutcome = 'SUCCEEDED' | 'FAILED';
 export type CoordinationTaskStatus = 'ASSIGNED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+export type CoordinationDecisionStatus = 'OPEN' | 'RESOLVED' | 'CANCELLED';
+export type QuorumVote = 'APPROVE' | 'REJECT' | 'ABSTAIN';
+export type QuorumThreshold = { kind: 'all' } | { kind: 'majority' } | { kind: 'count'; count: number };
+export type QuorumOutcome = 'APPROVED' | 'REJECTED';
+export type CoordinationQuorumStatus = 'OPEN' | 'RESOLVED' | 'CANCELLED';
+export type EvaluationOutcome = 'PASS' | 'FAIL' | 'INCONCLUSIVE';
+export type EvaluationTarget = { type: 'task'; id: string } | { type: 'decision'; id: string }
+  | { type: 'quorum'; id: string } | { type: 'artifact'; ref: string };
 
 export interface SessionResolution {
   outcome: SessionOutcome;
@@ -82,6 +90,27 @@ export interface CoordinationTask {
   updatedAt: number;
 }
 
+export interface CoordinationDecision {
+  decisionId: string; workflowRunId: string; sessionId: string; question: string;
+  authorityAgentId: string; options?: string[]; status: CoordinationDecisionStatus;
+  value?: string; rationaleRef?: string; evidenceRefs?: string[];
+  createdAt: number; updatedAt: number;
+}
+export interface DecisionResolvedPayload { decisionId: string; value: string; rationaleRef?: string; evidenceRefs?: string[] }
+
+export interface CoordinationQuorum {
+  quorumId: string; workflowRunId: string; sessionId: string; question: string;
+  eligibleAgentIds: string[]; threshold: QuorumThreshold; votes: Record<string, QuorumVote>;
+  status: CoordinationQuorumStatus; outcome?: QuorumOutcome; createdAt: number; updatedAt: number;
+}
+export interface QuorumVoteCastPayload { quorumId: string; vote: QuorumVote }
+export interface QuorumResolvedPayload { quorumId: string; outcome: QuorumOutcome }
+
+export interface CoordinationEvaluation {
+  evaluationId: string; workflowRunId: string; sessionId: string; evaluatorAgentId: string;
+  target: EvaluationTarget; outcome: EvaluationOutcome; summary?: string; evidenceRefs?: string[]; createdAt: number;
+}
+
 export interface TaskCompletedPayload { resultRef?: string; evidenceRefs?: string[] }
 export interface TaskFailedPayload { failureReason: string; evidenceRefs?: string[] }
 export interface WorkflowBlockedPayload { reason: string }
@@ -111,6 +140,8 @@ export type CoordinationEventType =
   | 'WorkflowRunCreated' | 'SessionStarted' | 'SessionSuspended' | 'SessionResumed'
   | 'SessionResolved' | 'SessionCancelled' | 'SessionExpired'
   | 'TaskAssigned' | 'TaskCompleted' | 'TaskFailed' | 'TaskCancelled'
+  | 'DecisionOpened' | 'DecisionResolved' | 'DecisionCancelled'
+  | 'QuorumOpened' | 'QuorumVoteCast' | 'QuorumResolved' | 'QuorumCancelled'
   | 'EvaluationAdded' | 'PolicyEvaluated' | 'WorkflowSuspended' | 'WorkflowBlocked' | 'WorkflowResumed'
   | 'CommitmentRequested' | 'CommitmentAccepted' | 'WorkflowCancelled' | 'ErrorRecorded';
 
@@ -131,5 +162,8 @@ export interface CoordinationSnapshot {
   policy: CoordinationPolicy;
   sessions: Record<string, CoordinationSession>;
   tasks: Record<string, CoordinationTask>;
+  decisions: Record<string, CoordinationDecision>;
+  quorums: Record<string, CoordinationQuorum>;
+  evaluations: Record<string, CoordinationEvaluation>;
   events: CoordinationEvent[];
 }
