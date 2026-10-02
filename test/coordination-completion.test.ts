@@ -97,3 +97,53 @@ test('snapshot commitment invariants reject forged terminal state and metadata',
   assert.throws(() => validateCoordinationSnapshot({ ...base, commitment: { ...requested, status: 'CANCELLED', decidedAt: 3 } }), /cancelled workflow/);
   assert.throws(() => validateCoordinationSnapshot({ ...base, commitment: { ...requested, status: 'ACCEPTED', decidedByAgentId: 'worker', decidedAt: 3 } }), /supervisor decision/);
 });
+
+test('normalized event payloads retain exact event and idempotency retry semantics', () => {
+  let state = work();
+  const acceptance = { ...ev(state, 'AcceptanceCriterionEvaluated', { criterion: ' A ', outcome: 'SATISFIED', evidenceEventIds: [' e4 '], note: ' checked ' }), idempotencyKey: 'accept:A' };
+  state = appendEvent(state, acceptance);
+  assert.equal((state.events.at(-1)!.payload as { criterion: string }).criterion, ' A ');
+  assert.equal(appendEvent(state, acceptance), state);
+  assert.equal(appendEvent(state, { ...acceptance, eventId: 'accept-retry' }), state);
+  state = criterion(state, 'B', 'SATISFIED'); state = policyEvent(state);
+  const request = ev(state, 'CommitmentRequested', { commitmentId: ' c1 ', summary: ' done ', evidenceRefs: [' artifact '] }, 'worker');
+  state = appendEvent(state, request); assert.equal((state.events.at(-1)!.payload as { commitmentId: string }).commitmentId, ' c1 '); assert.equal(appendEvent(state, request), state);
+  const rejection = ev(state, 'CommitmentRejected', { commitmentId: ' c1 ', reason: ' more work ' });
+  state = appendEvent(state, rejection); assert.equal((state.events.at(-1)!.payload as { reason: string }).reason, ' more work '); assert.equal(appendEvent(state, rejection), state);
+  validateCoordinationSnapshot(state);
+});
+
+test('commitment projection is anchored to replayed request, acceptance, rejection, and cancellation', () => {
+  const base = fresh();
+  const forgedRequest = { commitmentId: 'forged', status: 'REQUESTED' as const, requestedByAgentId: 'worker', requestedAt: 2 };
+  assert.throws(() => validateCoordinationSnapshot({ ...base, commitment: forgedRequest }), /projection/);
+  assert.throws(() => validateCoordinationSnapshot({ ...base, run: { ...base.run, status: 'RESOLVED' }, commitment: { ...forgedRequest, status: 'ACCEPTED', decidedByAgentId: 's', decidedAt: 3 } }), /projection/);
+
+  let requested = criterion(criterion(work(), 'A', 'SATISFIED'), 'B', 'SATISFIED'); requested = policyEvent(requested); requested = add(requested, 'CommitmentRequested', { commitmentId: 'c1' }, 'worker');
+  assert.throws(() => validateCoordinationSnapshot({ ...requested, commitment: { ...requested.commitment!, commitmentId: 'c2' } }), /projection/);
+  assert.throws(() => validateCoordinationSnapshot({ ...requested, commitment: { ...requested.commitment!, status: 'UNKNOWN' as never } }), /status is invalid/);
+  validateCoordinationSnapshot(requested);
+
+  const rejected = add(requested, 'CommitmentRejected', { commitmentId: 'c1', reason: 'not yet' }); validateCoordinationSnapshot(rejected);
+  let accepted = criterion(criterion(work(), 'A', 'SATISFIED'), 'B', 'SATISFIED'); accepted = policyEvent(accepted); accepted = add(accepted, 'CommitmentRequested', { commitmentId: 'accepted' }, 'worker'); accepted = add(accepted, 'CommitmentAccepted', { commitmentId: 'accepted' }); validateCoordinationSnapshot(accepted);
+  let cancelled = criterion(criterion(work(), 'A', 'SATISFIED'), 'B', 'SATISFIED'); cancelled = policyEvent(cancelled); cancelled = add(cancelled, 'CommitmentRequested', { commitmentId: 'cancelled' }, 'worker'); cancelled = add(cancelled, 'WorkflowCancelled', {}); validateCoordinationSnapshot(cancelled);
+});
+
+test('workflow creation anchors immutable run metadata and journal origin', () => {
+  const base = fresh();
+  assert.throws(() => validateCoordinationSnapshot({ ...base, events: [] }), /begin with WorkflowRunCreated/);
+  assert.throws(() => validateCoordinationSnapshot({ ...base, events: [...base.events, { ...base.events[0], eventId: 'created-again', sequence: 2 }] }), /exactly one/);
+  assert.throws(() => validateCoordinationSnapshot({ ...base, run: { ...base.run, acceptanceCriteria: ['A'] } }), /immutable workflow metadata/);
+  assert.throws(() => validateCoordinationSnapshot({ ...base, run: { ...base.run, supervisorAgentId: 'worker' } }), /immutable workflow metadata/);
+  assert.throws(() => validateCoordinationSnapshot({ ...base, run: { ...base.run, participantAgentIds: ['s'] } }), /immutable workflow metadata/);
+  const malformed = structuredClone(base); malformed.events[0].payload = null; assert.throws(() => validateCoordinationSnapshot(malformed), /immutable workflow metadata/);
+});
+
+test('commitment gate contains all malformed snapshot failures', () => {
+  const base = fresh(); const invalid = (state: CoordinationSnapshot) => assert.deepEqual(evaluateCommitmentGate(state, 2), { allowed: false, activeSessionIds: [], missingCriteria: [], reasons: ['snapshot-invalid'] });
+  invalid({ ...base, policy: { ...base.policy, completionRules: undefined as never } });
+  invalid({ ...base, run: { ...base.run, budget: undefined as never } });
+  invalid({ ...base, run: { ...base.run, usage: undefined as never } });
+  invalid({ ...base, run: { ...base.run, usage: { ...base.run.usage, rounds: -1 } } });
+  invalid({ ...base, run: { ...base.run, budget: { ...base.run.budget, maxRounds: 99 } } });
+});

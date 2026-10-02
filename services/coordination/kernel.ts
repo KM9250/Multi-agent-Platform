@@ -177,6 +177,7 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
   if (STOPPED_WORKFLOW_STATUSES.has(snapshot.run.status) && !ALLOWED_WHILE_STOPPED.has(event.type)) throw new Error(`Workflow is stopped: ${snapshot.run.status}`);
   const expected = snapshot.events.length ? snapshot.events.at(-1)!.sequence + 1 : 1;
   if (event.sequence !== expected) throw new Error(`Expected event sequence ${expected}.`);
+  const journalEvent = clone(event);
 
   const run = { ...snapshot.run, updatedAt: event.timestamp };
   const sessions = { ...snapshot.sessions };
@@ -339,7 +340,6 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
     if (payload.outcome === 'SATISFIED' && !evidenceEventIds.length) throw new Error('Satisfied criterion requires evidence.');
     for (const id of evidenceEventIds) { const evidence = snapshot.events.find(candidate => candidate.eventId === id); if (!evidence) throw new Error('Acceptance evidence must reference a prior event.'); if (!ACCEPTANCE_EVIDENCE_TYPES.has(evidence.type)) throw new Error('Acceptance evidence type is not allowed.'); }
     const note = payload.note?.trim(); if (payload.note !== undefined && !note) throw new Error('Acceptance note cannot be empty.');
-    event = { ...event, payload: { criterion, outcome: payload.outcome, evidenceEventIds, ...(note ? { note } : {}) } };
     const satisfied = new Set(run.satisfiedCriteria); if (payload.outcome === 'SATISFIED') satisfied.add(criterion); else satisfied.delete(criterion);
     run.satisfiedCriteria = run.acceptanceCriteria.filter(value => satisfied.has(value));
   } else if (event.type === 'PolicyEvaluated') {
@@ -361,7 +361,6 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
     const summary = payload.summary?.trim(); if (payload.summary !== undefined && !summary) throw new Error('Commitment summary cannot be empty.');
     const evidenceRefs = validateRefs(payload.evidenceRefs, 'evidenceRefs');
     commitment = { commitmentId, status: 'REQUESTED', requestedByAgentId: event.actorAgentId, requestedAt: event.timestamp, ...(summary ? { summary } : {}), ...(evidenceRefs ? { evidenceRefs } : {}) };
-    event = { ...event, payload: { commitmentId, ...(summary ? { summary } : {}), ...(evidenceRefs ? { evidenceRefs } : {}) } };
   } else if (event.type === 'CommitmentAccepted') {
     requireWorkflowScopedEvent(event); requireSupervisor(run, event);
     const commitmentId = (event.payload as CommitmentAcceptedPayload)?.commitmentId?.trim();
@@ -378,7 +377,6 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
     if (!commitmentId || commitmentId !== commitment.commitmentId) throw new Error('Commitment ID does not match the pending request.');
     if (!reason) throw new Error('Commitment rejection reason is required.');
     commitment = { ...commitment, status: 'REJECTED', decidedByAgentId: event.actorAgentId, decidedAt: event.timestamp, rejectionReason: reason };
-    event = { ...event, payload: { commitmentId, reason } };
   } else if (event.type === 'WorkflowSuspended' || event.type === 'WorkflowBlocked') {
     requireSupervisor(run, event);
     if (run.status !== 'RUNNING') throw new Error('Workflow must be running to stop.');
@@ -402,5 +400,5 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
   } else if (SESSION_SCOPED_EVENTS.has(event.type)) {
     requireExistingSession(sessions, event);
   }
-  return { run, policy: snapshot.policy, sessions, tasks, decisions, quorums, evaluations, ...(commitment ? { commitment } : {}), events: [...snapshot.events, clone(event)] };
+  return { run, policy: snapshot.policy, sessions, tasks, decisions, quorums, evaluations, ...(commitment ? { commitment } : {}), events: [...snapshot.events, journalEvent] };
 };
