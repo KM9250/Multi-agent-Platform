@@ -8,8 +8,13 @@ const POSITIVE_INTEGER_BUDGET_FIELDS: (keyof WorkflowBudget)[] = [
 const POSITIVE_NUMBER_BUDGET_FIELDS: (keyof WorkflowBudget)[] = ['maxWallTimeMs', 'maxEstimatedCost'];
 
 export const validatePolicy = (policy: CoordinationPolicy): void => {
+  if (!policy || typeof policy !== 'object') throw new Error('Policy is required.');
   if (!policy.policyId.trim() || !policy.version.trim()) throw new Error('Policy identity and version are required.');
   if (policy.schemaVersion !== 1) throw new Error('Unsupported policy schemaVersion.');
+  if (!policy.completionRules || policy.completionRules.commitAuthority !== 'supervisor'
+    || typeof policy.completionRules.requireAllAcceptanceCriteria !== 'boolean') {
+    throw new Error('Completion rules are invalid.');
+  }
   for (const field of POSITIVE_INTEGER_BUDGET_FIELDS) {
     const value = policy.budgets[field];
     if (!Number.isInteger(value) || value <= 0) throw new Error(`${field} must be a positive integer.`);

@@ -3,3 +3,4 @@ export * from './policy';
 export * from './kernel';
 export * from './validation';
 export * from './quorum';
+export * from './completion';

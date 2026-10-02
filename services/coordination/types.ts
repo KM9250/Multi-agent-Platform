@@ -12,6 +12,7 @@ export type QuorumThreshold = { kind: 'all' } | { kind: 'majority' } | { kind: '
 export type QuorumOutcome = 'APPROVED' | 'REJECTED';
 export type CoordinationQuorumStatus = 'OPEN' | 'RESOLVED' | 'CANCELLED';
 export type EvaluationOutcome = 'PASS' | 'FAIL' | 'INCONCLUSIVE';
+export type AcceptanceCriterionOutcome = 'SATISFIED' | 'UNSATISFIED';
 export type EvaluationTarget = { type: 'task'; id: string } | { type: 'decision'; id: string }
   | { type: 'quorum'; id: string } | { type: 'artifact'; ref: string };
 
@@ -119,6 +120,37 @@ export interface WorkflowResumePayload {
   reason?: string;
 }
 
+export interface AcceptanceCriterionEvaluatedPayload {
+  criterion: string;
+  outcome: AcceptanceCriterionOutcome;
+  evidenceEventIds: string[];
+  note?: string;
+}
+
+export interface CommitmentGateResult {
+  allowed: boolean;
+  activeSessionIds: string[];
+  missingCriteria: string[];
+  exhaustedBudget?: keyof WorkflowBudget;
+  reasons: string[];
+}
+export interface CommitmentPolicyEvaluationPayload { scope: 'commitment'; result: CommitmentGateResult }
+export interface CommitmentRequestedPayload { commitmentId: string; summary?: string; evidenceRefs?: string[] }
+export interface CommitmentAcceptedPayload { commitmentId: string }
+export interface CommitmentRejectedPayload { commitmentId: string; reason: string }
+export type WorkflowCommitmentStatus = 'REQUESTED' | 'ACCEPTED' | 'REJECTED' | 'CANCELLED';
+export interface WorkflowCommitmentState {
+  commitmentId: string;
+  status: WorkflowCommitmentStatus;
+  requestedByAgentId: string;
+  requestedAt: number;
+  summary?: string;
+  evidenceRefs?: string[];
+  decidedByAgentId?: string;
+  decidedAt?: number;
+  rejectionReason?: string;
+}
+
 export interface CoordinationSession {
   sessionId: string;
   workflowRunId: string;
@@ -143,7 +175,8 @@ export type CoordinationEventType =
   | 'DecisionOpened' | 'DecisionResolved' | 'DecisionCancelled'
   | 'QuorumOpened' | 'QuorumVoteCast' | 'QuorumResolved' | 'QuorumCancelled'
   | 'EvaluationAdded' | 'PolicyEvaluated' | 'WorkflowSuspended' | 'WorkflowBlocked' | 'WorkflowResumed'
-  | 'CommitmentRequested' | 'CommitmentAccepted' | 'WorkflowCancelled' | 'ErrorRecorded';
+  | 'AcceptanceCriterionEvaluated' | 'CommitmentRequested' | 'CommitmentAccepted' | 'CommitmentRejected'
+  | 'WorkflowCancelled' | 'ErrorRecorded';
 
 export interface CoordinationEvent<T = unknown> {
   eventId: string;
@@ -165,5 +198,6 @@ export interface CoordinationSnapshot {
   decisions: Record<string, CoordinationDecision>;
   quorums: Record<string, CoordinationQuorum>;
   evaluations: Record<string, CoordinationEvaluation>;
+  commitment?: WorkflowCommitmentState;
   events: CoordinationEvent[];
 }

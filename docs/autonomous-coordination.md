@@ -19,12 +19,12 @@ The initial kernel is **MACP-Coord Level 1 adapter-ready**, not wire-compatible.
 - A Workflow may own multiple active Sessions. Each Session is suspended, resumed, cancelled, expired, or resolved independently.
 - Tasks are first-class Session state and move from `ASSIGNED` to `COMPLETED`, `FAILED`, or `CANCELLED`. `TaskCompleted` supplies evidence but never resolves its Session or Workflow.
 - `Session.state = RESOLVED` means that the Session lifecycle is complete. `Session.resolution.outcome` describes whether its result `SUCCEEDED` or `FAILED`; a failed outcome does not automatically fail the Workflow, so a later Session may retry the work.
-- Task-mode Session resolution requires at least one Task and requires every Task to be terminal. A successful result additionally requires at least one completed Task. Decision and quorum resolution remain deferred to COORD-2B.
-- Only the configured Supervisor can accept a commitment, and only against an existing, open Session belonging to that Workflow. Full commitment-policy evaluation and acceptance-criteria enforcement are deferred to COORD-2.
+- Task-mode Session resolution requires at least one Task and requires every Task to be terminal. A successful result additionally requires at least one completed Task. Decision and Quorum Sessions apply equivalent mode-specific terminal checks.
+- Commitment is Workflow-scoped. Only the configured Supervisor can accept a valid pending commitment, and acceptance succeeds only when the current completion gate passes.
 - New Sessions must be open, policy-bound, owned and initiated by Workflow participants, and include the configured Supervisor; duplicate Session IDs are rejected.
 - Terminal Workflows (`RESOLVED`, `CANCELLED`, and `FAILED`) reject all later events except an exact idempotent retry. `BLOCKED` and `SUSPENDED` are non-terminal stopped states in which no coordination work proceeds.
 - A `SUSPENDED` or `BLOCKED` Workflow never resumes implicitly. `WorkflowResumed` requires an explicit user authorization carried by a Supervisor event. Stopping suspends every open Session, and resuming reopens suspended Sessions without changing terminal Sessions.
-- In this foundation kernel, `CommitmentAccepted` is the final Workflow-level commitment and is rejected while any other Session remains open or suspended. Intermediate Session commitment and resolution semantics are deferred to COORD-2.
+- `CommitmentAccepted` is the sole event that resolves a Workflow. It does not resolve or clean up Sessions, Tasks, Decisions, or Quorums; those objects must already satisfy the gate.
 - Suspension, blocking, resumption, and cancellation are explicit durable events. Cancellation closes all active Sessions and assigned Tasks while preserving already-terminal Tasks.
 
 ## Delivery roadmap
@@ -49,3 +49,13 @@ Coordination separates its principal objects by session mode: `map.coord.task.v1
 A **Decision** is a single-authority coordination judgment. Only the workflow supervisor opens or cancels it, while only its named authority resolves it. A **Quorum** is an explicit multi-Persona vote. Votes may change while the Quorum is `OPEN`; `APPROVED` may resolve as soon as its threshold is reached, while `REJECTED` requires every eligible voter to have cast a vote with approvals still below the threshold. Quorum approval is neither policy allowance, human approval, nor workflow completion.
 
 An **Evaluation** records advisory evidence about a task, decision, quorum, or artifact. An Evaluation `PASS` does not complete its target, Session, or Workflow. Conversation `STAMP` reactions are never interpreted as Decision resolution or Quorum votes; the Conversation and Coordination planes remain separate.
+
+## COORD-2B2: acceptance and Workflow commitment
+
+Acceptance Criteria are Supervisor-owned, authoritative completion evaluations. A `SATISFIED` evaluation must cite allowed, prior journal events; a later `UNSATISFIED` evaluation can reverse it. The durable `satisfiedCriteria` projection is checked by replaying these evaluations in journal order. Task completion, Decision resolution, Quorum approval, Session resolution, and Evaluation results are evidence only: none completes a Workflow by itself.
+
+The deterministic commitment gate requires a running Workflow, no open or suspended Sessions, and—when policy requires them—all Acceptance Criteria to be satisfied. Budget exhaustion is reported by the gate but is not a finalization blocker: budgets stop further autonomous work, not the commitment of work that is already complete.
+
+`PolicyEvaluated` is audit evidence only. The kernel recomputes and compares its result at append time. A Workflow participant may make a workflow-scoped `CommitmentRequested` only immediately after a passing policy evaluation, and the kernel recomputes the gate on both request and acceptance. A request does not freeze the Workflow; later work may make the gate fail. The Supervisor can explicitly reject the request, or accept it while the current gate still passes. Only `CommitmentAccepted` by the Supervisor resolves the Workflow.
+
+Conversation responses, STAMP reactions, Quorum votes, Acceptance Criteria, and Commitments remain distinct domain concepts. The kernel never automatically converts one into another.
