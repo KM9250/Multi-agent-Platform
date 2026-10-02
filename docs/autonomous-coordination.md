@@ -32,7 +32,8 @@ The initial kernel is **MACP-Coord Level 1 adapter-ready**, not wire-compatible.
 - **COORD-0:** typed conversation recipients, participation profiles, and non-triggering STAMP outcomes.
 - **COORD-1:** provider/model scheduler, backpressure, bounded retry with jitter, and queue cancellation.
 - **COORD-2A:** multiple Session and Task lifecycles, immutable policy snapshots, explicit stop/resume, snapshot validation, and journal mutation protection.
-- **COORD-2B+:** Decision, Quorum, acceptance-criterion evaluation, and the Workflow-level commitment gate.
+- **COORD-2B:** Decision, Quorum, acceptance-criterion evaluation, and the Workflow-level commitment gate.
+- **COORD-2C:** deterministic audit projection, event-driven usage/progress accounting, and runtime/snapshot invariant hardening.
 - **COORD-3:** browser PoC for the bounded PLAN/ASSIGN/EXECUTE/COLLECT/VERIFY/DECIDE recipe.
 - **COORD-4:** terminal and `NEEDS_USER` notifications through MACP-Command.
 - **COORD-5:** UI-independent durable runtime, checkpoint recovery, and idempotent restart.
@@ -59,3 +60,13 @@ The deterministic commitment gate requires a running Workflow, no open or suspen
 `PolicyEvaluated` is audit evidence only. The kernel recomputes and compares its result at append time. A Workflow participant may make a workflow-scoped `CommitmentRequested` only immediately after a passing policy evaluation, and the kernel recomputes the gate on both request and acceptance. A request does not freeze the Workflow; later work may make the gate fail. The Supervisor can explicitly reject the request, or accept it while the current gate still passes. Only `CommitmentAccepted` by the Supervisor resolves the Workflow.
 
 Conversation responses, STAMP reactions, Quorum votes, Acceptance Criteria, and Commitments remain distinct domain concepts. The kernel never automatically converts one into another.
+
+## COORD-2C: usage, progress, and audit projection
+
+`UsageRecorded` is a Supervisor-owned, Workflow-scoped record of LLM resources that have already been consumed. It may therefore be appended while a Workflow is `SUSPENDED` or `BLOCKED`, and may reach or exceed a budget without being rejected or changing Workflow state. The future Runner must inspect `findExhaustedBudget` before starting another round; budget exhaustion is not Workflow failure or commitment rejection.
+
+`ProgressRecorded` records the result of exactly one coordination round. `PROGRESS` resets both the error and no-progress streaks; `NO_PROGRESS` increments the no-progress streak and resets consecutive errors; `ERROR` increments both streaks. Unlike generic audit-oriented `ErrorRecorded`, only `ProgressRecorded(ERROR)` changes round-level budget counters. Progress never satisfies Acceptance Criteria or completes the Workflow.
+
+Workflow usage is replayed from `UsageRecorded` and `ProgressRecorded` journal events during snapshot validation, preventing forged counters. Event timestamps are finite, non-negative, monotonic, and anchor `run.updatedAt`; runtime enum, array, object timestamp, current-session, and policy structure invariants fail closed.
+
+`buildCoordinationAuditView(snapshot, now)` validates authoritative state and derives a deterministic, read-only-by-isolation view of Workflow metadata, counts, acceptance, usage, budget exhaustion, latest progress, commitment, and the event trail. It performs no LLM summarization and persists no audit state.

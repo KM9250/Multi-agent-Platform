@@ -42,6 +42,9 @@ export interface WorkflowUsage {
   consecutiveErrors: number;
   noProgressCycles: number;
 }
+export type WorkflowProgressOutcome = 'PROGRESS' | 'NO_PROGRESS' | 'ERROR';
+export interface UsageRecordedPayload { llmCalls: number; inputTokens: number; outputTokens: number; estimatedCost: number; sourceRef?: string }
+export interface ProgressRecordedPayload { outcome: WorkflowProgressOutcome; summary: string; evidenceEventIds?: string[] }
 
 export interface CoordinationPolicy {
   policyId: string;
@@ -176,6 +179,7 @@ export type CoordinationEventType =
   | 'QuorumOpened' | 'QuorumVoteCast' | 'QuorumResolved' | 'QuorumCancelled'
   | 'EvaluationAdded' | 'PolicyEvaluated' | 'WorkflowSuspended' | 'WorkflowBlocked' | 'WorkflowResumed'
   | 'AcceptanceCriterionEvaluated' | 'CommitmentRequested' | 'CommitmentAccepted' | 'CommitmentRejected'
+  | 'UsageRecorded' | 'ProgressRecorded'
   | 'WorkflowCancelled' | 'ErrorRecorded';
 
 export interface CoordinationEvent<T = unknown> {
@@ -200,4 +204,23 @@ export interface CoordinationSnapshot {
   evaluations: Record<string, CoordinationEvaluation>;
   commitment?: WorkflowCommitmentState;
   events: CoordinationEvent[];
+}
+
+export interface CoordinationAuditEntry {
+  sequence: number; eventId: string; type: CoordinationEventType; timestamp: number;
+  scope: 'workflow' | 'session'; sessionId?: string; actorAgentId?: string;
+}
+export interface CoordinationAuditView {
+  workflow: Pick<WorkflowRun, 'runId' | 'status' | 'statusReason' | 'executionMode' | 'supervisorAgentId' | 'policyId' | 'policyVersion' | 'createdAt' | 'updatedAt'>;
+  events: { count: number; lastSequence: number; lastEventAt: number };
+  activeSessionIds: string[];
+  sessionCounts: Record<SessionState, number>;
+  taskCounts: Record<CoordinationTaskStatus, number>;
+  decisionCounts: Record<CoordinationDecisionStatus, number>;
+  quorumCounts: Record<CoordinationQuorumStatus, number>;
+  evaluationCounts: Record<EvaluationOutcome, number>;
+  acceptance: { total: number; satisfiedCriteria: string[]; missingCriteria: string[] };
+  usage: WorkflowUsage; budget: WorkflowBudget; exhaustedBudget?: keyof WorkflowBudget;
+  progress?: { outcome: WorkflowProgressOutcome; summary: string; eventId: string; sequence: number; timestamp: number };
+  commitment?: WorkflowCommitmentState; trail: CoordinationAuditEntry[];
 }
