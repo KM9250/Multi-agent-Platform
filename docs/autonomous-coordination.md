@@ -41,3 +41,11 @@ The initial kernel is **MACP-Coord Level 1 adapter-ready**, not wire-compatible.
 Browser hosting is only a PoC. Formal unattended operation requires the durable runtime because reloads, OS sleep, browser crashes, and background throttling cannot be controlled by React state or `localStorage`.
 
 Full replay, persistent stores, checkpoint restore, autonomous runners, browser execution, MACP bridges, and durable runtime remain future responsibilities.
+
+## COORD-2B1: decisions, quorum, and evaluations
+
+Coordination separates its principal objects by session mode: `map.coord.task.v1` contains work Tasks, `map.coord.decision.v1` contains Decisions, and `map.coord.quorum.v1` contains Quorums. Principal objects are not mixed between these modes; Evaluations may accompany any session as advisory evidence.
+
+A **Decision** is a single-authority coordination judgment. Only the workflow supervisor opens or cancels it, while only its named authority resolves it. A **Quorum** is an explicit multi-Persona vote. Votes may change while the Quorum is `OPEN`; `APPROVED` may resolve as soon as its threshold is reached, while `REJECTED` requires every eligible voter to have cast a vote with approvals still below the threshold. Quorum approval is neither policy allowance, human approval, nor workflow completion.
+
+An **Evaluation** records advisory evidence about a task, decision, quorum, or artifact. An Evaluation `PASS` does not complete its target, Session, or Workflow. Conversation `STAMP` reactions are never interpreted as Decision resolution or Quorum votes; the Conversation and Coordination planes remain separate.
