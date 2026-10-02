@@ -1,9 +1,25 @@
-import type { CoordinationSnapshot, WorkflowStatus } from './types';
+import type { AcceptanceCriterionEvaluatedPayload, CommitmentGateResult, CommitmentPolicyEvaluationPayload, CoordinationSnapshot, WorkflowStatus } from './types';
 import { evaluateQuorumOutcome, requiredQuorumApprovals } from './quorum';
 
 const TERMINAL_WORKFLOW_STATUSES = new Set<WorkflowStatus>(['RESOLVED', 'CANCELLED', 'FAILED']);
 const TERMINAL_TASK_STATUSES = new Set(['COMPLETED', 'FAILED', 'CANCELLED']);
 const TERMINAL_PRINCIPAL_STATUSES = new Set(['RESOLVED', 'CANCELLED']);
+const ACCEPTANCE_EVIDENCE_TYPES = new Set(['TaskCompleted', 'TaskFailed', 'DecisionResolved', 'QuorumResolved', 'EvaluationAdded', 'SessionResolved']);
+
+const validateStringArray = (values: unknown, name: string): string[] => {
+  if (!Array.isArray(values) || values.some(value => typeof value !== 'string' || !value.trim())) throw new Error(`${name} must contain non-empty strings.`);
+  const normalized = values.map(value => value.trim());
+  if (new Set(normalized).size !== normalized.length) throw new Error(`${name} cannot contain duplicates.`);
+  return normalized;
+};
+
+const validateGateResult = (result: CommitmentGateResult): void => {
+  if (!result || typeof result.allowed !== 'boolean') throw new Error('Policy evaluation result is invalid.');
+  validateStringArray(result.activeSessionIds, 'activeSessionIds');
+  validateStringArray(result.missingCriteria, 'missingCriteria');
+  validateStringArray(result.reasons, 'reasons');
+  if (result.exhaustedBudget !== undefined && !['maxWallTimeMs', 'maxRounds', 'maxLlmCalls', 'maxInputTokens', 'maxOutputTokens', 'maxEstimatedCost', 'maxConsecutiveErrors', 'maxNoProgressCycles'].includes(result.exhaustedBudget)) throw new Error('Policy exhausted budget is invalid.');
+};
 
 const validateResolvedSession = (snapshot: CoordinationSnapshot, sessionId: string): void => {
   const session = snapshot.sessions[sessionId];
@@ -42,9 +58,47 @@ export const validateCoordinationSnapshot = (snapshot: CoordinationSnapshot): vo
     throw new Error('Snapshot policy identity must match the workflow policy.');
   }
   if (!run.participantAgentIds.includes(run.supervisorAgentId)) throw new Error('Supervisor must be a workflow participant.');
-  if (run.satisfiedCriteria.some(criterion => !run.acceptanceCriteria.includes(criterion))) {
-    throw new Error('Satisfied criteria must be acceptance criteria.');
+  const eventIds = new Set<string>(); const idempotencyKeys = new Set<string>(); const satisfied = new Set<string>();
+  snapshot.events.forEach((event, index) => {
+    if (event.sequence !== index + 1) throw new Error('Journal event sequences must be contiguous.');
+    if (event.workflowRunId !== run.runId) throw new Error('Journal event belongs to another workflow.');
+    if (!event.eventId?.trim() || eventIds.has(event.eventId)) throw new Error('Journal event IDs must be non-empty and unique.');
+    eventIds.add(event.eventId);
+    if (event.idempotencyKey) { if (!event.idempotencyKey.trim() || idempotencyKeys.has(event.idempotencyKey)) throw new Error('Journal idempotency keys must be unique.'); idempotencyKeys.add(event.idempotencyKey); }
+    if (event.type === 'AcceptanceCriterionEvaluated') {
+      if (event.sessionId !== undefined || event.actorAgentId !== run.supervisorAgentId) throw new Error('Acceptance evaluation must be workflow-scoped and supervisor-owned.');
+      const payload = event.payload as AcceptanceCriterionEvaluatedPayload; const criterion = payload?.criterion?.trim();
+      if (!criterion || !run.acceptanceCriteria.includes(criterion)) throw new Error('Acceptance criterion is unknown.');
+      if (payload.outcome !== 'SATISFIED' && payload.outcome !== 'UNSATISFIED') throw new Error('Acceptance outcome is invalid.');
+      const evidenceIds = validateStringArray(payload.evidenceEventIds, 'evidenceEventIds');
+      if (payload.note !== undefined && !payload.note.trim()) throw new Error('Acceptance note cannot be empty.');
+      if (payload.outcome === 'SATISFIED' && !evidenceIds.length) throw new Error('Satisfied criterion requires evidence.');
+      for (const id of evidenceIds) { const evidenceIndex = snapshot.events.findIndex(candidate => candidate.eventId === id); if (evidenceIndex < 0 || evidenceIndex >= index) throw new Error('Acceptance evidence must reference a prior event.'); if (!ACCEPTANCE_EVIDENCE_TYPES.has(snapshot.events[evidenceIndex].type)) throw new Error('Acceptance evidence type is not allowed.'); }
+      if (payload.outcome === 'SATISFIED') satisfied.add(criterion); else satisfied.delete(criterion);
+    }
+    if (event.type === 'PolicyEvaluated') {
+      if (event.sessionId !== undefined || event.actorAgentId !== run.supervisorAgentId) throw new Error('Policy evaluation must be workflow-scoped and supervisor-owned.');
+      const payload = event.payload as CommitmentPolicyEvaluationPayload; if (payload?.scope !== 'commitment') throw new Error('Policy evaluation scope is invalid.'); validateGateResult(payload.result);
+    }
+    if (['CommitmentRequested', 'CommitmentAccepted', 'CommitmentRejected'].includes(event.type) && event.sessionId !== undefined) throw new Error('Commitment events must be workflow-scoped.');
+  });
+  const replayed = run.acceptanceCriteria.filter(criterion => satisfied.has(criterion));
+  if (replayed.length !== run.satisfiedCriteria.length || replayed.some((criterion, index) => criterion !== run.satisfiedCriteria[index])) throw new Error('Satisfied criteria projection does not match the journal.');
+
+  const commitment = snapshot.commitment;
+  if (commitment) {
+    if (!commitment.commitmentId?.trim()) throw new Error('Commitment ID is required.');
+    if (!run.participantAgentIds.includes(commitment.requestedByAgentId)) throw new Error('Commitment requester must be a workflow participant.');
+    if (commitment.summary !== undefined && !commitment.summary.trim()) throw new Error('Commitment summary cannot be empty.');
+    if (commitment.evidenceRefs) validateStringArray(commitment.evidenceRefs, 'commitment evidenceRefs');
+    if (commitment.status === 'REQUESTED' && (commitment.decidedByAgentId !== undefined || commitment.decidedAt !== undefined || commitment.rejectionReason !== undefined)) throw new Error('Requested commitment cannot contain decision metadata.');
+    if (commitment.status === 'ACCEPTED' && (commitment.decidedByAgentId !== run.supervisorAgentId || commitment.decidedAt === undefined || run.status !== 'RESOLVED')) throw new Error('Accepted commitment requires supervisor decision and resolved workflow.');
+    if (commitment.status === 'REJECTED' && (commitment.decidedByAgentId !== run.supervisorAgentId || commitment.decidedAt === undefined || !commitment.rejectionReason?.trim())) throw new Error('Rejected commitment requires supervisor decision and reason.');
+    if (commitment.status === 'CANCELLED' && run.status !== 'CANCELLED') throw new Error('Cancelled commitment requires cancelled workflow.');
   }
+  if (run.status === 'RESOLVED' && commitment?.status !== 'ACCEPTED') throw new Error('Resolved workflow requires an accepted commitment.');
+  if (commitment?.status === 'ACCEPTED' && run.status !== 'RESOLVED') throw new Error('Accepted commitment requires a resolved workflow.');
+  if (run.status === 'RESOLVED' && snapshot.policy.completionRules.requireAllAcceptanceCriteria && run.satisfiedCriteria.length !== run.acceptanceCriteria.length) throw new Error('Resolved workflow requires all acceptance criteria.');
   for (const session of Object.values(snapshot.sessions)) {
     if (session.workflowRunId !== run.runId) throw new Error('Session belongs to another workflow.');
     if (session.policyId !== run.policyId || session.policyVersion !== run.policyVersion) throw new Error('Session policy must match the workflow policy.');

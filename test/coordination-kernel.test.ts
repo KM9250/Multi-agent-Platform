@@ -145,28 +145,11 @@ test('journal ordering, semantic retries, collisions, and payload isolation are 
   assert.throws(() => appendEvent(recorded, event(5, 'ErrorRecorded')), /sequence 4/);
 });
 
-test('legacy commitment authority and unresolved-session guard remain intact', () => {
-  let state = assign(); state = taskEvent(state, 'TaskCompleted', 't1', { resultRef: 'done' }); state = start(state, session({ sessionId: 'second' }));
-  assert.throws(() => appendEvent(state, event(6, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'worker' })), /supervisor/);
-  assert.throws(() => appendEvent(state, event(6, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /other sessions/);
-});
 
-test('legacy commitment cannot bypass the task resolution gate', () => {
-  const state = assign();
-  assert.throws(() => appendEvent(state, event(4, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /terminal/);
-  assert.equal(state.run.status, 'RUNNING'); assert.equal(state.sessions.task.state, 'OPEN'); assert.equal(state.tasks.t1.status, 'ASSIGNED');
-});
 
-test('legacy commitment resolves only a successful task session and records resolution', () => {
-  let state = assign(); state = taskEvent(state, 'TaskCompleted', 't1', { resultRef: 'done' });
-  state = appendEvent(state, event(5, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' }));
-  assert.equal(state.run.status, 'RESOLVED'); assert.equal(state.sessions.task.state, 'RESOLVED');
-  assert.equal(state.sessions.task.resolution?.outcome, 'SUCCEEDED'); assert.equal(state.tasks.t1.status, 'COMPLETED');
-  for (const mode of ['map.coord.decision.v1', 'map.coord.quorum.v1'] as const) {
-    const unsupported = start(workflow(), session({ mode }));
-    assert.throws(() => appendEvent(unsupported, event(3, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /not resolvable in COORD-2A/);
-  }
-});
+
+
+
 
 test('terminal workflow and stopped workflow guards retain retry and audit behavior', () => {
   let state = start(); const cancellation = event(3, 'WorkflowCancelled', {}, { actorAgentId: 'supervisor' }); state = appendEvent(state, cancellation);
@@ -221,11 +204,7 @@ test('idempotency keys reject semantic collisions', () => {
   assert.throws(() => appendEvent(keyed, event(4, 'TaskAssigned', task('two'), { sessionId: 'task', actorAgentId: 'supervisor', idempotencyKey: 'shared' })), /Idempotency key collision/);
 });
 
-test('commitment requires an existing open session', () => {
-  assert.throws(() => appendEvent(workflow(), event(2, 'CommitmentAccepted', {}, { sessionId: 'missing', actorAgentId: 'supervisor' })), /does not exist/);
-  let state = start(); state = appendEvent(state, event(3, 'SessionSuspended', {}, { sessionId: 'task', actorAgentId: 'supervisor' }));
-  assert.throws(() => appendEvent(state, event(4, 'CommitmentAccepted', {}, { sessionId: 'task', actorAgentId: 'supervisor' })), /not commit-ready/);
-});
+
 
 test('stopped workflows reject work but allow cancellation and audit events', () => {
   for (const type of ['WorkflowSuspended', 'WorkflowBlocked'] as const) {
