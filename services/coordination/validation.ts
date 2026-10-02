@@ -56,6 +56,7 @@ export const validateCoordinationSnapshot = (snapshot: CoordinationSnapshot): vo
     const session = snapshot.sessions[quorum.sessionId];
     if (!session) throw new Error('Quorum references a missing session.');
     if (session.mode !== 'map.coord.quorum.v1') throw new Error('Quorum session must use quorum mode.');
+    if (!quorum.question?.trim()) throw new Error('Quorum question is required.');
     if (!quorum.eligibleAgentIds.length || new Set(quorum.eligibleAgentIds).size !== quorum.eligibleAgentIds.length) throw new Error('Eligible agents must be non-empty and unique.');
     if (quorum.eligibleAgentIds.some(id => !session.participants.includes(id) || !run.participantAgentIds.includes(id))) throw new Error('Eligible agent must be a workflow and session participant.');
     requiredQuorumApprovals(quorum.threshold, quorum.eligibleAgentIds.length);
@@ -70,9 +71,18 @@ export const validateCoordinationSnapshot = (snapshot: CoordinationSnapshot): vo
     const session = snapshot.sessions[evaluation.sessionId];
     if (!session) throw new Error('Evaluation references a missing session.');
     if (!session.participants.includes(evaluation.evaluatorAgentId)) throw new Error('Evaluator must be a session participant.');
+    if (!['PASS', 'FAIL', 'INCONCLUSIVE'].includes(evaluation.outcome)) throw new Error('Evaluation outcome is invalid.');
     const target = evaluation.target;
     if (target.type === 'artifact') { if (!target.ref?.trim()) throw new Error('Evaluation artifact reference is required.'); }
-    else { const entity = target.type === 'task' ? snapshot.tasks[target.id] : target.type === 'decision' ? snapshot.decisions[target.id] : snapshot.quorums[target.id]; if (!entity) throw new Error('Evaluation target does not exist.'); if (entity.sessionId !== evaluation.sessionId) throw new Error('Evaluation target belongs to another session.'); }
+    else {
+      let entity;
+      if (target.type === 'task') entity = snapshot.tasks[target.id];
+      else if (target.type === 'decision') entity = snapshot.decisions[target.id];
+      else if (target.type === 'quorum') entity = snapshot.quorums[target.id];
+      else throw new Error('Evaluation target type is invalid.');
+      if (!entity) throw new Error('Evaluation target does not exist.');
+      if (entity.sessionId !== evaluation.sessionId) throw new Error('Evaluation target belongs to another session.');
+    }
   }
   for (const session of Object.values(snapshot.sessions)) {
     if (session.state === 'RESOLVED' && !session.resolution) throw new Error('Resolved session must include a resolution.');

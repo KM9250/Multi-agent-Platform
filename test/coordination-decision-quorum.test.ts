@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { appendEvent, createWorkflow, evaluateQuorumOutcome, validateCoordinationSnapshot } from '../services/coordination/index.ts';
+import { appendEvent, createWorkflow, evaluateQuorumOutcome, requiredQuorumApprovals, validateCoordinationSnapshot } from '../services/coordination/index.ts';
 import type { CoordinationDecision, CoordinationPolicy, CoordinationQuorum, CoordinationSession } from '../services/coordination/index.ts';
 
 const policy: CoordinationPolicy = { policyId: 'p', version: '1', schemaVersion: 1, budgets: { maxWallTimeMs: 1, maxRounds: 1, maxLlmCalls: 1, maxInputTokens: 1, maxOutputTokens: 1, maxEstimatedCost: 1, maxConsecutiveErrors: 1, maxNoProgressCycles: 1 }, riskRules: {}, completionRules: { commitAuthority: 'supervisor', requireAllAcceptanceCriteria: true }, schedulerRules: { sameModelConcurrency: 1 }, retryRules: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 } };
@@ -71,4 +71,69 @@ test('workflow cancellation closes decisions and quorums while suspension preser
   let stopped = appendEvent(state, ev(state, 'WorkflowSuspended', {}, undefined)); assert.equal(stopped.decisions.d1.status, 'OPEN'); assert.equal(stopped.quorums.q1.status, 'OPEN'); assert.throws(() => appendEvent(stopped, ev(stopped, 'QuorumVoteCast', { quorumId: 'q1', vote: 'APPROVE' }, 'quo', 'a')), /stopped/);
   stopped = appendEvent(stopped, ev(stopped, 'WorkflowResumed', { authorization: { type: 'user' } }, undefined)); stopped = appendEvent(stopped, ev(stopped, 'QuorumVoteCast', { quorumId: 'q1', vote: 'APPROVE' }, 'quo', 'a')); assert.equal(stopped.quorums.q1.votes.a, 'APPROVE');
   state = appendEvent(state, ev(state, 'WorkflowCancelled', {}, undefined)); assert.equal(state.decisions.d1.status, 'CANCELLED'); assert.equal(state.quorums.q1.status, 'CANCELLED');
+});
+
+test('quorum thresholds fail closed at helper and event boundaries', () => {
+  assert.throws(() => requiredQuorumApprovals({ kind: 'unknown', count: 1 } as never, 3), /Unknown quorum threshold kind/);
+  for (const eligibleCount of [0, -1, 1.5]) {
+    assert.throws(() => requiredQuorumApprovals({ kind: 'all' }, eligibleCount), /eligible count/);
+  }
+  assert.throws(() => evaluateQuorumOutcome(quorum({ eligibleAgentIds: [] })), /eligible count/);
+
+  const state = openSession(fresh(), 'quo', 'map.coord.quorum.v1');
+  assert.throws(
+    () => appendEvent(state, ev(state, 'QuorumOpened', quorum({ threshold: { kind: 'unknown', count: 1 } as never }), 'quo')),
+    /Unknown quorum threshold kind/,
+  );
+});
+
+test('principal opening rejects wrong modes, duplicate IDs, and invalid participants', () => {
+  const taskState = openSession(fresh(), 'task', 'map.coord.task.v1');
+  assert.throws(() => appendEvent(taskState, ev(taskState, 'DecisionOpened', decision({ sessionId: 'task' }), 'task')), /does not accept decisions/);
+  assert.throws(() => appendEvent(taskState, ev(taskState, 'QuorumOpened', quorum({ sessionId: 'task' }), 'task')), /does not accept quorums/);
+
+  let decisions = openSession(fresh(), 'dec', 'map.coord.decision.v1');
+  assert.throws(() => appendEvent(decisions, ev(decisions, 'DecisionOpened', decision({ authorityAgentId: 'outsider' }), 'dec')), /Persona participant/);
+  decisions = appendEvent(decisions, ev(decisions, 'DecisionOpened', decision(), 'dec'));
+  assert.throws(() => appendEvent(decisions, ev(decisions, 'DecisionOpened', decision(), 'dec')), /Duplicate decision ID/);
+
+  const quorums = openSession(fresh(), 'quo', 'map.coord.quorum.v1');
+  assert.throws(() => appendEvent(quorums, ev(quorums, 'QuorumOpened', quorum({ eligibleAgentIds: ['a', 'a'] }), 'quo')), /unique/);
+  assert.throws(() => appendEvent(quorums, ev(quorums, 'QuorumOpened', quorum({ eligibleAgentIds: ['a', 'outsider'] }), 'quo')), /Persona participant/);
+});
+
+test('quorum terminal actions remain supervisor-only', () => {
+  let resolvable = openSession(fresh(), 'quo', 'map.coord.quorum.v1');
+  resolvable = appendEvent(resolvable, ev(resolvable, 'QuorumOpened', quorum({ eligibleAgentIds: ['a'], threshold: { kind: 'all' } }), 'quo'));
+  resolvable = appendEvent(resolvable, ev(resolvable, 'QuorumVoteCast', { quorumId: 'q1', vote: 'APPROVE' }, 'quo', 'a'));
+  assert.throws(() => appendEvent(resolvable, ev(resolvable, 'QuorumResolved', { quorumId: 'q1', outcome: 'APPROVED' }, 'quo', 'a')), /supervisor/);
+
+  let cancellable = openSession(fresh(), 'quo', 'map.coord.quorum.v1');
+  cancellable = appendEvent(cancellable, ev(cancellable, 'QuorumOpened', quorum(), 'quo'));
+  assert.throws(() => appendEvent(cancellable, ev(cancellable, 'QuorumCancelled', { quorumId: 'q1' }, 'quo', 'a')), /supervisor/);
+});
+
+test('evaluation event validation rejects invalid actors, participants, targets, and artifacts', () => {
+  let state = openSession(fresh(), 'dec', 'map.coord.decision.v1');
+  state = appendEvent(state, ev(state, 'DecisionOpened', decision(), 'dec'));
+  const evaluation = { evaluationId: 'eval', workflowRunId: 'r', sessionId: 'dec', evaluatorAgentId: 'a', target: { type: 'decision', id: 'd1' }, outcome: 'PASS' };
+  assert.throws(() => appendEvent(state, ev(state, 'EvaluationAdded', evaluation, 'dec', 'b')), /actor must match/);
+  assert.throws(() => appendEvent(state, ev(state, 'EvaluationAdded', { ...evaluation, evaluatorAgentId: 'outsider' }, 'dec', 'outsider')), /session participant/);
+  assert.throws(() => appendEvent(state, ev(state, 'EvaluationAdded', { ...evaluation, target: { type: 'artifact', ref: ' ' } }, 'dec', 'a')), /artifact reference/);
+
+  state = openSession(state, 'other', 'map.coord.decision.v1');
+  assert.throws(() => appendEvent(state, ev(state, 'EvaluationAdded', { ...evaluation, sessionId: 'other' }, 'other', 'a')), /another session/);
+});
+
+test('snapshot validation rejects unknown evaluation values and malformed quorum questions', () => {
+  let state = openSession(fresh(), 'quo', 'map.coord.quorum.v1');
+  state = appendEvent(state, ev(state, 'QuorumOpened', quorum(), 'quo'));
+  state = appendEvent(state, ev(state, 'EvaluationAdded', { evaluationId: 'eval', workflowRunId: 'r', sessionId: 'quo', evaluatorAgentId: 'a', target: { type: 'quorum', id: 'q1' }, outcome: 'PASS' }, 'quo', 'a'));
+
+  assert.throws(() => validateCoordinationSnapshot({ ...state, quorums: { q1: { ...state.quorums.q1, question: '   ' } } }), /question/);
+  assert.throws(() => validateCoordinationSnapshot({ ...state, evaluations: { eval: { ...state.evaluations.eval, outcome: 'UNKNOWN' as never } } }), /outcome/);
+  assert.throws(
+    () => validateCoordinationSnapshot({ ...state, evaluations: { eval: { ...state.evaluations.eval, target: { type: 'unknown', id: 'q1' } as never } } }),
+    /target type/,
+  );
 });

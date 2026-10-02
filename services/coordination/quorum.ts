@@ -8,8 +8,12 @@ export interface QuorumEvaluation {
 }
 
 export const requiredQuorumApprovals = (threshold: QuorumThreshold, eligibleCount: number): number => {
+  if (!Number.isInteger(eligibleCount) || eligibleCount <= 0) {
+    throw new Error('Quorum eligible count must be a positive integer.');
+  }
   if (threshold.kind === 'all') return eligibleCount;
   if (threshold.kind === 'majority') return Math.floor(eligibleCount / 2) + 1;
+  if (threshold.kind !== 'count') throw new Error('Unknown quorum threshold kind.');
   if (!Number.isInteger(threshold.count) || threshold.count < 1 || threshold.count > eligibleCount) {
     throw new Error('Quorum count threshold is invalid.');
   }
