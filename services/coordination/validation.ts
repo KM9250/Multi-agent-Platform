@@ -1,8 +1,9 @@
-import type { AcceptanceCriterionEvaluatedPayload, CommitmentAcceptedPayload, CommitmentGateResult, CommitmentPolicyEvaluationPayload, CommitmentRejectedPayload, CommitmentRequestedPayload, CoordinationSnapshot, WorkflowCommitmentState, WorkflowStatus } from './types';
+import type { AcceptanceCriterionEvaluatedPayload, CommitmentAcceptedPayload, CommitmentGateResult, CommitmentPolicyEvaluationPayload, CommitmentRejectedPayload, CommitmentRequestedPayload, CoordinationSnapshot, ProgressRecordedPayload, UsageRecordedPayload, WorkflowBlockedPayload, WorkflowCommitmentState, WorkflowResumePayload, WorkflowStatus } from './types';
+import { ALLOWED_WHILE_STOPPED, COORDINATION_EVENT_TYPES, STOPPED_WORKFLOW_STATUSES, TERMINAL_WORKFLOW_STATUSES } from './types';
 import { evaluateQuorumOutcome, requiredQuorumApprovals } from './quorum';
 import { validatePolicy } from './policy';
+import { applyProgress, applyUsageDelta, emptyWorkflowUsage, validateProgressPayload, validateUsagePayload } from './usage';
 
-const TERMINAL_WORKFLOW_STATUSES = new Set<WorkflowStatus>(['RESOLVED', 'CANCELLED', 'FAILED']);
 const TERMINAL_TASK_STATUSES = new Set(['COMPLETED', 'FAILED', 'CANCELLED']);
 const TERMINAL_PRINCIPAL_STATUSES = new Set(['RESOLVED', 'CANCELLED']);
 const ACCEPTANCE_EVIDENCE_TYPES = new Set(['TaskCompleted', 'TaskFailed', 'DecisionResolved', 'QuorumResolved', 'EvaluationAdded', 'SessionResolved']);
@@ -73,10 +74,18 @@ export const validateCoordinationSnapshot = (snapshot: CoordinationSnapshot): vo
     throw new Error('Snapshot policy identity must match the workflow policy.');
   }
   if (!run.budget || BUDGET_FIELDS.some(field => run.budget[field] !== snapshot.policy.budgets[field])) throw new Error('Workflow budget must match the policy budget.');
-  if (!run.usage || INTEGER_USAGE_FIELDS.some(field => !Number.isInteger(run.usage[field]) || run.usage[field] < 0)
+  if (!['RUNNING', 'SUSPENDED', 'RESOLVED', 'CANCELLED', 'FAILED', 'BLOCKED'].includes(run.status)) throw new Error('Workflow status is invalid.');
+  if (!['interactive', 'supervised_autonomous'].includes(run.executionMode)) throw new Error('Execution mode is invalid.');
+  const participants = validateStringArray(run.participantAgentIds, 'participantAgentIds');
+  if (!participants.length) throw new Error('Workflow requires participants.');
+  validateStringArray(run.acceptanceCriteria, 'acceptanceCriteria');
+  validateStringArray(run.satisfiedCriteria, 'satisfiedCriteria');
+  if (run.satisfiedCriteria.some(value => !run.acceptanceCriteria.includes(value))) throw new Error('Satisfied criteria must belong to acceptance criteria.');
+  if (!run.usage || INTEGER_USAGE_FIELDS.some(field => !Number.isSafeInteger(run.usage[field]) || run.usage[field] < 0)
     || !Number.isFinite(run.usage.estimatedCost) || run.usage.estimatedCost < 0) throw new Error('Workflow usage must be finite and non-negative.');
   if (!run.participantAgentIds.includes(run.supervisorAgentId)) throw new Error('Supervisor must be a workflow participant.');
   if (!Array.isArray(snapshot.events) || snapshot.events.length === 0 || snapshot.events[0].type !== 'WorkflowRunCreated') throw new Error('Journal must begin with WorkflowRunCreated.');
+  if (run.currentSessionId !== undefined && !snapshot.sessions[run.currentSessionId]) throw new Error('currentSessionId must reference an existing session.');
   if (snapshot.events.filter(event => event.type === 'WorkflowRunCreated').length !== 1) throw new Error('Journal must contain exactly one WorkflowRunCreated event.');
   const creation = snapshot.events[0];
   const creationPayload = creation.payload as Partial<Pick<typeof run, 'roomId' | 'goal' | 'acceptanceCriteria' | 'supervisorAgentId' | 'participantAgentIds' | 'executionMode' | 'policyId' | 'policyVersion'>> | null;
@@ -90,10 +99,19 @@ export const validateCoordinationSnapshot = (snapshot: CoordinationSnapshot): vo
 
   const eventIds = new Set<string>(); const idempotencyKeys = new Set<string>(); const satisfied = new Set<string>();
   const usedCommitmentIds = new Set<string>(); let replayedCommitment: WorkflowCommitmentState | undefined;
+  let replayedUsage = emptyWorkflowUsage(); let previousTimestamp = -1;
+  let replayedWorkflowStatus: WorkflowStatus = 'RUNNING';
   snapshot.events.forEach((event, index) => {
+    if (!COORDINATION_EVENT_TYPES.has(event.type)) throw new Error('Coordination event type is invalid.');
+    if (index > 0 && TERMINAL_WORKFLOW_STATUSES.has(replayedWorkflowStatus)) throw new Error('Terminal workflow cannot contain later events.');
+    if (index > 0 && STOPPED_WORKFLOW_STATUSES.has(replayedWorkflowStatus) && !ALLOWED_WHILE_STOPPED.has(event.type)) {
+      throw new Error('Stopped workflow contains an invalid event.');
+    }
     if (event.sequence !== index + 1) throw new Error('Journal event sequences must be contiguous.');
     if (event.workflowRunId !== run.runId) throw new Error('Journal event belongs to another workflow.');
     if (!event.eventId?.trim() || eventIds.has(event.eventId)) throw new Error('Journal event IDs must be non-empty and unique.');
+    if (!Number.isFinite(event.timestamp) || event.timestamp < 0 || event.timestamp < previousTimestamp) throw new Error('Journal event timestamps must be finite, non-negative, and monotonic.');
+    previousTimestamp = event.timestamp;
     eventIds.add(event.eventId);
     if (event.idempotencyKey) { if (!event.idempotencyKey.trim() || idempotencyKeys.has(event.idempotencyKey)) throw new Error('Journal idempotency keys must be unique.'); idempotencyKeys.add(event.idempotencyKey); }
     if (event.type === 'AcceptanceCriterionEvaluated') {
@@ -106,6 +124,19 @@ export const validateCoordinationSnapshot = (snapshot: CoordinationSnapshot): vo
       if (payload.outcome === 'SATISFIED' && !evidenceIds.length) throw new Error('Satisfied criterion requires evidence.');
       for (const id of evidenceIds) { const evidenceIndex = snapshot.events.findIndex(candidate => candidate.eventId === id); if (evidenceIndex < 0 || evidenceIndex >= index) throw new Error('Acceptance evidence must reference a prior event.'); if (!ACCEPTANCE_EVIDENCE_TYPES.has(snapshot.events[evidenceIndex].type)) throw new Error('Acceptance evidence type is not allowed.'); }
       if (payload.outcome === 'SATISFIED') satisfied.add(criterion); else satisfied.delete(criterion);
+    }
+    if (event.type === 'UsageRecorded') {
+      if (TERMINAL_WORKFLOW_STATUSES.has(replayedWorkflowStatus)) throw new Error('Usage cannot be recorded after workflow termination.');
+      if (event.sessionId !== undefined || event.actorAgentId !== run.supervisorAgentId) throw new Error('Usage must be workflow-scoped and supervisor-owned.');
+      const payload = validateUsagePayload(event.payload as UsageRecordedPayload);
+      replayedUsage = applyUsageDelta(replayedUsage, payload);
+    }
+    if (event.type === 'ProgressRecorded') {
+      if (replayedWorkflowStatus !== 'RUNNING') throw new Error('Progress can only be recorded while workflow is running.');
+      if (event.sessionId !== undefined || event.actorAgentId !== run.supervisorAgentId) throw new Error('Progress must be workflow-scoped and supervisor-owned.');
+      const payload = validateProgressPayload(event.payload as ProgressRecordedPayload);
+      for (const id of payload.evidenceEventIds ?? []) { const evidenceIndex = snapshot.events.findIndex(candidate => candidate.eventId === id); if (evidenceIndex < 0 || evidenceIndex >= index) throw new Error('Progress evidence must reference a prior event.'); }
+      replayedUsage = applyProgress(replayedUsage, payload);
     }
     if (event.type === 'PolicyEvaluated') {
       if (event.sessionId !== undefined || event.actorAgentId !== run.supervisorAgentId) throw new Error('Policy evaluation must be workflow-scoped and supervisor-owned.');
@@ -129,15 +160,32 @@ export const validateCoordinationSnapshot = (snapshot: CoordinationSnapshot): vo
       if (!replayedCommitment || replayedCommitment.status !== 'REQUESTED') throw new Error('No commitment request is pending.');
       const commitmentId = (event.payload as CommitmentAcceptedPayload)?.commitmentId?.trim();
       if (!commitmentId || commitmentId !== replayedCommitment.commitmentId) throw new Error('Commitment ID does not match the pending request.');
-      if (event.type === 'CommitmentAccepted') replayedCommitment = { ...replayedCommitment, status: 'ACCEPTED', decidedByAgentId: event.actorAgentId, decidedAt: event.timestamp };
+      if (event.type === 'CommitmentAccepted') {
+        replayedCommitment = { ...replayedCommitment, status: 'ACCEPTED', decidedByAgentId: event.actorAgentId, decidedAt: event.timestamp };
+        replayedWorkflowStatus = 'RESOLVED';
+      }
       else {
         const reason = (event.payload as CommitmentRejectedPayload)?.reason?.trim(); if (!reason) throw new Error('Commitment rejection reason is required.');
         replayedCommitment = { ...replayedCommitment, status: 'REJECTED', decidedByAgentId: event.actorAgentId, decidedAt: event.timestamp, rejectionReason: reason };
       }
-    } else if (event.type === 'WorkflowCancelled' && replayedCommitment?.status === 'REQUESTED') {
-      replayedCommitment = { ...replayedCommitment, status: 'CANCELLED', decidedAt: event.timestamp };
+    } else if (event.type === 'WorkflowCancelled') {
+      if (replayedCommitment?.status === 'REQUESTED') replayedCommitment = { ...replayedCommitment, status: 'CANCELLED', decidedAt: event.timestamp };
+      replayedWorkflowStatus = 'CANCELLED';
+    }
+    if (event.type === 'WorkflowSuspended' || event.type === 'WorkflowBlocked') {
+      if (replayedWorkflowStatus !== 'RUNNING') throw new Error('Workflow can only be stopped while running.');
+      if (event.actorAgentId !== run.supervisorAgentId) throw new Error('Only the configured supervisor may stop the workflow.');
+      if (event.type === 'WorkflowBlocked' && !(event.payload as WorkflowBlockedPayload | undefined)?.reason?.trim()) throw new Error('Workflow block reason is required.');
+      replayedWorkflowStatus = event.type === 'WorkflowSuspended' ? 'SUSPENDED' : 'BLOCKED';
+    } else if (event.type === 'WorkflowResumed') {
+      if (replayedWorkflowStatus !== 'SUSPENDED' && replayedWorkflowStatus !== 'BLOCKED') throw new Error('Workflow can only resume from a stopped state.');
+      if (event.actorAgentId !== run.supervisorAgentId) throw new Error('Only the configured supervisor may resume the workflow.');
+      if ((event.payload as WorkflowResumePayload | undefined)?.authorization?.type !== 'user') throw new Error('User authorization is required to resume workflow.');
+      replayedWorkflowStatus = 'RUNNING';
     }
   });
+  if (run.updatedAt !== snapshot.events.at(-1)!.timestamp) throw new Error('Workflow updatedAt must match the last journal event.');
+  if (INTEGER_USAGE_FIELDS.some(field => replayedUsage[field] !== run.usage[field]) || replayedUsage.estimatedCost !== run.usage.estimatedCost) throw new Error('Workflow usage projection does not match the journal.');
   const replayed = run.acceptanceCriteria.filter(criterion => satisfied.has(criterion));
   if (replayed.length !== run.satisfiedCriteria.length || replayed.some((criterion, index) => criterion !== run.satisfiedCriteria[index])) throw new Error('Satisfied criteria projection does not match the journal.');
 
@@ -158,6 +206,12 @@ export const validateCoordinationSnapshot = (snapshot: CoordinationSnapshot): vo
   if (commitment?.status === 'ACCEPTED' && run.status !== 'RESOLVED') throw new Error('Accepted commitment requires a resolved workflow.');
   if (run.status === 'RESOLVED' && snapshot.policy.completionRules.requireAllAcceptanceCriteria && run.satisfiedCriteria.length !== run.acceptanceCriteria.length) throw new Error('Resolved workflow requires all acceptance criteria.');
   for (const session of Object.values(snapshot.sessions)) {
+    if (!['map.coord.task.v1', 'map.coord.decision.v1', 'map.coord.quorum.v1'].includes(session.mode)) throw new Error('Session mode is invalid.');
+    if (!['OPEN', 'SUSPENDED', 'RESOLVED', 'CANCELLED', 'EXPIRED'].includes(session.state)) throw new Error('Session state is invalid.');
+    const sessionParticipants = validateStringArray(session.participants, 'session participants'); if (!sessionParticipants.length) throw new Error('Session requires participants.');
+    if (!session.goal?.trim()) throw new Error('Session goal is required.');
+    if (!Number.isFinite(session.createdAt) || !Number.isFinite(session.updatedAt) || session.createdAt < run.createdAt
+      || session.createdAt > session.updatedAt || session.updatedAt > run.updatedAt) throw new Error('Session timestamps are invalid.');
     if (session.workflowRunId !== run.runId) throw new Error('Session belongs to another workflow.');
     if (session.policyId !== run.policyId || session.policyVersion !== run.policyVersion) throw new Error('Session policy must match the workflow policy.');
     if (session.supervisor !== run.supervisorAgentId) throw new Error('Session supervisor must match the workflow supervisor.');
@@ -169,6 +223,9 @@ export const validateCoordinationSnapshot = (snapshot: CoordinationSnapshot): vo
     }
   }
   for (const task of Object.values(snapshot.tasks)) {
+    if (!['ASSIGNED', 'COMPLETED', 'FAILED', 'CANCELLED'].includes(task.status)) throw new Error('Task status is invalid.');
+    if (!Number.isFinite(task.createdAt) || !Number.isFinite(task.updatedAt) || task.createdAt < run.createdAt
+      || task.createdAt > task.updatedAt || task.updatedAt > run.updatedAt) throw new Error('Task timestamps are invalid.');
     if (task.workflowRunId !== run.runId) throw new Error('Task belongs to another workflow.');
     const session = snapshot.sessions[task.sessionId];
     if (!session) throw new Error('Task references a missing session.');
@@ -183,6 +240,8 @@ export const validateCoordinationSnapshot = (snapshot: CoordinationSnapshot): vo
     }
   }
   for (const decision of Object.values(snapshot.decisions)) {
+    if (!Number.isFinite(decision.createdAt) || !Number.isFinite(decision.updatedAt) || decision.createdAt < run.createdAt
+      || decision.createdAt > decision.updatedAt || decision.updatedAt > run.updatedAt) throw new Error('Decision timestamps are invalid.');
     if (decision.workflowRunId !== run.runId) throw new Error('Decision belongs to another workflow.');
     const session = snapshot.sessions[decision.sessionId];
     if (!session) throw new Error('Decision references a missing session.');
@@ -205,6 +264,8 @@ export const validateCoordinationSnapshot = (snapshot: CoordinationSnapshot): vo
     if ((session.state === 'RESOLVED' || session.state === 'CANCELLED' || session.state === 'EXPIRED') && decision.status === 'OPEN') throw new Error('Terminal session cannot contain an open decision.');
   }
   for (const quorum of Object.values(snapshot.quorums)) {
+    if (!Number.isFinite(quorum.createdAt) || !Number.isFinite(quorum.updatedAt) || quorum.createdAt < run.createdAt
+      || quorum.createdAt > quorum.updatedAt || quorum.updatedAt > run.updatedAt) throw new Error('Quorum timestamps are invalid.');
     if (quorum.workflowRunId !== run.runId) throw new Error('Quorum belongs to another workflow.');
     const session = snapshot.sessions[quorum.sessionId];
     if (!session) throw new Error('Quorum references a missing session.');
@@ -221,6 +282,7 @@ export const validateCoordinationSnapshot = (snapshot: CoordinationSnapshot): vo
     if ((session.state === 'RESOLVED' || session.state === 'CANCELLED' || session.state === 'EXPIRED') && quorum.status === 'OPEN') throw new Error('Terminal session cannot contain an open quorum.');
   }
   for (const evaluation of Object.values(snapshot.evaluations)) {
+    if (!Number.isFinite(evaluation.createdAt) || evaluation.createdAt < run.createdAt || evaluation.createdAt > run.updatedAt) throw new Error('Evaluation timestamp is invalid.');
     if (evaluation.workflowRunId !== run.runId) throw new Error('Evaluation belongs to another workflow.');
     const session = snapshot.sessions[evaluation.sessionId];
     if (!session) throw new Error('Evaluation references a missing session.');
@@ -241,4 +303,5 @@ export const validateCoordinationSnapshot = (snapshot: CoordinationSnapshot): vo
   for (const session of Object.values(snapshot.sessions)) {
     if (session.state === 'RESOLVED') validateResolvedSession(snapshot, session.sessionId);
   }
+  if (replayedWorkflowStatus !== run.status) throw new Error('Workflow status projection does not match the journal.');
 };

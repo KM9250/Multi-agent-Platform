@@ -9,12 +9,13 @@ const POSITIVE_NUMBER_BUDGET_FIELDS: (keyof WorkflowBudget)[] = ['maxWallTimeMs'
 
 export const validatePolicy = (policy: CoordinationPolicy): void => {
   if (!policy || typeof policy !== 'object') throw new Error('Policy is required.');
-  if (!policy.policyId.trim() || !policy.version.trim()) throw new Error('Policy identity and version are required.');
+  if (typeof policy.policyId !== 'string' || typeof policy.version !== 'string' || !policy.policyId.trim() || !policy.version.trim()) throw new Error('Policy identity and version are required.');
   if (policy.schemaVersion !== 1) throw new Error('Unsupported policy schemaVersion.');
   if (!policy.completionRules || policy.completionRules.commitAuthority !== 'supervisor'
     || typeof policy.completionRules.requireAllAcceptanceCriteria !== 'boolean') {
     throw new Error('Completion rules are invalid.');
   }
+  if (!policy.budgets || typeof policy.budgets !== 'object' || Array.isArray(policy.budgets)) throw new Error('Policy budgets are invalid.');
   for (const field of POSITIVE_INTEGER_BUDGET_FIELDS) {
     const value = policy.budgets[field];
     if (!Number.isInteger(value) || value <= 0) throw new Error(`${field} must be a positive integer.`);
@@ -23,9 +24,13 @@ export const validatePolicy = (policy: CoordinationPolicy): void => {
     const value = policy.budgets[field];
     if (!Number.isFinite(value) || value <= 0) throw new Error(`${field} must be a finite positive value.`);
   }
-  if (!Number.isInteger(policy.schedulerRules.sameModelConcurrency) || policy.schedulerRules.sameModelConcurrency <= 0) {
+  if (!policy.riskRules || typeof policy.riskRules !== 'object' || Array.isArray(policy.riskRules)
+    || Object.entries(policy.riskRules).some(([key, value]) => !key.trim() || !['ALLOW', 'NEEDS_USER', 'DENY'].includes(value))) throw new Error('Risk rules are invalid.');
+  if (!policy.schedulerRules || typeof policy.schedulerRules !== 'object' || Array.isArray(policy.schedulerRules)
+    || !Number.isInteger(policy.schedulerRules.sameModelConcurrency) || policy.schedulerRules.sameModelConcurrency <= 0) {
     throw new Error('sameModelConcurrency must be a positive integer.');
   }
+  if (!policy.retryRules || typeof policy.retryRules !== 'object' || Array.isArray(policy.retryRules)) throw new Error('Retry rules are invalid.');
   if (!Number.isInteger(policy.retryRules.maxAttempts) || policy.retryRules.maxAttempts <= 0) {
     throw new Error('maxAttempts must be a positive integer.');
   }

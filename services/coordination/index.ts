@@ -4,3 +4,5 @@ export * from './kernel';
 export * from './validation';
 export * from './quorum';
 export * from './completion';
+export * from './usage';
+export * from './audit';

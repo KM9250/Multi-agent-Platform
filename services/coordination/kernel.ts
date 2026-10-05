@@ -2,18 +2,17 @@ import type {
   CoordinationEvent, CoordinationEventType, CoordinationPolicy, CoordinationSession,
   CoordinationSnapshot, CoordinationTask, CoordinationDecision, CoordinationQuorum, CoordinationEvaluation,
   DecisionResolvedPayload, QuorumVoteCastPayload, QuorumResolvedPayload, SessionResolution, TaskCompletedPayload,
-  TaskFailedPayload, WorkflowBlockedPayload, WorkflowResumePayload, WorkflowRun, WorkflowStatus,
+  TaskFailedPayload, WorkflowBlockedPayload, WorkflowResumePayload, WorkflowRun,
   AcceptanceCriterionEvaluatedPayload, CommitmentPolicyEvaluationPayload, CommitmentRequestedPayload,
   CommitmentAcceptedPayload, CommitmentRejectedPayload,
+  UsageRecordedPayload, ProgressRecordedPayload,
 } from './types';
+import { ALLOWED_WHILE_STOPPED, COORDINATION_EVENT_TYPES, STOPPED_WORKFLOW_STATUSES, TERMINAL_WORKFLOW_STATUSES } from './types';
 import { validatePolicy } from './policy';
 import { evaluateQuorumOutcome, requiredQuorumApprovals } from './quorum';
 import { commitmentGateResultsEqual, evaluateCommitmentGate } from './completion';
+import { applyProgress, applyUsageDelta, emptyWorkflowUsage, validateProgressPayload, validateUsagePayload } from './usage';
 
-const emptyUsage = () => ({ rounds: 0, llmCalls: 0, inputTokens: 0, outputTokens: 0, estimatedCost: 0, consecutiveErrors: 0, noProgressCycles: 0 });
-const TERMINAL_WORKFLOW_STATUSES = new Set<WorkflowStatus>(['RESOLVED', 'CANCELLED', 'FAILED']);
-const STOPPED_WORKFLOW_STATUSES = new Set<WorkflowStatus>(['SUSPENDED', 'BLOCKED']);
-const ALLOWED_WHILE_STOPPED = new Set<CoordinationEventType>(['WorkflowResumed', 'WorkflowCancelled', 'ErrorRecorded']);
 const SESSION_SCOPED_EVENTS = new Set<CoordinationEventType>([
   'SessionSuspended', 'SessionResumed', 'SessionResolved', 'SessionCancelled', 'SessionExpired',
   'TaskAssigned', 'TaskCompleted', 'TaskFailed', 'TaskCancelled', 'EvaluationAdded',
@@ -134,21 +133,25 @@ export interface CreateWorkflowInput {
 
 export const createWorkflow = (input: CreateWorkflowInput): CoordinationSnapshot => {
   validatePolicy(input.policy);
+  if (!['interactive', 'supervised_autonomous'].includes(input.executionMode)) throw new Error('Execution mode is invalid.');
   const participants = input.participantAgentIds.map(id => id.trim());
+  if (!participants.length) throw new Error('Workflow requires at least one participant.');
   if (participants.some(id => !id)) throw new Error('Participant IDs cannot be empty.');
+  if (new Set(participants).size !== participants.length) throw new Error('Participant IDs cannot contain duplicates.');
   if (!participants.includes(input.supervisorAgentId)) throw new Error('Supervisor must be a Persona participant.');
   if (!input.goal.trim()) throw new Error('Workflow goal is required.');
   const criteria = input.acceptanceCriteria.map(value => value.trim());
   if (criteria.some(value => !value)) throw new Error('Acceptance criteria cannot be empty.');
   if (new Set(criteria).size !== criteria.length) throw new Error('Acceptance criteria cannot contain duplicates.');
   const now = input.now ?? Date.now();
+  if (!Number.isFinite(now) || now < 0) throw new Error('Workflow timestamp must be finite and non-negative.');
   const policy = clonePolicy(input.policy);
   const run: WorkflowRun = {
     runId: input.runId, roomId: input.roomId, goal: input.goal.trim(), acceptanceCriteria: criteria,
     satisfiedCriteria: [], supervisorAgentId: input.supervisorAgentId,
     participantAgentIds: [...new Set(participants)], executionMode: input.executionMode,
     policyId: policy.policyId, policyVersion: policy.version, status: 'RUNNING', budget: clone(policy.budgets),
-    usage: emptyUsage(), createdAt: now, updatedAt: now,
+    usage: emptyWorkflowUsage(), createdAt: now, updatedAt: now,
   };
   const payload = { roomId: run.roomId, goal: run.goal, acceptanceCriteria: [...criteria], supervisorAgentId: run.supervisorAgentId,
     participantAgentIds: [...run.participantAgentIds], executionMode: run.executionMode, policyId: run.policyId, policyVersion: run.policyVersion };
@@ -173,6 +176,11 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
       throw new Error('Idempotency key collision.');
     }
   }
+  if (!COORDINATION_EVENT_TYPES.has(event.type)) throw new Error('Coordination event type is invalid.');
+  if (event.type === 'WorkflowRunCreated' && snapshot.events.length > 0) throw new Error('WorkflowRunCreated may only begin the journal.');
+  if (!Number.isFinite(event.timestamp) || event.timestamp < 0) throw new Error('Event timestamp must be finite and non-negative.');
+  const lastTimestamp = snapshot.events.at(-1)?.timestamp;
+  if (lastTimestamp !== undefined && event.timestamp < lastTimestamp) throw new Error('Event timestamp cannot move backwards.');
   if (TERMINAL_WORKFLOW_STATUSES.has(snapshot.run.status)) throw new Error(`Workflow is already terminal: ${snapshot.run.status}`);
   if (STOPPED_WORKFLOW_STATUSES.has(snapshot.run.status) && !ALLOWED_WHILE_STOPPED.has(event.type)) throw new Error(`Workflow is stopped: ${snapshot.run.status}`);
   const expected = snapshot.events.length ? snapshot.events.at(-1)!.sequence + 1 : 1;
@@ -197,6 +205,9 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
     if (value.policyId !== run.policyId || value.policyVersion !== run.policyVersion) throw new Error('Session policy must match the workflow policy.');
     if (value.supervisor !== run.supervisorAgentId) throw new Error('Session supervisor must match the workflow supervisor.');
     if (value.state !== 'OPEN') throw new Error('A new session must be OPEN.');
+    if (!['map.coord.task.v1', 'map.coord.decision.v1', 'map.coord.quorum.v1'].includes(value.mode)) throw new Error('Session mode is invalid.');
+    if (!Number.isFinite(value.createdAt) || !Number.isFinite(value.updatedAt)
+      || value.createdAt < run.createdAt || value.createdAt > value.updatedAt || value.updatedAt > event.timestamp) throw new Error('Session timestamps are invalid.');
     if (!value.goal.trim()) throw new Error('Session goal is required.');
     if (!value.participants.length) throw new Error('Session must have at least one participant.');
     if (value.participants.some(id => !id.trim())) throw new Error('Session participant IDs cannot be empty.');
@@ -238,6 +249,8 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
     if (!session.participants.includes(task.assigneeAgentId) || !run.participantAgentIds.includes(task.assigneeAgentId)) throw new Error('Task assignee must be a Persona participant.');
     if (!session.participants.includes(task.assignedByAgentId) || task.assignedByAgentId !== event.actorAgentId) throw new Error('Task assigner must match the participating actor.');
     if (task.status !== 'ASSIGNED') throw new Error('A new task must be ASSIGNED.');
+    if (!Number.isFinite(task.createdAt) || !Number.isFinite(task.updatedAt)
+      || task.createdAt < run.createdAt || task.createdAt > task.updatedAt || task.updatedAt > event.timestamp) throw new Error('Task timestamps are invalid.');
     if (task.resultRef !== undefined || task.evidenceRefs !== undefined || task.failureReason !== undefined) throw new Error('A new task cannot contain terminal result fields.');
     tasks[task.taskId] = { ...clone(task), title: task.title.trim(), goal: task.goal.trim(), inputRefs: validateRefs(task.inputRefs, 'inputRefs') };
   } else if (event.type === 'TaskCompleted' || event.type === 'TaskFailed' || event.type === 'TaskCancelled') {
@@ -268,6 +281,8 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
     if (!value.question?.trim()) throw new Error('Decision question is required.');
     if (!session.participants.includes(value.authorityAgentId) || !run.participantAgentIds.includes(value.authorityAgentId)) throw new Error('Decision authority must be a Persona participant.');
     if (value.status !== 'OPEN') throw new Error('A new decision must be OPEN.');
+    if (!Number.isFinite(value.createdAt) || !Number.isFinite(value.updatedAt)
+      || value.createdAt < run.createdAt || value.createdAt > value.updatedAt || value.updatedAt > event.timestamp) throw new Error('Decision timestamps are invalid.');
     if (value.value !== undefined || value.rationaleRef !== undefined || value.evidenceRefs !== undefined) throw new Error('A new decision cannot contain terminal result fields.');
     const options = value.options?.map(option => option.trim());
     if (options && (!options.length || options.some(option => !option) || new Set(options).size !== options.length)) throw new Error('Decision options must be non-empty and unique.');
@@ -297,6 +312,8 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
     if (!value.eligibleAgentIds?.length || value.eligibleAgentIds.some(id => !id.trim()) || new Set(value.eligibleAgentIds).size !== value.eligibleAgentIds.length) throw new Error('Eligible agents must be non-empty and unique.');
     if (value.eligibleAgentIds.some(id => !session.participants.includes(id) || !run.participantAgentIds.includes(id))) throw new Error('Eligible agent must be a Persona participant.');
     requiredQuorumApprovals(value.threshold, value.eligibleAgentIds.length);
+    if (!Number.isFinite(value.createdAt) || !Number.isFinite(value.updatedAt)
+      || value.createdAt < run.createdAt || value.createdAt > value.updatedAt || value.updatedAt > event.timestamp) throw new Error('Quorum timestamps are invalid.');
     if (Object.keys(value.votes ?? {}).length || value.status !== 'OPEN' || value.outcome !== undefined) throw new Error('A new quorum must be OPEN without votes or outcome.');
     quorums[value.quorumId] = { ...clone(value), question: value.question.trim(), eligibleAgentIds: [...value.eligibleAgentIds], votes: {} };
   } else if (event.type === 'QuorumVoteCast' || event.type === 'QuorumResolved' || event.type === 'QuorumCancelled') {
@@ -329,7 +346,9 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
     if (target?.type === 'artifact') { const ref = target.ref?.trim(); if (!ref) throw new Error('Evaluation artifact reference is required.'); normalizedTarget = { ...target, ref }; }
     else { const entity = target?.type === 'task' ? tasks[target.id] : target?.type === 'decision' ? decisions[target.id] : target?.type === 'quorum' ? quorums[target.id] : undefined; if (!entity) throw new Error('Evaluation target does not exist.'); if (entity.sessionId !== session.sessionId) throw new Error('Evaluation target belongs to another session.'); }
     const summary = value.summary?.trim(); if (value.summary !== undefined && !summary) throw new Error('Evaluation summary cannot be empty.');
-    evaluations[value.evaluationId] = { ...clone(value), target: normalizedTarget, summary, evidenceRefs: validateRefs(value.evidenceRefs, 'evidenceRefs') };
+    const createdAt = value.createdAt ?? event.timestamp;
+    if (!Number.isFinite(createdAt) || createdAt < run.createdAt || createdAt > event.timestamp) throw new Error('Evaluation timestamp is invalid.');
+    evaluations[value.evaluationId] = { ...clone(value), createdAt, target: normalizedTarget, summary, evidenceRefs: validateRefs(value.evidenceRefs, 'evidenceRefs') };
   } else if (event.type === 'AcceptanceCriterionEvaluated') {
     requireWorkflowScopedEvent(event); requireSupervisor(run, event);
     const payload = event.payload as AcceptanceCriterionEvaluatedPayload;
@@ -342,6 +361,15 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
     const note = payload.note?.trim(); if (payload.note !== undefined && !note) throw new Error('Acceptance note cannot be empty.');
     const satisfied = new Set(run.satisfiedCriteria); if (payload.outcome === 'SATISFIED') satisfied.add(criterion); else satisfied.delete(criterion);
     run.satisfiedCriteria = run.acceptanceCriteria.filter(value => satisfied.has(value));
+  } else if (event.type === 'UsageRecorded') {
+    requireWorkflowScopedEvent(event); requireSupervisor(run, event);
+    validateUsagePayload(event.payload as UsageRecordedPayload);
+    run.usage = applyUsageDelta(run.usage, event.payload as UsageRecordedPayload);
+  } else if (event.type === 'ProgressRecorded') {
+    requireWorkflowScopedEvent(event); requireSupervisor(run, event);
+    const payload = validateProgressPayload(event.payload as ProgressRecordedPayload);
+    for (const id of payload.evidenceEventIds ?? []) if (!snapshot.events.some(candidate => candidate.eventId === id)) throw new Error('Progress evidence must reference a prior event.');
+    run.usage = applyProgress(run.usage, payload);
   } else if (event.type === 'PolicyEvaluated') {
     requireWorkflowScopedEvent(event); requireSupervisor(run, event);
     const payload = event.payload as CommitmentPolicyEvaluationPayload;
