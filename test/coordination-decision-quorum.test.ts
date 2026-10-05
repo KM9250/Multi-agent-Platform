@@ -144,7 +144,7 @@ test('snapshot validation replays mode-specific successful session gates', () =>
   });
 
   const taskState = openSession(fresh(), 'task', 'map.coord.task.v1');
-  const cancelledTask: CoordinationTask = { taskId: 't1', workflowRunId: 'r', sessionId: 'task', title: 'Task', goal: 'work', assigneeAgentId: 'a', assignedByAgentId: 'supervisor', status: 'CANCELLED', createdAt: 2, updatedAt: 3 };
+  const cancelledTask: CoordinationTask = { taskId: 't1', workflowRunId: 'r', sessionId: 'task', title: 'Task', goal: 'work', assigneeAgentId: 'a', assignedByAgentId: 'supervisor', status: 'CANCELLED', createdAt: 2, updatedAt: 2 };
   assert.throws(
     () => validateCoordinationSnapshot({ ...taskState, sessions: { task: resolvedSession(taskState, 'task') }, tasks: { t1: cancelledTask } }),
     /completed task/,
