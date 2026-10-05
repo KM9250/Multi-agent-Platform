@@ -43,7 +43,9 @@ test('journal replay rejects forged or stale acceptance projections and corrupt 
 test('commitment gate is deterministic, blocks state not budgets, and fails closed', () => {
   let state = fresh(); let result = evaluateCommitmentGate(state, 20); assert.equal(result.allowed, false); assert.deepEqual(result.missingCriteria, ['A', 'B']); assert.equal(result.exhaustedBudget, 'maxWallTimeMs');
   state = work(state); result = evaluateCommitmentGate(state, 20); assert.equal(result.allowed, false); assert.deepEqual(result.activeSessionIds, []);
-  state = criterion(criterion(state, 'A', 'SATISFIED'), 'B', 'SATISFIED'); state = { ...state, run: { ...state.run, usage: { ...state.run.usage, rounds: 2 } } };
+  state = criterion(criterion(state, 'A', 'SATISFIED'), 'B', 'SATISFIED');
+  state = add(state, 'ProgressRecorded', { outcome: 'NO_PROGRESS', summary: 'no progress one' });
+  state = add(state, 'ProgressRecorded', { outcome: 'NO_PROGRESS', summary: 'no progress two' });
   result = evaluateCommitmentGate(state, 5); assert.equal(result.allowed, true); assert.equal(result.exhaustedBudget, 'maxRounds');
   let optional = work(fresh(false)); result = evaluateCommitmentGate(optional, 5); assert.equal(result.allowed, true); assert.deepEqual(result.missingCriteria, ['A', 'B']);
   const invalid = { ...optional, run: { ...optional.run, satisfiedCriteria: ['A'] } }; assert.deepEqual(evaluateCommitmentGate(invalid, 5).reasons, ['snapshot-invalid']);
