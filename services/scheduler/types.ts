@@ -1,4 +1,4 @@
-export type SchedulerJobKind = 'decision' | 'generation' | 'subagent';
+export type SchedulerJobKind = 'decision' | 'generation' | 'subagent' | 'coordination';
 
 export interface SchedulerExecutionContext {
   /** One-based attempt number. */
