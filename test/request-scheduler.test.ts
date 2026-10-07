@@ -144,3 +144,19 @@ test('a completed retry wait removes its abort listener', async () => {
   // One queue listener and one retry-wait listener are both removed normally.
   assert.equal(added, removed);
 });
+
+test('coordination jobs queue, retry transient errors, and cancel while queued', async () => {
+  const subject = scheduler(1); const gate = deferred(); let attempts = 0; let cancelledStarted = false;
+  const first = subject.schedule({ provider: 'fake', model: 'coordination', kind: 'coordination', execute: () => gate.promise });
+  const retry = subject.schedule({ provider: 'fake', model: 'coordination', kind: 'coordination', execute: async () => {
+    if (++attempts === 1) throw Object.assign(new Error('Unavailable'), { status: 503 });
+    return 'ok';
+  } });
+  const controller = new AbortController();
+  const cancelled = subject.schedule({ provider: 'fake', model: 'coordination', kind: 'coordination', signal: controller.signal,
+    execute: async () => { cancelledStarted = true; } });
+  controller.abort(); await assert.rejects(cancelled, { name: 'AbortError' });
+  assert.equal(attempts, 0); gate.resolve(); await first; assert.equal(await retry, 'ok');
+  assert.equal(attempts, 2); assert.equal(cancelledStarted, false);
+  assert.ok(subject.getDiagnostics().some(event => event.kind === 'coordination' && event.state === 'retrying'));
+});
