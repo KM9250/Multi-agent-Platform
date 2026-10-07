@@ -1,7 +1,7 @@
 import { appendEvent } from '../kernel';
 import { validateCoordinationSnapshot } from '../validation';
 import type { CoordinationEvent, CoordinationSnapshot } from '../types';
-import type { CoordinationRunnerStore, PreparedRunnerAction, RunnerEvidence, RunnerEvidenceStore, RunnerIdGenerator, RunnerPendingActionStore } from './types';
+import type { CoordinationRunnerStore, RunnerPendingActionRecord, RunnerEvidence, RunnerEvidenceStore, RunnerIdGenerator, RunnerPendingActionStore } from './types';
 
 export const defaultRunnerIds: RunnerIdGenerator = { nextId: kind => `${kind}-${globalThis.crypto.randomUUID()}` };
 export class InMemoryCoordinationRunnerStore implements CoordinationRunnerStore {
@@ -25,13 +25,25 @@ export class InMemoryCoordinationRunnerStore implements CoordinationRunnerStore 
   }
 }
 export class InMemoryRunnerPendingActionStore implements RunnerPendingActionStore {
-  private readonly actions = new Map<string, PreparedRunnerAction>();
-  get(id: string): PreparedRunnerAction | undefined { const action = this.actions.get(id); return action && structuredClone(action); }
-  put(action: PreparedRunnerAction): void {
-    if (this.actions.has(action.actionId)) throw new Error('Pending action ID already exists.');
-    this.actions.set(action.actionId, structuredClone(action));
+  private readonly actions = new Map<string, Map<string, RunnerPendingActionRecord>>();
+  get(workflowRunId: string, actionId: string): RunnerPendingActionRecord | undefined {
+    const record = this.actions.get(workflowRunId)?.get(actionId);
+    return record && structuredClone(record);
   }
-  delete(id: string): void { this.actions.delete(id); }
+  put(record: RunnerPendingActionRecord): void {
+    for (const id of [record.workflowRunId, record.sessionId, record.taskId, record.action.actionId]) {
+      if (typeof id !== 'string' || !id.trim()) throw new Error('Pending action ownership IDs are required.');
+    }
+    const actions = this.actions.get(record.workflowRunId) ?? new Map<string, RunnerPendingActionRecord>();
+    if (actions.has(record.action.actionId)) throw new Error('Pending action ID already exists in workflow.');
+    actions.set(record.action.actionId, structuredClone(record));
+    this.actions.set(record.workflowRunId, actions);
+  }
+  delete(workflowRunId: string, actionId: string): void {
+    const actions = this.actions.get(workflowRunId);
+    actions?.delete(actionId);
+    if (!actions?.size) this.actions.delete(workflowRunId);
+  }
 }
 export class InMemoryRunnerEvidenceStore implements RunnerEvidenceStore {
   private readonly evidence = new Map<string, RunnerEvidence>();

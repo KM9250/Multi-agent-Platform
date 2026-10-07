@@ -71,10 +71,16 @@ export interface RunnerActionExecutor {
   execute(action: PreparedRunnerAction, context: RunnerExecutionContext): Promise<RunnerExecutionResult>;
 }
 export interface RunnerExecutorRegistry { get(executorId: string): RunnerActionExecutor | undefined }
+export interface RunnerPendingActionRecord {
+  workflowRunId: string;
+  sessionId: string;
+  taskId: string;
+  action: PreparedRunnerAction;
+}
 export interface RunnerPendingActionStore {
-  get(actionId: string): PreparedRunnerAction | undefined;
-  put(action: PreparedRunnerAction): void;
-  delete(actionId: string): void;
+  get(workflowRunId: string, actionId: string): RunnerPendingActionRecord | undefined;
+  put(record: RunnerPendingActionRecord): void;
+  delete(workflowRunId: string, actionId: string): void;
 }
 export interface RunnerPendingApproval { actionId: string; fingerprint: string; actionClass: string; approvalRef: string; summary: string }
 export interface RunnerEvidence { kind: string; content: unknown; createdAt: number }

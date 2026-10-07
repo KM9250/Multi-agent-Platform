@@ -14,7 +14,14 @@ const RUNNER_SESSION_PREFIX = 'map.runner.v1:';
 // Shared across runner instances in this JS runtime; deliberately not a distributed lock.
 const running = new Map<string, AbortController>();
 // Results are ephemeral, shared by runners using the same store, and never authorize execution.
-const collected = new WeakMap<CoordinationRunnerStore, Map<string, RunnerExecutionResult>>();
+interface RetainedRunnerResult {
+  sessionId: string;
+  actionId: string;
+  fingerprint: string;
+  result: RunnerExecutionResult;
+}
+type RunnerResultMap = Map<string, Map<string, RetainedRunnerResult>>;
+const collected = new WeakMap<CoordinationRunnerStore, RunnerResultMap>();
 class ModelDispatchDeferred extends Error {}
 interface RoundContext { id: string; key: string; signal: AbortSignal; completed: number }
 const cursor = (s: CoordinationSnapshot): string => `${s.events.at(-1)!.sequence}:${s.events.at(-1)!.eventId}`;
@@ -25,7 +32,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
   private readonly deps: CoordinationRunnerDependencies;
   private readonly clock: RunnerClock;
   private readonly ids: RunnerIdGenerator;
-  private readonly results: Map<string, RunnerExecutionResult>;
+  private readonly results: RunnerResultMap;
   constructor(deps: CoordinationRunnerDependencies) {
     this.deps = deps; this.clock = deps.clock ?? { now: Date.now }; this.ids = deps.ids ?? defaultRunnerIds;
     if (deps.scheduler) {
@@ -61,8 +68,10 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       if (stopped) return { ...stopped, roundsCompleted: rounds + ctx.completed };
       return { ...this.result(ctx, 'error', undefined, 'RUNNER_INTERNAL_ERROR'), roundsCompleted: rounds + ctx.completed };
     } finally {
-      options.signal?.removeEventListener('abort', abort);
-      running.delete(id);
+      try { this.cleanupTerminal(this.snapshot(ctx)); } finally {
+        options.signal?.removeEventListener('abort', abort);
+        running.delete(id);
+      }
     }
   }
   private snapshot(ctx: RoundContext): CoordinationSnapshot { return this.deps.store.getSnapshot(ctx.id); }
@@ -75,16 +84,56 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
   private result(ctx: RoundContext, reason: RunnerStopReason, pendingApproval?: RunnerPendingApproval, errorCode?: string): RunnerRunResult {
     return { workflowRunId: ctx.id, reason, snapshot: this.snapshot(ctx), roundsCompleted: ctx.completed, pendingApproval, errorCode };
   }
+  /** Validate ownership before policy, approval, execution, or deletion. */
+  private pendingAction(s: CoordinationSnapshot, task: CoordinationTask): PreparedRunnerAction | undefined {
+    if (task.workflowRunId !== s.run.runId || s.sessions[task.sessionId]?.workflowRunId !== s.run.runId) return;
+    const ref = parseRunnerActionRef(task.inputRefs);
+    const record = ref && this.deps.pendingActions.get(s.run.runId, ref.actionId);
+    if (!record || record.workflowRunId !== s.run.runId || record.sessionId !== task.sessionId
+      || record.taskId !== task.taskId || record.action.actionId !== ref!.actionId
+      || record.action.fingerprint !== ref!.fingerprint) return;
+    return record.action;
+  }
   private pendingApproval(s: CoordinationSnapshot): RunnerPendingApproval | undefined {
     for (const task of Object.values(s.tasks)) {
       if (task.status !== 'ASSIGNED' || !owned(s.sessions[task.sessionId])) continue;
-      const ref = parseRunnerActionRef(task.inputRefs); const action = ref && this.deps.pendingActions.get(ref.actionId);
-      if (action && action.fingerprint === ref!.fingerprint) return runnerPendingApproval(s.run.runId, action);
+      const action = this.pendingAction(s, task);
+      if (action) return runnerPendingApproval(s.run.runId, action);
+    }
+  }
+  private setResult(workflowRunId: string, task: CoordinationTask, result: RunnerExecutionResult): void {
+    const ref = parseRunnerActionRef(task.inputRefs);
+    if (task.workflowRunId !== workflowRunId || !ref) throw new Error('Invalid result ownership.');
+    const results = this.results.get(workflowRunId) ?? new Map<string, RetainedRunnerResult>();
+    results.set(task.taskId, { sessionId: task.sessionId, ...ref, result });
+    this.results.set(workflowRunId, results);
+  }
+  private getResult(workflowRunId: string, task: CoordinationTask): RunnerExecutionResult | undefined {
+    const retained = this.results.get(workflowRunId)?.get(task.taskId);
+    const ref = parseRunnerActionRef(task.inputRefs);
+    if (task.workflowRunId !== workflowRunId || !retained || !ref || retained.sessionId !== task.sessionId
+      || retained.actionId !== ref.actionId || retained.fingerprint !== ref.fingerprint) return;
+    return retained.result;
+  }
+  private deleteResult(workflowRunId: string, taskId: string): void {
+    const results = this.results.get(workflowRunId);
+    results?.delete(taskId);
+    if (!results?.size) this.results.delete(workflowRunId);
+  }
+  private cleanupTerminal(s: CoordinationSnapshot): void {
+    if (!TERMINAL_WORKFLOW_STATUSES.has(s.run.status)) return;
+    this.results.delete(s.run.runId);
+    for (const task of Object.values(s.tasks)) {
+      const action = this.pendingAction(s, task);
+      if (action) this.deps.pendingActions.delete(s.run.runId, action.actionId);
     }
   }
   private safePoint(ctx: RoundContext): RunnerRunResult | undefined {
     const s = this.snapshot(ctx);
-    if (TERMINAL_WORKFLOW_STATUSES.has(s.run.status)) return this.result(ctx, s.run.status === 'CANCELLED' ? 'cancelled' : 'terminal');
+    if (TERMINAL_WORKFLOW_STATUSES.has(s.run.status)) {
+      this.cleanupTerminal(s);
+      return this.result(ctx, s.run.status === 'CANCELLED' ? 'cancelled' : 'terminal');
+    }
     if (s.run.status !== 'RUNNING') {
       const reason = s.run.statusReason ?? '';
       return this.result(ctx, reason.startsWith('RUNNER_BUDGET_EXHAUSTED:') ? 'budget_exhausted' : s.run.status === 'BLOCKED' ? 'needs_user' : 'stopped',
@@ -130,9 +179,9 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
   private close(ctx: RoundContext, task: CoordinationTask, outcome: WorkflowProgressOutcome, succeeded = false): void {
     this.append(ctx, 'SessionResolved', { outcome: succeeded ? 'SUCCEEDED' : 'FAILED' }, task.sessionId, undefined, 'resolve');
     this.progress(ctx, outcome, `Runner round ${outcome.toLowerCase()}.`);
-    const ref = parseRunnerActionRef(task.inputRefs);
-    if (ref) this.deps.pendingActions.delete(ref.actionId);
-    this.results.delete(task.taskId);
+    const action = this.pendingAction(this.snapshot(ctx), task);
+    if (action) this.deps.pendingActions.delete(ctx.id, action.actionId);
+    this.deleteResult(ctx.id, task.taskId);
   }
   private failTask(ctx: RoundContext, task: CoordinationTask, code: string, outcome: WorkflowProgressOutcome = 'ERROR'): RunnerRunResult {
     if (task.status === 'ASSIGNED') this.append(ctx, 'TaskFailed', { taskId: task.taskId, failureReason: code }, task.sessionId);
@@ -189,7 +238,8 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       const task = tasks[0];
       if (task.status === 'COMPLETED' || task.status === 'FAILED') return this.verify(ctx, task);
       if (task.status !== 'ASSIGNED') return this.failTask(ctx, task, 'RUNNER_TASK_CANCELLED');
-      if (this.results.has(task.taskId)) return this.collect(ctx, task, this.results.get(task.taskId)!);
+      const result = this.getResult(ctx.id, task);
+      if (result) return this.collect(ctx, task, result);
       const exhausted = this.budget(ctx); if (exhausted) return this.block(ctx, `RUNNER_BUDGET_EXHAUSTED:${exhausted}`);
       return this.execute(ctx, task, true);
     }
@@ -220,19 +270,25 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       const budget = this.budget(ctx); if (budget) return this.block(ctx, `RUNNER_BUDGET_EXHAUSTED:${budget}`);
       const current = this.snapshot(ctx);
       if (Object.values(current.tasks).some(task => parseRunnerActionRef(task.inputRefs)?.actionId === action.actionId)) throw new Error('Action ID already used.');
-      this.deps.pendingActions.put(action);
       const sessionId = this.ids.nextId('session'); const taskId = this.ids.nextId('task'); const now = this.now(current);
-      this.append(ctx, 'SessionStarted', {
-        sessionId, workflowRunId: ctx.id, mode: 'map.coord.task.v1', participants: [...current.run.participantAgentIds],
-        initiator: current.run.supervisorAgentId, supervisor: current.run.supervisorAgentId, state: 'OPEN',
-        policyId: current.run.policyId, policyVersion: current.run.policyVersion, goal: action.publicSummary,
-        contextRef: `${RUNNER_SESSION_PREFIX}${ctx.key}`, createdAt: now, updatedAt: now,
-      }, sessionId);
-      this.append(ctx, 'TaskAssigned', {
-        taskId, workflowRunId: ctx.id, sessionId, title: action.publicSummary, goal: action.publicSummary,
-        assigneeAgentId: assignee, assignedByAgentId: current.run.supervisorAgentId,
-        inputRefs: [runnerActionRef(action)], status: 'ASSIGNED', createdAt: now, updatedAt: now,
-      }, sessionId);
+      this.deps.pendingActions.put({ workflowRunId: ctx.id, sessionId, taskId, action });
+      try {
+        this.append(ctx, 'SessionStarted', {
+          sessionId, workflowRunId: ctx.id, mode: 'map.coord.task.v1', participants: [...current.run.participantAgentIds],
+          initiator: current.run.supervisorAgentId, supervisor: current.run.supervisorAgentId, state: 'OPEN',
+          policyId: current.run.policyId, policyVersion: current.run.policyVersion, goal: action.publicSummary,
+          contextRef: `${RUNNER_SESSION_PREFIX}${ctx.key}`, createdAt: now, updatedAt: now,
+        }, sessionId);
+        this.append(ctx, 'TaskAssigned', {
+          taskId, workflowRunId: ctx.id, sessionId, title: action.publicSummary, goal: action.publicSummary,
+          assigneeAgentId: assignee, assignedByAgentId: current.run.supervisorAgentId,
+          inputRefs: [runnerActionRef(action)], status: 'ASSIGNED', createdAt: now, updatedAt: now,
+        }, sessionId);
+      } catch (error) {
+        // Roll back only ephemeral registration, never already-appended Kernel events.
+        this.deps.pendingActions.delete(ctx.id, action.actionId);
+        throw error;
+      }
       return this.execute(ctx, this.snapshot(ctx).tasks[taskId], false);
     } catch (error) {
       const stopped = this.safePoint(ctx); if (stopped) return stopped;
@@ -243,9 +299,9 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     }
   }
   private async execute(ctx: RoundContext, task: CoordinationTask, continuation: boolean): Promise<RunnerRunResult> {
-    const ref = parseRunnerActionRef(task.inputRefs); const action = ref && this.deps.pendingActions.get(ref.actionId);
-    if (!action || action.actionId !== ref!.actionId || action.fingerprint !== ref!.fingerprint) return this.failTask(ctx, task, 'RUNNER_PENDING_ACTION_UNAVAILABLE');
-    const s = this.snapshot(ctx); const risk = evaluateRunnerActionRisk(s, action);
+    const s = this.snapshot(ctx); const action = this.pendingAction(s, task);
+    if (!action) return this.failTask(ctx, task, 'RUNNER_PENDING_ACTION_UNAVAILABLE');
+    const risk = evaluateRunnerActionRisk(s, action);
     if (risk === 'DENY') return this.failTask(ctx, task, `POLICY_DENY:${action.actionClass}`, 'NO_PROGRESS');
     if (risk === 'NEEDS_USER') {
       const approval = runnerPendingApproval(ctx.id, action);
@@ -260,7 +316,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     const executor = this.deps.executors.get(action.executorId);
     if (!executor || executor.id !== action.executorId) return this.failTask(ctx, task, 'RUNNER_EXECUTOR_UNAVAILABLE');
     // Consume before crossing the external boundary. Even a throwing executor must not be retried.
-    this.deps.pendingActions.delete(action.actionId);
+    this.deps.pendingActions.delete(ctx.id, action.actionId);
     let result: RunnerExecutionResult;
     try {
       result = validateRunnerExecution(await executor.execute(structuredClone(action), { workflowRunId: ctx.id, sessionId: task.sessionId, taskId: task.taskId, signal: ctx.signal }));
@@ -268,7 +324,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       result = { status: 'uncertain', summary: 'Executor outcome could not be established.' };
     }
     if (result.status === 'aborted') result = { ...result, status: 'uncertain' };
-    this.results.set(task.taskId, result);
+    this.setResult(ctx.id, task, result);
     return this.collect(ctx, task, result);
   }
   private taskWritable(ctx: RoundContext, task: CoordinationTask): boolean {
@@ -287,7 +343,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       // Raw summaries stay in evidence storage. The journal receives opaque references only.
       if (!result.resultRef) {
         const resultRef = await this.deps.evidenceStore.put({ kind: 'runner.execution', content: result, createdAt: this.clock.now() });
-        result = { ...result, resultRef }; this.results.set(task.taskId, result);
+        result = { ...result, resultRef }; this.setResult(ctx.id, task, result);
       }
       const after = this.safePoint(ctx); if (after) return after;
       if (!this.taskWritable(ctx, task)) return this.result(ctx, 'stopped', undefined, 'RUNNER_STALE_EXECUTION');
@@ -296,7 +352,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       } else {
         this.append(ctx, 'TaskFailed', { taskId: task.taskId, failureReason: 'RUNNER_EXECUTION_FAILED', evidenceRefs: [...new Set([result.resultRef!, ...(result.evidenceRefs ?? [])])] }, task.sessionId);
       }
-      this.results.delete(task.taskId);
+      this.deleteResult(ctx.id, task.taskId);
       return this.verify(ctx, this.snapshot(ctx).tasks[task.taskId]);
     } catch {
       const after = this.safePoint(ctx); if (after) return after;

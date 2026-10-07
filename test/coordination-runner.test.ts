@@ -8,7 +8,7 @@ import {
 import type {
   CoordinationPolicy, CoordinationEventType, CoordinationSnapshot, RunnerPlanProposal, RunnerVerification,
   RunnerSupervisorProvider, RunnerActionExecutor, RunnerExecutionResult, RunnerModelResult, RunnerModelUsage,
-  PreparedRunnerAction, CoordinationRunnerDependencies, RunnerPlanRequest, RunnerVerifyRequest,
+  PreparedRunnerAction, RunnerPendingActionRecord, CoordinationRunner, CoordinationRunnerDependencies, RunnerPlanRequest, RunnerVerifyRequest,
 } from '../services/coordination/index.ts';
 import { RequestScheduler } from '../services/scheduler/index.ts';
 
@@ -21,7 +21,7 @@ const policy: CoordinationPolicy = {
 };
 const usage: RunnerModelUsage = { llmCalls: 1, inputTokens: 3, outputTokens: 2, estimatedCost: 0.01 };
 const modelResult = <T>(value: T, consumed = usage): RunnerModelResult<T> => ({ value, usage: consumed, provider: 'fake', model: 'test', latencyMs: 1 });
-const plan: RunnerPlanProposal = { kind: 'execute', objective: 'Process the item', action: { executorId: 'executor', operation: 'read', arguments: { secret: 'private-form-value' } } };
+const plan: Extract<RunnerPlanProposal, { kind: 'execute' }> = { kind: 'execute', objective: 'Process the item', action: { executorId: 'executor', operation: 'read', arguments: { secret: 'private-form-value' } } };
 const pass: RunnerVerification = { taskOutcome: 'PASS', summary: 'Verified.', criteria: [{ criterion: 'done', outcome: 'SATISFIED' }] };
 const deferred = <T>() => { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r; }); return { promise, resolve }; };
 function fixture(options: { mode?: 'interactive' | 'supervised_autonomous'; criteria?: string[]; budget?: Partial<CoordinationPolicy['budgets']>; actionClass?: string; result?: RunnerExecutionResult; verification?: RunnerVerification; proposal?: RunnerPlanProposal } = {}) {
@@ -158,13 +158,13 @@ test('reused actionId fails closed before another session or execution', async (
 });
 test('missing pending payload fails closed and closes the original round', async () => {
   const f = fixture({ actionClass: 'write' }); const first = await f.runner.runOneRound('run');
-  f.pendingActions.delete(first.pendingApproval!.actionId); f.resume(first.pendingApproval!.approvalRef);
+  f.pendingActions.delete('run', first.pendingApproval!.actionId); f.resume(first.pendingApproval!.approvalRef);
   await f.runner.runOneRound('run'); assert.equal(f.calls.execute, 0); assert.equal(firstTask(f.get()).failureReason, 'RUNNER_PENDING_ACTION_UNAVAILABLE');
   assert.deepEqual(progress(f), ['ERROR']); validate(f);
 });
 test('pending payload fingerprint mismatch cannot execute', async () => {
-  const f = fixture({ actionClass: 'write' }); const first = await f.runner.runOneRound('run'); const action = f.pendingActions.get(first.pendingApproval!.actionId)!;
-  f.pendingActions.delete(action.actionId); f.pendingActions.put({ ...action, fingerprint: 'changed' }); f.resume(first.pendingApproval!.approvalRef);
+  const f = fixture({ actionClass: 'write' }); const first = await f.runner.runOneRound('run'); const record = f.pendingActions.get('run', first.pendingApproval!.actionId)!;
+  f.pendingActions.delete('run', record.action.actionId); f.pendingActions.put({ ...record, action: { ...record.action, fingerprint: 'changed' } }); f.resume(first.pendingApproval!.approvalRef);
   await f.runner.runOneRound('run'); assert.equal(f.calls.execute, 0); assert.deepEqual(progress(f), ['ERROR']);
 });
 test('journal never stores private action arguments or raw result', async () => {
@@ -313,8 +313,8 @@ test('model context is bounded and explicitly treats evidence as untrusted', asy
 });
 test('stores clone inputs and outputs, preventing authority through reference mutation', async () => {
   const f = fixture({ actionClass: 'write' }); const copy = f.get(); copy.run.status = 'RESOLVED'; assert.equal(f.get().run.status, 'RUNNING');
-  const result = await f.runner.runOneRound('run'); const action = f.pendingActions.get(result.pendingApproval!.actionId)!;
-  action.actionClass = 'read'; assert.equal(f.pendingActions.get(action.actionId)!.actionClass, 'write');
+  const result = await f.runner.runOneRound('run'); const action = f.pendingActions.get('run', result.pendingApproval!.actionId)!.action;
+  action.actionClass = 'read'; assert.equal(f.pendingActions.get('run', action.actionId)!.action.actionClass, 'write');
   const evidence = { kind: 'test', content: { text: 'original' }, createdAt: 1 }; const ref = await f.evidenceStore.put(evidence); evidence.content.text = 'mutated';
   assert.deepEqual((await f.evidenceStore.get(ref))!.content, { text: 'original' });
 });
@@ -379,4 +379,174 @@ for (const phase of ['plan', 'verify']) test(`state changed after ${phase} usage
   };
   await f.runner.runOneRound('run'); assert.equal(f.events('EvaluationAdded').length, 0); assert.deepEqual(progress(f), []);
   assert.equal(f.calls.execute, phase === 'plan' ? 0 : 1); assert.equal(f.get().run.usage.llmCalls, phase === 'plan' ? 1 : 2); validate(f);
+});
+
+// Shared stores with deliberately colliding session/task/action IDs and fingerprints.
+function multiWorkflowFixture(risks: { A?: 'ALLOW' | 'NEEDS_USER'; B?: 'ALLOW' | 'NEEDS_USER' } = {}) {
+  let serial = 0;
+  const ids = { nextId: (kind: string) => ['session', 'task'].includes(kind) ? `${kind}-1` : `${kind}-${++serial}` };
+  const clock = { now: () => 10 };
+  const snapshots = ['A', 'B'].map(runId => createWorkflow({ runId, roomId: 'room', goal: `Goal ${runId}`, acceptanceCriteria: ['done'],
+    supervisorAgentId: 'supervisor', participantAgentIds: ['supervisor'], executionMode: 'supervised_autonomous', now: 1,
+    policy: { ...policy, riskRules: { shared: risks[runId] ?? 'ALLOW' } } }));
+  const store = new InMemoryCoordinationRunnerStore(snapshots);
+  const pendingActions = new InMemoryRunnerPendingActionStore(); const evidenceStore = new InMemoryRunnerEvidenceStore(ids);
+  const calls: string[] = []; const verifications: RunnerVerifyRequest[] = [];
+  const get = (id: string) => store.getSnapshot(id);
+  const add = (id: string, type: CoordinationEventType, payload: unknown, sessionId?: string) => store.append(createRunnerEvent(get(id), type, payload, clock, ids, { sessionId }));
+  const resume = (id: string, reference?: string) => add(id, 'WorkflowResumed', { authorization: { type: 'user', reference } });
+  const provider: RunnerSupervisorProvider = {
+    async plan(request) { return modelResult({ ...plan, action: { ...plan.action, arguments: { owner: request.workflowRunId } } }); },
+    async verify(request) { verifications.push(request); return modelResult(pass); },
+  };
+  const executor: RunnerActionExecutor = {
+    id: 'executor',
+    async prepare(proposal) { return { actionId: 'action-1', executorId: 'executor', operation: 'read', actionClass: 'shared',
+      fingerprint: 'fingerprint-1', publicSummary: 'Public action', retrySafety: 'never', payload: proposal.arguments }; },
+    async execute(action, context) {
+      calls.push(context.workflowRunId);
+      assert.equal((action.payload as { owner: string }).owner, context.workflowRunId);
+      add(context.workflowRunId, 'WorkflowSuspended', {});
+      return { status: 'succeeded', summary: `Result ${context.workflowRunId}` };
+    },
+  };
+  const deps: CoordinationRunnerDependencies = { store, pendingActions, evidenceStore, supervisorProvider: provider, executors: { get: () => executor }, ids, clock };
+  const runner = createCoordinationRunner(deps);
+  const seedTask = (id: string) => {
+    add(id, 'SessionStarted', { sessionId: 'session-1', workflowRunId: id, mode: 'map.coord.task.v1', participants: ['supervisor'], initiator: 'supervisor', supervisor: 'supervisor',
+      state: 'OPEN', policyId: 'policy', policyVersion: '1', goal: 'Public action', contextRef: `map.runner.v1:seed-${id}`, createdAt: 10, updatedAt: 10 }, 'session-1');
+    add(id, 'TaskAssigned', { taskId: 'task-1', workflowRunId: id, sessionId: 'session-1', title: 'Public action', goal: 'Public action', assigneeAgentId: 'supervisor',
+      assignedByAgentId: 'supervisor', inputRefs: ['map.runner.action.v1:action-1:fingerprint-1'], status: 'ASSIGNED', createdAt: 10, updatedAt: 10 }, 'session-1');
+  };
+  const events = (id: string, type: CoordinationEventType) => get(id).events.filter(event => event.type === type);
+  return { runner, deps, store, pendingActions, evidenceStore, executor, get, add, resume, seedTask, events, calls, verifications };
+}
+// Inspect ephemeral retention only; these assertions must not create a public state authority API.
+const retainedResults = (runner: CoordinationRunner) => (runner as unknown as { results: Map<string, Map<string, unknown>> }).results;
+
+test('shared store does not collect A result for B with the same task/action/fingerprint', async () => {
+  const f = multiWorkflowFixture(); await f.runner.runOneRound('A'); f.seedTask('B');
+  await f.runner.runOneRound('B'); assert.equal(f.events('B', 'TaskCompleted').length, 0);
+  assert.equal(firstTask(f.get('B')).failureReason, 'RUNNER_PENDING_ACTION_UNAVAILABLE');
+  assert.equal(retainedResults(f.runner).get('A')?.size, 1); assert.deepEqual(f.calls, ['A']);
+  f.resume('A'); await f.runner.runOneRound('A'); assert.equal(f.events('A', 'TaskCompleted').length, 1);
+});
+
+test('colliding task IDs independently retain and collect each workflow result once', async () => {
+  const f = multiWorkflowFixture(); await Promise.all([f.runner.runOneRound('A'), f.runner.runOneRound('B')]);
+  assert.equal(retainedResults(f.runner).get('A')?.size, 1); assert.equal(retainedResults(f.runner).get('B')?.size, 1);
+  for (const id of ['B', 'A']) {
+    f.resume(id); await createCoordinationRunner(f.deps).runOneRound(id);
+    assert.equal(f.events(id, 'TaskCompleted').length, 1); assert.equal(f.events(id, 'ProgressRecorded').length, 1);
+    assert.equal(f.get(id).run.status, 'RESOLVED'); validateCoordinationSnapshot(f.get(id));
+  }
+  assert.deepEqual(f.calls.sort(), ['A', 'B']); assert.equal(retainedResults(f.runner).size, 0);
+  for (const request of f.verifications) assert.equal((request.evidence[0].content as RunnerExecutionResult).summary, `Result ${request.workflowRunId}`);
+});
+
+test('pending records allow equal action IDs across workflows and isolate clone/deletion', async () => {
+  const f = multiWorkflowFixture({ A: 'NEEDS_USER', B: 'NEEDS_USER' });
+  await f.runner.runOneRound('A'); await f.runner.runOneRound('B');
+  const a = f.pendingActions.get('A', 'action-1')!; const b = f.pendingActions.get('B', 'action-1')!;
+  assert.equal(a.workflowRunId, 'A'); assert.equal(b.workflowRunId, 'B'); assert.equal(a.taskId, b.taskId);
+  assert.throws(() => f.pendingActions.put(b), /already exists/);
+  b.sessionId = 'mutated'; assert.equal(f.pendingActions.get('B', 'action-1')!.sessionId, 'session-1');
+  f.pendingActions.delete('B', 'action-1'); assert.deepEqual(f.pendingActions.get('A', 'action-1'), a);
+  assert.deepEqual(f.calls, []); assert.equal(f.events('A', 'ProgressRecorded').length, 0); assert.equal(f.events('B', 'ProgressRecorded').length, 0);
+});
+
+test('B ALLOW policy cannot execute A NEEDS_USER action by cross-workflow reference', async () => {
+  const f = multiWorkflowFixture({ A: 'NEEDS_USER' }); await f.runner.runOneRound('A'); f.seedTask('B');
+  const a = f.pendingActions.get('A', 'action-1'); await f.runner.runOneRound('B');
+  assert.deepEqual(f.calls, []); assert.equal(f.events('B', 'TaskCompleted').length, 0);
+  assert.equal(firstTask(f.get('B')).failureReason, 'RUNNER_PENDING_ACTION_UNAVAILABLE');
+  assert.deepEqual(f.pendingActions.get('A', 'action-1'), a); assert.equal(f.get('A').run.status, 'BLOCKED');
+});
+
+for (const field of ['workflowRunId', 'sessionId', 'taskId', 'actionId', 'fingerprint']) test(`injected pending record with mismatched ${field} fails before policy or approval`, async () => {
+  const f = multiWorkflowFixture({ A: 'NEEDS_USER', B: 'NEEDS_USER' }); await f.runner.runOneRound('A'); f.seedTask('B');
+  const a = f.pendingActions.get('A', 'action-1')!;
+  const record: RunnerPendingActionRecord = { ...structuredClone(a), workflowRunId: 'B' };
+  if (field === 'actionId' || field === 'fingerprint') record.action[field] = 'mismatch';
+  else record[field] = field === 'workflowRunId' ? 'A' : 'mismatch';
+  const get = f.pendingActions.get.bind(f.pendingActions); const deletions: string[] = [];
+  f.pendingActions.get = (id, actionId) => id === 'B' ? record : get(id, actionId);
+  const remove = f.pendingActions.delete.bind(f.pendingActions);
+  f.pendingActions.delete = (id, actionId) => { deletions.push(id); remove(id, actionId); };
+  await f.runner.runOneRound('B'); assert.deepEqual(f.calls, []);
+  assert.equal(firstTask(f.get('B')).failureReason, 'RUNNER_PENDING_ACTION_UNAVAILABLE');
+  assert.equal(f.events('B', 'WorkflowBlocked').length, 0); // NEEDS_USER policy was never reached.
+  assert.deepEqual(deletions, []); assert.deepEqual(get('A', 'action-1'), a);
+});
+
+test('exact approval cannot substitute for pending task ownership', async () => {
+  const f = multiWorkflowFixture({ A: 'NEEDS_USER' }); const waiting = await f.runner.runOneRound('A');
+  const record = f.pendingActions.get('A', 'action-1')!; f.pendingActions.delete('A', 'action-1');
+  f.pendingActions.put({ ...record, taskId: 'other-task' }); f.resume('A', waiting.pendingApproval!.approvalRef);
+  await f.runner.runOneRound('A'); assert.deepEqual(f.calls, []); assert.equal(f.events('A', 'TaskCompleted').length, 0);
+});
+
+test('terminal observation cleans a late executor result without appending TaskCompleted', async () => {
+  const f = multiWorkflowFixture(); const started = deferred<void>(); const settled = deferred<RunnerExecutionResult>();
+  f.executor.execute = async () => { started.resolve(); return settled.promise; };
+  const running = f.runner.runOneRound('A'); await started.promise;
+  f.add('A', 'WorkflowCancelled', {}); settled.resolve({ status: 'succeeded', summary: 'Late A result' }); await running;
+  assert.equal(f.get('A').run.status, 'CANCELLED'); assert.equal(f.events('A', 'TaskCompleted').length, 0);
+  assert.equal(retainedResults(f.runner).has('A'), false); assert.equal(f.runner.isRunning('A'), false);
+});
+
+test('terminal preflight removes only its workflow results and cleanup is idempotent', async () => {
+  const f = multiWorkflowFixture(); await f.runner.runOneRound('A'); await f.runner.runOneRound('B');
+  f.add('A', 'WorkflowCancelled', {});
+  assert.equal(retainedResults(f.runner).has('A'), true); // No lifecycle observer when runner is idle.
+  await f.runner.runOneRound('A'); await f.runner.runOneRound('A');
+  assert.equal(retainedResults(f.runner).has('A'), false); assert.equal(retainedResults(f.runner).get('B')?.size, 1);
+  f.resume('B'); await f.runner.runOneRound('B'); assert.equal(f.events('B', 'TaskCompleted').length, 1); assert.deepEqual(f.calls, ['A', 'B']);
+});
+
+test('terminal cleanup preserves other workflow pending actions and stored evidence', async () => {
+  const f = multiWorkflowFixture({ A: 'NEEDS_USER', B: 'NEEDS_USER' }); await f.runner.runOneRound('A'); await f.runner.runOneRound('B');
+  const b = f.pendingActions.get('B', 'action-1'); const ref = await f.evidenceStore.put({ kind: 'retained', content: 'history', createdAt: 10 });
+  f.add('A', 'WorkflowCancelled', {}); await f.runner.runOneRound('A');
+  assert.equal(f.pendingActions.get('A', 'action-1'), undefined); assert.deepEqual(f.pendingActions.get('B', 'action-1'), b);
+  assert.equal((await f.evidenceStore.get(ref))!.content, 'history');
+});
+
+for (const type of ['WorkflowSuspended', 'WorkflowBlocked'] as const) test(`${type} retains the result for exactly one collection after resume`, async () => {
+  const f = multiWorkflowFixture(); f.executor.execute = async (_action, ctx) => {
+    f.calls.push(ctx.workflowRunId); f.add(ctx.workflowRunId, type, { reason: 'Wait' }); return { status: 'succeeded', summary: 'Known result' };
+  };
+  await f.runner.runOneRound('A'); assert.equal(retainedResults(f.runner).get('A')?.size, 1);
+  await f.runner.runOneRound('A'); assert.equal(retainedResults(f.runner).get('A')?.size, 1);
+  f.resume('A'); await f.runner.runOneRound('A');
+  assert.deepEqual(f.calls, ['A']); assert.equal(f.events('A', 'TaskCompleted').length, 1); assert.equal(f.events('A', 'ProgressRecorded').length, 1);
+  assert.equal(retainedResults(f.runner).has('A'), false);
+});
+
+for (const failureType of ['SessionStarted', 'TaskAssigned'] as const) test(`${failureType} append failure cleans registration without rolling back journal`, async () => {
+  const f = multiWorkflowFixture({ A: 'NEEDS_USER', B: 'NEEDS_USER' }); await f.runner.runOneRound('B');
+  const append = f.store.append.bind(f.store);
+  f.store.append = event => { if (event.workflowRunId === 'A' && event.type === failureType) throw new Error('Injected append failure'); return append(event); };
+  await f.runner.runOneRound('A'); assert.equal(f.pendingActions.get('A', 'action-1'), undefined);
+  assert.ok(f.pendingActions.get('B', 'action-1')); assert.deepEqual(f.calls, []);
+  assert.equal(f.events('A', 'SessionStarted').length, failureType === 'TaskAssigned' ? 1 : 0); validateCoordinationSnapshot(f.get('A'));
+});
+
+test('COLLECT safe point cleans results when workflow terminalizes during evidence storage', async () => {
+  const f = multiWorkflowFixture();
+  f.executor.execute = async () => ({ status: 'succeeded', summary: 'Known result' });
+  const put = f.evidenceStore.put.bind(f.evidenceStore);
+  f.evidenceStore.put = async evidence => { f.add('A', 'WorkflowCancelled', {}); return put(evidence); };
+  await f.runner.runOneRound('A');
+  assert.equal(f.events('A', 'TaskCompleted').length, 0); assert.equal(retainedResults(f.runner).has('A'), false);
+  assert.equal(f.get('A').run.status, 'CANCELLED'); validateCoordinationSnapshot(f.get('A'));
+});
+
+test('retained result also requires matching session/action identity before collection', async () => {
+  const f = multiWorkflowFixture(); await f.runner.runOneRound('A');
+  // Simulate an inconsistent ephemeral cache; the authoritative task remains unchanged.
+  const retained = retainedResults(f.runner).get('A')!.get('task-1') as { sessionId: string };
+  retained.sessionId = 'other-session'; f.resume('A'); await f.runner.runOneRound('A');
+  assert.equal(f.events('A', 'TaskCompleted').length, 0); assert.deepEqual(f.calls, ['A']);
+  assert.equal(firstTask(f.get('A')).failureReason, 'RUNNER_PENDING_ACTION_UNAVAILABLE');
 });

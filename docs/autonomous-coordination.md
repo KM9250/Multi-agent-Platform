@@ -205,3 +205,33 @@ checkpoint, restart recovery, or guarantee of more than four hours of runtime.
 Durability belongs to COORD-5. Browser execution is deferred to COORD-3B as an
 additional `RunnerActionExecutor`; no DOM, Playwright, UI, Gemini adapter, dynamic
 tool discovery, or MACP integration is included here.
+
+
+### Workflow ownership and ephemeral cleanup
+
+Pending actions use `RunnerPendingActionRecord { workflowRunId, sessionId,
+taskId, action }`. `get(workflowRunId, actionId)` and
+`delete(workflowRunId, actionId)` always require the workflow namespace. The
+in-memory store uses nested maps: duplicate action IDs are rejected within one
+workflow and permitted across workflows. Session/task IDs are generated before
+registration; failed SessionStarted/TaskAssigned appends remove the ephemeral
+registration without rolling back Kernel events.
+
+Before policy evaluation or approval, the runner checks the record's workflow,
+session, task, action ID, and fingerprint against the authoritative task and its
+input reference. A mismatch fails that task closed and never deletes another
+owner's action. An exact approval reference does not replace ownership checks.
+
+Retained execution results use nested workflow/task maps and also bind the
+session, action ID, and fingerprint. Identical IDs in two workflows cannot share
+results or cause a TaskCompleted event in the other workflow. Collection and
+session completion remove only the corresponding workflow/task entry.
+
+When the runner observes RESOLVED, CANCELLED, or FAILED at a safe point or in
+its final cleanup, it idempotently drops that workflow's retained results and
+any referenced pending actions whose ownership matches. It preserves other
+workflows, all evidence, and SUSPENDED/BLOCKED results needed for explicit
+resume and collection without reexecution. No background observer is provided:
+terminal cleanup is guaranteed when the runner observes terminal state, not
+immediately during periods in which the runner is idle. Durable lifecycle
+observation and evidence retention remain COORD-5 work.
