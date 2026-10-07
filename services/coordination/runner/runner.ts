@@ -23,6 +23,11 @@ interface RetainedRunnerResult {
 type RunnerResultMap = Map<string, Map<string, RetainedRunnerResult>>;
 const collected = new WeakMap<CoordinationRunnerStore, RunnerResultMap>();
 class ModelDispatchDeferred extends Error {}
+class RegistrationCleanupError extends AggregateError {
+  constructor(registrationError: unknown, cleanupError: unknown) {
+    super([registrationError, cleanupError], 'Runner registration cleanup failed.', { cause: registrationError });
+  }
+}
 interface RoundContext { id: string; key: string; signal: AbortSignal; completed: number }
 const cursor = (s: CoordinationSnapshot): string => `${s.events.at(-1)!.sequence}:${s.events.at(-1)!.eventId}`;
 const active = (s: CoordinationSession): boolean => s.state === 'OPEN' || s.state === 'SUSPENDED';
@@ -188,6 +193,19 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     this.close(ctx, task, outcome);
     return this.decide(ctx);
   }
+  private cancelEmptyRunnerSession(ctx: RoundContext, sessionId: string): boolean {
+    const s = this.snapshot(ctx); const session = s.sessions[sessionId];
+    if (s.run.status !== 'RUNNING' || !session || session.workflowRunId !== ctx.id
+      || !owned(session) || session.contextRef !== `${RUNNER_SESSION_PREFIX}${ctx.key}`
+      || !ctx.key.trim() || session.state !== 'OPEN'
+      || Object.values(s.tasks).some(task => task.sessionId === sessionId)) return false;
+    this.append(ctx, 'SessionCancelled', {}, sessionId, undefined, 'registration-cancel');
+    return true;
+  }
+  private cleanupFailedRegistration(ctx: RoundContext, sessionId: string, actionId: string): void {
+    this.deps.pendingActions.delete(ctx.id, actionId);
+    this.cancelEmptyRunnerSession(ctx, sessionId);
+  }
   private async model<T>(ctx: RoundContext, phase: string, call: () => Promise<RunnerModelResult<T>>): Promise<{ value: T; stale: boolean; cursor: string }> {
     const base = cursor(this.snapshot(ctx));
     let response: RunnerModelResult<T>;
@@ -233,7 +251,15 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     if (session) {
       if (session.state !== 'OPEN' || session.mode !== 'map.coord.task.v1') return this.result(ctx, 'stopped');
       ctx.key = session.contextRef!.slice(RUNNER_SESSION_PREFIX.length);
+      if (!ctx.key.trim()) return this.result(ctx, 'error', undefined, 'RUNNER_INVALID_PENDING_WORK');
       const tasks = Object.values(s.tasks).filter(task => task.sessionId === session.sessionId);
+      if (tasks.length === 0) {
+        if (!this.cancelEmptyRunnerSession(ctx, session.sessionId)) {
+          return this.safePoint(ctx) ?? this.result(ctx, 'error', undefined, 'RUNNER_INVALID_PENDING_WORK');
+        }
+        this.progress(ctx, 'ERROR', 'Runner task registration did not complete.');
+        return this.decide(ctx);
+      }
       if (tasks.length !== 1) return this.result(ctx, 'error', undefined, 'RUNNER_INVALID_PENDING_WORK');
       const task = tasks[0];
       if (task.status === 'COMPLETED' || task.status === 'FAILED') return this.verify(ctx, task);
@@ -285,8 +311,12 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
           inputRefs: [runnerActionRef(action)], status: 'ASSIGNED', createdAt: now, updatedAt: now,
         }, sessionId);
       } catch (error) {
-        // Roll back only ephemeral registration, never already-appended Kernel events.
-        this.deps.pendingActions.delete(ctx.id, action.actionId);
+        try {
+          this.cleanupFailedRegistration(ctx, sessionId, action.actionId);
+        } catch (cleanupError) {
+          // A stop/terminal race must respect Kernel guards; otherwise retain both errors.
+          if (this.snapshot(ctx).run.status === 'RUNNING') throw new RegistrationCleanupError(error, cleanupError);
+        }
         throw error;
       }
       return this.execute(ctx, this.snapshot(ctx).tasks[taskId], false);
@@ -295,7 +325,9 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       if (error instanceof ModelDispatchDeferred) return this.decide(ctx);
       this.progress(ctx, 'ERROR', 'Runner planning or preparation failed.');
       const result = this.decide(ctx);
-      return { ...result, errorCode: 'RUNNER_PLAN_ERROR' };
+      const cleanupFailed = error instanceof RegistrationCleanupError;
+      return { ...result, reason: cleanupFailed && result.reason === 'round_completed' ? 'error' : result.reason,
+        errorCode: cleanupFailed ? 'RUNNER_INTERNAL_ERROR' : 'RUNNER_PLAN_ERROR' };
     }
   }
   private async execute(ctx: RoundContext, task: CoordinationTask, continuation: boolean): Promise<RunnerRunResult> {

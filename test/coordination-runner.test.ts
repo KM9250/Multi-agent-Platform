@@ -294,7 +294,8 @@ test('terminalized workflow receives no late result or usage events', async () =
 test('manual active session prevents PLAN', async () => {
   const f = fixture(); f.add('SessionStarted', { sessionId: 'manual', workflowRunId: 'run', mode: 'map.coord.task.v1', participants: ['supervisor'],
     initiator: 'supervisor', supervisor: 'supervisor', state: 'OPEN', policyId: 'policy', policyVersion: '1', goal: 'Manual work', createdAt: 10, updatedAt: 10 }, 'manual');
-  assert.equal((await f.runner.runOneRound('run')).reason, 'stopped'); assert.equal(f.calls.plan, 0); validate(f);
+  assert.equal((await f.runner.runOneRound('run')).reason, 'stopped'); assert.equal(f.calls.plan, 0);
+  assert.equal(f.events('SessionCancelled').length, 0); validate(f);
 });
 test('VERIFY budget boundary closes existing task session without new model work', async () => {
   const f = fixture(); const execute = f.executor.execute;
@@ -529,7 +530,11 @@ for (const failureType of ['SessionStarted', 'TaskAssigned'] as const) test(`${f
   f.store.append = event => { if (event.workflowRunId === 'A' && event.type === failureType) throw new Error('Injected append failure'); return append(event); };
   await f.runner.runOneRound('A'); assert.equal(f.pendingActions.get('A', 'action-1'), undefined);
   assert.ok(f.pendingActions.get('B', 'action-1')); assert.deepEqual(f.calls, []);
-  assert.equal(f.events('A', 'SessionStarted').length, failureType === 'TaskAssigned' ? 1 : 0); validateCoordinationSnapshot(f.get('A'));
+  assert.equal(f.events('A', 'SessionStarted').length, failureType === 'TaskAssigned' ? 1 : 0);
+  assert.equal(f.events('A', 'SessionCancelled').length, failureType === 'TaskAssigned' ? 1 : 0);
+  assert.equal(Object.values(f.get('A').sessions).filter(session => session.state === 'OPEN').length, 0);
+  assert.deepEqual(f.events('A', 'ProgressRecorded').map(event => (event.payload as { outcome: string }).outcome), ['ERROR']);
+  validateCoordinationSnapshot(f.get('A'));
 });
 
 test('COLLECT safe point cleans results when workflow terminalizes during evidence storage', async () => {
@@ -549,4 +554,100 @@ test('retained result also requires matching session/action identity before coll
   retained.sessionId = 'other-session'; f.resume('A'); await f.runner.runOneRound('A');
   assert.equal(f.events('A', 'TaskCompleted').length, 0); assert.deepEqual(f.calls, ['A']);
   assert.equal(firstTask(f.get('A')).failureReason, 'RUNNER_PENDING_ACTION_UNAVAILABLE');
+});
+
+test('TaskAssigned failure cancels the empty session once and permits the next plan', async () => {
+  const f = fixture(); const append = f.store.append.bind(f.store); let fail = true;
+  f.store.append = event => { if (event.type === 'TaskAssigned' && fail) { fail = false; throw new Error('Registration failed'); } return append(event); };
+  const result = await f.runner.runOneRound('run'); const session = Object.values(f.get().sessions)[0];
+  assert.equal(result.roundsCompleted, 1); assert.equal(session.state, 'CANCELLED'); assert.equal(f.pendingActions.get('run', 'action-1'), undefined);
+  assert.equal(f.events('SessionStarted').length, 1); assert.equal(f.events('SessionCancelled').length, 1);
+  assert.equal(f.events('SessionCancelled')[0].actorAgentId, 'supervisor'); assert.deepEqual(progress(f), ['ERROR']);
+  assert.equal(f.events('ProgressRecorded')[0].idempotencyKey, `runner:run:${session.contextRef!.slice('map.runner.v1:'.length)}:progress`);
+  const next = await f.runner.runOneRound('run'); assert.equal(next.reason, 'completed'); assert.equal(f.calls.plan, 2);
+  assert.deepEqual(progress(f), ['ERROR', 'PROGRESS']); assert.equal(f.events('SessionCancelled').length, 1); validate(f);
+});
+
+for (const stoppedType of ['WorkflowSuspended', 'WorkflowBlocked'] as const) test(`${stoppedType} during registration defers cancellation until resume`, async () => {
+  const f = fixture(); const append = f.store.append.bind(f.store); let stop = true;
+  f.store.append = event => {
+    if (event.type === 'TaskAssigned' && stop) { stop = false; f.add(stoppedType, { reason: 'Pause registration' }); }
+    return append(event); // Real Kernel guard rejects TaskAssigned while stopped.
+  };
+  await f.runner.runOneRound('run'); const session = Object.values(f.get().sessions)[0];
+  assert.equal(f.get().run.status, stoppedType === 'WorkflowSuspended' ? 'SUSPENDED' : 'BLOCKED');
+  assert.equal(session.state, 'SUSPENDED'); assert.equal(f.events('SessionCancelled').length, 0);
+  assert.deepEqual(progress(f), []); assert.equal(f.pendingActions.get('run', 'action-1'), undefined);
+  await f.runner.runOneRound('run'); assert.equal(f.events('SessionCancelled').length, 0);
+  f.resume(); const recovered = await f.runner.runOneRound('run');
+  assert.equal(recovered.roundsCompleted, 1); assert.equal(f.calls.plan, 1); assert.equal(f.calls.execute, 0);
+  assert.equal(f.get().sessions[session.sessionId].state, 'CANCELLED'); assert.equal(f.events('SessionCancelled').length, 1);
+  assert.deepEqual(progress(f), ['ERROR']);
+  assert.equal(f.events('ProgressRecorded')[0].idempotencyKey, `runner:run:${session.contextRef!.slice('map.runner.v1:'.length)}:progress`);
+  await f.runner.runOneRound('run'); assert.equal(f.calls.plan, 2); assert.equal(f.calls.execute, 1);
+  assert.deepEqual(progress(f), ['ERROR', 'PROGRESS']); validate(f);
+});
+
+test('terminal race during registration appends no cancellation or progress after terminalization', async () => {
+  const f = fixture(); const append = f.store.append.bind(f.store);
+  f.store.append = event => { if (event.type === 'TaskAssigned') f.add('WorkflowCancelled', {}); return append(event); };
+  const result = await f.runner.runOneRound('run'); assert.equal(result.reason, 'cancelled');
+  assert.equal(f.get().events.at(-1)!.type, 'WorkflowCancelled'); assert.equal(f.get().run.status, 'CANCELLED');
+  assert.equal(f.events('SessionCancelled').length, 0); assert.deepEqual(progress(f), []);
+  assert.equal(f.pendingActions.get('run', 'action-1'), undefined); assert.equal(f.calls.execute, 0); validate(f);
+});
+
+function seedRunnerSession(f: ReturnType<typeof fixture>, contextRef = 'map.runner.v1:original-round') {
+  f.add('SessionStarted', { sessionId: 'incomplete', workflowRunId: 'run', mode: 'map.coord.task.v1', participants: ['supervisor'],
+    initiator: 'supervisor', supervisor: 'supervisor', state: 'OPEN', policyId: 'policy', policyVersion: '1', goal: 'Registration', contextRef,
+    createdAt: 10, updatedAt: 10 }, 'incomplete');
+}
+
+test('multiple tasks in runner session remain fail closed without automatic cancellation', async () => {
+  const f = fixture(); seedRunnerSession(f);
+  for (const taskId of ['one', 'two']) f.add('TaskAssigned', { taskId, workflowRunId: 'run', sessionId: 'incomplete', title: 'Work', goal: 'Work',
+    assigneeAgentId: 'supervisor', assignedByAgentId: 'supervisor', status: 'ASSIGNED', createdAt: 10, updatedAt: 10 }, 'incomplete');
+  const result = await f.runner.runOneRound('run'); assert.equal(result.errorCode, 'RUNNER_INVALID_PENDING_WORK');
+  assert.equal(f.events('SessionCancelled').length, 0); assert.deepEqual(progress(f), []);
+  assert.ok(Object.values(f.get().tasks).every(task => task.status === 'ASSIGNED')); assert.equal(f.calls.plan, 0); validate(f);
+});
+
+for (const contextRef of ['map.runner.v1:', 'map.runner.v1:   ']) test(`malformed empty round key ${JSON.stringify(contextRef)} is not repaired`, async () => {
+  const f = fixture(); seedRunnerSession(f, contextRef); const result = await f.runner.runOneRound('run');
+  assert.equal(result.errorCode, 'RUNNER_INVALID_PENDING_WORK'); assert.equal(f.events('SessionCancelled').length, 0);
+  assert.deepEqual(progress(f), []); assert.equal(f.calls.plan, 0); validate(f);
+});
+
+test('unexpected registration cleanup failure stops safely and later recovery does not duplicate progress', async () => {
+  const f = fixture(); const append = f.store.append.bind(f.store); let fail = true;
+  f.store.append = event => {
+    if (fail && ['TaskAssigned', 'SessionCancelled'].includes(event.type)) throw new Error(`Unavailable: ${event.type}`);
+    return append(event);
+  };
+  const first = await f.runner.runOneRound('run'); assert.equal(first.reason, 'error'); assert.equal(first.errorCode, 'RUNNER_INTERNAL_ERROR');
+  assert.deepEqual(progress(f), ['ERROR']); assert.equal(f.pendingActions.get('run', 'action-1'), undefined);
+  assert.equal(Object.values(f.get().sessions)[0].state, 'OPEN'); assert.equal(f.runner.isRunning('run'), false);
+  fail = false; const recovered = await f.runner.runOneRound('run');
+  assert.equal(recovered.roundsCompleted, 0); assert.equal(f.events('SessionCancelled').length, 1); assert.deepEqual(progress(f), ['ERROR']);
+  await f.runner.runOneRound('run'); assert.equal(f.calls.plan, 2); assert.deepEqual(progress(f), ['ERROR', 'PROGRESS']); validate(f);
+});
+
+test('registration cleanup leaves a session containing an already-appended task intact', async () => {
+  const f = fixture(); const append = f.store.append.bind(f.store);
+  f.store.append = event => { const s = append(event); if (event.type === 'TaskAssigned') throw new Error('Append acknowledgement lost'); return s; };
+  await f.runner.runOneRound('run'); assert.equal(firstTask(f.get()).status, 'ASSIGNED');
+  assert.equal(Object.values(f.get().sessions)[0].state, 'OPEN'); assert.equal(f.events('SessionCancelled').length, 0);
+  assert.equal(f.calls.execute, 0); assert.deepEqual(progress(f), ['ERROR']); validate(f);
+});
+
+test('stop while attempting registration cancellation respects guard and recovers on resume', async () => {
+  const f = fixture(); const append = f.store.append.bind(f.store); let failTask = true; let stopCleanup = true;
+  f.store.append = event => {
+    if (event.type === 'TaskAssigned' && failTask) { failTask = false; throw new Error('Registration failed'); }
+    if (event.type === 'SessionCancelled' && stopCleanup) { stopCleanup = false; f.add('WorkflowSuspended', {}); }
+    return append(event);
+  };
+  await f.runner.runOneRound('run'); assert.equal(f.get().run.status, 'SUSPENDED'); assert.equal(f.events('SessionCancelled').length, 0);
+  assert.deepEqual(progress(f), []); f.resume(); await f.runner.runOneRound('run');
+  assert.equal(f.events('SessionCancelled').length, 1); assert.deepEqual(progress(f), ['ERROR']); assert.equal(f.calls.execute, 0); validate(f);
 });

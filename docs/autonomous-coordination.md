@@ -235,3 +235,6 @@ resume and collection without reexecution. No background observer is provided:
 terminal cleanup is guaranteed when the runner observes terminal state, not
 immediately during periods in which the runner is idle. Durable lifecycle
 observation and evidence retention remain COORD-5 work.
+
+Incomplete runner task registration cancels only its own empty OPEN session while RUNNING, preserving the journal; stopped workflows recover that empty session after explicit resume.
+Registration recovery reuses the original round key for exactly-once ERROR progress and never repairs manual sessions, multiple-task sessions, or malformed round markers.
