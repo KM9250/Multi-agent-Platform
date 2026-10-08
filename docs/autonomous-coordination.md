@@ -42,7 +42,7 @@ The initial kernel is **MACP-Coord Level 1 adapter-ready**, not wire-compatible.
 
 Browser hosting is only a PoC. Formal unattended operation requires the durable runtime because reloads, OS sleep, browser crashes, and background throttling cannot be controlled by React state or `localStorage`.
 
-Persistent stores, checkpoint restore, browser execution, MACP bridges, and durable runtime remain future responsibilities.
+Persistent stores, checkpoint restore, unrestricted external-site execution, MACP bridges, and durable runtime remain future responsibilities.
 
 ## COORD-2B1: decisions, quorum, and evaluations
 
@@ -238,3 +238,197 @@ observation and evidence retention remain COORD-5 work.
 
 Incomplete runner task registration cancels only its own empty OPEN session while RUNNING, preserving the journal; stopped workflows recover that empty session after explicit resume.
 Registration recovery reuses the original round key for exactly-once ERROR progress and never repairs manual sessions, multiple-task sessions, or malformed round markers.
+
+## COORD-3B: safety-gated browser PoC
+
+`createBrowserPocExecutor({ driver, evidenceStore, ids?, clock? })` registers as
+`browser` in the existing Runner executor registry. This PoC controls only the
+same-origin MAP sandbox explicitly supplied to `DomSandboxBrowserDriver`.
+It cannot navigate to arbitrary URLs, execute JavaScript/selectors/XPath supplied
+by a planner, operate outside the pinned root, access credentials/storage/cookies,
+upload/download files, or issue network requests/native form submission.
+
+### Operations, immutable policy, and trusted targets
+
+Copy `BROWSER_RISK_RULES` into the policy passed to `createWorkflow`; the Kernel
+captures that immutable policy snapshot. The executor never changes policy.
+
+| Operation | Action class | Initial policy | Allowed effect |
+| --- | --- | --- | --- |
+| navigate | browser.navigate | ALLOW | Switch registered `form` / `result` page |
+| read | browser.read | ALLOW | Structured page / target observation |
+| input | browser.input | NEEDS_USER | Local text field state transition |
+| interact | browser.interact | NEEDS_USER | Checkbox, allowlisted option, preview |
+| submit | browser.submit | NEEDS_USER | Local status and exact submit count |
+
+Runtime validation rejects unknown operations, malformed values, executable
+selectors, arbitrary URLs and unknown target IDs. Classification comes from
+validated operations and trusted target capabilities, never `arguments.actionClass`
+or a proposed fingerprint. Submit/navigation-capable targets cannot be clicked
+through `interact`. Password, hidden, file and credential fields are excluded.
+Read is retry-safe; all state transitions, including navigation, use `never`.
+The Runner consumes each prepared action before dispatch and never retries it.
+
+The driver owns only sandbox effects and observation. It never evaluates policy,
+approves an action or changes Workflow state. `BrowserSandboxController` is the
+shared source of truth for the DOM driver and `InMemoryBrowserPocDriver` used by
+Node tests. React subscribes to its synchronous transitions with `flushSync`;
+changing a DOM input alone is rejected as state desynchronization. The fixed
+`data-browser-id` registry is resolved only inside the supplied root. Duplicate,
+missing, replaced, detached, disabled or role/type-mismatched targets fail closed.
+Registry metadata and option values originate in trusted code, not DOM claims.
+All seven target elements remain mounted; page visibility changes through state.
+No native click, form.submit, form.requestSubmit, fetch or browser navigation is
+used by the driver. Buttons labelled Submit have HTML `type="button"`.
+
+### Fingerprints, preconditions and privacy
+
+Prepared payloads are structured-cloneable `{ schemaVersion: 1, surfaceId,
+operation, command, stateToken }`. The executor computes canonical SHA-256 over
+schema version, executor ID, surface, operation, authoritative action class,
+normalized command (including private input value) and the trusted state token.
+Action IDs remain unique independently of deterministic fingerprints.
+
+The token hashes the complete driver snapshot: surface/page identity, revision,
+target IDs/roles/capabilities, disabled flags, relevant control state, visible text
+and submission state. Tokens supplied in proposals never replace inspection.
+Execute revalidates the payload and public metadata, recomputes the fingerprint,
+and reinspects the surface. This PoC conservatively requires the same token for
+all five operations. A changed token returns `BROWSER_STALE_STATE` without a
+transition; it never silently reprepares or reuses approval for the new state.
+The driver also compares the exact inspected snapshot synchronously immediately
+before transition, closing the executor's asynchronous hashing/inspection gap.
+This guard is mandatory for direct driver dispatch too. New drivers must preserve
+that atomic precondition/transition contract.
+
+Public summaries are fixed trusted text, independent of page labels and input
+values. Input remains in the pending payload only; it does not enter Task titles,
+goals, approval summaries, execution summaries, the Journal or input Evidence.
+Read observations redact control values as well. Fingerprints are bindings,
+not encryption: do not enter real secrets or credentials into the sandbox.
+
+### Evidence and external-content trust
+
+Evidence kinds are `browser.observation.v1`, `browser.navigation.v1`,
+`browser.input.v1`, `browser.interaction.v1`, `browser.submission.v1` and
+`browser.trust-assessment.v1`. Successful results expose opaque evidence refs
+through `RunnerEvidenceStore`; missing evidence fails closed. Submission evidence
+includes target ID, previous/new state token, count and result status, not inputs.
+
+Observation contains bounded text and controls, never raw HTML, scripts/styles,
+event handlers or hidden/password fields. Limits are 50 text blocks, 100 controls,
+1,000 characters per text item, 20,000 total text characters (including labels and
+options), and 50 options per control. Truncation is explicit and requires review;
+it is never treated as harmless missing content. Unsupported visible controls,
+embedded content and visibility gaps require review. Read-target filtering happens
+only after the whole visible page and all visible labels/options have been checked.
+
+`assessBrowserContent` is a deterministic, English/Japanese PoC detector with
+NFKC/case/whitespace normalization. It checks instruction attempts, system/developer
+authority spoofing, fake user approval, tool redirection, goal substitution,
+exfiltration requests and ambiguous/indirect instructions. It checks before
+all operations, including mutating dispatch, and again on the resulting surface.
+The page cannot declare its own trust or authority. `DATA_ONLY` means no known
+instruction pattern was identified; it does not authenticate the page or prove
+its safety. `NEEDS_REVIEW`, incomplete visibility and security-relevant truncation
+produce a SafetyHold even if the action's policy was ALLOW. Observations remain
+untrusted data; the existing `RUNNER_PROVIDER_SYSTEM_CONTRACT` is unchanged.
+
+### SafetyHold, security review and resumption
+
+The only Runner contract addition is optional `RunnerExecutionResult.safetyHold`:
+
+```ts
+{
+  kind: 'untrusted-content',
+  reasonCode: 'CONTENT_REVIEW_REQUIRED',
+  reviewRef: 'map.runner.security-review.v1:<encoded-workflow>:<encoded-task>:<encoded-sha256>',
+  safeSummary: 'Untrusted content requires user review.'
+}
+```
+
+The executor generates the task/workflow-bound reference using a fresh random
+nonce. Runtime validation restricts kind/reason/summary/ref syntax and rejects
+extra fields; Runner COLLECT checks ownership. Safe trust assessments are kept
+in memory. On the hold path no raw suspicious text is persisted or automatically
+forwarded to either model phase. The Runner journals only its safe reason and
+opaque reference, through this sequence:
+
+```text
+TaskFailed → SessionResolved(FAILED) → ProgressRecorded(ERROR)
+           → WorkflowBlocked(RUNNER_UNTRUSTED_CONTENT:<reviewRef>)
+```
+
+No VERIFY, next PLAN, automatic Workflow failure/cancellation, or Action Approval
+occurs on this path. Pending actions/results are discarded. Partial journal writes
+are recovered before any later PLAN/VERIFY with exactly-once round progress.
+If the effect outcome is actually unknown, `uncertain` retains priority and uses
+the existing `RUNNER_EXECUTION_UNCERTAIN` behavior. A known pre-dispatch abort is
+`failed / BROWSER_ABORTED_BEFORE_DISPATCH`; a lost dispatch result is `uncertain`.
+Finding suspicious prose alone is never an uncertain effect.
+
+A trusted user adapter may only (1) discard suspicious material and replan from the
+original Workflow goal, or (2) explicitly cancel the Workflow. To choose (1),
+it must confirm the current review reference and append the existing event:
+
+```ts
+WorkflowResumed({ authorization: { type: 'user', reference: reviewRef } })
+```
+
+The Kernel requires user authorization but does not interpret this reference.
+Runner preflight checks the **first resume after the latest security block** for
+an exact reference match. Missing, wrong, ordinary action approval, cross-workflow,
+cross-task and past-review references reblock. A new hold always gets a new ref.
+Once that review is resolved, later ordinary action approvals retain their existing
+semantics. Security review never authorizes a DENY action. Closed held tasks are
+never reexecuted: the next PLAN gets the original goal and safe audit, no suspicious
+proposal or raw Evidence. Revisiting the same suspicious page holds again.
+There is deliberately no “follow the suspicious instruction” resolution option.
+
+Runner core changes are limited to the SafetyHold type/validation, COLLECT handling,
+security preflight/recovery and the browser exports. Kernel, coordination validation,
+completion, usage, Scheduler, SubAgents and event types are unchanged.
+
+### Running the development sandbox
+
+Run `npm install`, then `npm run dev`, and open
+`http://localhost:3000/browser-poc.html`. This separate Vite development entry is
+not included in the production build and is not attached to the Conversation Plane.
+It uses a scripted PLAN/VERIFY provider, not Gemini or another actual model.
+
+1. Choose `read` and Start workflow: ALLOW leads to structured Evidence and VERIFY.
+2. Choose `input`, `interact`, or `submit`: the Workflow stops first. Approve this
+   exact action to execute it once; `submit` increments the displayed count by one.
+3. While an action is blocked, change a sandbox field/page manually, then approve:
+   the old action fails its state precondition and makes no further change.
+4. Choose `navigate` to switch between Form and Result, including the displayed
+   local submission state. Form controls can also be operated manually.
+5. Insert suspicious content, then start a read: it stops for security review and
+   displays a dedicated discard/replan button, never the action-approval button.
+6. Restore ordinary content and select Discard suspicious evidence and replan:
+   a fresh read is planned. Without restoring content, it safely holds again.
+   Cancel workflow is the other explicit resolution.
+
+The screen is a development harness, not a production approval interface. Its
+scripted verifier checks local result/evidence presence for demonstration; it is
+not a general semantic verifier. No external website, real POST, authentication,
+file transfer, purchase, email or SNS operation is implemented.
+
+### Tests and limitations
+
+`coordination-browser-executor.test.ts` covers runtime commands, capability/risk
+boundaries, exact approvals, canonical fingerprints, stale/aborted/unknown outcomes,
+private evidence and once-only execution. `coordination-browser-trust.test.ts`
+covers representative English/Japanese attacks, insufficient visibility, blocking,
+review binding/replay, fresh planning, DENY, cancellation and partial-hold recovery.
+`coordination-browser-dom.test.ts` uses jsdom to exercise actual DOM scoping,
+identity, forbidden fields, structured extraction and controller consistency.
+All preexisting COORD-0–3A tests remain part of `npm test`.
+
+This is a PoC, **not a production security guarantee or general prompt-injection
+resistance claim**. Undetected attacks, false positives, languages and expressions
+outside the known patterns remain possible. Policy, target boundaries, exact
+approval, state preconditions and evidence isolation are independent controls;
+a detector miss never grants additional operation authority. In-memory driver,
+pending action, evidence, review and Runner state have no durability across reload,
+crash or restart. Persistent runtime/checkpoint recovery remains COORD-5 work.

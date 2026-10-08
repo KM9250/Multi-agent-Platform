@@ -11,6 +11,7 @@ import { defaultRunnerIds } from './stores';
 import type { CoordinationRunner, CoordinationRunnerDependencies, CoordinationRunnerStore, PreparedRunnerAction, RunnerClock, RunnerExecutionResult, RunnerIdGenerator, RunnerModelResult, RunnerPendingApproval, RunnerRunOptions, RunnerRunResult, RunnerStopReason } from './types';
 
 const RUNNER_SESSION_PREFIX = 'map.runner.v1:';
+const SECURITY_BLOCK_PREFIX = 'RUNNER_UNTRUSTED_CONTENT:';
 // Shared across runner instances in this JS runtime; deliberately not a distributed lock.
 const running = new Map<string, AbortController>();
 // Results are ephemeral, shared by runners using the same store, and never authorize execution.
@@ -245,6 +246,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     const s = this.snapshot(ctx); validateCoordinationSnapshot(s);
     if (s.run.executionMode !== 'supervised_autonomous') return this.result(ctx, 'stopped', undefined, 'RUNNER_EXECUTION_MODE');
     const stopped = this.safePoint(ctx); if (stopped) return stopped;
+    const securityBlock = this.securityPreflight(ctx); if (securityBlock) return securityBlock;
     const sessions = Object.values(s.sessions).filter(active);
     if (sessions.length > 1) return this.result(ctx, 'stopped', undefined, 'RUNNER_AMBIGUOUS_PENDING_WORK');
     const session = sessions[0];
@@ -272,6 +274,38 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     const complete = this.finalize(ctx); if (complete) return complete;
     const exhausted = this.budget(ctx); if (exhausted) return this.block(ctx, `RUNNER_BUDGET_EXHAUSTED:${exhausted}`);
     return this.plan(ctx);
+  }
+  /** Only the first resume following the latest security block can resolve that review.
+   * Later ordinary action approvals do not consume/reuse a security review authorization. */
+  private securityPreflight(ctx: RoundContext): RunnerRunResult | undefined {
+    const s = this.snapshot(ctx);
+    // Recover a partially journaled hold before any VERIFY/PLAN, even across runner instances.
+    const held = [...s.events].reverse().find(event => event.type === 'TaskFailed'
+      && (event.payload as { failureReason?: string }).failureReason?.startsWith(SECURITY_BLOCK_PREFIX)
+      && !!event.sessionId && owned(s.sessions[event.sessionId]));
+    if (held) {
+      const payload = held.payload as { taskId: string; failureReason: string };
+      const recorded = s.events.some(event => event.type === 'WorkflowBlocked' && event.sequence > held.sequence
+        && (event.payload as { reason?: string }).reason === payload.failureReason);
+      if (!recorded) {
+        const task = s.tasks[payload.taskId];
+        const session = s.sessions[task.sessionId];
+        ctx.key = session.contextRef!.slice(RUNNER_SESSION_PREFIX.length);
+        if (active(session)) this.close(ctx, task, 'ERROR');
+        else { this.progress(ctx, 'ERROR', 'Runner round error.'); this.deleteResult(ctx.id, task.taskId); }
+        return this.block(ctx, payload.failureReason);
+      }
+    }
+    const block = [...s.events].reverse().find(event => event.type === 'WorkflowBlocked'
+      && (event.payload as { reason?: string }).reason?.startsWith(SECURITY_BLOCK_PREFIX));
+    if (!block) return;
+    const reason = (block.payload as { reason: string }).reason;
+    const reviewRef = reason.slice(SECURITY_BLOCK_PREFIX.length);
+    const resume = s.events.find(event => event.type === 'WorkflowResumed' && event.sequence > block.sequence);
+    const auth = (resume?.payload as WorkflowResumePayload | undefined)?.authorization;
+    if (!reviewRef.startsWith(`map.runner.security-review.v1:${encodeURIComponent(ctx.id)}:`)
+      || auth?.type !== 'user' || auth.reference !== reviewRef) return this.block(ctx, reason);
+    // The held task/session are already closed; PLAN sees the original goal and safe journal only.
   }
   private async plan(ctx: RoundContext): Promise<RunnerRunResult> {
     try {
@@ -371,6 +405,19 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     }
     const stopped = this.safePoint(ctx); if (stopped) return stopped;
     if (!this.taskWritable(ctx, task)) return this.result(ctx, 'stopped', undefined, 'RUNNER_STALE_EXECUTION');
+    if (result.safetyHold) {
+      const prefix = `map.runner.security-review.v1:${encodeURIComponent(ctx.id)}:${encodeURIComponent(task.taskId)}:`;
+      if (!result.safetyHold.reviewRef.startsWith(prefix)) {
+        // An executor cannot transfer a review from another task or workflow.
+        result = { status: 'uncertain', summary: 'Invalid security review ownership.' };
+        this.setResult(ctx.id, task, result);
+        return this.collect(ctx, task, result);
+      }
+      const reason = `${SECURITY_BLOCK_PREFIX}${result.safetyHold.reviewRef}`;
+      this.append(ctx, 'TaskFailed', { taskId: task.taskId, failureReason: reason }, task.sessionId);
+      this.close(ctx, task, 'ERROR');
+      return this.block(ctx, reason);
+    }
     try {
       // Raw summaries stay in evidence storage. The journal receives opaque references only.
       if (!result.resultRef) {
