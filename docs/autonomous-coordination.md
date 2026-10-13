@@ -544,3 +544,138 @@ approval, state preconditions and evidence isolation are independent controls;
 a detector miss never grants additional operation authority. In-memory driver,
 pending action, evidence, review and Runner state have no durability across reload,
 crash or restart. Persistent runtime/checkpoint recovery remains COORD-5 work.
+
+## COORD-4A: Journal notifications and in-memory outbox
+
+`services/coordination/notifications` projects committed Journal events into
+informational notifications. The Kernel, Runner, PolicyGuard, event types and
+Workflow transitions are unchanged. Neither model prose nor an executor/Runner
+return value is a notification source. `WorkflowSuspended` emits nothing; there
+is no invented `WorkflowFailed` event.
+
+| Journal event / validated reason | Notification kind | MACP intent / status | Priority / user action |
+| --- | --- | --- | --- |
+| CommitmentAccepted | workflow_completed | notify_user / done | normal / false |
+| WorkflowCancelled | workflow_cancelled | notify_user / done | normal / false |
+| WorkflowBlocked / RUNNER_NEEDS_USER | action_approval_required | need_review / need_review | high / true |
+| WorkflowBlocked / RUNNER_UNTRUSTED_CONTENT | security_review_required | need_review / need_review | high / true |
+| WorkflowBlocked / RUNNER_VERIFY_EVIDENCE_UNAVAILABLE | evidence_review_required | need_review / need_review | high / true |
+| WorkflowBlocked / RUNNER_EXECUTION_UNCERTAIN | execution_review_required | need_review / need_review | high / true |
+| WorkflowBlocked / RUNNER_BUDGET_EXHAUSTED | budget_exhausted | notify_user / blocked | high / true |
+| Other or malformed known WorkflowBlocked reason | workflow_attention_required | need_review / need_review | high / true |
+
+The classifier checks canonical approval encoding and workflow ownership, reuses
+strict security/evidence review parsers, and allowlists budget keys. Unknown or
+malformed metadata remains visible as generic attention; it never becomes an
+approval. Execution uncertainty uses the current Runner's opaque action/task ID
+suffix. Classification is informational and does not validate or grant authority
+to resume an action.
+
+### Identity and payload
+
+`projectCoordinationNotifications(snapshot)` is synchronous, validates the
+snapshot and scans the Journal in sequence order without modifying it. It does
+not consult wall-clock time, evidence stores, pending actions or the network.
+IDs are `map.notification.v1:<SHA-256 hex>` over a canonical JSON tuple:
+`["map.coordination.notification", 1, workflowRunId, kind, scope, identity]`.
+For valid approval/security/evidence references and uncertain action IDs, scope
+is `reference`; otherwise it is `event` and identity is the canonical event ID.
+The encoded references must already be canonical; distinct opaque identifiers
+are not lowercased, trimmed or Unicode-normalized. JSON tuple boundaries avoid
+separator ambiguity. The synchronous browser-compatible SHA-256 implementation
+is checked against Node crypto, including padding boundaries and Unicode.
+
+Repeated blocks for the same reference keep the first event ID/timestamp. New
+references create new notifications. Workflow identity isolates runs. Terminal
+events, budgets and unrecognized reasons use event identity; an idempotent
+append still points to the original Journal event. The complete historical
+notification set is retained even after a later resume, completion or cancel.
+
+Summaries are fixed Japanese templates capped at 120 characters. Approval/review
+references and fingerprints only participate in internal hashing; no raw goal,
+evidence, external text, exception, input or token is included. Outbox enqueue
+and MACP conversion rebuild allowlisted payloads and derive summary, priority
+and user-action flags from kind, discarding extra fields and caller prose.
+Workflow and event IDs in the internal model are trusted Journal identifiers;
+MACP carries only the hashed notification ID and the allowlisted kind metadata.
+Hashes are identifiers, not encryption or authorization credentials.
+
+### Store integration and recovery
+
+Install the decorator once when constructing a Runner and retain the same
+wrapped store for that runtime (Runner retained results are keyed by store).
+All writers that need immediate observation must append through that wrapper.
+Appending directly to the base store requires later explicit reconciliation.
+
+```ts
+const outbox = new InMemoryNotificationOutbox();
+const observer = createCoordinationNotificationObserver(outbox);
+const diagnostics = ({ code }) => recordSafeDiagnostic(code);
+const store = createNotifyingCoordinationStore(baseStore, observer, diagnostics);
+const runner = createCoordinationRunner({ ...dependencies, store });
+
+// Recovery after an observer/enqueue failure, or adoption of existing history:
+await reconcileCoordinationNotifications(store, workflowRunId, observer, diagnostics);
+
+// Explicit delivery; this example performs no HTTP requests:
+const transport = new InMemoryNotificationTransport();
+for (const notification of outbox.pending()) {
+  await deliverCoordinationNotification(outbox, notification.notificationId, transport);
+}
+```
+
+Append first calls the base store. Only after success does it obtain a new
+committed snapshot and invoke the observer with a clone; it then returns the
+exact original append result. The default observer projects and enqueues
+synchronously. Custom asynchronous observers are permitted, but their completion
+is not awaited by the synchronous store; rejected promises are isolated too.
+Snapshot-read, projection and enqueue failures produce only
+`NOTIFICATION_OBSERVER_FAILED` via the optional separate diagnostic callback.
+Even a throwing/rejecting diagnostic callback cannot fail an accepted append.
+
+An append rejected by the base store still rejects and emits nothing. If a
+store commits and then loses its acknowledgement, the decorator cannot claim
+append success: explicit reconciliation can recover the committed history.
+Reconciliation scans all history so partial enqueue failures recover without
+resetting or duplicating existing delivery records. There is no automatic
+reconcile timer, replay cursor, persistent checkpoint or startup installation.
+
+### Outbox and transport
+
+Transitions are `PENDING -> SENDING -> DELIVERED` or
+`PENDING -> SENDING -> DELIVERY_FAILED`. Only explicit `prepareRetry(id)` moves
+`DELIVERY_FAILED -> PENDING`; it cannot reset `SENDING` or `DELIVERED`.
+A synchronous delivery claim excludes concurrent sends for an ID. Increasing
+attempt numbers reject stale success/failure acknowledgements. Duplicate enqueue
+never replaces the first payload or resets its state. All reads, claims and
+stored notifications are independent copies. Diagnostics store a fixed failure
+code, never a transport exception. Delivery failure/retry has no Runner,
+Executor, approval, pending-action or Journal dependency.
+
+`InMemoryNotificationTransport` records cloned packets and supports `failNext()`
+for deterministic delivery failure tests. There is no HTTP transport or automatic
+retry. A transport must settle its promise before a sending entry can finish;
+there is no lease expiry or recovery for a hung send. Transport success means
+that the transport accepted the packet, not that a human read it. Durable or
+cross-runtime exactly-once delivery is not promised by this in-memory outbox.
+
+### MACP compatibility and limits
+
+The adapter targets the existing MACP `0.1.0` schema in
+[Multi-Agent-Command-Protocol/server/schemas.py](https://github.com/KM9250/Multi-Agent-Command-Protocol/blob/main/server/schemas.py)
+(reviewed source blob `4e39bbc6a01cd558105a780d20eab2b2d772532b`). `task_type:
+coordination` and additional `metadata` are accepted by that schema's forward
+compatibility rules. `task_id` is the stable notification ID; `created_at` is the
+source event's timestamp in UTC, preserved across retries. No server-owned
+fields, `actions`, handoff, approval URL or authorization are sent. Cancellation's
+`done` means the notification fact is final; `metadata.notification_kind:
+workflow_cancelled` distinguishes it from successful Workflow completion.
+
+Tests cover classification/fallback, identity, commit boundaries, reconciliation,
+state transitions, isolation of returned objects, concurrent delivery, mock
+failure/retry, safe packets and integration with the actual Browser Runner.
+The TypeScript tests assert the pinned MACP field/enum contract; verification
+against the upstream Pydantic model is also possible offline. No MACP API/UI,
+real model/HTTP connection, approval UI, persistent outbox, infinite retries or
+authority to resume a Workflow is introduced. Trusted MAP adapters remain solely
+responsible for user authorization and resumption.

@@ -7,3 +7,4 @@ export * from './completion';
 export * from './usage';
 export * from './audit';
 export * from './runner/index';
+export * from './notifications/index';
