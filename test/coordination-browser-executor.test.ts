@@ -163,3 +163,60 @@ test('observation projects only allowlisted fields, even if driver supplies extr
   const obs = JSON.stringify(browserObservation(s));
   for (const marker of ['innerHTML', 'eventHandlers', 'credential', 'private-']) assert.equal(obs.includes(marker), false);
 });
+
+// A driver-confirmed effect must block if its evidence cannot subsequently be established.
+for (const fault of ['first-put', 'second-put', 'execution-put', 'first-get-missing', 'second-get-missing', 'execution-get-missing', 'get-throws', 'get-corrupt', 'state-token']) {
+  test(`post-submit ${fault} failure blocks without VERIFY, another PLAN or repeated submit`, async t => {
+    const f = browserFixture({ operation: 'submit', targetId: 'submit-button' });
+    const approval = await f.runner.runOneRound('run');
+    const put = f.evidenceStore.put.bind(f.evidenceStore), get = f.evidenceStore.get.bind(f.evidenceStore);
+    let puts = 0, gets = 0, dispatched = false;
+    f.evidenceStore.put = async evidence => {
+      puts++;
+      if ((fault === 'first-put' && puts === 1) || (fault === 'second-put' && puts === 2) || (fault === 'execution-put' && puts === 3)) throw new Error('private-store-diagnostic');
+      return put(evidence);
+    };
+    f.evidenceStore.get = async ref => {
+      gets++;
+      if ((fault === 'first-get-missing' && gets === 1) || (fault === 'second-get-missing' && gets === 2) || (fault === 'execution-get-missing' && gets === 3)) return undefined;
+      if (fault === 'get-throws') throw new Error('private-get-diagnostic');
+      if (fault === 'get-corrupt') return { kind: 'wrong', content: 'private-corrupt-value', createdAt: 0 };
+      return get(ref);
+    };
+    const submit = f.driver.submit.bind(f.driver);
+    f.driver.submit = async (...args) => { const result = await submit(...args); dispatched = true; return result; };
+    const digest = globalThis.crypto.subtle.digest.bind(globalThis.crypto.subtle);
+    if (fault === 'state-token') t.mock.method(globalThis.crypto.subtle, 'digest', (...args: Parameters<typeof digest>) => {
+      if (dispatched) throw new Error('private-hash-diagnostic');
+      return digest(...args);
+    });
+    const execute = f.tracked.execute; let executionResult: Awaited<ReturnType<typeof execute>>;
+    f.tracked.execute = async (...args) => { executionResult = await execute(...args); return executionResult; };
+    f.resume(approval.pendingApproval!.approvalRef);
+    await f.runner.runUntilStop('run');
+    assert.equal(executionResult!.status, 'uncertain');
+    assert.equal(executionResult!.errorCode, 'BROWSER_EVIDENCE_UNAVAILABLE_AFTER_DISPATCH');
+    assert.equal(executionResult!.safetyHold, undefined);
+    assert.equal(f.get().run.status, 'BLOCKED'); assert.match(f.get().run.statusReason!, /^RUNNER_EXECUTION_UNCERTAIN:/);
+    assert.deepEqual(f.get().events.slice(-4).map(e => e.type), ['TaskFailed', 'SessionResolved', 'ProgressRecorded', 'WorkflowBlocked']);
+    assert.equal((f.get().events.at(-2)!.payload as { outcome: string }).outcome, 'ERROR');
+    assert.equal(Object.values(f.get().tasks)[0].failureReason, 'EXECUTION_UNCERTAIN');
+    await f.runner.runOneRound('run'); await createCoordinationRunner(f.deps).runUntilStop('run');
+    assert.equal(f.calls.plan, 1); assert.equal(f.calls.verify, 0); assert.equal(f.calls.execute, 1);
+    assert.equal(f.controller.getState().submitCount, 1); assert.equal(f.get().events.filter(e => e.type === 'ProgressRecorded').length, 1);
+    assert.equal(JSON.stringify(f.get()).includes('private-'), false);
+    assert.equal(puts, fault === 'state-token' ? 0 : fault === 'first-put' ? 1 : fault.startsWith('execution-') ? 3 : 2);
+  });
+}
+test('post-read evidence loss also stops autonomous continuation', async () => {
+  const f = browserFixture(); f.evidenceStore.put = async () => { throw new Error('private-failure'); };
+  await f.runner.runUntilStop('run');
+  assert.equal(f.get().run.status, 'BLOCKED'); assert.match(f.get().run.statusReason!, /^RUNNER_EXECUTION_UNCERTAIN:/);
+  assert.equal(f.calls.plan, 1); assert.equal(f.calls.verify, 0); assert.equal(f.controller.getState().revision, 0);
+});
+test('unknown driver outcome remains distinct from post-dispatch evidence failure', async () => {
+  const f = browserFixture(); const action = await f.executor.prepare(proposal({ operation: 'submit', targetId: 'submit-button' }));
+  f.driver.submit = async () => { throw new Error('private-driver-diagnostic'); };
+  const result = await f.executor.execute(action, executionContext);
+  assert.equal(result.status, 'uncertain'); assert.equal(result.errorCode, 'BROWSER_UNKNOWN_OUTCOME'); assert.equal(result.safetyHold, undefined);
+});

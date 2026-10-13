@@ -1,5 +1,5 @@
 import { defaultRunnerIds } from '../stores';
-import type { PreparedRunnerAction, RunnerActionExecutor, RunnerClock, RunnerEvidenceStore, RunnerExecutionContext, RunnerExecutionResult, RunnerIdGenerator } from '../types';
+import type { PreparedRunnerAction, RunnerActionExecutor, RunnerClock, RunnerEvidenceStore, RunnerExecutionContext, RunnerExecutionResult, RunnerIdGenerator, RunnerSafetyHoldEffectState } from '../types';
 import { BrowserBeforeDispatchError } from './browserDriver';
 import { assessBrowserContent } from './contentTrust';
 import { browserFingerprint, browserStateToken, canonicalSerialize, sha256 } from './fingerprint';
@@ -13,13 +13,13 @@ export function createBrowserPocExecutor(options: { driver: BrowserPocDriver; ev
   const summary = (operation: string): string => ({ navigate: 'Navigate within the browser sandbox.', read: 'Read sandbox data.',
     input: 'Enter text into the sandbox search field.', interact: 'Interact with a sandbox control.', submit: 'Submit the local sandbox form.' })[operation]!;
   const failed = (errorCode: string): RunnerExecutionResult => ({ status: 'failed', summary: 'Browser action did not execute.', errorCode });
-  async function hold(context: RunnerExecutionContext, assessment: BrowserContentTrustAssessment): Promise<RunnerExecutionResult> {
+  async function hold(context: RunnerExecutionContext, assessment: BrowserContentTrustAssessment, effectState: RunnerSafetyHoldEffectState): Promise<RunnerExecutionResult> {
     const reviewFingerprint = await sha256({ workflowRunId: context.workflowRunId, taskId: context.taskId, nonce: globalThis.crypto.randomUUID() });
     const reviewRef = `map.runner.security-review.v1:${[context.workflowRunId, context.taskId, reviewFingerprint].map(encodeURIComponent).join(':')}`;
     // Raw external text and form values are never stored on this path, including failure diagnostics.
-    try { await evidenceStore.put({ kind: 'browser.trust-assessment.v1', createdAt: clock.now(), content: { ...assessment, reviewRef } }); } catch { /* Review remains mandatory if evidence storage is unavailable. */ }
+    try { await evidenceStore.put({ kind: 'browser.trust-assessment.v1', createdAt: clock.now(), content: { ...assessment, reviewRef, effectState } }); } catch { /* Review remains mandatory if evidence storage is unavailable. */ }
     return { status: 'failed', summary: 'Browser content requires security review.', safetyHold: {
-      kind: 'untrusted-content', reasonCode: 'CONTENT_REVIEW_REQUIRED', reviewRef, safeSummary: 'Untrusted content requires user review.',
+      kind: 'untrusted-content', effectState, reasonCode: 'CONTENT_REVIEW_REQUIRED', reviewRef, safeSummary: 'Untrusted content requires user review.',
     } };
   }
   return {
@@ -52,7 +52,7 @@ export function createBrowserPocExecutor(options: { driver: BrowserPocDriver; ev
         validateBrowserTarget(command, current);
       } catch (error) { return failed(error instanceof BrowserValidationError ? error.code : 'BROWSER_INVALID_PREPARED_ACTION'); }
       const beforeTrust = assessBrowserContent(browserObservation(current));
-      if (beforeTrust.decision === 'NEEDS_REVIEW') return hold(context, beforeTrust);
+      if (beforeTrust.decision === 'NEEDS_REVIEW') return hold(context, beforeTrust, 'not_dispatched');
       if (context.signal?.aborted) return failed('BROWSER_ABORTED_BEFORE_DISPATCH');
       let after: BrowserSurfaceSnapshot;
       try {
@@ -71,10 +71,10 @@ export function createBrowserPocExecutor(options: { driver: BrowserPocDriver; ev
         if (error instanceof BrowserBeforeDispatchError) return failed(error.code);
         return { status: 'uncertain', summary: 'Browser dispatch outcome could not be established.', errorCode: 'BROWSER_UNKNOWN_OUTCOME' };
       }
-      const observation = browserObservation(after);
-      const assessment = assessBrowserContent(observation);
-      if (assessment.decision === 'NEEDS_REVIEW') return hold(context, assessment);
       try {
+        const observation = browserObservation(after);
+        const assessment = assessBrowserContent(observation);
+        if (assessment.decision === 'NEEDS_REVIEW') return await hold(context, assessment, payload.operation === 'read' ? 'not_dispatched' : 'applied');
         const newStateToken = await browserStateToken(after);
         const kind = { navigate: 'navigation', read: 'observation', input: 'input', interact: 'interaction', submit: 'submission' }[payload.operation];
         const command = payload.command;
@@ -83,11 +83,22 @@ export function createBrowserPocExecutor(options: { driver: BrowserPocDriver; ev
           ...('targetId' in command ? { targetId: command.targetId } : {}), previousStateToken: payload.stateToken,
           newStateToken, submitCount: after.submitCount, resultStatus: after.resultStatus,
         };
-        const ref = await evidenceStore.put({ kind: `browser.${kind}.v1`, content, createdAt: clock.now() });
-        const trustRef = await evidenceStore.put({ kind: 'browser.trust-assessment.v1', content: assessment, createdAt: clock.now() });
-        if (!await evidenceStore.get(ref) || !await evidenceStore.get(trustRef)) throw new Error('Missing evidence.');
-        return { status: 'succeeded', summary: 'Browser sandbox action completed.', evidenceRefs: [ref, trustRef] };
-      } catch { return { status: 'failed', summary: 'Browser result evidence is unavailable.', errorCode: 'BROWSER_EVIDENCE_UNAVAILABLE' }; }
+        const evidence = { kind: `browser.${kind}.v1`, content, createdAt: clock.now() };
+        const trustEvidence = { kind: 'browser.trust-assessment.v1', content: assessment, createdAt: clock.now() };
+        const ref = await evidenceStore.put(evidence);
+        const trustRef = await evidenceStore.put(trustEvidence);
+        if (typeof ref !== 'string' || !ref.trim() || typeof trustRef !== 'string' || !trustRef.trim() || ref === trustRef
+          || canonicalSerialize(await evidenceStore.get(ref)) !== canonicalSerialize(evidence)
+          || canonicalSerialize(await evidenceStore.get(trustRef)) !== canonicalSerialize(trustEvidence)) throw new Error('Unverified evidence.');
+        const result: RunnerExecutionResult = { status: 'succeeded', summary: 'Browser sandbox action completed.', evidenceRefs: [ref, trustRef] };
+        // Establish the Runner envelope inside this same blocking boundary. Otherwise
+        // COLLECT would perform an additional, unguarded evidence write after success.
+        const executionEvidence = { kind: 'runner.execution', content: result, createdAt: clock.now() };
+        const resultRef = await evidenceStore.put(executionEvidence);
+        if (typeof resultRef !== 'string' || !resultRef.trim() || resultRef === ref || resultRef === trustRef
+          || canonicalSerialize(await evidenceStore.get(resultRef)) !== canonicalSerialize(executionEvidence)) throw new Error('Unverified execution evidence.');
+        return { ...result, resultRef };
+      } catch { return { status: 'uncertain', summary: 'Browser action evidence could not be established.', errorCode: 'BROWSER_EVIDENCE_UNAVAILABLE_AFTER_DISPATCH' }; }
     },
   };
 }

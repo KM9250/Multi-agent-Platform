@@ -1,3 +1,4 @@
+import { formatSecurityHoldReason, parseSecurityHoldReason, parseSecurityReviewRef, SECURITY_BLOCK_PREFIX } from './securityHold';
 import { evaluateCommitmentGate } from '../completion';
 import { findExhaustedBudget } from '../policy';
 import { validateCoordinationSnapshot } from '../validation';
@@ -11,7 +12,6 @@ import { defaultRunnerIds } from './stores';
 import type { CoordinationRunner, CoordinationRunnerDependencies, CoordinationRunnerStore, PreparedRunnerAction, RunnerClock, RunnerExecutionResult, RunnerIdGenerator, RunnerModelResult, RunnerPendingApproval, RunnerRunOptions, RunnerRunResult, RunnerStopReason } from './types';
 
 const RUNNER_SESSION_PREFIX = 'map.runner.v1:';
-const SECURITY_BLOCK_PREFIX = 'RUNNER_UNTRUSTED_CONTENT:';
 // Shared across runner instances in this JS runtime; deliberately not a distributed lock.
 const running = new Map<string, AbortController>();
 // Results are ephemeral, shared by runners using the same store, and never authorize execution.
@@ -285,6 +285,9 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       && !!event.sessionId && owned(s.sessions[event.sessionId]));
     if (held) {
       const payload = held.payload as { taskId: string; failureReason: string };
+      if (!parseSecurityHoldReason(payload.failureReason, { workflowRunId: ctx.id, taskId: payload.taskId })) {
+        return this.block(ctx, `${SECURITY_BLOCK_PREFIX}INVALID_METADATA`);
+      }
       const recorded = s.events.some(event => event.type === 'WorkflowBlocked' && event.sequence > held.sequence
         && (event.payload as { reason?: string }).reason === payload.failureReason);
       if (!recorded) {
@@ -300,11 +303,16 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       && (event.payload as { reason?: string }).reason?.startsWith(SECURITY_BLOCK_PREFIX));
     if (!block) return;
     const reason = (block.payload as { reason: string }).reason;
-    const reviewRef = reason.slice(SECURITY_BLOCK_PREFIX.length);
+    const metadata = parseSecurityHoldReason(reason, { workflowRunId: ctx.id });
+    const binding = metadata && parseSecurityReviewRef(metadata.reviewRef);
+    const task = binding && s.tasks[binding.taskId];
+    if (!metadata || !task || !owned(s.sessions[task.sessionId]) || task.failureReason !== reason
+      || (held && (held.payload as { failureReason: string }).failureReason !== reason)) {
+      return this.block(ctx, `${SECURITY_BLOCK_PREFIX}INVALID_METADATA`);
+    }
     const resume = s.events.find(event => event.type === 'WorkflowResumed' && event.sequence > block.sequence);
     const auth = (resume?.payload as WorkflowResumePayload | undefined)?.authorization;
-    if (!reviewRef.startsWith(`map.runner.security-review.v1:${encodeURIComponent(ctx.id)}:`)
-      || auth?.type !== 'user' || auth.reference !== reviewRef) return this.block(ctx, reason);
+    if (auth?.type !== 'user' || auth.reference !== metadata.reviewRef) return this.block(ctx, reason);
     // The held task/session are already closed; PLAN sees the original goal and safe journal only.
   }
   private async plan(ctx: RoundContext): Promise<RunnerRunResult> {
@@ -406,14 +414,14 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     const stopped = this.safePoint(ctx); if (stopped) return stopped;
     if (!this.taskWritable(ctx, task)) return this.result(ctx, 'stopped', undefined, 'RUNNER_STALE_EXECUTION');
     if (result.safetyHold) {
-      const prefix = `map.runner.security-review.v1:${encodeURIComponent(ctx.id)}:${encodeURIComponent(task.taskId)}:`;
-      if (!result.safetyHold.reviewRef.startsWith(prefix)) {
+      const binding = parseSecurityReviewRef(result.safetyHold.reviewRef);
+      if (binding?.workflowRunId !== ctx.id || binding.taskId !== task.taskId) {
         // An executor cannot transfer a review from another task or workflow.
         result = { status: 'uncertain', summary: 'Invalid security review ownership.' };
         this.setResult(ctx.id, task, result);
         return this.collect(ctx, task, result);
       }
-      const reason = `${SECURITY_BLOCK_PREFIX}${result.safetyHold.reviewRef}`;
+      const reason = formatSecurityHoldReason({ reviewRef: result.safetyHold.reviewRef, effectState: result.safetyHold.effectState });
       this.append(ctx, 'TaskFailed', { taskId: task.taskId, failureReason: reason }, task.sessionId);
       this.close(ctx, task, 'ERROR');
       return this.block(ctx, reason);

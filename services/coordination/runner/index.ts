@@ -5,3 +5,4 @@ export * from './policyGuard';
 export * from './context';
 export * from './eventFactory';
 export * from './browser/index';
+export * from './securityHold';

@@ -312,7 +312,10 @@ not encryption: do not enter real secrets or credentials into the sandbox.
 Evidence kinds are `browser.observation.v1`, `browser.navigation.v1`,
 `browser.input.v1`, `browser.interaction.v1`, `browser.submission.v1` and
 `browser.trust-assessment.v1`. Successful results expose opaque evidence refs
-through `RunnerEvidenceStore`; missing evidence fails closed. Submission evidence
+through `RunnerEvidenceStore`; missing evidence fails closed. The executor also
+establishes and reads back the `runner.execution` envelope before returning
+success, so COLLECT needs no additional evidence write. Read-back content must
+match the evidence that was written. Submission evidence
 includes target ID, previous/new state token, count and result status, not inputs.
 
 Observation contains bounded text and controls, never raw HTML, scripts/styles,
@@ -341,6 +344,7 @@ The only Runner contract addition is optional `RunnerExecutionResult.safetyHold`
 ```ts
 {
   kind: 'untrusted-content',
+  effectState: 'not_dispatched', // or 'applied'
   reasonCode: 'CONTENT_REVIEW_REQUIRED',
   reviewRef: 'map.runner.security-review.v1:<encoded-workflow>:<encoded-task>:<encoded-sha256>',
   safeSummary: 'Untrusted content requires user review.'
@@ -348,15 +352,15 @@ The only Runner contract addition is optional `RunnerExecutionResult.safetyHold`
 ```
 
 The executor generates the task/workflow-bound reference using a fresh random
-nonce. Runtime validation restricts kind/reason/summary/ref syntax and rejects
+nonce. Runtime validation restricts kind/reason/summary/ref/effectState and rejects
 extra fields; Runner COLLECT checks ownership. Safe trust assessments are kept
 in memory. On the hold path no raw suspicious text is persisted or automatically
 forwarded to either model phase. The Runner journals only its safe reason and
-opaque reference, through this sequence:
+opaque reference and effect state, through this sequence:
 
 ```text
 TaskFailed → SessionResolved(FAILED) → ProgressRecorded(ERROR)
-           → WorkflowBlocked(RUNNER_UNTRUSTED_CONTENT:<reviewRef>)
+           → WorkflowBlocked(RUNNER_UNTRUSTED_CONTENT:v1:<encodeURIComponent(reviewRef)>|effect=<effectState>)
 ```
 
 No VERIFY, next PLAN, automatic Workflow failure/cancellation, or Action Approval
@@ -367,12 +371,46 @@ the existing `RUNNER_EXECUTION_UNCERTAIN` behavior. A known pre-dispatch abort i
 `failed / BROWSER_ABORTED_BEFORE_DISPATCH`; a lost dispatch result is `uncertain`.
 Finding suspicious prose alone is never an uncertain effect.
 
+`RunnerSafetyHoldEffectState = 'not_dispatched' | 'applied'` records the effect
+of the held action, not the state of the entire Workflow. Pre-dispatch holds use
+`not_dispatched`. After a trusted Driver confirms navigation/input/interact/submit,
+a hold uses `applied`; post-read holds use `not_dispatched` because read has no
+state-changing effect. Unknown Driver results keep the existing uncertain path
+and must not be labelled applied. The Executor supplies effectState from its
+execution stage, never from proposal arguments, labels or external text.
+**TaskFailed does not mean the browser action had no effect, and discarding
+suspicious evidence does not undo an applied action.**
+
+Both TaskFailed.failureReason and WorkflowBlocked.reason use the versioned format
+above. Shared `formatSecurityHoldReason` / `parseSecurityHoldReason` helpers encode
+and recover the exact reviewRef and allowlisted effectState, including escaped IDs.
+Extra fields, invalid refs, unknown states/versions, and legacy reasons without an
+effect state are rejected. Invalid journal metadata reblocks for cancellation or
+trusted investigation; the UI does not offer a review-resume action for it. The
+Runner additionally binds the reference to the held task, Workflow and latest hold.
+Partial append recovery preserves the same effectState after ephemeral results
+are discarded, with no repeat dispatch and exactly-once progress.
+
+After a Driver-confirmed result, failures while computing the new state token,
+writing observation/trust/execution evidence, or verifying any read-back return
+`uncertain / BROWSER_EVIDENCE_UNAVAILABLE_AFTER_DISPATCH`. The existing
+`RUNNER_EXECUTION_UNCERTAIN` path blocks before VERIFY or a new PLAN, including
+for read. In this case uncertain means **a verifiable execution result could not
+be established**, even if the Driver confirmed that the effect was applied. It
+is distinct from `BROWSER_UNKNOWN_OUTCOME`, which means the Driver outcome itself
+is unknown. No automatic dispatch retry or evidence-write retry is performed.
+Pre-dispatch validation, stale state, capability failures and abort retain their
+existing failed/no-effect behavior. The optional diagnostic trust-assessment copy
+on a SafetyHold path is best-effort: even if unavailable, the hold still blocks
+and the known effect is recorded in the Journal. No raw diagnostic is journaled.
+
 A trusted user adapter may only (1) discard suspicious material and replan from the
 original Workflow goal, or (2) explicitly cancel the Workflow. To choose (1),
 it must confirm the current review reference and append the existing event:
 
 ```ts
 WorkflowResumed({ authorization: { type: 'user', reference: reviewRef } })
+// Use only reviewRef, never the formatted reason or its effect suffix.
 ```
 
 The Kernel requires user authorization but does not interpret this reference.
@@ -384,6 +422,12 @@ semantics. Security review never authorizes a DENY action. Closed held tasks are
 never reexecuted: the next PLAN gets the original goal and safe audit, no suspicious
 proposal or raw Evidence. Revisiting the same suspicious page holds again.
 There is deliberately no “follow the suspicious instruction” resolution option.
+The development provider begins review recovery with a newly prepared read to
+inspect the current state, including after an applied submit. Releasing that hold
+must not increment submitCount again. Other provider integrations must likewise
+start applied-hold recovery with read-only inspection; any subsequent mutation is
+a new proposal subject to its immutable policy and a fresh exact Action Approval,
+never the security review reference or an old action/fingerprint.
 
 Runner core changes are limited to the SafetyHold type/validation, COLLECT handling,
 security preflight/recovery and the browser exports. Kernel, coordination validation,
@@ -408,6 +452,12 @@ It uses a scripted PLAN/VERIFY provider, not Gemini or another actual model.
 6. Restore ordinary content and select Discard suspicious evidence and replan:
    a fresh read is planned. Without restoring content, it safely holds again.
    Cancel workflow is the other explicit resolution.
+7. For a post-dispatch hold, restore ordinary content, enable “Show suspicious
+   content after next local submit”, then start and approve a submit. The security
+   review panel shows **Applied**, and the count increases exactly once. Restore
+   ordinary content and discard/replan; the count stays unchanged during the fresh
+   read. Pre-dispatch holds show **Not dispatched**. Both labels come only from
+   parsed Journal metadata, not the external content or the current DOM state.
 
 The screen is a development harness, not a production approval interface. Its
 scripted verifier checks local result/evidence presence for demonstration; it is
@@ -423,6 +473,11 @@ covers representative English/Japanese attacks, insufficient visibility, blockin
 review binding/replay, fresh planning, DENY, cancellation and partial-hold recovery.
 `coordination-browser-dom.test.ts` uses jsdom to exercise actual DOM scoping,
 identity, forbidden fields, structured extraction and controller consistency.
+Additional audit regressions inject failures into each evidence put/read-back,
+post-dispatch state-token hashing, pre/post-dispatch holds, reason parsing and
+ownership, applied-hold read/replan and stale approval reuse, and all four partial
+journal append boundaries. They assert no VERIFY/next PLAN, unchanged submitCount,
+exactly-once Progress, safe metadata retention and redaction.
 All preexisting COORD-0–3A tests remain part of `npm test`.
 
 This is a PoC, **not a production security guarantee or general prompt-injection
