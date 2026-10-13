@@ -430,8 +430,60 @@ a new proposal subject to its immutable policy and a fresh exact Action Approval
 never the security review reference or an old action/fingerprint.
 
 Runner core changes are limited to the SafetyHold type/validation, COLLECT handling,
-security preflight/recovery and the browser exports. Kernel, coordination validation,
+security preflight/recovery, VERIFY evidence review and the browser exports. Kernel, coordination validation,
 completion, usage, Scheduler, SubAgents and event types are unchanged.
+
+### Runner VERIFY evidence loss
+
+After the Executor has established its result and `TaskCompleted` is journaled,
+Runner retrieves that evidence again for VERIFY. A missing value, storage exception,
+or invalid minimum evidence structure (`kind` nonempty string, own `content` field,
+finite nonnegative `createdAt`) is a dedicated `RunnerVerifyEvidenceUnavailable`.
+Content meaning is not assessed here. Provider errors, invalid verification results,
+scheduler deferrals, stale verification and budget handling retain their existing
+semantics; they are not reclassified as evidence loss.
+
+The Runner rechecks the latest workflow, task and session before recording
+`WorkflowBlocked`. The reason contains only:
+
+```text
+RUNNER_VERIFY_EVIDENCE_UNAVAILABLE:<reviewRef>
+map.runner.verify-evidence-review.v1:<encoded workflowId>:<encoded taskId>:<encoded opaqueId>
+```
+
+The workflow becomes BLOCKED and its session SUSPENDED; the task stays COMPLETED
+(or FAILED if execution originally failed). The Runner does not close the session,
+record final Progress, recreate a pending action, call VERIFY, or start another PLAN.
+Raw evidence, private inputs and exception diagnostics are absent from the reason.
+
+A trusted user adapter must explicitly confirm the current evidence review and
+append `WorkflowResumed({ authorization: { type: 'user', reference: reviewRef } })`.
+Use the reference after the reason prefix. It authorizes retrieval and VERIFY for
+the same terminal task, never another Executor call. This review is separate from
+both ordinary Action Approval and Security Review: neither substitutes for it, and
+it cannot discharge either of those authorizations. Runner preflight binds the
+first resume after the latest evidence block to its workflow, task and exact
+reference, before any evidence retrieval, VERIFY, PLAN or execution. Missing, wrong,
+cross-workflow, cross-task and past references reblock without attempting retrieval.
+
+If evidence is recovered, normal VERIFY/evaluation/session resolution resumes and
+Progress is recorded once using the original round key. If retrieval fails again,
+a new review reference (including a fresh journal sequence and generated ID) is
+required. A correctly resolved historical review does not interfere with later
+ordinary action approvals. Cancellation remains possible and does not undo the
+completed task or any applied external effect. The development UI has no dedicated
+evidence recovery control; this path currently requires a trusted adapter.
+
+If retrieval finishes or throws after a suspend/block, the Runner preserves that
+stop without a duplicate block. After terminalization it appends no late events
+and runs existing cleanup. If the evidence block append throws, the Runner rereads
+the snapshot: a committed block with a lost acknowledgement is observed without
+writing it again; an uncommitted write returns `error / RUNNER_INTERNAL_ERROR`.
+That invocation performs no retry, next PLAN or additional execution. **Without a
+committed block, persistent review gating cannot be guaranteed**: the workflow can
+still be RUNNING with its terminal task and open session. A later explicit Runner
+invocation may retry retrieval/VERIFY. Journal durability/recovery is outside this
+change; no permanent hold is claimed for an uncommitted event.
 
 ### Running the development sandbox
 
@@ -478,6 +530,11 @@ post-dispatch state-token hashing, pre/post-dispatch holds, reason parsing and
 ownership, applied-hold read/replan and stale approval reuse, and all four partial
 journal append boundaries. They assert no VERIFY/next PLAN, unchanged submitCount,
 exactly-once Progress, safe metadata retention and redaction.
+VERIFY evidence regressions additionally cover missing/throwing/malformed reads,
+loss at each of the three references after successful Executor read-back, exact
+review recovery without another submit, invalid/replayed references, deferred
+exactly-once Progress, stop/terminal races, block append failure before/after commit,
+and ordinary provider error compatibility.
 All preexisting COORD-0–3A tests remain part of `npm test`.
 
 This is a PoC, **not a production security guarantee or general prompt-injection

@@ -350,8 +350,11 @@ test('scheduler queue wait rechecks state before dispatching model', async () =>
 });
 test('missing external evidence fails verification closed without calling provider', async () => {
   const f = fixture({ result: { status: 'succeeded', summary: 'Done', resultRef: 'unavailable' } });
-  const result = await f.runner.runOneRound('run'); assert.equal(result.errorCode, 'RUNNER_VERIFY_ERROR');
-  assert.equal(f.calls.verify, 0); assert.deepEqual(f.get().run.satisfiedCriteria, []); assert.deepEqual(progress(f), ['ERROR']);
+  const result = await f.runner.runOneRound('run'); assert.equal(result.reason, 'needs_user');
+  assert.match(f.get().run.statusReason!, /^RUNNER_VERIFY_EVIDENCE_UNAVAILABLE:/);
+  assert.equal(firstTask(f.get()).status, 'COMPLETED');
+  assert.equal(f.get().sessions[firstTask(f.get()).sessionId].state, 'SUSPENDED');
+  assert.equal(f.calls.verify, 0); assert.deepEqual(f.get().run.satisfiedCriteria, []); assert.deepEqual(progress(f), []); validate(f);
 });
 test('known VERIFY error usage is recorded', async () => {
   const f = fixture(); f.verifications.push(Object.assign(new Error('Verify unavailable'), { usage: { ...usage, llmCalls: 2 } }));
@@ -650,4 +653,133 @@ test('stop while attempting registration cancellation respects guard and recover
   await f.runner.runOneRound('run'); assert.equal(f.get().run.status, 'SUSPENDED'); assert.equal(f.events('SessionCancelled').length, 0);
   assert.deepEqual(progress(f), []); f.resume(); await f.runner.runOneRound('run');
   assert.equal(f.events('SessionCancelled').length, 1); assert.deepEqual(progress(f), ['ERROR']); assert.equal(f.calls.execute, 0); validate(f);
+});
+
+// VERIFY storage failures retain the executed task until a dedicated human review.
+const evidenceBlockPrefix = 'RUNNER_VERIFY_EVIDENCE_UNAVAILABLE:';
+const evidenceReview = (f: ReturnType<typeof fixture>) => f.get().run.statusReason!.slice(evidenceBlockPrefix.length);
+for (const [name, value] of [
+  ['undefined', undefined], ['null', null], ['array', []], ['empty kind', { kind: '', content: {}, createdAt: 1 }],
+  ['missing content', { kind: 'test', createdAt: 1 }], ['invalid timestamp', { kind: 'test', content: {}, createdAt: NaN }],
+  ['negative timestamp', { kind: 'test', content: {}, createdAt: -1 }],
+] as const) test(`VERIFY evidence ${name} blocks without closing the executed round`, async () => {
+  const f = fixture(); f.evidenceStore.get = async () => value as never;
+  const result = await f.runner.runUntilStop('run');
+  assert.equal(result.reason, 'needs_user'); assert.equal(result.roundsCompleted, 0);
+  assert.equal(f.get().run.status, 'BLOCKED'); assert.equal(firstTask(f.get()).status, 'COMPLETED');
+  assert.equal(f.get().sessions[firstTask(f.get()).sessionId].state, 'SUSPENDED');
+  assert.deepEqual(f.calls, { plan: 1, prepare: 1, execute: 1, verify: 0 });
+  assert.equal(f.events('SessionResolved').length, 0); assert.deepEqual(progress(f), []); validate(f);
+});
+test('VERIFY evidence exception diagnostics never reach journal, model or result', async () => {
+  const f = fixture(); f.evidenceStore.get = async () => { throw new Error('private-evidence-value SECRET-store-message'); };
+  const result = await f.runner.runUntilStop('run');
+  assert.equal(result.reason, 'needs_user'); assert.equal(f.calls.verify, 0);
+  assert.doesNotMatch(JSON.stringify([result, f.requests]), /private-evidence-value|SECRET-store-message/);
+  assert.equal(f.events('TaskFailed').length, 0); assert.deepEqual(progress(f), []); validate(f);
+});
+for (const content of [null, 'plain evidence', 42, { observation: 'ordinary content' }]) test(`VERIFY minimum structure accepts content ${JSON.stringify(content)}`, async () => {
+  const f = fixture(); f.evidenceStore.get = async () => ({ kind: 'test', content, createdAt: 0 });
+  assert.equal((await f.runner.runOneRound('run')).reason, 'completed'); assert.equal(f.calls.verify, 1);
+});
+for (const invalid of ['missing', 'wrong', 'action', 'security', 'workflow', 'task', 'system']) test(`VERIFY evidence review rejects ${invalid} authorization before any retrieval`, async () => {
+  const f = fixture(); let gets = 0;
+  f.evidenceStore.get = async () => { gets++; return undefined; };
+  await f.runner.runUntilStop('run'); const ref = evidenceReview(f);
+  const references: Record<string, string | undefined> = {
+    missing: undefined, wrong: 'wrong', action: 'map.runner.approval.v1:run:action-1:fingerprint-1',
+    security: `map.runner.security-review.v1:run:${firstTask(f.get()).taskId}:sha256%3A${'a'.repeat(64)}`,
+    workflow: ref.replace(':run:', ':foreign-workflow:'), task: ref.replace(`:${firstTask(f.get()).taskId}:`, ':foreign-task:'), system: ref,
+  };
+  const resume = () => f.add('WorkflowResumed', { authorization: { type: invalid === 'system' ? 'system' : 'user', reference: references[invalid] } });
+  if (invalid === 'system') assert.throws(resume, /User authorization/); else resume();
+  const result = await createCoordinationRunner(f.deps).runUntilStop('run');
+  assert.equal(result.reason, 'needs_user'); assert.equal(evidenceReview(f), ref); assert.equal(gets, 1);
+  assert.deepEqual(f.calls, { plan: 1, prepare: 1, execute: 1, verify: 0 }); assert.deepEqual(progress(f), []); validate(f);
+});
+test('exact Evidence Review after store recovery verifies the same completed task and records progress once', async () => {
+  const f = fixture(); const get = f.evidenceStore.get.bind(f.evidenceStore);
+  f.evidenceStore.get = async () => undefined;
+  await f.runner.runUntilStop('run'); const task = firstTask(f.get());
+  assert.equal(f.pendingActions.get('run', 'action-1'), undefined);
+  f.evidenceStore.get = get; f.resume(evidenceReview(f));
+  const runner = createCoordinationRunner(f.deps); const result = await runner.runUntilStop('run');
+  assert.equal(result.reason, 'completed'); assert.equal(result.roundsCompleted, 1);
+  assert.deepEqual(f.calls, { plan: 1, prepare: 1, execute: 1, verify: 1 });
+  assert.deepEqual(firstTask(f.get()), task); assert.deepEqual(progress(f), ['PROGRESS']);
+  assert.equal(f.events('TaskCompleted').length, 1); assert.equal(f.events('SessionResolved').length, 1);
+  assert.equal(f.pendingActions.get('run', 'action-1'), undefined);
+  await runner.runOneRound('run'); assert.deepEqual(progress(f), ['PROGRESS']); validate(f);
+});
+test('repeated evidence loss generates a new review and rejects the old authorization', async () => {
+  const f = fixture(); let gets = 0; f.evidenceStore.get = async () => { gets++; return undefined; };
+  await f.runner.runUntilStop('run'); const old = evidenceReview(f); f.resume(old);
+  await createCoordinationRunner(f.deps).runUntilStop('run'); const latest = evidenceReview(f);
+  assert.notEqual(latest, old); assert.equal(gets, 2); f.resume(old);
+  assert.equal((await f.runner.runUntilStop('run')).reason, 'needs_user'); assert.equal(gets, 2);
+  assert.equal(evidenceReview(f), latest); assert.equal(f.calls.execute, 1); assert.deepEqual(progress(f), []); validate(f);
+});
+for (const transition of ['suspend', 'block', 'cancel', 'abort'] as const) for (const failure of ['missing', 'throw'] as const)
+  test(`VERIFY evidence ${failure} respects asynchronous ${transition} race`, async () => {
+    const f = fixture(); let eventsAfterTransition = 0;
+    f.evidenceStore.get = async () => {
+      await Promise.resolve();
+      if (transition === 'abort') f.runner.stop('run');
+      else f.add(transition === 'suspend' ? 'WorkflowSuspended' : transition === 'block' ? 'WorkflowBlocked' : 'WorkflowCancelled', transition === 'block' ? { reason: 'external-stop' } : {});
+      eventsAfterTransition = f.get().events.length;
+      if (failure === 'throw') throw new Error('private-race-diagnostic');
+      return undefined;
+    };
+    const result = await f.runner.runUntilStop('run');
+    assert.equal(result.reason, transition === 'cancel' || transition === 'abort' ? 'cancelled' : transition === 'block' ? 'needs_user' : 'stopped');
+    assert.equal(f.get().events.length, eventsAfterTransition + (transition === 'abort' ? 1 : 0));
+    assert.equal(f.events('WorkflowBlocked').filter(e => (e.payload as { reason: string }).reason.startsWith(evidenceBlockPrefix)).length, 0);
+    assert.equal(f.calls.verify, 0); assert.equal(f.calls.execute, 1); assert.deepEqual(progress(f), []); validate(f);
+  });
+for (const committed of [false, true]) test(`VERIFY evidence block append failure, committed=${committed}, never starts another PLAN`, async () => {
+  const f = fixture(); let gets = 0, writes = 0; f.evidenceStore.get = async () => { gets++; return undefined; };
+  const append = f.store.append.bind(f.store);
+  f.store.append = event => {
+    if (event.type === 'WorkflowBlocked' && (event.payload as { reason: string }).reason.startsWith(evidenceBlockPrefix)) {
+      writes++; if (committed) append(event); throw new Error('private-journal-diagnostic');
+    }
+    return append(event);
+  };
+  const result = await f.runner.runUntilStop('run');
+  assert.equal(result.reason, committed ? 'needs_user' : 'error');
+  assert.equal(result.errorCode, committed ? undefined : 'RUNNER_INTERNAL_ERROR');
+  assert.equal(f.get().run.status, committed ? 'BLOCKED' : 'RUNNING'); assert.equal(writes, 1); assert.equal(gets, 1);
+  assert.equal(f.events('WorkflowBlocked').length, committed ? 1 : 0); assert.equal(firstTask(f.get()).status, 'COMPLETED');
+  assert.deepEqual(f.calls, { plan: 1, prepare: 1, execute: 1, verify: 0 }); assert.deepEqual(progress(f), []);
+  assert.doesNotMatch(JSON.stringify(result), /private-journal-diagnostic/); validate(f);
+});
+test('ordinary VERIFY provider failure retains existing error progress and never creates Evidence Review', async () => {
+  const f = fixture(); f.verifications.push(new Error('private-provider-error'));
+  const result = await f.runner.runOneRound('run');
+  assert.equal(result.reason, 'round_completed'); assert.equal(result.errorCode, 'RUNNER_VERIFY_ERROR');
+  assert.deepEqual(progress(f), ['ERROR']); assert.equal(f.events('SessionResolved').length, 1);
+  assert.equal(f.events('WorkflowBlocked').length, 0); assert.doesNotMatch(JSON.stringify(result), /private-provider-error/); validate(f);
+});
+test('failed execution also retains its terminal task across Evidence Review and records ERROR once on recovery', async () => {
+  const f = fixture({ result: { status: 'failed', summary: 'Failed', errorCode: 'EXPECTED' } });
+  const get = f.evidenceStore.get.bind(f.evidenceStore); f.evidenceStore.get = async () => undefined;
+  await f.runner.runUntilStop('run'); assert.equal(firstTask(f.get()).status, 'FAILED'); assert.deepEqual(progress(f), []);
+  f.evidenceStore.get = get; f.resume(evidenceReview(f)); await f.runner.runOneRound('run');
+  assert.equal(f.calls.execute, 1); assert.equal(f.calls.verify, 1); assert.deepEqual(progress(f), ['ERROR']); validate(f);
+});
+test('Evidence Review recovery retains original progress idempotency key when already recorded', async () => {
+  const f = fixture(); const get = f.evidenceStore.get.bind(f.evidenceStore); f.evidenceStore.get = async () => undefined;
+  await f.runner.runUntilStop('run'); const task = firstTask(f.get());
+  const roundKey = f.get().sessions[task.sessionId].contextRef!.slice('map.runner.v1:'.length);
+  f.resume(evidenceReview(f));
+  f.store.append(createRunnerEvent(f.get(), 'ProgressRecorded', { outcome: 'PROGRESS', summary: 'Previously recorded.' }, f.clock, f.ids,
+    { idempotencyKey: `runner:run:${roundKey}:progress` }));
+  f.evidenceStore.get = get; const result = await f.runner.runOneRound('run');
+  assert.equal(result.roundsCompleted, 0); assert.deepEqual(progress(f), ['PROGRESS']); assert.equal(f.calls.verify, 1); validate(f);
+});
+test('evidence loss after a harmless journal advance still blocks instead of taking stale verification continuation', async () => {
+  const f = fixture();
+  f.evidenceStore.get = async () => { f.add('UsageRecorded', { llmCalls: 0, inputTokens: 0, outputTokens: 0, estimatedCost: 0, sourceRef: 'concurrent' }); return undefined; };
+  assert.equal((await f.runner.runUntilStop('run')).reason, 'needs_user');
+  assert.equal(f.calls.plan, 1); assert.equal(f.calls.execute, 1); assert.equal(f.calls.verify, 0); assert.deepEqual(progress(f), []); validate(f);
 });
