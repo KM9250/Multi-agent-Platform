@@ -1,3 +1,5 @@
+import { formatSecurityHoldReason, parseSecurityHoldReason, parseSecurityReviewRef, SECURITY_BLOCK_PREFIX } from './securityHold';
+import { parseVerifyEvidenceReviewRef, verifyEvidenceReviewRef, VERIFY_EVIDENCE_BLOCK_PREFIX } from './verifyEvidenceReview';
 import { evaluateCommitmentGate } from '../completion';
 import { findExhaustedBudget } from '../policy';
 import { validateCoordinationSnapshot } from '../validation';
@@ -23,6 +25,7 @@ interface RetainedRunnerResult {
 type RunnerResultMap = Map<string, Map<string, RetainedRunnerResult>>;
 const collected = new WeakMap<CoordinationRunnerStore, RunnerResultMap>();
 class ModelDispatchDeferred extends Error {}
+class RunnerVerifyEvidenceUnavailable extends Error {}
 class RegistrationCleanupError extends AggregateError {
   constructor(registrationError: unknown, cleanupError: unknown) {
     super([registrationError, cleanupError], 'Runner registration cleanup failed.', { cause: registrationError });
@@ -245,6 +248,8 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     const s = this.snapshot(ctx); validateCoordinationSnapshot(s);
     if (s.run.executionMode !== 'supervised_autonomous') return this.result(ctx, 'stopped', undefined, 'RUNNER_EXECUTION_MODE');
     const stopped = this.safePoint(ctx); if (stopped) return stopped;
+    const securityBlock = this.securityPreflight(ctx); if (securityBlock) return securityBlock;
+    const evidenceBlock = this.verifyEvidencePreflight(ctx); if (evidenceBlock) return evidenceBlock;
     const sessions = Object.values(s.sessions).filter(active);
     if (sessions.length > 1) return this.result(ctx, 'stopped', undefined, 'RUNNER_AMBIGUOUS_PENDING_WORK');
     const session = sessions[0];
@@ -272,6 +277,72 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     const complete = this.finalize(ctx); if (complete) return complete;
     const exhausted = this.budget(ctx); if (exhausted) return this.block(ctx, `RUNNER_BUDGET_EXHAUSTED:${exhausted}`);
     return this.plan(ctx);
+  }
+  /** Only the first resume following the latest security block can resolve that review.
+   * Later ordinary action approvals do not consume/reuse a security review authorization. */
+  private securityPreflight(ctx: RoundContext): RunnerRunResult | undefined {
+    const s = this.snapshot(ctx);
+    // Recover a partially journaled hold before any VERIFY/PLAN, even across runner instances.
+    const held = [...s.events].reverse().find(event => event.type === 'TaskFailed'
+      && (event.payload as { failureReason?: string }).failureReason?.startsWith(SECURITY_BLOCK_PREFIX)
+      && !!event.sessionId && owned(s.sessions[event.sessionId]));
+    if (held) {
+      const payload = held.payload as { taskId: string; failureReason: string };
+      if (!parseSecurityHoldReason(payload.failureReason, { workflowRunId: ctx.id, taskId: payload.taskId })) {
+        return this.block(ctx, `${SECURITY_BLOCK_PREFIX}INVALID_METADATA`);
+      }
+      const recorded = s.events.some(event => event.type === 'WorkflowBlocked' && event.sequence > held.sequence
+        && (event.payload as { reason?: string }).reason === payload.failureReason);
+      if (!recorded) {
+        const task = s.tasks[payload.taskId];
+        const session = s.sessions[task.sessionId];
+        ctx.key = session.contextRef!.slice(RUNNER_SESSION_PREFIX.length);
+        if (active(session)) this.close(ctx, task, 'ERROR');
+        else { this.progress(ctx, 'ERROR', 'Runner round error.'); this.deleteResult(ctx.id, task.taskId); }
+        return this.block(ctx, payload.failureReason);
+      }
+    }
+    const block = [...s.events].reverse().find(event => event.type === 'WorkflowBlocked'
+      && (event.payload as { reason?: string }).reason?.startsWith(SECURITY_BLOCK_PREFIX));
+    if (!block) return;
+    const reason = (block.payload as { reason: string }).reason;
+    const metadata = parseSecurityHoldReason(reason, { workflowRunId: ctx.id });
+    const binding = metadata && parseSecurityReviewRef(metadata.reviewRef);
+    const task = binding && s.tasks[binding.taskId];
+    if (!metadata || !task || !owned(s.sessions[task.sessionId]) || task.failureReason !== reason
+      || (held && (held.payload as { failureReason: string }).failureReason !== reason)) {
+      return this.block(ctx, `${SECURITY_BLOCK_PREFIX}INVALID_METADATA`);
+    }
+    const resume = s.events.find(event => event.type === 'WorkflowResumed' && event.sequence > block.sequence);
+    const auth = (resume?.payload as WorkflowResumePayload | undefined)?.authorization;
+    if (auth?.type !== 'user' || auth.reference !== metadata.reviewRef) return this.block(ctx, reason);
+    // The held task/session are already closed; PLAN sees the original goal and safe journal only.
+  }
+  /** A failed block write must never fall through to round_completed/another PLAN.
+   * Re-read after append errors, including a committed write whose acknowledgement was lost. */
+  private blockVerifyEvidence(ctx: RoundContext, reason: string): RunnerRunResult {
+    try { return this.block(ctx, reason); }
+    catch { return this.safePoint(ctx) ?? this.result(ctx, 'error', undefined, 'RUNNER_INTERNAL_ERROR'); }
+  }
+  private verifyEvidencePreflight(ctx: RoundContext): RunnerRunResult | undefined {
+    const s = this.snapshot(ctx);
+    const block = [...s.events].reverse().find(event => event.type === 'WorkflowBlocked'
+      && (event.payload as { reason?: string }).reason?.startsWith(VERIFY_EVIDENCE_BLOCK_PREFIX));
+    if (!block) return;
+    const reason = (block.payload as { reason: string }).reason;
+    const reviewRef = reason.slice(VERIFY_EVIDENCE_BLOCK_PREFIX.length);
+    const binding = parseVerifyEvidenceReviewRef(reviewRef);
+    const task = binding && s.tasks[binding.taskId];
+    const session = task && s.sessions[task.sessionId];
+    if (!binding || binding.workflowRunId !== ctx.id || !task || task.workflowRunId !== ctx.id
+      || !session || session.workflowRunId !== ctx.id || !owned(session)
+      || !['COMPLETED', 'FAILED'].includes(task.status)) {
+      return this.blockVerifyEvidence(ctx, `${VERIFY_EVIDENCE_BLOCK_PREFIX}INVALID_METADATA`);
+    }
+    // Only the first resume after this block resolves it. Later action approvals are independent.
+    const resume = s.events.find(event => event.type === 'WorkflowResumed' && event.sequence > block.sequence);
+    const auth = (resume?.payload as WorkflowResumePayload | undefined)?.authorization;
+    if (auth?.type !== 'user' || auth.reference !== reviewRef) return this.blockVerifyEvidence(ctx, reason);
   }
   private async plan(ctx: RoundContext): Promise<RunnerRunResult> {
     try {
@@ -371,6 +442,19 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     }
     const stopped = this.safePoint(ctx); if (stopped) return stopped;
     if (!this.taskWritable(ctx, task)) return this.result(ctx, 'stopped', undefined, 'RUNNER_STALE_EXECUTION');
+    if (result.safetyHold) {
+      const binding = parseSecurityReviewRef(result.safetyHold.reviewRef);
+      if (binding?.workflowRunId !== ctx.id || binding.taskId !== task.taskId) {
+        // An executor cannot transfer a review from another task or workflow.
+        result = { status: 'uncertain', summary: 'Invalid security review ownership.' };
+        this.setResult(ctx.id, task, result);
+        return this.collect(ctx, task, result);
+      }
+      const reason = formatSecurityHoldReason({ reviewRef: result.safetyHold.reviewRef, effectState: result.safetyHold.effectState });
+      this.append(ctx, 'TaskFailed', { taskId: task.taskId, failureReason: reason }, task.sessionId);
+      this.close(ctx, task, 'ERROR');
+      return this.block(ctx, reason);
+    }
     try {
       // Raw summaries stay in evidence storage. The journal receives opaque references only.
       if (!result.resultRef) {
@@ -401,10 +485,17 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       const base = cursor(this.snapshot(ctx));
       const evidence = [];
       for (const ref of new Set([task.resultRef, ...(task.evidenceRefs ?? [])].filter((ref): ref is string => !!ref))) {
-        const item = await this.deps.evidenceStore.get(ref);
+        let item;
+        // Classify only the storage boundary and minimum structure, never provider failures.
+        try {
+          item = await this.deps.evidenceStore.get(ref);
+          if (!item || typeof item !== 'object' || Array.isArray(item)
+            || typeof item.kind !== 'string' || !item.kind.trim()
+            || !Object.prototype.hasOwnProperty.call(item, 'content')
+            || !Number.isFinite(item.createdAt) || item.createdAt < 0) throw new RunnerVerifyEvidenceUnavailable();
+        } catch { throw new RunnerVerifyEvidenceUnavailable(); }
         const after = this.safePoint(ctx); if (after) return after;
         if (cursor(this.snapshot(ctx)) !== base) return this.decide(ctx);
-        if (!item) throw new Error('Runner evidence unavailable.');
         evidence.push(item);
       }
       const budget = this.budget(ctx);
@@ -434,6 +525,14 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       const after = this.safePoint(ctx); if (after) return after;
       if (error instanceof ModelDispatchDeferred) return this.decide(ctx);
       if (!this.taskWritable(ctx, task)) return this.result(ctx, 'stopped');
+      if (error instanceof RunnerVerifyEvidenceUnavailable) {
+        const s = this.snapshot(ctx); const latest = s.tasks[task.taskId]; const session = s.sessions[task.sessionId];
+        if (latest.workflowRunId !== ctx.id || latest.sessionId !== task.sessionId
+          || session.workflowRunId !== ctx.id || !owned(session)) return this.result(ctx, 'stopped');
+        // Sequence also keeps each failed retrieval review fresh across runner instances.
+        const ref = verifyEvidenceReviewRef(ctx.id, task.taskId, `${s.events.at(-1)!.sequence}-${this.ids.nextId('verify-evidence-review')}`);
+        return this.blockVerifyEvidence(ctx, `${VERIFY_EVIDENCE_BLOCK_PREFIX}${ref}`);
+      }
       this.close(ctx, task, 'ERROR');
       return { ...this.decide(ctx), errorCode: 'RUNNER_VERIFY_ERROR' };
     }

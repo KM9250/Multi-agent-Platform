@@ -1,4 +1,5 @@
-import type { PreparedRunnerAction, RunnerExecutionResult, RunnerModelUsage, RunnerPlanProposal, RunnerVerification } from './types';
+import { isSafetyHoldEffectState, parseSecurityReviewRef } from './securityHold';
+import type { PreparedRunnerAction, RunnerExecutionResult, RunnerModelUsage, RunnerPlanProposal, RunnerSafetyHold, RunnerVerification } from './types';
 const object = (value: unknown): Record<string, unknown> => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Expected an object.');
   return value as Record<string, unknown>;
@@ -43,7 +44,17 @@ const refs = (value: unknown): string[] | undefined => {
 export const validateRunnerExecution = (value: unknown): RunnerExecutionResult => {
   const v = object(value);
   if (!['succeeded', 'failed', 'uncertain', 'aborted'].includes(v.status as string)) throw new Error('Invalid execution status.');
+  let safetyHold: RunnerSafetyHold | undefined;
+  if (v.safetyHold !== undefined) {
+    const h = object(v.safetyHold);
+    if (Object.keys(h).some(key => !['kind', 'reasonCode', 'reviewRef', 'safeSummary', 'effectState'].includes(key))
+      || h.kind !== 'untrusted-content' || h.reasonCode !== 'CONTENT_REVIEW_REQUIRED'
+      || h.safeSummary !== 'Untrusted content requires user review.' || typeof h.reviewRef !== 'string'
+      || !parseSecurityReviewRef(h.reviewRef) || !isSafetyHoldEffectState(h.effectState)) throw new Error('Invalid safety hold.');
+    safetyHold = { kind: h.kind, reasonCode: h.reasonCode, reviewRef: h.reviewRef, safeSummary: h.safeSummary, effectState: h.effectState };
+  }
   return { status: v.status as RunnerExecutionResult['status'], summary: runnerText(v.summary),
+    ...(safetyHold ? { safetyHold } : {}),
     resultRef: v.resultRef === undefined ? undefined : runnerText(v.resultRef), evidenceRefs: refs(v.evidenceRefs),
     errorCode: v.errorCode === undefined ? undefined : runnerText(v.errorCode), errorDetail: v.errorDetail === undefined ? undefined : runnerText(v.errorDetail) };
 };

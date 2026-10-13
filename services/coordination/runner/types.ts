@@ -59,9 +59,18 @@ export interface PreparedRunnerAction {
 }
 export interface RunnerExecutionContext { workflowRunId: string; sessionId: string; taskId: string; signal?: AbortSignal }
 export type RunnerExecutionStatus = 'succeeded' | 'failed' | 'uncertain' | 'aborted';
+export type RunnerSafetyHoldEffectState = 'not_dispatched' | 'applied';
+export interface RunnerSafetyHold {
+  kind: 'untrusted-content';
+  effectState: RunnerSafetyHoldEffectState;
+  reasonCode: 'CONTENT_REVIEW_REQUIRED';
+  reviewRef: string;
+  safeSummary: 'Untrusted content requires user review.';
+}
 export interface RunnerExecutionResult {
   status: RunnerExecutionStatus; summary: string; resultRef?: string; evidenceRefs?: string[];
   errorCode?: string; errorDetail?: string;
+  safetyHold?: RunnerSafetyHold;
 }
 export interface RunnerActionExecutor {
   id: string;
