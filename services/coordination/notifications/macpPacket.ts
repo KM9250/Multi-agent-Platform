@@ -9,6 +9,7 @@ export interface MacpNotificationPacket {
   priority: 'normal' | 'high'; summary: string;
   evaluation: { requires_user_action: boolean };
   metadata: { notification_kind: CoordinationNotificationKind };
+  producer_id: 'map-coordination'; producer_event_id: string;
   created_at: string;
 }
 export function toMacpNotificationPacket(notification: CoordinationNotification): MacpNotificationPacket {
@@ -19,5 +20,5 @@ export function toMacpNotificationPacket(notification: CoordinationNotification)
     intent: review ? 'need_review' : 'notify_user',
     status: n.kind === 'budget_exhausted' ? 'blocked' : review ? 'need_review' : 'done',
     priority: n.priority, summary: n.safeSummary, evaluation: { requires_user_action: n.requiresUserAction },
-    metadata: { notification_kind: n.kind }, created_at: new Date(n.occurredAt).toISOString() };
+    metadata: { notification_kind: n.kind }, producer_id: 'map-coordination', producer_event_id: n.notificationId, created_at: new Date(n.occurredAt).toISOString() };
 }

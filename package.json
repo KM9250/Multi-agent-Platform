@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:macp": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/integration/coordination-macp.integration.ts"
   },
   "dependencies": {
     "@google/genai": "^1.30.0",

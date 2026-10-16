@@ -585,8 +585,13 @@ are not lowercased, trimmed or Unicode-normalized. JSON tuple boundaries avoid
 separator ambiguity. The synchronous browser-compatible SHA-256 implementation
 is checked against Node crypto, including padding boundaries and Unicode.
 
-Repeated blocks for the same reference keep the first event ID/timestamp. New
-references create new notifications. Workflow identity isolates runs. Terminal
+Repeated blocks for the same unresolved reference keep the first event ID/time.
+The first reference hash is also the internal logical `correlationId`. After a
+matching user-authorized resume, a later block of the same reference creates a
+new notification occurrence: hash the JSON pair `[correlationId, sourceEventId]`
+with event scope. The correlation remains stable, while notification IDs differ.
+The first occurrence retains its COORD-4A ID for compatibility. New references
+create new notifications. Workflow identity isolates runs. Terminal
 events, budgets and unrecognized reasons use event identity; an idempotent
 append still points to the original Journal event. The complete historical
 notification set is retained even after a later resume, completion or cancel.
@@ -620,7 +625,7 @@ await reconcileCoordinationNotifications(store, workflowRunId, observer, diagnos
 // Explicit delivery; this example performs no HTTP requests:
 const transport = new InMemoryNotificationTransport();
 for (const notification of outbox.pending()) {
-  await deliverCoordinationNotification(outbox, notification.notificationId, transport);
+  await deliverCoordinationNotification(outbox, notification.notificationId, transport, store);
 }
 ```
 
@@ -640,42 +645,95 @@ Reconciliation scans all history so partial enqueue failures recover without
 resetting or duplicating existing delivery records. There is no automatic
 reconcile timer, replay cursor, persistent checkpoint or startup installation.
 
-### Outbox and transport
+### Outbox and transport (COORD-4C)
 
-Transitions are `PENDING -> SENDING -> DELIVERED` or
-`PENDING -> SENDING -> DELIVERY_FAILED`. Only explicit `prepareRetry(id)` moves
-`DELIVERY_FAILED -> PENDING`; it cannot reset `SENDING` or `DELIVERED`.
-A synchronous delivery claim excludes concurrent sends for an ID. Increasing
-attempt numbers reject stale success/failure acknowledgements. Duplicate enqueue
-never replaces the first payload or resets its state. All reads, claims and
-stored notifications are independent copies. Diagnostics store a fixed failure
-code, never a transport exception. Delivery failure/retry has no Runner,
-Executor, approval, pending-action or Journal dependency.
+Outbox states are `PENDING -> SENDING -> DELIVERED`,
+`PENDING -> SENDING -> DELIVERY_FAILED`, and `PENDING -> SUPPRESSED`.
+`SUPPRESSED` retains history and is terminal; it is never a delivery success.
+`prepareRetry(id)` only moves `DELIVERY_FAILED -> PENDING`. Neither retry nor
+reconciliation resets `SENDING`, `DELIVERED` or `SUPPRESSED`. A snapshot-read or
+validation failure records `DELIVERY_FAILED / SNAPSHOT_UNAVAILABLE` without an
+HTTP attempt; it must not be interpreted as proof that a review was resolved.
 
-`InMemoryNotificationTransport` records cloned packets and supports `failNext()`
-for deterministic delivery failure tests. There is no HTTP transport or automatic
-retry. A transport must settle its promise before a sending entry can finish;
-there is no lease expiry or recovery for a hung send. Transport success means
-that the transport accepted the packet, not that a human read it. Durable or
-cross-runtime exactly-once delivery is not promised by this in-memory outbox.
+`deliverCoordinationNotification(outbox, id, transport, store, options)` requires
+an authoritative synchronous snapshot reader. Immediately before every send,
+including after retry backoff, it validates the latest committed snapshot and
+matches the notification occurrence against its current block event. All six
+review/attention kinds are checked. Resolved/superseded pending occurrences are
+suppressed. Completion and cancellation notifications remain deliverable.
+A bare or mismatched `WorkflowResumed` does not resolve approval, security or
+evidence review. Action approval keeps tracking after a mismatch so a later
+resume with `type: user` and the exact approval reference can resolve it, including
+after an intervening suspension. Security/evidence review evaluates only the
+first resume after the block, matching its dedicated Runner preflight; a later
+matching resume cannot bypass that rule before a new block. While a mismatched
+resume has left the workflow RUNNING/SUSPENDED, delivery returns `deferred` and
+keeps PENDING.
+If Runner re-blocks the same unresolved reference, it remains one occurrence.
+These checks are informational: pending-action ownership, prepared-action
+fingerprints, task/evidence eligibility and permission to execute are still
+checked only by the existing Runner. No notification code authorizes a resume.
 
-### MACP compatibility and limits
+`deliverPendingCoordinationNotifications` orders each workflow by Journal source
+events, even if enqueue order differs, and processes different workflows
+independently. An unresolved failed/deferred earlier notification pauses later
+sends for that workflow. Failed entries require explicit `prepareRetry` after
+the automatic retry budget is exhausted. Process-local workflow locks span the
+send and retry backoff; a synchronous outbox claim prevents duplicate claims of
+one notification ID. Neither lock is a Kernel lock. A resume after the final
+snapshot check but before MACP accepts the request cannot be prevented atomically;
+a confirmed delivered entry remains DELIVERED even in that race.
 
-The adapter targets the existing MACP `0.1.0` schema in
-[Multi-Agent-Command-Protocol/server/schemas.py](https://github.com/KM9250/Multi-Agent-Command-Protocol/blob/main/server/schemas.py)
-(reviewed source blob `4e39bbc6a01cd558105a780d20eab2b2d772532b`). `task_type:
-coordination` and additional `metadata` are accepted by that schema's forward
-compatibility rules. `task_id` is the stable notification ID; `created_at` is the
-source event's timestamp in UTC, preserved across retries. No server-owned
-fields, `actions`, handoff, approval URL or authorization are sent. Cancellation's
-`done` means the notification fact is final; `metadata.notification_kind:
-workflow_cancelled` distinguishes it from successful Workflow completion.
+The outbox stores the sanitized MACP packet once at enqueue and sends clones of
+that saved value on every attempt. The packet, notification, attempt history and
+receipts returned by outbox accessors are copies. Attempt numbers reject stale
+acknowledgements. Audit history records actual send attempts, normalized error
+codes, HTTP status and validated receipt fields, never raw exceptions or tokens.
+Suppression does not increment attempts. `InMemoryNotificationTransport` remains
+available for deterministic tests, without networking or automatic retries.
 
-Tests cover classification/fallback, identity, commit boundaries, reconciliation,
-state transitions, isolation of returned objects, concurrent delivery, mock
-failure/retry, safe packets and integration with the actual Browser Runner.
-The TypeScript tests assert the pinned MACP field/enum contract; verification
-against the upstream Pydantic model is also possible offline. No MACP API/UI,
-real model/HTTP connection, approval UI, persistent outbox, infinite retries or
-authority to resume a Workflow is introduced. Trusted MAP adapters remain solely
-responsible for user authorization and resumption.
+### MACP HTTP adapter and limits
+
+The server-only adapter is imported directly from
+`services/coordination/notifications/macpTransport.ts`; it is deliberately not
+exported from the browser barrel. It implements the MACP 0.1.0 / COORD-4B
+contract verified at upstream commit
+[`e88937d0c8132ae7d18098a24d01ee28bffda655`](https://github.com/KM9250/Multi-Agent-Command-Protocol/commit/e88937d0c8132ae7d18098a24d01ee28bffda655).
+
+`producer_id` is `map-coordination`; `producer_event_id` and `task_id` are the
+notification occurrence ID. Source timestamp, summary, intent, status and all
+other digest fields are stable across retries. New acceptance requires 201,
+`ok: true`, matching `task_id`, a positive safe-integer `event_id`, and
+`idempotent_replay: false`. An identical replay requires 200 and
+`idempotent_replay: true`. Invalid JSON, oversized bodies (over 64 KiB), mismatched
+IDs or other success statuses are failures. Error bodies are not retained.
+DELIVERED means confirmed server acceptance, not device display or human review.
+
+Configure a full `/api/notify` HTTPS URL from trusted deployment configuration.
+HTTP is accepted only for explicit `allowDevelopmentLoopback: true` and
+localhost, 127.0.0.1 or ::1. Credentials in URLs, query strings and fragments are
+rejected; redirects are disabled. A private server-side token is sent only as a
+Bearer header. The adapter rejects browser construction and reads no environment
+variables itself. Never put MACP_TOKEN in React, Vite define, client environment
+variables, localStorage, URL queries or notification payloads.
+
+Automatic retries require the trusted operator to set
+`idempotencyConfirmed: true` after verifying COORD-4B on the destination server.
+Only network failures, timeouts, 429 and 502/503/504 are retryable. 400/422,
+401/403, 409, invalid configuration/responses, other HTTP errors and caller aborts
+are not automatically retried. Defaults: 10-second request/body timeout,
+3 total send attempts, exponential backoff starting at 250 ms capped at 5 seconds,
+and equal jitter in the upper half of each delay interval. Options bound the
+attempt limit to 1–10 and maximum backoff to 60 seconds. The attempt cap applies
+to the entry's total recorded attempts; an explicit manual retry may initiate
+one more send but does not reset its history or automatic attempt budget.
+Every retry rechecks snapshot validity and can instead suppress the entry.
+None of this is connected to `RunnerActionExecutor.execute` retries.
+
+See [MACP integration runbook](coordination-macp-integration.md) for the Node
+example and real FastAPI/SQLite/SSE tests. This is not a completed production MAP
+server runtime: installation, secure token provisioning, durable outbox,
+restart recovery, distributed coordination and approval UI remain future work.
+No MACP API/UI, ack/retry API, Kernel, Runner or PolicyGuard authorization
+contract is changed. Trusted MAP adapters remain responsible for user
+resumption; notification delivery cannot complete or rerun MAP tasks.
