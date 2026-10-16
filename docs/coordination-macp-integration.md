@@ -39,6 +39,11 @@ notification occurrence; a subsequent block with the same logical reference
 gets a new notification ID. Completed/cancelled notifications are historical
 facts and are delivered normally. Suppressed and delivered history is immutable.
 
+For action approval, a mismatched resume keeps the occurrence tracked: a later
+matching approval resume after suspension can resolve it. Security/evidence
+review still evaluates only the first resume after each block, so a later matching
+resume cannot override an initial mismatch before Runner commits a new block.
+
 This remains an ephemeral outbox: a process restart can replay Journal history
 but does not restore delivery bookkeeping. Stable producer event IDs let MACP
 recognize identical retries; durable state and distributed exclusion are COORD-5

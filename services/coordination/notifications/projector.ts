@@ -28,9 +28,13 @@ export function projectNotificationOccurrences(snapshot: CoordinationSnapshot): 
       const auth = (event.payload as WorkflowResumePayload).authorization;
       if (auth.type === 'user' && (requiredReference === undefined || auth.reference === requiredReference)) {
         current.resolved = true;
+        current = undefined;
+      } else if (current.notification.kind !== 'action_approval_required') {
+        // Security/Evidence preflight only accepts the first resume after a block.
+        current = undefined;
       }
-      // Only the first resume after a block can resolve that block, as in Runner.
-      current = undefined;
+      // Action approval checks the latest resume: keep an unmatched occurrence
+      // available for a later matching resume, including across suspension.
       continue;
     }
     const classified = classifyCoordinationEvent(event);

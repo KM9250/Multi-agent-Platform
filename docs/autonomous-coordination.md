@@ -662,9 +662,13 @@ matches the notification occurrence against its current block event. All six
 review/attention kinds are checked. Resolved/superseded pending occurrences are
 suppressed. Completion and cancellation notifications remain deliverable.
 A bare or mismatched `WorkflowResumed` does not resolve approval, security or
-evidence review: the first resume after the block must carry `type: user` and
-the exact reference, as checked by the Runner. While a mismatched resume has left
-the workflow RUNNING/SUSPENDED, delivery returns `deferred` and keeps PENDING.
+evidence review. Action approval keeps tracking after a mismatch so a later
+resume with `type: user` and the exact approval reference can resolve it, including
+after an intervening suspension. Security/evidence review evaluates only the
+first resume after the block, matching its dedicated Runner preflight; a later
+matching resume cannot bypass that rule before a new block. While a mismatched
+resume has left the workflow RUNNING/SUSPENDED, delivery returns `deferred` and
+keeps PENDING.
 If Runner re-blocks the same unresolved reference, it remains one occurrence.
 These checks are informational: pending-action ownership, prepared-action
 fingerprints, task/evidence eligibility and permission to execute are still
