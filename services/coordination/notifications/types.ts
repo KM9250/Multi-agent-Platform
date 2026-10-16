@@ -1,3 +1,6 @@
+import type { MacpNotificationPacket } from './macpPacket';
+import type { DeliveryErrorCode, NotificationDeliveryReceipt } from './deliveryError';
+
 /** Informational projections only; never an authorization or Runner command. */
 export type CoordinationNotificationKind =
   | 'workflow_completed' | 'workflow_cancelled' | 'action_approval_required'
@@ -16,14 +19,25 @@ export interface CoordinationNotification {
   safeSummary: string;
 }
 
-export type NotificationDeliveryState = 'PENDING' | 'SENDING' | 'DELIVERED' | 'DELIVERY_FAILED';
+export type NotificationDeliveryState = 'PENDING' | 'SENDING' | 'DELIVERED' | 'DELIVERY_FAILED' | 'SUPPRESSED';
 export interface NotificationOutboxEntry {
   notification: CoordinationNotification;
   state: NotificationDeliveryState;
   attempts: number;
-  failureCode?: 'NOTIFICATION_DELIVERY_FAILED';
+  packet: MacpNotificationPacket;
+  history: NotificationDeliveryRecord[];
+  receipt?: NotificationDeliveryReceipt;
+  failureCode?: DeliveryErrorCode;
+}
+export interface NotificationDeliveryRecord {
+  attempt: number;
+  state: 'SENDING' | 'DELIVERED' | 'DELIVERY_FAILED';
+  httpStatus?: number;
+  errorCode?: DeliveryErrorCode;
+  receipt?: NotificationDeliveryReceipt;
 }
 export interface NotificationDeliveryAttempt {
+  packet: MacpNotificationPacket;
   notification: CoordinationNotification;
   attempt: number;
 }

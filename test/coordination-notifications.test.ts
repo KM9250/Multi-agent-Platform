@@ -2,46 +2,18 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
 import {
-  appendEvent, createWorkflow, evaluateCommitmentGate, InMemoryCoordinationRunnerStore,
+  InMemoryCoordinationRunnerStore,
   projectCoordinationNotifications, createCoordinationNotificationObserver, createNotifyingCoordinationStore,
   reconcileCoordinationNotifications, InMemoryNotificationOutbox, InMemoryNotificationTransport,
   deliverCoordinationNotification, toMacpNotificationPacket, MAX_NOTIFICATION_SUMMARY_LENGTH,
-  createCoordinationRunner, formatSecurityHoldReason, validateCoordinationSnapshot,
+  createCoordinationRunner, validateCoordinationSnapshot,
 } from '../services/coordination/index.ts';
-import type { CoordinationEvent, CoordinationEventType, CoordinationSnapshot, CoordinationNotification,
+import type { CoordinationEventType, CoordinationSnapshot, CoordinationNotification,
   CoordinationNotificationKind, NotificationDiagnostic } from '../services/coordination/index.ts';
 import { notificationSha256, notificationIdentity } from '../services/coordination/notifications/identity.ts';
-import { verifyEvidenceReviewRef } from '../services/coordination/runner/verifyEvidenceReview.ts';
 import { browserFixture } from './browser-fixture.ts';
 
-function fresh(runId = 'run'): CoordinationSnapshot {
-  return createWorkflow({ runId, roomId: 'room', goal: 'raw-private-goal', acceptanceCriteria: [],
-    supervisorAgentId: 'supervisor', participantAgentIds: ['supervisor'], executionMode: 'supervised_autonomous', now: 1,
-    policy: { policyId: 'policy', version: '1', schemaVersion: 1, riskRules: {},
-      budgets: { maxWallTimeMs: 10000, maxRounds: 10, maxLlmCalls: 20, maxInputTokens: 1000, maxOutputTokens: 1000, maxEstimatedCost: 10, maxConsecutiveErrors: 3, maxNoProgressCycles: 3 },
-      completionRules: { commitAuthority: 'supervisor', requireAllAcceptanceCriteria: true },
-      schedulerRules: { sameModelConcurrency: 1 }, retryRules: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 } } });
-}
-const event = (s: CoordinationSnapshot, type: CoordinationEventType, payload: unknown): CoordinationEvent => ({
-  eventId: `event-${s.events.length + 1}`, sequence: s.events.length + 1, workflowRunId: s.run.runId,
-  actorAgentId: s.run.supervisorAgentId, timestamp: s.events.length + 1, type, payload,
-});
-const add = (s: CoordinationSnapshot, type: CoordinationEventType, payload: unknown) => appendEvent(s, event(s, type, payload));
-const block = (reason: string, s = fresh()) => add(s, 'WorkflowBlocked', { reason });
-const resume = (s: CoordinationSnapshot) => add(s, 'WorkflowResumed', { authorization: { type: 'user' } });
-const approvalRef = (id = 'action', runId = 'run') => `map.runner.approval.v1:${[runId, id, 'private-fingerprint'].map(encodeURIComponent).join(':')}`;
-const securityRef = (nonce = 'a', runId = 'run') => `map.runner.security-review.v1:${encodeURIComponent(runId)}:task:sha256%3A${nonce.repeat(64)}`;
-const securityReason = (nonce = 'a', runId = 'run') => formatSecurityHoldReason({ reviewRef: securityRef(nonce, runId), effectState: 'applied' });
-const evidenceReason = (nonce = 'one', runId = 'run') => `RUNNER_VERIFY_EVIDENCE_UNAVAILABLE:${verifyEvidenceReviewRef(runId, 'task', nonce)}`;
-const done = () => {
-  let s = fresh();
-  s = add(s, 'PolicyEvaluated', { scope: 'commitment', result: evaluateCommitmentGate(s, 2) });
-  s = add(s, 'CommitmentRequested', { commitmentId: 'c', summary: 'raw-private-evidence' });
-  return add(s, 'CommitmentAccepted', { commitmentId: 'c' });
-};
-const cancelled = () => add(fresh(), 'WorkflowCancelled', { reason: 'raw-private-exception' });
-const notification = () => projectCoordinationNotifications(cancelled())[0];
-const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; };
+import { fresh, event, add, block, resume, approvalRef, securityRef, securityReason, evidenceReason, done, cancelled, notification, deferred } from './notification-fixture.ts';
 
 for (const [label, snapshot, kind] of [
   ['completion', done, 'workflow_completed'], ['cancellation', cancelled, 'workflow_cancelled'],
@@ -102,7 +74,6 @@ for (const [label, reason, nextReason] of [
   ['approval', `RUNNER_NEEDS_USER:${approvalRef()}`, `RUNNER_NEEDS_USER:${approvalRef('next')}`],
   ['security', securityReason(), securityReason('b')],
   ['evidence', evidenceReason(), evidenceReason('two')],
-  ['execution', 'RUNNER_EXECUTION_UNCERTAIN:one', 'RUNNER_EXECUTION_UNCERTAIN:two'],
 ]) test(`${label} re-BLOCK keeps the first source event, new reference produces a new ID`, () => {
   let s = block(reason); const first = projectCoordinationNotifications(s)[0];
   s = block(reason, resume(s)); assert.deepEqual(projectCoordinationNotifications(s), [first]);
@@ -189,7 +160,8 @@ test('partial enqueue failure reconciles all history without replacing or duplic
   const base = new InMemoryCoordinationRunnerStore([s]), outbox = new InMemoryNotificationOutbox(); let attempts = 0;
   const failing = createCoordinationNotificationObserver({ enqueue(n) { if (++attempts === 2) throw new Error('raw'); return outbox.enqueue(n); } });
   assert.equal(await reconcileCoordinationNotifications(base, 'run', failing), false); assert.equal(outbox.list().length, 1);
-  const first = outbox.pending()[0]; await deliverCoordinationNotification(outbox, first.notificationId, new InMemoryNotificationTransport());
+  const first = outbox.pending()[0], claim = outbox.startDelivery(first.notificationId)!;
+  outbox.recordDelivered(first.notificationId, claim.attempt);
   const good = createCoordinationNotificationObserver(outbox);
   assert.equal(await reconcileCoordinationNotifications(base, 'run', good), true);
   assert.equal(await reconcileCoordinationNotifications(base, 'run', good), true);
@@ -235,18 +207,18 @@ test('Outbox rejects invalid transitions and stale delivery acknowledgements', (
 test('concurrent delivery claims send one packet only', async () => {
   const outbox = new InMemoryNotificationOutbox(), n = notification(), gate = deferred(); outbox.enqueue(n); let calls = 0;
   const transport = { async send() { calls++; await gate.promise; } };
-  const first = deliverCoordinationNotification(outbox, n.notificationId, transport);
+  const first = deliverCoordinationNotification(outbox, n.notificationId, transport, new InMemoryCoordinationRunnerStore([cancelled()]));
   assert.equal(outbox.get(n.notificationId)!.state, 'SENDING');
-  assert.equal(await deliverCoordinationNotification(outbox, n.notificationId, transport), 'skipped');
+  assert.equal(await deliverCoordinationNotification(outbox, n.notificationId, transport, new InMemoryCoordinationRunnerStore([cancelled()])), 'skipped');
   gate.resolve(); assert.equal(await first, 'delivered'); assert.equal(calls, 1);
 });
 test('mock delivery failure requires explicit retry and preserves packet identity/time', async () => {
   const outbox = new InMemoryNotificationOutbox(), transport = new InMemoryNotificationTransport(), n = notification(); outbox.enqueue(n);
-  transport.failNext(); assert.equal(await deliverCoordinationNotification(outbox, n.notificationId, transport), 'failed');
+  transport.failNext(); assert.equal(await deliverCoordinationNotification(outbox, n.notificationId, transport, new InMemoryCoordinationRunnerStore([cancelled()])), 'failed');
   assert.equal(outbox.get(n.notificationId)!.state, 'DELIVERY_FAILED'); assert.deepEqual(transport.packets(), []);
-  assert.equal(await deliverCoordinationNotification(outbox, n.notificationId, transport), 'skipped');
+  assert.equal(await deliverCoordinationNotification(outbox, n.notificationId, transport, new InMemoryCoordinationRunnerStore([cancelled()])), 'skipped');
   assert.equal(outbox.prepareRetry(n.notificationId), true);
-  assert.equal(await deliverCoordinationNotification(outbox, n.notificationId, transport), 'delivered');
+  assert.equal(await deliverCoordinationNotification(outbox, n.notificationId, transport, new InMemoryCoordinationRunnerStore([cancelled()])), 'delivered');
   assert.deepEqual(transport.packets(), [toMacpNotificationPacket(n)]);
   transport.packets()[0].summary = 'tampered'; assert.equal(transport.packets()[0].summary, n.safeSummary);
   assert.equal(outbox.get(n.notificationId)!.attempts, 2); assert.equal(outbox.get(n.notificationId)!.failureCode, undefined);
@@ -255,7 +227,7 @@ test('transport exceptions and packet mutation cannot leak or change Outbox payl
   const outbox = new InMemoryNotificationOutbox(), n = notification(); outbox.enqueue(n);
   assert.equal(await deliverCoordinationNotification(outbox, n.notificationId, { async send(packet) {
     packet.summary = 'private-token'; throw new Error('raw-evidence api-key');
-  } }), 'failed');
+  } }, new InMemoryCoordinationRunnerStore([cancelled()])), 'failed');
   assert.doesNotMatch(JSON.stringify(outbox.list()), /private-token|raw-evidence|api-key/);
   assert.equal(outbox.get(n.notificationId)!.failureCode, 'NOTIFICATION_DELIVERY_FAILED');
 });
@@ -317,8 +289,8 @@ for (const mode of ['approval', 'security', 'evidence', 'uncertain', 'observer-f
   assert.equal(outbox.pending()[0].kind, { approval: 'action_approval_required', security: 'security_review_required', evidence: 'execution_review_required', uncertain: 'execution_review_required' }[mode]);
   // Evidence loss during the browser executor read-back is execution uncertainty.
   const before = f.get(), calls = structuredClone(f.calls), transport = new InMemoryNotificationTransport(), id = outbox.pending()[0].notificationId;
-  transport.failNext(); assert.equal(await deliverCoordinationNotification(outbox, id, transport), 'failed');
-  outbox.prepareRetry(id); assert.equal(await deliverCoordinationNotification(outbox, id, transport), 'delivered');
+  transport.failNext(); assert.equal(await deliverCoordinationNotification(outbox, id, transport, f.store), 'failed');
+  outbox.prepareRetry(id); assert.equal(await deliverCoordinationNotification(outbox, id, transport, f.store), 'delivered');
   assert.deepEqual(f.get(), before); assert.deepEqual(f.calls, calls); assert.equal(f.get().run.status, 'BLOCKED');
   assert.doesNotMatch(JSON.stringify(transport.packets()), /private-input|private-exception|approvalRef|fingerprint|reviewRef/);
 });

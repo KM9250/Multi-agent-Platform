@@ -1,3 +1,6 @@
+import { toMacpNotificationPacket } from './macpPacket';
+import { DeliveryError } from './deliveryError';
+import type { NotificationDeliveryReceipt } from './deliveryError';
 import { sanitizeCoordinationNotification } from './sanitize';
 import type { CoordinationNotification, NotificationDeliveryAttempt, NotificationOutboxEntry } from './types';
 
@@ -7,7 +10,7 @@ export class InMemoryNotificationOutbox {
   enqueue(notification: CoordinationNotification): boolean {
     const safe = sanitizeCoordinationNotification(notification);
     if (this.entries.has(safe.notificationId)) return false;
-    this.entries.set(safe.notificationId, { notification: safe, state: 'PENDING', attempts: 0 });
+    this.entries.set(safe.notificationId, { notification: safe, state: 'PENDING', attempts: 0, packet: toMacpNotificationPacket(safe), history: [] });
     return true;
   }
   get(notificationId: string): NotificationOutboxEntry | undefined {
@@ -23,15 +26,43 @@ export class InMemoryNotificationOutbox {
     const entry = this.entries.get(notificationId);
     if (!entry || entry.state !== 'PENDING') return;
     entry.state = 'SENDING'; entry.attempts++;
-    return { notification: structuredClone(entry.notification), attempt: entry.attempts };
+    entry.history.push({ attempt: entry.attempts, state: 'SENDING' });
+    return { notification: structuredClone(entry.notification), packet: structuredClone(entry.packet), attempt: entry.attempts };
   }
-  recordDelivered(notificationId: string, attempt: number): boolean { return this.finish(notificationId, attempt, true); }
-  recordDeliveryFailed(notificationId: string, attempt: number): boolean { return this.finish(notificationId, attempt, false); }
-  private finish(notificationId: string, attempt: number, delivered: boolean): boolean {
+  suppress(notificationId: string): boolean {
+    const entry = this.entries.get(notificationId);
+    if (!entry || entry.state !== 'PENDING' || !entry.notification.requiresUserAction) return false;
+    entry.state = 'SUPPRESSED';
+    return true;
+  }
+  recordPreflightFailure(notificationId: string): void {
+    const entry = this.entries.get(notificationId);
+    if (entry?.state === 'PENDING') {
+      entry.state = 'DELIVERY_FAILED'; entry.failureCode = 'SNAPSHOT_UNAVAILABLE';
+    }
+  }
+  recordDelivered(notificationId: string, attempt: number, receipt?: NotificationDeliveryReceipt): boolean {
+    return this.finish(notificationId, attempt, undefined, receipt);
+  }
+  recordDeliveryFailed(notificationId: string, attempt: number, error = new DeliveryError('NOTIFICATION_DELIVERY_FAILED')): boolean {
+    return this.finish(notificationId, attempt, error);
+  }
+  private finish(notificationId: string, attempt: number, error?: DeliveryError, receipt?: NotificationDeliveryReceipt): boolean {
     const entry = this.entries.get(notificationId);
     if (!entry || entry.state !== 'SENDING' || entry.attempts !== attempt) return false;
-    entry.state = delivered ? 'DELIVERED' : 'DELIVERY_FAILED';
-    if (!delivered) entry.failureCode = 'NOTIFICATION_DELIVERY_FAILED';
+    entry.state = error ? 'DELIVERY_FAILED' : 'DELIVERED';
+    const record = entry.history.at(-1)!;
+    record.state = entry.state;
+    if (error) {
+      entry.failureCode = error.code; record.errorCode = error.code;
+      if (error.httpStatus !== undefined) record.httpStatus = error.httpStatus;
+    }
+    if (receipt) {
+      // Select only allowed audit fields, never transport-specific extras.
+      entry.receipt = { taskId: receipt.taskId, eventId: receipt.eventId,
+        idempotentReplay: receipt.idempotentReplay, httpStatus: receipt.httpStatus };
+      record.receipt = structuredClone(entry.receipt); record.httpStatus = receipt.httpStatus;
+    }
     return true;
   }
   prepareRetry(notificationId: string): boolean {

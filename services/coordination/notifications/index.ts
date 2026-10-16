@@ -5,3 +5,5 @@ export * from './notificationObserver';
 export * from './notificationOutbox';
 export * from './macpPacket';
 export * from './transport';
+export * from './delivery';
+export * from './deliveryError';
