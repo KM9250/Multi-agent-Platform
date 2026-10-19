@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import type { TestContext } from 'node:test';
 import { join } from 'node:path';
 import { statSync } from 'node:fs';
 import { fixture, fresh, event, history, saveHistory, plain, usage } from './durable-fixture.ts';
@@ -41,6 +42,96 @@ test('both event ID and idempotency key collisions are checked, even on simultan
     assert.throws(() => f.store.append(e), { code: 'EVENT_COLLISION' });
   }
   assert.equal(f.store.getSnapshot('run').events.length, 3);
+});
+
+function identicalCommittedOperations(t: TestContext) {
+  const f = fixture(t);
+  const a = { ...usage(fresh(), 'event-A'), idempotencyKey: 'key-A' };
+  const b = { ...usage(f.store.append(a), 'event-B'), idempotencyKey: 'key-B' };
+  assert.deepEqual(a.payload, b.payload);
+  f.store.append(b);
+  f.store.createCheckpoint('run');
+  f.store.append(event(f.store.getSnapshot('run'), 'ProgressRecorded', { outcome: 'PROGRESS', summary: 'later progress' }));
+  const persisted = () => ({
+    rows: f.db.read(tx => ({
+      journal: tx.all('SELECT * FROM journal_events ORDER BY sequence'),
+      seeds: tx.all('SELECT * FROM workflow_seeds ORDER BY workflow_run_id'),
+      checkpoints: tx.all('SELECT * FROM workflow_checkpoints ORDER BY checkpoint_id'),
+    })),
+    snapshot: f.store.getSnapshot('run'),
+  });
+  return { ...f, a, b, persisted };
+}
+
+for (const direction of ['A-ID/B-key', 'B-ID/A-key'] as const) {
+  test(`identical-content cross collision ${direction} leaves Journal, head, checkpoint and projections unchanged`, t => {
+    const f = identicalCommittedOperations(t), before = f.persisted();
+    const crossed = direction === 'A-ID/B-key'
+      ? { ...f.a, idempotencyKey: f.b.idempotencyKey }
+      : { ...f.b, idempotencyKey: f.a.idempotencyKey };
+    assert.throws(() => f.store.append(crossed), { code: 'EVENT_COLLISION' });
+    assert.deepEqual(f.persisted(), before);
+  });
+}
+
+for (const match of ['both', 'ID only', 'key only'] as const) {
+  test(`legitimate retry matching ${match} returns latest state and preserves original committed identity`, t => {
+    const f = identicalCommittedOperations(t), before = f.persisted();
+    const retry = { ...f.a, sequence: 99, timestamp: 100,
+      ...(match === 'ID only' ? { idempotencyKey: 'unused-key' } : {}),
+      ...(match === 'key only' ? { eventId: 'unused-ID' } : {}),
+    };
+    assert.deepEqual(f.store.append(retry), before.snapshot);
+    assert.deepEqual(f.store.getSnapshot('run').events[1], f.a);
+    assert.deepEqual(f.persisted(), before);
+  });
+}
+
+test('same key with different content still collides without changing persisted state', t => {
+  const f = identicalCommittedOperations(t), before = f.persisted();
+  const retry = { ...f.a, eventId: 'unused-ID', payload: { llmCalls: 2, inputTokens: 2, outputTokens: 3, estimatedCost: 0.01 } };
+  assert.throws(() => f.store.append(retry), { code: 'EVENT_COLLISION' });
+  assert.deepEqual(f.persisted(), before);
+});
+
+test('unused identifiers still append a new operation with identical semantic content', t => {
+  const f = identicalCommittedOperations(t), before = f.persisted();
+  const nextEvent = usage(before.snapshot, 'unused-ID-and-key');
+  assert.deepEqual(nextEvent.payload, f.a.payload);
+  const next = f.store.append(nextEvent), after = f.persisted();
+  assert.equal(next.events.length, before.snapshot.events.length + 1);
+  assert.deepEqual(next.events.at(-1), nextEvent);
+  assert.equal(next.run.usage.llmCalls, before.snapshot.run.usage.llmCalls + 1);
+  assert.equal(after.rows.seeds[0].last_sequence, nextEvent.sequence);
+  assert.notEqual(after.rows.seeds[0].journal_anchor, before.rows.seeds[0].journal_anchor);
+  assert.deepEqual(after.rows.checkpoints, before.rows.checkpoints);
+});
+
+test('cross collisions remain rejected after closing and reopening the SQLite connection', t => {
+  const f = identicalCommittedOperations(t), before = f.persisted();
+  f.db.close();
+  const reopened = f.open();
+  for (const crossed of [{ ...f.a, idempotencyKey: f.b.idempotencyKey }, { ...f.b, idempotencyKey: f.a.idempotencyKey }]) {
+    assert.throws(() => reopened.store.append(crossed), { code: 'EVENT_COLLISION' });
+  }
+  assert.deepEqual(reopened.store.getSnapshot('run'), before.snapshot);
+  assert.deepEqual(reopened.db.read(tx => ({
+    journal: tx.all('SELECT * FROM journal_events ORDER BY sequence'),
+    seeds: tx.all('SELECT * FROM workflow_seeds ORDER BY workflow_run_id'),
+    checkpoints: tx.all('SELECT * FROM workflow_checkpoints ORDER BY checkpoint_id'),
+  })), before.rows);
+});
+
+test('cross collision propagates through shared writer and rolls back preceding participant writes', t => {
+  const f = identicalCommittedOperations(t), before = f.persisted(), raw = f.raw();
+  raw.exec('CREATE TABLE extension_fixture (id TEXT PRIMARY KEY)');
+  assert.throws(() => f.db.write(tx => {
+    tx.run('INSERT INTO extension_fixture VALUES (?)', 'provisional');
+    f.store.appendInTransaction(tx, usage(before.snapshot, 'provisional-event'));
+    f.store.appendInTransaction(tx, { ...f.a, idempotencyKey: f.b.idempotencyKey });
+  }), { code: 'EVENT_COLLISION' });
+  assert.equal(raw.prepare('SELECT count(*) AS n FROM extension_fixture').get()!.n, 0);
+  assert.deepEqual(f.persisted(), before);
 });
 test('stale sequence and invalid Kernel transitions cannot advance the Journal', t => {
   const f = fixture(t), e = usage(fresh()); f.store.append(e);

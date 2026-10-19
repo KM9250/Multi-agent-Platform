@@ -65,13 +65,16 @@ export class SqliteCoordinationRunnerStore implements CoordinationRunnerStore, D
     const event = jsonCopy(input);
     const journal = readJournal(tx, event.workflowRunId);
     const state = journal.snapshot;
-    // Check BOTH identities: an ID replay must not hide a collision on another operation's key.
-    const matches = state.events.filter(e => e.eventId === event.eventId || (event.idempotencyKey && e.idempotencyKey === event.idempotencyKey));
-    if (matches.length) {
-      for (const match of matches) {
-        const probe = { ...event, eventId: match.eventId, idempotencyKey: match.idempotencyKey };
-        guarded('EVENT_COLLISION', () => appendEvent(state, probe)); // Kernel owns semantic equality.
-      }
+    const byId = state.events.find(e => e.eventId === event.eventId);
+    const byKey = event.idempotencyKey
+      ? state.events.find(e => e.idempotencyKey === event.idempotencyKey)
+      : undefined;
+    // Resolve identity before semantic comparison: equal content cannot merge distinct committed events.
+    if (byId && byKey && byId.eventId !== byKey.eventId) throw new DurableStoreError('EVENT_COLLISION');
+    const match = byId ?? byKey;
+    if (match) {
+      const probe = { ...event, eventId: match.eventId, idempotencyKey: match.idempotencyKey };
+      guarded('EVENT_COLLISION', () => appendEvent(state, probe)); // Kernel owns semantic equality.
       return state;
     }
     if (event.sequence !== state.events.length + 1) throw new DurableStoreError('SEQUENCE_CONFLICT');
