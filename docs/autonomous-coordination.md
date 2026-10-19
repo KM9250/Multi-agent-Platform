@@ -737,3 +737,21 @@ restart recovery, distributed coordination and approval UI remain future work.
 No MACP API/UI, ack/retry API, Kernel, Runner or PolicyGuard authorization
 contract is changed. Trusted MAP adapters remain responsible for user
 resumption; notification delivery cannot complete or rerun MAP tasks.
+
+## COORD-5A: durable Journal and checkpoint foundation
+
+The server-only `services/coordination/durable/index.ts` entry point adds SQLite
+seed/Journal persistence, synchronous `SqliteCoordinationRunnerStore`, versioned
+migrations, transactional idempotent append, checkpoints and validated Kernel
+replay. It requires Node >=22.13 and uses `node:sqlite`; the browser barrel and
+Browser PoC remain in-memory and never import SQLite. See the
+[durable runtime runbook](coordination-durable-runtime.md) for configuration,
+transaction participation, corruption handling, backup and crash tests.
+
+Journal is authoritative; corrupt checkpoints fall back to older valid candidates
+or full replay, while Journal corruption fails closed. Checkpoints are currently
+a correctness foundation, not a promise of faster incremental restoration.
+Restoring a RUNNING Workflow does not start the Runner or recover external
+operations. Pending Action/Evidence/Execution Ledger (5B), leases and Recovery
+Manager (5C), and the durable notification outbox (5D) are explicitly deferred.
+The COORD-4C in-memory outbox is not atomic with the durable Journal in 5A.
