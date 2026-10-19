@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "test": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "test:macp": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/integration/coordination-macp.integration.ts"
+    "test:macp": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/integration/coordination-macp.integration.ts",
+    "test:durable": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/coordination-durable-*.test.ts test/coordination-checkpoint.test.ts"
   },
   "dependencies": {
     "@google/genai": "^1.30.0",
@@ -26,6 +27,6 @@
     "vite": "^6.2.0"
   },
   "engines": {
-    "node": ">=22.7.0"
+    "node": ">=22.13.0"
   }
 }
