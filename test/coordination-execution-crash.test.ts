@@ -54,3 +54,43 @@ test('two Node processes racing the same Action produce at most one reservation 
   assert.ok(outcomes.some(o=>!o.code));assert.equal(effects(effectPath),1);
   const snapshot=f.open().store.getSnapshot('run');assert.equal(snapshot.events.filter(e=>e.type==='TaskCompleted').length,1);
 });
+
+
+for (const stage of ['task','session','progress'] as const) test(`SIGKILL after legacy uncertain ${stage} COMMIT: fresh explicit Runner completes one block without dispatch or PLAN`, async t => {
+  const f=executionFixture(t),effectPath=join(f.dir,'uncertain-effects.log');f.register();f.db.close();
+  const crash=child(t,f.path,`uncertain-legacy-${stage}`,effectPath);await crash.ready;crash.process.send({});
+  assert.equal((await crash.result).stage,`uncertain-legacy-${stage}`);crash.process.kill('SIGKILL');await crash.closed;
+  const reopened=f.open(),before=reopened.store.getSnapshot('run');
+  const ledger=()=>reopened.db.read(tx=>tx.get("SELECT * FROM execution_ledger WHERE workflow_run_id='run' AND action_id='action'"));
+  const saved=ledger();assert.equal(saved!.state,'REVIEW_REQUIRED');assert.equal(saved!.review_reason,'EXECUTION_UNCERTAIN');
+  assert.equal(before.run.status,'RUNNING');assert.equal(effects(effectPath),1);
+  const recovery=child(t,f.path,'uncertain-recover',effectPath);await recovery.ready;recovery.process.send({});
+  assert.equal((await recovery.result).outcome.reason,'needs_user');await recovery.closed;
+  const after=reopened.store.getSnapshot('run');assert.equal(after.run.status,'BLOCKED');assert.equal(after.run.statusReason,'RUNNER_EXECUTION_UNCERTAIN:action');
+  assert.deepEqual(after.events.slice(0,before.events.length),before.events);assert.deepEqual(ledger(),saved);
+  for(const type of ['TaskFailed','SessionResolved','ProgressRecorded','WorkflowBlocked'])assert.equal(after.events.filter(e=>e.type===type).length,1);
+  assert.equal(after.run.usage.rounds,1);assert.equal(after.run.usage.consecutiveErrors,1);
+  const retry=child(t,f.path,'uncertain-recover',effectPath);await retry.ready;retry.process.send({});await retry.result;await retry.closed;
+  assert.deepEqual(reopened.store.getSnapshot('run'),after);assert.deepEqual(ledger(),saved);
+  assert.equal(effects(effectPath),1);assert.equal(effects(effectPath+'.plan'),0);assert.equal(effects(effectPath+'.verify'),0);
+});
+for(const boundary of ['before','after'] as const) test(`SIGKILL ${boundary} uncertain completion COMMIT preserves atomic suffix and exactly one block on retry`,async t=>{
+  const f=executionFixture(t),effectPath=join(f.dir,'atomic-uncertain-effects.log');f.register();f.db.close();
+  const stage=child(t,f.path,'uncertain-legacy-task',effectPath);await stage.ready;stage.process.send({});await stage.result;stage.process.kill('SIGKILL');await stage.closed;
+  const reopened=f.open(),before=reopened.store.getSnapshot('run');
+  const ledger=()=>reopened.db.read(tx=>tx.get("SELECT * FROM execution_ledger WHERE workflow_run_id='run' AND action_id='action'"));const saved=ledger();
+  const crash=child(t,f.path,`uncertain-atomic-${boundary}`,effectPath);await crash.ready;crash.process.send({});
+  assert.equal((await crash.result).stage,`uncertain-atomic-${boundary}`);crash.process.kill('SIGKILL');await crash.closed;
+  const committed=reopened.store.getSnapshot('run');
+  if(boundary==='before')assert.deepEqual(committed,before);
+  else{assert.equal(committed.run.status,'BLOCKED');assert.equal(committed.events.length,before.events.length+3);}
+  assert.deepEqual(ledger(),saved);
+  for(let i=0;i<2;i++){
+    const retry=child(t,f.path,'uncertain-recover',effectPath);await retry.ready;retry.process.send({});
+    assert.equal((await retry.result).outcome.reason,'needs_user');await retry.closed;
+  }
+  const after=reopened.store.getSnapshot('run');assert.equal(after.events.length,before.events.length+3);
+  for(const type of ['TaskFailed','SessionResolved','ProgressRecorded','WorkflowBlocked'])assert.equal(after.events.filter(e=>e.type===type).length,1);
+  assert.equal(after.run.usage.rounds,1);assert.deepEqual(ledger(),saved);
+  assert.equal(effects(effectPath),1);assert.equal(effects(effectPath+'.plan'),0);assert.equal(effects(effectPath+'.verify'),0);
+});

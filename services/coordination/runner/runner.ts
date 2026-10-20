@@ -255,12 +255,20 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       this.append(ctx, 'UsageRecorded', { ...usage, sourceRef: `map.runner.model.v1:${ctx.key}:${phase}` });
     }
   }
+  private completeUncertainBlock(ctx: RoundContext): RunnerRunResult | undefined {
+    if (!this.deps.durableExecution) return;
+    const recovered = this.durable(() => this.deps.durableExecution!.completeUncertainBlock(ctx.id));
+    if (!recovered) return;
+    if (recovered.progressRecorded) ctx.completed++;
+    return this.safePoint(ctx) ?? this.result(ctx, 'error', undefined, 'RUNNER_DURABLE_EXECUTION_STOPPED');
+  }
   private async round(ctx: RoundContext): Promise<RunnerRunResult> {
     const s = this.snapshot(ctx); validateCoordinationSnapshot(s);
     if (s.run.executionMode !== 'supervised_autonomous') return this.result(ctx, 'stopped', undefined, 'RUNNER_EXECUTION_MODE');
     const stopped = this.safePoint(ctx); if (stopped) return stopped;
     const securityBlock = this.securityPreflight(ctx); if (securityBlock) return securityBlock;
     const evidenceBlock = this.verifyEvidencePreflight(ctx); if (evidenceBlock) return evidenceBlock;
+    const uncertainBlock = this.completeUncertainBlock(ctx); if (uncertainBlock) return uncertainBlock;
     const sessions = Object.values(s.sessions).filter(active);
     if (sessions.length > 1) return this.result(ctx, 'stopped', undefined, 'RUNNER_AMBIGUOUS_PENDING_WORK');
     const session = sessions[0];
@@ -278,11 +286,6 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       }
       if (tasks.length !== 1) return this.result(ctx, 'error', undefined, 'RUNNER_INVALID_PENDING_WORK');
       const task = tasks[0];
-      if (this.deps.durableExecution && task.failureReason === 'EXECUTION_UNCERTAIN') {
-        const result = this.getResult(ctx.id, task);
-        if (!result) throw new DurableRunnerStop();
-        return this.collect(ctx, task, result);
-      }
       if (task.status === 'COMPLETED' || task.status === 'FAILED') return this.verify(ctx, task);
       if (task.status !== 'ASSIGNED') return this.failTask(ctx, task, 'RUNNER_TASK_CANCELLED');
       const result = this.getResult(ctx.id, task);
@@ -439,8 +442,13 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
   }
   private async collect(ctx: RoundContext, task: CoordinationTask, result: RunnerExecutionResult): Promise<RunnerRunResult> {
     if (result.status === 'uncertain' && this.taskWritable(ctx, task)) {
-      if (this.deps.durableExecution) this.durable(() => this.deps.durableExecution!.finalizeResult(ctx.id, task));
-      else this.append(ctx, 'TaskFailed', { taskId: task.taskId, failureReason: 'EXECUTION_UNCERTAIN' }, task.sessionId);
+      if (this.deps.durableExecution) {
+        this.durable(() => this.deps.durableExecution!.finalizeResult(ctx.id, task));
+        const stopped = this.completeUncertainBlock(ctx) ?? this.safePoint(ctx);
+        if (stopped) return stopped;
+        throw new DurableRunnerStop();
+      }
+      this.append(ctx, 'TaskFailed', { taskId: task.taskId, failureReason: 'EXECUTION_UNCERTAIN' }, task.sessionId);
       this.close(ctx, task, 'ERROR');
       return this.block(ctx, `RUNNER_EXECUTION_UNCERTAIN:${parseRunnerActionRef(task.inputRefs)?.actionId ?? task.taskId}`);
     }

@@ -134,6 +134,42 @@ Task as though the external action did not happen, or plan a replacement Action.
 A subsequent explicit invocation can finalize an intact RESULT_RECORDED;
 DISPATCH_RESERVED without a Result remains a safety stop for COORD-5C.
 
+## Completing a partially journaled uncertain stop
+
+On an explicit Runner invocation, after Workflow state checks and existing
+Security/Evidence Review preflights, `completeUncertainBlock(workflowRunId)`
+examines REVIEW_REQUIRED / EXECUTION_UNCERTAIN records. It finds the historical
+Task and Session through the Ledger even when the Session is already RESOLVED.
+A validated saved uncertain Result and its committed TaskFailed event are
+required. A Result not yet journaled follows normal `finalizeResult()` first;
+this completion API never invents a Result or changes the Ledger.
+
+Under one `BEGIN IMMEDIATE`, the method verifies Action/Fingerprint ownership,
+the Ledger's finalized event ID, the Session's original Round Key, and the
+payload, actor, scope and ordering of existing stop events. Session resolution
+and Progress retain `runner:<workflow>:<round>:resolve` / `:progress`. Only
+missing SessionResolved, ERROR ProgressRecorded and WorkflowBlocked events are
+appended through the existing factory and `appendInTransaction()`. Each append
+uses the preceding Snapshot's sequence/time. Any failure rolls back the entire
+new suffix while preserving previously committed prefixes and all Ledger fields.
+
+The block uses `runner:<workflow>:<round>:execution-uncertain-block:<action>`;
+legacy matching blocks without a key are also recognized. Repeated completion,
+COMMIT acknowledgement loss, and later user resume cannot duplicate the original
+uncertain block or count Progress twice. An ordinary resume still cannot clear
+uncertainty or authorize PLAN, VERIFY, commitment, or Executor redispatch.
+BLOCKED, SUSPENDED and terminal Workflows receive no completion events; an
+unrelated block reason is never overwritten. Invalid ownership, event contents,
+ordering or ambiguous uncertainty fail closed. Existing Security/Evidence Review
+first-resume semantics take priority and are not changed.
+
+Tests reconstruct the previous implementation's TaskFailed-only,
+SessionResolved and ProgressRecorded prefixes, SIGKILL children after each
+legacy COMMIT, and start a fresh explicit Runner to finish the stop. Additional
+SIGKILL tests before/after the new atomic COMMIT verify rollback/response loss,
+with an independent effect counter and PLAN/VERIFY monitors. Opening a database
+still does not scan or start Workflows; runtime-wide recovery remains COORD-5C.
+
 ## Evidence, JSON and credentials
 
 `SqliteRunnerEvidenceStore.put/get` use a trusted AsyncLocalStorage scope set by

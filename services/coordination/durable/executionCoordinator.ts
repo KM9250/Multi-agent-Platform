@@ -246,6 +246,76 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
         row.state === 'REVIEW_REQUIRED' ? 'REVIEW_REQUIRED' : 'FINALIZED', event.eventId, this.now(), id, r.action.actionId);
     });
   }
+  /** Complete only a committed uncertain Task failure. Never dispatch, resume, or change its Ledger. */
+  completeUncertainBlock(id: string): { reason: string; progressRecorded: boolean } | undefined {
+    return this.store.database.write(tx => {
+      let s = readJournal(tx, id).snapshot;
+      if (s.run.status !== 'RUNNING') return;
+      requireIntegrity(!runnerSecurityReviewReason(s) && !runnerEvidenceReviewReason(s));
+      const rows = tx.all("SELECT action_id FROM execution_ledger WHERE workflow_run_id = ? AND state = 'REVIEW_REQUIRED' AND review_reason = 'EXECUTION_UNCERTAIN'", id);
+      requireIntegrity(rows.length <= 1);
+      if (!rows.length) return;
+      const r = this.pendingActions.getInTransaction(tx, id, String(rows[0].action_id)); requireIntegrity(r);
+      validateActionOwner(s, r);
+      const row = readExecution(tx, r), result = this.resultInTransaction(tx, r);
+      requireIntegrity(result?.status === 'uncertain' && !result.safetyHold);
+      const task = s.tasks[r.taskId], session = s.sessions[r.sessionId];
+      // A Result not yet reflected into TaskFailed follows the existing finalizeResult path.
+      if (!row.finalized_event_id) { requireIntegrity(task.status === 'ASSIGNED'); return; }
+      const expected = this.resultEvent(s, r, result);
+      const failed = s.events.find(e => e.eventId === row.finalized_event_id);
+      requireIntegrity(failed && failed.eventId === expected.eventId && failed.type === 'TaskFailed'
+        && failed.sessionId === r.sessionId && failed.actorAgentId === expected.actorAgentId
+        && failed.idempotencyKey === expected.idempotencyKey && canonicalJson(failed.payload) === canonicalJson(expected.payload)
+        && task.status === 'FAILED' && task.failureReason === 'EXECUTION_UNCERTAIN');
+      const prefix = 'map.runner.v1:', context = session.contextRef;
+      requireIntegrity(context?.startsWith(prefix) && !!context.slice(prefix.length).trim());
+      const saved = tx.get('SELECT round_key FROM pending_actions WHERE workflow_run_id = ? AND action_id = ?', id, r.action.actionId);
+      requireIntegrity(saved?.round_key === context && Object.values(s.sessions).filter(item => item.contextRef === context).length === 1
+        && Object.values(s.tasks).filter(item => item.sessionId === r.sessionId).length === 1
+        && Object.values(s.sessions).every(item => !['OPEN','SUSPENDED'].includes(item.state) || item.sessionId === r.sessionId));
+      const roundKey = context.slice(prefix.length), key = `runner:${id}:${roundKey}`;
+      const resolveKey = `${key}:resolve`, progressKey = `${key}:progress`;
+      const reason = `RUNNER_EXECUTION_UNCERTAIN:${r.action.actionId}`, blockKey = `${key}:execution-uncertain-block:${r.action.actionId}`;
+      const resolutions = s.events.filter(e => e.type === 'SessionResolved' && e.sessionId === r.sessionId);
+      const blocks = s.events.filter(e => e.type === 'WorkflowBlocked' && (e.payload as { reason?: string }).reason === reason);
+      requireIntegrity(resolutions.length <= 1 && blocks.length <= 1);
+      let resolved = resolutions[0], progress = s.events.find(e => e.idempotencyKey === progressKey), block = blocks[0];
+      const matches = (event: CoordinationEvent, type: CoordinationEvent['type'], payload: unknown, sessionId?: string) =>
+        event.workflowRunId === id && event.type === type && event.sessionId === sessionId
+        && event.actorAgentId === s.run.supervisorAgentId && canonicalJson(event.payload) === canonicalJson(payload);
+      const resolvePayload = { outcome: 'FAILED' }, progressPayload = { outcome: 'ERROR', summary: 'Runner round error.' };
+      requireIntegrity(!s.events.some(e => e.idempotencyKey === resolveKey && e !== resolved)
+        && !s.events.some(e => e.idempotencyKey === blockKey && e !== block));
+      requireIntegrity(resolved
+        ? matches(resolved, 'SessionResolved', resolvePayload, r.sessionId) && resolved.idempotencyKey === resolveKey
+          && resolved.sequence > failed.sequence && session.state === 'RESOLVED' && session.resolution?.outcome === 'FAILED'
+        : session.state === 'OPEN');
+      if (progress) requireIntegrity(resolved && matches(progress, 'ProgressRecorded', progressPayload) && progress.sequence > resolved.sequence);
+      if (block) {
+        requireIntegrity(progress && matches(block, 'WorkflowBlocked', { reason }) && block.sequence > progress.sequence
+          && (!block.idempotencyKey || block.idempotencyKey === blockKey));
+        // A later user resume cannot resolve uncertainty or create another copy of this block.
+        return { reason, progressRecorded: false };
+      }
+      const append = (type: CoordinationEvent['type'], payload: unknown, idempotencyKey: string, sessionId?: string): CoordinationEvent => {
+        const event = createRunnerEvent(s, type, payload, { now: () => this.now() },
+          { nextId: () => `durable-uncertain-${digest([id, r.action.actionId, type])}` }, { sessionId, idempotencyKey });
+        const count = s.events.length;
+        s = this.store.appendInTransaction(tx, event);
+        requireIntegrity(s.events.length === count + 1);
+        return event;
+      };
+      if (!resolved) resolved = append('SessionResolved', resolvePayload, resolveKey, r.sessionId);
+      const progressRecorded = !progress;
+      if (!progress) progress = append('ProgressRecorded', progressPayload, progressKey);
+      block = append('WorkflowBlocked', { reason }, blockKey);
+      requireIntegrity(['BLOCKED'].includes(s.run.status) && s.run.statusReason === reason
+        && s.sessions[r.sessionId].state === 'RESOLVED' && failed.sequence < resolved.sequence
+        && resolved.sequence < progress.sequence && progress.sequence < block.sequence);
+      return { reason, progressRecorded };
+    });
+  }
   async getOwnedEvidence(id: string, task: CoordinationTask, ref: string) {
     return this.store.database.read(tx => {
       const r = this.record(tx, id, task); validateActionOwner(readJournal(tx, id).snapshot, r);

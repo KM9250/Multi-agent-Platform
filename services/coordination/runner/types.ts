@@ -101,6 +101,7 @@ export interface RunnerDurableExecution {
   readonly pendingActions: RunnerPendingActionStore;
   readonly evidenceStore: RunnerEvidenceStore;
   readonly executors: RunnerExecutorRegistry;
+  completeUncertainBlock(workflowRunId: string): { reason: string; progressRecorded: boolean } | undefined;
   assertCanPlan(workflowRunId: string): void;
   validatePreparedAction(input: unknown, executorId: string): PreparedRunnerAction;
   registerAction(record: RunnerPendingActionRecord, expected: CoordinationSnapshot, sessionEvent: CoordinationEvent, taskEvent: CoordinationEvent): RunnerPendingActionRecord;
