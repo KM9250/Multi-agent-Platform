@@ -2,6 +2,7 @@ import type { RequestScheduler } from '../../scheduler';
 import type { CoordinationAuditEntry, CoordinationAuditView, CoordinationEvent, CoordinationSnapshot, CoordinationTask } from '../types';
 
 export interface CoordinationRunnerStore {
+  readonly persistence?: 'durable';
   getSnapshot(workflowRunId: string): CoordinationSnapshot;
   append(event: CoordinationEvent): CoordinationSnapshot;
 }
@@ -94,7 +95,23 @@ export interface RunnerPendingActionStore {
 export interface RunnerPendingApproval { actionId: string; fingerprint: string; actionClass: string; approvalRef: string; summary: string }
 export interface RunnerEvidence { kind: string; content: unknown; createdAt: number }
 export interface RunnerEvidenceStore { put(evidence: RunnerEvidence): Promise<string>; get(ref: string): Promise<RunnerEvidence | undefined> }
+/** Node-free contract; implementations live only in the durable server entry point. */
+export interface RunnerDurableExecution {
+  readonly store: CoordinationRunnerStore;
+  readonly pendingActions: RunnerPendingActionStore;
+  readonly evidenceStore: RunnerEvidenceStore;
+  readonly executors: RunnerExecutorRegistry;
+  completeUncertainBlock(workflowRunId: string): { reason: string; progressRecorded: boolean } | undefined;
+  assertCanPlan(workflowRunId: string): void;
+  validatePreparedAction(input: unknown, executorId: string): PreparedRunnerAction;
+  registerAction(record: RunnerPendingActionRecord, expected: CoordinationSnapshot, sessionEvent: CoordinationEvent, taskEvent: CoordinationEvent): RunnerPendingActionRecord;
+  dispatch(workflowRunId: string, task: CoordinationTask, signal?: AbortSignal): Promise<RunnerExecutionResult>;
+  getResult(workflowRunId: string, task: CoordinationTask): RunnerExecutionResult | undefined;
+  finalizeResult(workflowRunId: string, task: CoordinationTask): void;
+  getOwnedEvidence(workflowRunId: string, task: CoordinationTask, ref: string): Promise<RunnerEvidence | undefined>;
+}
 export interface CoordinationRunnerDependencies {
+  durableExecution?: RunnerDurableExecution;
   store: CoordinationRunnerStore; supervisorProvider: RunnerSupervisorProvider; executors: RunnerExecutorRegistry;
   pendingActions: RunnerPendingActionStore; evidenceStore: RunnerEvidenceStore;
   clock?: RunnerClock; ids?: RunnerIdGenerator; scheduler?: RequestScheduler;
