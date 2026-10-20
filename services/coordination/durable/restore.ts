@@ -4,7 +4,7 @@ import { emptyWorkflowUsage } from '../usage';
 import type { CoordinationEvent, CoordinationSnapshot } from '../types';
 import type { DurableTransaction, Row } from './db';
 import { canonicalJson, digest, DurableStoreError, guarded, jsonCopy, parseJson, requireIntegrity } from './integrity';
-import { SCHEMA_VERSION } from './schema';
+import { JOURNAL_SCHEMA_VERSION } from './schema';
 
 export const nextAnchor = (previous: string, event: CoordinationEvent): string => digest([previous, digest(event)]);
 export function validateSeed(input: CoordinationSnapshot): CoordinationSnapshot {
@@ -57,7 +57,7 @@ export function readJournal(tx: DurableTransaction, id: string): JournalState {
   return guarded('INTEGRITY_ERROR', () => {
     const row = tx.get('SELECT * FROM workflow_seeds WHERE workflow_run_id = ?', id);
     if (!row) throw new DurableStoreError('WORKFLOW_NOT_FOUND');
-    if (row.schema_version !== SCHEMA_VERSION) throw new DurableStoreError('SCHEMA_UNSUPPORTED');
+    if (row.schema_version !== JOURNAL_SCHEMA_VERSION) throw new DurableStoreError('SCHEMA_UNSUPPORTED');
     const seed = validateSeed(parseJson<CoordinationSnapshot>(row.seed_payload));
     requireIntegrity(seed.run.runId === id && seed.run.createdAt === row.created_at && digest(seed) === row.seed_digest);
     requireIntegrity(canonicalJson(seed.policy) === canonicalJson(parseJson(row.policy_payload)) && digest(seed.policy) === row.policy_digest);

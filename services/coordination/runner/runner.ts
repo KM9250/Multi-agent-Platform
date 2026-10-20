@@ -1,10 +1,11 @@
 import { formatSecurityHoldReason, parseSecurityHoldReason, parseSecurityReviewRef, SECURITY_BLOCK_PREFIX } from './securityHold';
-import { parseVerifyEvidenceReviewRef, verifyEvidenceReviewRef, VERIFY_EVIDENCE_BLOCK_PREFIX } from './verifyEvidenceReview';
+import { verifyEvidenceReviewRef, VERIFY_EVIDENCE_BLOCK_PREFIX } from './verifyEvidenceReview';
+import { runnerActionApproved, runnerSecurityReviewReason, runnerEvidenceReviewReason } from './dispatchGuard';
 import { evaluateCommitmentGate } from '../completion';
 import { findExhaustedBudget } from '../policy';
 import { validateCoordinationSnapshot } from '../validation';
 import { TERMINAL_WORKFLOW_STATUSES } from '../types';
-import type { CoordinationEvent, CoordinationEventType, CoordinationSession, CoordinationSnapshot, CoordinationTask, WorkflowProgressOutcome, WorkflowResumePayload } from '../types';
+import type { CoordinationEvent, CoordinationEventType, CoordinationSession, CoordinationSnapshot, CoordinationTask, WorkflowProgressOutcome } from '../types';
 import { runnerAudit, runnerPlanRequest, RUNNER_PROVIDER_SYSTEM_CONTRACT } from './context';
 import { createRunnerEvent, runnerTimestamp } from './eventFactory';
 import { runnerText, validatePreparedRunnerAction, validateRunnerExecution, validateRunnerPlan, validateRunnerUsage, validateRunnerVerification } from './model';
@@ -24,6 +25,7 @@ interface RetainedRunnerResult {
 }
 type RunnerResultMap = Map<string, Map<string, RetainedRunnerResult>>;
 const collected = new WeakMap<CoordinationRunnerStore, RunnerResultMap>();
+class DurableRunnerStop extends Error {}
 class ModelDispatchDeferred extends Error {}
 class RunnerVerifyEvidenceUnavailable extends Error {}
 class RegistrationCleanupError extends AggregateError {
@@ -42,6 +44,10 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
   private readonly ids: RunnerIdGenerator;
   private readonly results: RunnerResultMap;
   constructor(deps: CoordinationRunnerDependencies) {
+    if ((deps.store.persistence === 'durable' || deps.durableExecution) &&
+      (deps.store.persistence !== 'durable' || !deps.durableExecution || deps.durableExecution.store !== deps.store
+        || deps.durableExecution.pendingActions !== deps.pendingActions || deps.durableExecution.evidenceStore !== deps.evidenceStore
+        || deps.durableExecution.executors !== deps.executors)) throw new Error('RUNNER_DURABLE_CONFIGURATION_REQUIRED');
     this.deps = deps; this.clock = deps.clock ?? { now: Date.now }; this.ids = deps.ids ?? defaultRunnerIds;
     if (deps.scheduler) {
       runnerText(deps.supervisorProvider.scheduling?.provider);
@@ -71,7 +77,8 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
         rounds += ctx.completed;
         if (!loop || result.reason !== 'round_completed') return { ...result, roundsCompleted: rounds };
       } while (true); // Every new PLAN consumes budget; every completed round records Progress.
-    } catch {
+    } catch (error) {
+      if (this.deps.durableExecution || error instanceof DurableRunnerStop) return { ...this.result(ctx, 'error', undefined, 'RUNNER_DURABLE_EXECUTION_STOPPED'), roundsCompleted: rounds + ctx.completed };
       const stopped = this.safePoint(ctx);
       if (stopped) return { ...stopped, roundsCompleted: rounds + ctx.completed };
       return { ...this.result(ctx, 'error', undefined, 'RUNNER_INTERNAL_ERROR'), roundsCompleted: rounds + ctx.completed };
@@ -81,6 +88,9 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
         running.delete(id);
       }
     }
+  }
+  private durable<T>(fn: () => T): T {
+    try { return fn(); } catch { throw new DurableRunnerStop('RUNNER_DURABLE_EXECUTION_STOPPED'); }
   }
   private snapshot(ctx: RoundContext): CoordinationSnapshot { return this.deps.store.getSnapshot(ctx.id); }
   private now(s: CoordinationSnapshot): number { return runnerTimestamp(s, this.clock); }
@@ -117,6 +127,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     this.results.set(workflowRunId, results);
   }
   private getResult(workflowRunId: string, task: CoordinationTask): RunnerExecutionResult | undefined {
+    if (this.deps.durableExecution) return this.durable(() => this.deps.durableExecution!.getResult(workflowRunId, task));
     const retained = this.results.get(workflowRunId)?.get(task.taskId);
     const ref = parseRunnerActionRef(task.inputRefs);
     if (task.workflowRunId !== workflowRunId || !retained || !ref || retained.sessionId !== task.sessionId
@@ -267,6 +278,11 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       }
       if (tasks.length !== 1) return this.result(ctx, 'error', undefined, 'RUNNER_INVALID_PENDING_WORK');
       const task = tasks[0];
+      if (this.deps.durableExecution && task.failureReason === 'EXECUTION_UNCERTAIN') {
+        const result = this.getResult(ctx.id, task);
+        if (!result) throw new DurableRunnerStop();
+        return this.collect(ctx, task, result);
+      }
       if (task.status === 'COMPLETED' || task.status === 'FAILED') return this.verify(ctx, task);
       if (task.status !== 'ASSIGNED') return this.failTask(ctx, task, 'RUNNER_TASK_CANCELLED');
       const result = this.getResult(ctx.id, task);
@@ -274,6 +290,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       const exhausted = this.budget(ctx); if (exhausted) return this.block(ctx, `RUNNER_BUDGET_EXHAUSTED:${exhausted}`);
       return this.execute(ctx, task, true);
     }
+    if (this.deps.durableExecution) this.durable(() => this.deps.durableExecution!.assertCanPlan(ctx.id));
     const complete = this.finalize(ctx); if (complete) return complete;
     const exhausted = this.budget(ctx); if (exhausted) return this.block(ctx, `RUNNER_BUDGET_EXHAUSTED:${exhausted}`);
     return this.plan(ctx);
@@ -302,21 +319,8 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
         return this.block(ctx, payload.failureReason);
       }
     }
-    const block = [...s.events].reverse().find(event => event.type === 'WorkflowBlocked'
-      && (event.payload as { reason?: string }).reason?.startsWith(SECURITY_BLOCK_PREFIX));
-    if (!block) return;
-    const reason = (block.payload as { reason: string }).reason;
-    const metadata = parseSecurityHoldReason(reason, { workflowRunId: ctx.id });
-    const binding = metadata && parseSecurityReviewRef(metadata.reviewRef);
-    const task = binding && s.tasks[binding.taskId];
-    if (!metadata || !task || !owned(s.sessions[task.sessionId]) || task.failureReason !== reason
-      || (held && (held.payload as { failureReason: string }).failureReason !== reason)) {
-      return this.block(ctx, `${SECURITY_BLOCK_PREFIX}INVALID_METADATA`);
-    }
-    const resume = s.events.find(event => event.type === 'WorkflowResumed' && event.sequence > block.sequence);
-    const auth = (resume?.payload as WorkflowResumePayload | undefined)?.authorization;
-    if (auth?.type !== 'user' || auth.reference !== metadata.reviewRef) return this.block(ctx, reason);
-    // The held task/session are already closed; PLAN sees the original goal and safe journal only.
+    const reason = runnerSecurityReviewReason(s);
+    if (reason) return this.block(ctx, reason);
   }
   /** A failed block write must never fall through to round_completed/another PLAN.
    * Re-read after append errors, including a committed write whose acknowledgement was lost. */
@@ -325,27 +329,12 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     catch { return this.safePoint(ctx) ?? this.result(ctx, 'error', undefined, 'RUNNER_INTERNAL_ERROR'); }
   }
   private verifyEvidencePreflight(ctx: RoundContext): RunnerRunResult | undefined {
-    const s = this.snapshot(ctx);
-    const block = [...s.events].reverse().find(event => event.type === 'WorkflowBlocked'
-      && (event.payload as { reason?: string }).reason?.startsWith(VERIFY_EVIDENCE_BLOCK_PREFIX));
-    if (!block) return;
-    const reason = (block.payload as { reason: string }).reason;
-    const reviewRef = reason.slice(VERIFY_EVIDENCE_BLOCK_PREFIX.length);
-    const binding = parseVerifyEvidenceReviewRef(reviewRef);
-    const task = binding && s.tasks[binding.taskId];
-    const session = task && s.sessions[task.sessionId];
-    if (!binding || binding.workflowRunId !== ctx.id || !task || task.workflowRunId !== ctx.id
-      || !session || session.workflowRunId !== ctx.id || !owned(session)
-      || !['COMPLETED', 'FAILED'].includes(task.status)) {
-      return this.blockVerifyEvidence(ctx, `${VERIFY_EVIDENCE_BLOCK_PREFIX}INVALID_METADATA`);
-    }
-    // Only the first resume after this block resolves it. Later action approvals are independent.
-    const resume = s.events.find(event => event.type === 'WorkflowResumed' && event.sequence > block.sequence);
-    const auth = (resume?.payload as WorkflowResumePayload | undefined)?.authorization;
-    if (auth?.type !== 'user' || auth.reference !== reviewRef) return this.blockVerifyEvidence(ctx, reason);
+    const reason = runnerEvidenceReviewReason(this.snapshot(ctx));
+    if (reason) return this.blockVerifyEvidence(ctx, reason);
   }
   private async plan(ctx: RoundContext): Promise<RunnerRunResult> {
     try {
+      if (this.deps.durableExecution) this.durable(() => this.deps.durableExecution!.assertCanPlan(ctx.id));
       const s = this.snapshot(ctx);
       const response = await this.model(ctx, 'plan', () => this.deps.supervisorProvider.plan(runnerPlanRequest(s, this.now(s), ctx.signal)));
       const stopped = this.safePoint(ctx); if (stopped) return stopped;
@@ -361,37 +350,46 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       const assignee = proposal.assigneeAgentId ?? s.run.supervisorAgentId;
       if (!s.run.participantAgentIds.includes(assignee)) throw new Error('Unknown assignee.');
       const base = cursor(this.snapshot(ctx));
-      const action = validatePreparedRunnerAction(await executor.prepare(proposal.action), executor.id);
+      const prepared = await executor.prepare(proposal.action);
+      const action = this.deps.durableExecution
+        ? this.durable(() => this.deps.durableExecution!.validatePreparedAction(prepared, executor.id))
+        : validatePreparedRunnerAction(prepared, executor.id);
       const after = this.safePoint(ctx); if (after) return after;
       if (cursor(this.snapshot(ctx)) !== base) return this.decide(ctx);
       const budget = this.budget(ctx); if (budget) return this.block(ctx, `RUNNER_BUDGET_EXHAUSTED:${budget}`);
       const current = this.snapshot(ctx);
       if (Object.values(current.tasks).some(task => parseRunnerActionRef(task.inputRefs)?.actionId === action.actionId)) throw new Error('Action ID already used.');
       const sessionId = this.ids.nextId('session'); const taskId = this.ids.nextId('task'); const now = this.now(current);
-      this.deps.pendingActions.put({ workflowRunId: ctx.id, sessionId, taskId, action });
-      try {
-        this.append(ctx, 'SessionStarted', {
-          sessionId, workflowRunId: ctx.id, mode: 'map.coord.task.v1', participants: [...current.run.participantAgentIds],
-          initiator: current.run.supervisorAgentId, supervisor: current.run.supervisorAgentId, state: 'OPEN',
-          policyId: current.run.policyId, policyVersion: current.run.policyVersion, goal: action.publicSummary,
-          contextRef: `${RUNNER_SESSION_PREFIX}${ctx.key}`, createdAt: now, updatedAt: now,
-        }, sessionId);
-        this.append(ctx, 'TaskAssigned', {
-          taskId, workflowRunId: ctx.id, sessionId, title: action.publicSummary, goal: action.publicSummary,
-          assigneeAgentId: assignee, assignedByAgentId: current.run.supervisorAgentId,
-          inputRefs: [runnerActionRef(action)], status: 'ASSIGNED', createdAt: now, updatedAt: now,
-        }, sessionId);
-      } catch (error) {
+      const sessionEvent = createRunnerEvent(current, 'SessionStarted', {
+        sessionId, workflowRunId: ctx.id, mode: 'map.coord.task.v1', participants: [...current.run.participantAgentIds],
+        initiator: current.run.supervisorAgentId, supervisor: current.run.supervisorAgentId, state: 'OPEN',
+        policyId: current.run.policyId, policyVersion: current.run.policyVersion, goal: action.publicSummary,
+        contextRef: `${RUNNER_SESSION_PREFIX}${ctx.key}`, createdAt: now, updatedAt: now,
+      }, this.clock, this.ids, { sessionId });
+      const taskPayload = {
+        taskId, workflowRunId: ctx.id, sessionId, title: action.publicSummary, goal: action.publicSummary,
+        assigneeAgentId: assignee, assignedByAgentId: current.run.supervisorAgentId,
+        inputRefs: [runnerActionRef(action)], status: 'ASSIGNED', createdAt: now, updatedAt: now,
+      };
+      if (this.deps.durableExecution) {
+        const taskEvent = createRunnerEvent({ ...current, events: [...current.events, sessionEvent] }, 'TaskAssigned', taskPayload, this.clock, this.ids, { sessionId });
+        this.durable(() => this.deps.durableExecution!.registerAction({ workflowRunId: ctx.id, sessionId, taskId, action }, current, sessionEvent, taskEvent));
+      } else {
+        this.deps.pendingActions.put({ workflowRunId: ctx.id, sessionId, taskId, action });
         try {
-          this.cleanupFailedRegistration(ctx, sessionId, action.actionId);
-        } catch (cleanupError) {
-          // A stop/terminal race must respect Kernel guards; otherwise retain both errors.
-          if (this.snapshot(ctx).run.status === 'RUNNING') throw new RegistrationCleanupError(error, cleanupError);
+          this.deps.store.append(sessionEvent);
+          this.append(ctx, 'TaskAssigned', taskPayload, sessionId);
+        } catch (error) {
+          try { this.cleanupFailedRegistration(ctx, sessionId, action.actionId); }
+          catch (cleanupError) {
+            if (this.snapshot(ctx).run.status === 'RUNNING') throw new RegistrationCleanupError(error, cleanupError);
+          }
+          throw error;
         }
-        throw error;
       }
       return this.execute(ctx, this.snapshot(ctx).tasks[taskId], false);
     } catch (error) {
+      if (error instanceof DurableRunnerStop) throw error;
       const stopped = this.safePoint(ctx); if (stopped) return stopped;
       if (error instanceof ModelDispatchDeferred) return this.decide(ctx);
       this.progress(ctx, 'ERROR', 'Runner planning or preparation failed.');
@@ -403,21 +401,26 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
   }
   private async execute(ctx: RoundContext, task: CoordinationTask, continuation: boolean): Promise<RunnerRunResult> {
     const s = this.snapshot(ctx); const action = this.pendingAction(s, task);
-    if (!action) return this.failTask(ctx, task, 'RUNNER_PENDING_ACTION_UNAVAILABLE');
+    if (!action) {
+      if (this.deps.durableExecution) throw new DurableRunnerStop();
+      return this.failTask(ctx, task, 'RUNNER_PENDING_ACTION_UNAVAILABLE');
+    }
     const risk = evaluateRunnerActionRisk(s, action);
     if (risk === 'DENY') return this.failTask(ctx, task, `POLICY_DENY:${action.actionClass}`, 'NO_PROGRESS');
     if (risk === 'NEEDS_USER') {
       const approval = runnerPendingApproval(ctx.id, action);
-      const resume = [...s.events].reverse().find(event => event.type === 'WorkflowResumed');
-      const block = [...s.events].reverse().find(event => event.type === 'WorkflowBlocked'
-        && (event.payload as { reason?: string }).reason === `RUNNER_NEEDS_USER:${approval.approvalRef}`);
-      const auth = (resume?.payload as WorkflowResumePayload | undefined)?.authorization;
-      if (!continuation || !block || !resume || resume.sequence <= block.sequence || auth?.type !== 'user' || auth.reference !== approval.approvalRef) {
+      if (!continuation || !runnerActionApproved(s, action)) {
         return this.block(ctx, `RUNNER_NEEDS_USER:${approval.approvalRef}`, approval);
       }
     }
     const executor = this.deps.executors.get(action.executorId);
     if (!executor || executor.id !== action.executorId) return this.failTask(ctx, task, 'RUNNER_EXECUTOR_UNAVAILABLE');
+    if (this.deps.durableExecution) {
+      let result: RunnerExecutionResult;
+      try { result = await this.deps.durableExecution.dispatch(ctx.id, task, ctx.signal); }
+      catch { throw new DurableRunnerStop(); }
+      return this.collect(ctx, task, result);
+    }
     // Consume before crossing the external boundary. Even a throwing executor must not be retried.
     this.deps.pendingActions.delete(ctx.id, action.actionId);
     let result: RunnerExecutionResult;
@@ -436,7 +439,8 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
   }
   private async collect(ctx: RoundContext, task: CoordinationTask, result: RunnerExecutionResult): Promise<RunnerRunResult> {
     if (result.status === 'uncertain' && this.taskWritable(ctx, task)) {
-      this.append(ctx, 'TaskFailed', { taskId: task.taskId, failureReason: 'EXECUTION_UNCERTAIN' }, task.sessionId);
+      if (this.deps.durableExecution) this.durable(() => this.deps.durableExecution!.finalizeResult(ctx.id, task));
+      else this.append(ctx, 'TaskFailed', { taskId: task.taskId, failureReason: 'EXECUTION_UNCERTAIN' }, task.sessionId);
       this.close(ctx, task, 'ERROR');
       return this.block(ctx, `RUNNER_EXECUTION_UNCERTAIN:${parseRunnerActionRef(task.inputRefs)?.actionId ?? task.taskId}`);
     }
@@ -451,9 +455,14 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
         return this.collect(ctx, task, result);
       }
       const reason = formatSecurityHoldReason({ reviewRef: result.safetyHold.reviewRef, effectState: result.safetyHold.effectState });
-      this.append(ctx, 'TaskFailed', { taskId: task.taskId, failureReason: reason }, task.sessionId);
+      if (this.deps.durableExecution) this.durable(() => this.deps.durableExecution!.finalizeResult(ctx.id, task));
+      else this.append(ctx, 'TaskFailed', { taskId: task.taskId, failureReason: reason }, task.sessionId);
       this.close(ctx, task, 'ERROR');
       return this.block(ctx, reason);
+    }
+    if (this.deps.durableExecution) {
+      this.durable(() => this.deps.durableExecution!.finalizeResult(ctx.id, task));
+      return this.verify(ctx, this.snapshot(ctx).tasks[task.taskId]);
     }
     try {
       // Raw summaries stay in evidence storage. The journal receives opaque references only.
@@ -488,7 +497,9 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
         let item;
         // Classify only the storage boundary and minimum structure, never provider failures.
         try {
-          item = await this.deps.evidenceStore.get(ref);
+          item = this.deps.durableExecution
+            ? await this.deps.durableExecution.getOwnedEvidence(ctx.id, task, ref)
+            : await this.deps.evidenceStore.get(ref);
           if (!item || typeof item !== 'object' || Array.isArray(item)
             || typeof item.kind !== 'string' || !item.kind.trim()
             || !Object.prototype.hasOwnProperty.call(item, 'content')

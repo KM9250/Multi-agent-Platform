@@ -755,3 +755,16 @@ Restoring a RUNNING Workflow does not start the Runner or recover external
 operations. Pending Action/Evidence/Execution Ledger (5B), leases and Recovery
 Manager (5C), and the durable notification outbox (5D) are explicitly deferred.
 The COORD-4C in-memory outbox is not atomic with the durable Journal in 5A.
+
+
+## COORD-5B: durable Action execution
+
+The Node-only durable entry point now supplies atomic Action/Session/Task
+registration, at-most-once dispatch reservations, persistent Results/Evidence,
+and atomic Journal result reflection. Durable Store construction requires its
+matching Execution Coordinator and stores; missing persistence fails closed.
+Existing InMemory execution remains supported. See the
+[durable execution guide](coordination-durable-execution.md) for server wiring,
+Review compatibility, migration v2 and real process crash tests. Restoring a
+RUNNING Workflow never starts execution; automatic recovery and fencing remain
+COORD-5C work. MACP and notification packet/ID contracts are unchanged.

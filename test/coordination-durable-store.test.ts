@@ -4,7 +4,7 @@ import type { TestContext } from 'node:test';
 import { join } from 'node:path';
 import { statSync } from 'node:fs';
 import { fixture, fresh, event, history, saveHistory, plain, usage } from './durable-fixture.ts';
-import { DurableDatabase, SqliteCoordinationRunnerStore } from '../services/coordination/durable/index.ts';
+import { DurableDatabase, SqliteCoordinationRunnerStore, DurableExecutionCoordinator, createDurableCoordinationRunner } from '../services/coordination/durable/index.ts';
 import type { DurableTransaction } from '../services/coordination/durable/index.ts';
 import { createCoordinationRunner, projectCoordinationNotifications } from '../services/coordination/index.ts';
 import { browserFixture } from './browser-fixture.ts';
@@ -13,8 +13,8 @@ test('seed and original creation identity survive a fresh connection; repeated i
   const seed = fresh(); seed.events[0].eventId = 'custom-creation'; seed.events[0].idempotencyKey = 'creation';
   const f = fixture(t, seed); f.db.close();
   const reopened = f.open(); assert.deepEqual(reopened.store.getSnapshot('run'), seed);
-  assert.equal(f.raw().prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, 1);
-  assert.equal(f.raw().prepare('PRAGMA user_version').get()!.user_version, 1);
+  assert.equal(f.raw().prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, 2);
+  assert.equal(f.raw().prepare('PRAGMA user_version').get()!.user_version, 2);
 });
 test('all projections, usage/progress and terminal commitment equal Kernel replay', t => {
   const f = fixture(t), expected = history(); saveHistory(f.store, expected); f.db.close();
@@ -212,7 +212,13 @@ test('connection settings, private files, backup including WAL and configuration
 });
 test('actual Browser Runner accepts synchronous durable store; reads never auto-start actions', async t => {
   const browser = browserFixture(), f = fixture(t, browser.get());
-  const runner = createCoordinationRunner({ ...browser.deps, store: f.store });
+  const coordinator = new DurableExecutionCoordinator(f.store, browser.deps.executors, { clock: browser.deps.clock });
+  // Bind Browser writes to the Coordinator's trusted async Evidence scope.
+  const { createBrowserPocExecutor } = await import('../services/coordination/runner/browser/browserExecutor.ts');
+  const executor = createBrowserPocExecutor({ driver: browser.driver, evidenceStore: coordinator.evidenceStore, clock: browser.deps.clock });
+  const execute = executor.execute; executor.execute = async (...args) => { browser.calls.execute++; return execute(...args); };
+  browser.deps.executors.get = id => id === 'browser' ? executor : undefined;
+  const runner = createDurableCoordinationRunner({ coordinator, supervisorProvider: browser.deps.supervisorProvider, clock: browser.deps.clock, ids: browser.deps.ids });
   assert.equal((await runner.runOneRound('run')).reason, 'round_completed');
   assert.equal(browser.calls.execute, 1);
   const before = { ...browser.calls }, snapshot = f.store.getSnapshot('run'); f.db.close();

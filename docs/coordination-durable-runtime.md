@@ -1,5 +1,10 @@
 # Durable coordination foundation (COORD-5A)
 
+The current additive COORD-5B migration advances the database schema to 2 while
+retaining the version-1 Seed/Journal/Checkpoint payloads described here. See
+[durable execution](coordination-durable-execution.md) for mandatory Coordinator
+wiring: a durable Store alone is no longer a valid Runner execution setup.
+
 This Node-only module saves a Workflow seed and committed Journal in SQLite and
 restores a validated Kernel projection after restart. It does **not** recover
 external actions or start a Runner. A restored `RUNNING` status is historical
@@ -241,7 +246,9 @@ CI; Linux test success is not presented as Windows execution evidence.
 
 ## Follow-on boundaries
 
-COORD-5B adds Pending Action, Execution Ledger and Evidence persistence.
+COORD-5B adds Pending Action, Execution Ledger, Result and Evidence persistence;
+its explicit server Runner setup and safety stops are documented in
+[durable execution](coordination-durable-execution.md).
 COORD-5C adds leases/fencing, Recovery Manager, budget reservations and explicit
 safe resumption rules. COORD-5D adds a durable notification outbox and recovery
 delivery using the shared transaction owner. The current COORD-4C in-memory

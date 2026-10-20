@@ -8,7 +8,7 @@ import { findCheckpoint, writeCheckpoint } from './checkpoint';
 import type { WorkflowCheckpoint } from './checkpoint';
 import { canonicalJson, digest, DurableStoreError, guarded, jsonCopy, requireIntegrity } from './integrity';
 import { nextAnchor, readJournal, validateSeed } from './restore';
-import { SCHEMA_VERSION } from './schema';
+import { JOURNAL_SCHEMA_VERSION } from './schema';
 
 export interface DurableCoordinationAdministration {
   createWorkflow(snapshot: CoordinationSnapshot): void;
@@ -25,13 +25,14 @@ function insertEvent(tx: DurableTransaction, event: CoordinationEvent): void {
 
 /** Server-only persistence. Construction/restore never creates or invokes a Runner. */
 export class SqliteCoordinationRunnerStore implements CoordinationRunnerStore, DurableCoordinationAdministration {
-  constructor(private readonly database: DurableDatabase) {}
+  readonly persistence = 'durable' as const;
+  constructor(readonly database: DurableDatabase) {}
   createWorkflow(input: CoordinationSnapshot): void {
     const seed = validateSeed(input);
     this.database.write(tx => {
       const id = seed.run.runId;
       if (tx.get('SELECT workflow_run_id FROM workflow_seeds WHERE workflow_run_id = ?', id)) throw new DurableStoreError('WORKFLOW_EXISTS');
-      tx.run('INSERT INTO workflow_seeds VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', id, SCHEMA_VERSION,
+      tx.run('INSERT INTO workflow_seeds VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', id, JOURNAL_SCHEMA_VERSION,
         canonicalJson(seed), canonicalJson(seed.policy), digest(seed), digest(seed.policy), seed.run.createdAt,
         1, nextAnchor('', seed.events[0]));
       insertEvent(tx, seed.events[0]);
