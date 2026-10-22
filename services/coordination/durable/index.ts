@@ -14,3 +14,7 @@ export type { EvidenceOwner } from './evidenceStore';
 export type { DurableExecutionState, DurableExecutionInspection } from './executionLedger';
 export { EXECUTION_LIMITS } from './executionIntegrity';
 export type { DurableSecretReference } from './executionIntegrity';
+export { RecoveryReader } from './recoveryReader';
+export { RecoveryAuditReader } from './recoveryTimeline';
+export type { RecoveryDisposition, RecoveryNextStep, RecoveryInspection, ExecutionStateSummary,
+  RecoveryAuthorizationRequirement, TimelineQueryOptions, WorkflowTimelineEntry, WorkflowTimelinePage } from './recoveryTypes';

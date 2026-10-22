@@ -29,6 +29,8 @@ export function readExecution(tx: DurableTransaction, record: RunnerPendingActio
     ? ['EXECUTION_UNCERTAIN','SECURITY_REVIEW_REQUIRED','RESULT_INTEGRITY_UNAVAILABLE'].includes(String(row.review_reason))
     : row.review_reason === null);
   requireIntegrity(row.state !== 'FINALIZED' || typeof row.finalized_event_id === 'string');
+  requireIntegrity(row.state !== 'RESULT_RECORDED' || row.finalized_event_id === null);
+  requireIntegrity(typeof row.updated_at === 'number' && Number.isFinite(row.updated_at) && row.updated_at >= 0);
   requireIntegrity(!['PREPARED','DISPATCH_RESERVED'].includes(String(row.state)) || (row.result_ref === null && row.finalized_event_id === null));
   return row;
 }

@@ -6,7 +6,7 @@ import { validatePreparedRunnerAction, validateRunnerExecution } from '../runner
 import { createRunnerEvent } from '../runner/eventFactory';
 import { evaluateRunnerActionRisk, parseRunnerActionRef } from '../runner/policyGuard';
 import { runnerActionApproved, runnerEvidenceReviewReason, runnerSecurityReviewReason } from '../runner/dispatchGuard';
-import { formatSecurityHoldReason, parseSecurityReviewRef } from '../runner/securityHold';
+import { parseSecurityReviewRef } from '../runner/securityHold';
 import { SqliteCoordinationRunnerStore } from './durableCoordinationStore';
 import type { DurableTransaction } from './db';
 import { SqliteRunnerPendingActionStore, validateAction, validateActionOwner } from './pendingActionStore';
@@ -15,8 +15,9 @@ import type { EvidenceOwner } from './evidenceStore';
 import { readExecution } from './executionLedger';
 import type { DurableExecutionInspection, DurableExecutionState } from './executionLedger';
 import { canonicalJson, digest, DurableStoreError, guarded, requireIntegrity } from './integrity';
-import { EXECUTION_LIMITS, executionJson, parseExecutionJson, rejectEmbeddedCredentials } from './executionIntegrity';
+import { EXECUTION_LIMITS, executionJson, rejectEmbeddedCredentials } from './executionIntegrity';
 import { readJournal } from './restore';
+import { readExecutionResult, recordedResultEvent, validateExecutionEvidence, inspectUncertainStop } from './executionReader';
 
 export class DurableExecutionCoordinator implements RunnerDurableExecution {
   readonly pendingActions: SqliteRunnerPendingActionStore;
@@ -155,12 +156,6 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
       }
     });
   }
-  private validateEvidence(tx: DurableTransaction, r: RunnerPendingActionRecord, result: RunnerExecutionResult): void {
-    requireIntegrity(!!result.resultRef);
-    for (const ref of new Set([result.resultRef!, ...(result.evidenceRefs ?? [])])) {
-      requireIntegrity(this.evidenceStore.getOwnedInTransaction(tx, this.owner(r), ref));
-    }
-  }
   recordResult(id: string, task: CoordinationTask, attemptId: string, input: RunnerExecutionResult): RunnerExecutionResult {
     executionJson(input, EXECUTION_LIMITS.result);
     const result = guarded('INTEGRITY_ERROR', () => validateRunnerExecution(input));
@@ -173,7 +168,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
       const r = this.record(tx, id, task), row = readExecution(tx, r);
       validateActionOwner(readJournal(tx, id).snapshot, r);
       requireIntegrity(row.state === 'DISPATCH_RESERVED' && row.attempt_id === attemptId && row.result_ref === null);
-      this.validateEvidence(tx, r, result);
+      validateExecutionEvidence(tx, r, result, this.evidenceStore);
       const json = executionJson(result, EXECUTION_LIMITS.result), resultDigest = digest(result), ref = `map.runner.result.v1:${randomUUID()}`;
       const review = result.status === 'uncertain' || !!result.safetyHold;
       tx.run('INSERT INTO execution_results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)', ref, id, r.sessionId, r.taskId,
@@ -190,48 +185,19 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
       tx.run("UPDATE execution_ledger SET state = 'REVIEW_REQUIRED', review_reason = ?, updated_at = ? WHERE workflow_run_id = ? AND action_id = ?", reason, this.now(), id, r.action.actionId);
     });
   }
-  private resultInTransaction(tx: DurableTransaction, r: RunnerPendingActionRecord): RunnerExecutionResult | undefined {
-    const row = readExecution(tx, r);
-    if (!row.result_ref) return;
-    const saved = tx.get('SELECT * FROM execution_results WHERE result_ref = ?', row.result_ref);
-    requireIntegrity(saved && saved.workflow_run_id === r.workflowRunId && saved.session_id === r.sessionId && saved.task_id === r.taskId
-      && saved.action_id === r.action.actionId && saved.fingerprint === r.action.fingerprint && saved.executor_id === r.action.executorId
-      && saved.attempt_id === row.attempt_id && saved.schema_version === 1);
-    const parsed = parseExecutionJson<RunnerExecutionResult>(saved.result_json, EXECUTION_LIMITS.result);
-    const result = guarded('INTEGRITY_ERROR', () => validateRunnerExecution(parsed));
-    requireIntegrity(canonicalJson(result) === canonicalJson(parsed) && saved.result_digest === digest(result) && row.result_digest === saved.result_digest);
-    requireIntegrity(row.state === 'REVIEW_REQUIRED' ? result.status === 'uncertain' || !!result.safetyHold
-      : ['RESULT_RECORDED','FINALIZED'].includes(String(row.state)) && ['succeeded','failed'].includes(result.status) && !result.safetyHold);
-    this.validateEvidence(tx, r, result);
-    return result;
-  }
   getResult(id: string, task: CoordinationTask): RunnerExecutionResult | undefined {
     return this.store.database.read(tx => {
       const r = this.record(tx, id, task); validateActionOwner(readJournal(tx, id).snapshot, r);
-      const row = readExecution(tx, r), result = this.resultInTransaction(tx, r);
+      const row = readExecution(tx, r), result = readExecutionResult(tx, r, this.evidenceStore);
       if (!result && row.state !== 'PREPARED') throw new DurableStoreError('EXECUTION_REVIEW_REQUIRED');
       return result;
     });
   }
-  private resultEvent(s: CoordinationSnapshot, r: RunnerPendingActionRecord, result: RunnerExecutionResult): CoordinationEvent {
-    const task = s.tasks[r.taskId];
-    const failureReason = result.status === 'uncertain' ? 'EXECUTION_UNCERTAIN'
-      : result.safetyHold ? formatSecurityHoldReason({ reviewRef: result.safetyHold.reviewRef, effectState: result.safetyHold.effectState }) : 'RUNNER_EXECUTION_FAILED';
-    const success = result.status === 'succeeded' && !result.safetyHold;
-    return createRunnerEvent(s, success ? 'TaskCompleted' : 'TaskFailed', success
-      ? { taskId: r.taskId, resultRef: result.resultRef, evidenceRefs: result.evidenceRefs }
-      : { taskId: r.taskId, failureReason, ...(!result.safetyHold && result.status !== 'uncertain'
-        ? { evidenceRefs: [...new Set([result.resultRef!, ...(result.evidenceRefs ?? [])])] } : {}) }, this.clock,
-      { nextId: () => `durable-result-${digest([r.workflowRunId, r.action.actionId])}` }, {
-        sessionId: r.sessionId, actorAgentId: success ? task.assigneeAgentId : s.run.supervisorAgentId,
-        idempotencyKey: `durable-result:${digest([r.workflowRunId, r.action.actionId])}`,
-      });
-  }
   finalizeResult(id: string, task: CoordinationTask): void {
     this.store.database.write(tx => {
       const s = readJournal(tx, id).snapshot, r = this.record(tx, id, task); validateActionOwner(s, r);
-      const row = readExecution(tx, r), result = this.resultInTransaction(tx, r); requireIntegrity(result);
-      const event = this.resultEvent(s, r, result);
+      const row = readExecution(tx, r), result = readExecutionResult(tx, r, this.evidenceStore); requireIntegrity(result);
+      const event = recordedResultEvent(s, r, result, this.clock);
       if (row.finalized_event_id) {
         const existing = s.events.find(e => e.eventId === row.finalized_event_id);
         requireIntegrity(existing && existing.eventId === event.eventId && existing.type === event.type && existing.sessionId === event.sessionId
@@ -257,47 +223,12 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
       if (!rows.length) return;
       const r = this.pendingActions.getInTransaction(tx, id, String(rows[0].action_id)); requireIntegrity(r);
       validateActionOwner(s, r);
-      const row = readExecution(tx, r), result = this.resultInTransaction(tx, r);
+      const row = readExecution(tx, r), result = readExecutionResult(tx, r, this.evidenceStore);
       requireIntegrity(result?.status === 'uncertain' && !result.safetyHold);
-      const task = s.tasks[r.taskId], session = s.sessions[r.sessionId];
-      // A Result not yet reflected into TaskFailed follows the existing finalizeResult path.
-      if (!row.finalized_event_id) { requireIntegrity(task.status === 'ASSIGNED'); return; }
-      const expected = this.resultEvent(s, r, result);
-      const failed = s.events.find(e => e.eventId === row.finalized_event_id);
-      requireIntegrity(failed && failed.eventId === expected.eventId && failed.type === 'TaskFailed'
-        && failed.sessionId === r.sessionId && failed.actorAgentId === expected.actorAgentId
-        && failed.idempotencyKey === expected.idempotencyKey && canonicalJson(failed.payload) === canonicalJson(expected.payload)
-        && task.status === 'FAILED' && task.failureReason === 'EXECUTION_UNCERTAIN');
-      const prefix = 'map.runner.v1:', context = session.contextRef;
-      requireIntegrity(context?.startsWith(prefix) && !!context.slice(prefix.length).trim());
-      const saved = tx.get('SELECT round_key FROM pending_actions WHERE workflow_run_id = ? AND action_id = ?', id, r.action.actionId);
-      requireIntegrity(saved?.round_key === context && Object.values(s.sessions).filter(item => item.contextRef === context).length === 1
-        && Object.values(s.tasks).filter(item => item.sessionId === r.sessionId).length === 1
-        && Object.values(s.sessions).every(item => !['OPEN','SUSPENDED'].includes(item.state) || item.sessionId === r.sessionId));
-      const roundKey = context.slice(prefix.length), key = `runner:${id}:${roundKey}`;
-      const resolveKey = `${key}:resolve`, progressKey = `${key}:progress`;
-      const reason = `RUNNER_EXECUTION_UNCERTAIN:${r.action.actionId}`, blockKey = `${key}:execution-uncertain-block:${r.action.actionId}`;
-      const resolutions = s.events.filter(e => e.type === 'SessionResolved' && e.sessionId === r.sessionId);
-      const blocks = s.events.filter(e => e.type === 'WorkflowBlocked' && (e.payload as { reason?: string }).reason === reason);
-      requireIntegrity(resolutions.length <= 1 && blocks.length <= 1);
-      let resolved = resolutions[0], progress = s.events.find(e => e.idempotencyKey === progressKey), block = blocks[0];
-      const matches = (event: CoordinationEvent, type: CoordinationEvent['type'], payload: unknown, sessionId?: string) =>
-        event.workflowRunId === id && event.type === type && event.sessionId === sessionId
-        && event.actorAgentId === s.run.supervisorAgentId && canonicalJson(event.payload) === canonicalJson(payload);
-      const resolvePayload = { outcome: 'FAILED' }, progressPayload = { outcome: 'ERROR', summary: 'Runner round error.' };
-      requireIntegrity(!s.events.some(e => e.idempotencyKey === resolveKey && e !== resolved)
-        && !s.events.some(e => e.idempotencyKey === blockKey && e !== block));
-      requireIntegrity(resolved
-        ? matches(resolved, 'SessionResolved', resolvePayload, r.sessionId) && resolved.idempotencyKey === resolveKey
-          && resolved.sequence > failed.sequence && session.state === 'RESOLVED' && session.resolution?.outcome === 'FAILED'
-        : session.state === 'OPEN');
-      if (progress) requireIntegrity(resolved && matches(progress, 'ProgressRecorded', progressPayload) && progress.sequence > resolved.sequence);
-      if (block) {
-        requireIntegrity(progress && matches(block, 'WorkflowBlocked', { reason }) && block.sequence > progress.sequence
-          && (!block.idempotencyKey || block.idempotencyKey === blockKey));
-        // A later user resume cannot resolve uncertainty or create another copy of this block.
-        return { reason, progressRecorded: false };
-      }
+      const prefix = inspectUncertainStop(tx, s, r, row, result, this.clock);
+      if (!prefix) return;
+      let { reason, resolved, progress, block, resolveKey, progressKey, blockKey, failed, resolvePayload, progressPayload } = prefix;
+      if (block) return { reason, progressRecorded: false };
       const append = (type: CoordinationEvent['type'], payload: unknown, idempotencyKey: string, sessionId?: string): CoordinationEvent => {
         const event = createRunnerEvent(s, type, payload, { now: () => this.now() },
           { nextId: () => `durable-uncertain-${digest([id, r.action.actionId, type])}` }, { sessionId, idempotencyKey });
@@ -326,7 +257,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
     return this.store.database.read(tx => {
       const r = this.pendingActions.getInTransaction(tx, id, actionId); if (!r) return;
       const s = readJournal(tx, id).snapshot; validateActionOwner(s, r);
-      const row = readExecution(tx, r), result = this.resultInTransaction(tx, r);
+      const row = readExecution(tx, r), result = readExecutionResult(tx, r, this.evidenceStore);
       return { taskStatus: s.tasks[r.taskId].status, workflowStatus: s.run.status, sessionState: s.sessions[r.sessionId].state,
         roundKey: s.sessions[r.sessionId].contextRef!, journalCursor: s.events.at(-1)!.sequence, ...this.owner(r), fingerprint: r.action.fingerprint, executorId: r.action.executorId,
         state: row.state as DurableExecutionState, attemptId: row.attempt_id as string ?? undefined,

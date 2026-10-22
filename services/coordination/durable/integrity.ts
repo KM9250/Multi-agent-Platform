@@ -15,6 +15,8 @@ export function requireIntegrity(condition: unknown): asserts condition {
 export function guarded<T>(code: DurableErrorCode, fn: () => T): T {
   try { return fn(); } catch (error) {
     if (error instanceof DurableStoreError) throw error;
+    const errno = (error as { errcode?: number })?.errcode;
+    if (typeof errno === 'number') throw new DurableStoreError([5, 6].includes(errno & 255) ? 'DATABASE_BUSY' : 'DATABASE_ERROR');
     throw new DurableStoreError(code);
   }
 }
