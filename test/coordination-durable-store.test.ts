@@ -13,8 +13,8 @@ test('seed and original creation identity survive a fresh connection; repeated i
   const seed = fresh(); seed.events[0].eventId = 'custom-creation'; seed.events[0].idempotencyKey = 'creation';
   const f = fixture(t, seed); f.db.close();
   const reopened = f.open(); assert.deepEqual(reopened.store.getSnapshot('run'), seed);
-  assert.equal(f.raw().prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, 2);
-  assert.equal(f.raw().prepare('PRAGMA user_version').get()!.user_version, 2);
+  assert.equal(f.raw().prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, 3);
+  assert.equal(f.raw().prepare('PRAGMA user_version').get()!.user_version, 3);
 });
 test('all projections, usage/progress and terminal commitment equal Kernel replay', t => {
   const f = fixture(t), expected = history(); saveHistory(f.store, expected); f.db.close();

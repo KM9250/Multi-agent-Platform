@@ -43,16 +43,18 @@ export class SqliteCoordinationRunnerStore implements CoordinationRunnerStore, D
   }
   getSnapshot(id: string): CoordinationSnapshot { return this.restoreWorkflow(id); }
   restoreWorkflow(id: string): CoordinationSnapshot {
-    return this.database.read(tx => {
-      const journal = readJournal(tx, id);
-      const checkpoint = findCheckpoint(tx, journal);
-      if (!checkpoint) return journal.snapshot;
-      let state = checkpoint.snapshot;
-      for (const event of journal.events.slice(checkpoint.lastSequence)) state = guarded('INTEGRITY_ERROR', () => appendEvent(state, event));
-      guarded('INTEGRITY_ERROR', () => validateCoordinationSnapshot(state));
-      requireIntegrity(canonicalJson(state) === canonicalJson(journal.snapshot));
-      return state;
-    });
+    return this.database.read(tx => this.restoreWorkflowInTransaction(tx, id));
+  }
+  restoreWorkflowInTransaction(tx: DurableTransaction, id: string): CoordinationSnapshot {
+    this.database.assertTransaction(tx);
+    const journal = readJournal(tx, id);
+    const checkpoint = findCheckpoint(tx, journal);
+    if (!checkpoint) return journal.snapshot;
+    let state = checkpoint.snapshot;
+    for (const event of journal.events.slice(checkpoint.lastSequence)) state = guarded('INTEGRITY_ERROR', () => appendEvent(state, event));
+    guarded('INTEGRITY_ERROR', () => validateCoordinationSnapshot(state));
+    requireIntegrity(canonicalJson(state) === canonicalJson(journal.snapshot));
+    return state;
   }
   append(event: CoordinationEvent): CoordinationSnapshot {
     return this.database.write(tx => this.appendInTransaction(tx, event));

@@ -29,8 +29,8 @@ for (const fail of [false,true]) test(`real v1 database migration ${fail?'rolls 
   }
   const db=new DurableDatabase({path});t.after(()=>db.close());const store=new SqliteCoordinationRunnerStore(db);
   assert.deepEqual(store.getSnapshot('run'),f.snapshot());assert.ok(store.loadCheckpoint('run'));
-  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,2);assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n,2);
+  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,3);assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n,3);
   for(const table of Object.keys(before))assert.deepEqual(raw.prepare(`SELECT * FROM ${table}`).all(),before[table]);
   for(const table of ['pending_actions','execution_ledger','execution_results','runner_evidence'])assert.equal(raw.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n,0);
-  db.close();const again=new DurableDatabase({path});again.close();assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n,2);
+  db.close();const again=new DurableDatabase({path});again.close();assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n,3);
 });

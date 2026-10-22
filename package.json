@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "test:macp": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/integration/coordination-macp.integration.ts",
     "test:durable": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/coordination-durable-*.test.ts test/coordination-checkpoint.test.ts test/coordination-execution-*.test.ts",
-    "test:durable-execution": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/coordination-durable-actions.test.ts test/coordination-durable-evidence.test.ts test/coordination-durable-execution.test.ts test/coordination-execution-*.test.ts test/coordination-durable-migration.test.ts test/coordination-durable-browser.test.ts"
+    "test:durable-execution": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/coordination-durable-actions.test.ts test/coordination-durable-evidence.test.ts test/coordination-durable-execution.test.ts test/coordination-execution-*.test.ts test/coordination-durable-migration.test.ts test/coordination-durable-browser.test.ts",
+    "test:recovery-reader": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/coordination-recovery-*.test.ts"
   },
   "dependencies": {
     "@google/genai": "^1.30.0",

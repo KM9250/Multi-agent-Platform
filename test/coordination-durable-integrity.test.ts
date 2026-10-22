@@ -44,7 +44,8 @@ test('invalid Journal JSON and mismatched event digest fail safely', t => {
 });
 test('missing middle sequence and missing seed creation are refused', t => {
   const f = fixture(t), second = f.store.append(usage(fresh())); f.store.append(usage(second, 'later'));
-  const raw = f.raw(); raw.exec('DROP TRIGGER journal_no_delete; DELETE FROM journal_events WHERE sequence=2');
+  // Deliberate tampering must also bypass the additive audit reference foreign keys.
+  const raw = f.raw(); raw.exec('PRAGMA foreign_keys=OFF; DROP TRIGGER journal_no_delete; DELETE FROM journal_events WHERE sequence=2');
   assert.throws(() => f.store.getSnapshot('run'), { code: 'INTEGRITY_ERROR' });
   raw.exec('DELETE FROM journal_events WHERE sequence=1');
   assert.throws(() => f.store.getSnapshot('run'), { code: 'INTEGRITY_ERROR' });
@@ -59,7 +60,7 @@ test('policy copy or seed tampering is detected without substitution', t => {
 test('future database/seed schemas and inconsistent migration ledgers are refused', t => {
   const f = fixture(t), raw = f.raw(); f.db.close();
   raw.exec('PRAGMA user_version=999'); assert.throws(() => f.open(), { code: 'SCHEMA_UNSUPPORTED' });
-  raw.exec('PRAGMA user_version=2'); raw.prepare('UPDATE schema_migrations SET migration_id=? WHERE schema_version=1').run('future');
+  raw.exec('PRAGMA user_version=3'); raw.prepare('UPDATE schema_migrations SET migration_id=? WHERE schema_version=1').run('future');
   assert.throws(() => f.open(), { code: 'INTEGRITY_ERROR' });
   raw.prepare('UPDATE schema_migrations SET migration_id=? WHERE schema_version=1').run('001_durable_coordination');
   raw.exec('DROP TRIGGER seed_immutable; UPDATE workflow_seeds SET schema_version=999');
