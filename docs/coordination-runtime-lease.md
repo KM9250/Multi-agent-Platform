@@ -57,6 +57,12 @@ A shorter configured TTL without a heartbeat override uses at most TTL/6.
 `renew()` returns the same frozen handle with updated `expiresAt` metadata.
 Serialized/cloned/spread DTOs cannot be used as handles. Original objects are
 registered in an unexported WeakMap with a random 256-bit capability digest.
+Handles also retain a private issuing-file identity (canonical real path plus
+filesystem device/file ID). It is checked before writes, assertions, renewal or
+release. Passing the original handle explicitly to `withLease()` or a Store on
+another connection to that same canonical physical DB remains supported. A
+backup/copy cannot inherit this authority, even if its persisted ACTIVE Lease
+row is identical; rejection on the copy does not revoke the source handle.
 Only the hash is persisted; neither the capability nor its hash is returned by
 Lease/inspection/timeline DTOs or written to Audit/ordinary logs.
 
@@ -102,8 +108,13 @@ so `INSERT OR REPLACE` cannot evade immutable history triggers.
 Immutable Seed identity, Journal, Action, Result, Evidence, Ledger deletion and
 Audit constraints remain. UPDATE fences check both OLD and NEW Workflow IDs.
 Bootstrap refuses any pre-existing seed, and cannot create Checkpoints, Actions,
-Results or Evidence. Reads, diagnostics, trusted migrations and SQLite backup
-remain separate from Workflow write authorization. Future recovery writers must
+Results or Evidence. Before COMMIT it revalidates the canonical Seed/Journal
+(digests, Workflow ownership, one creation event, cursor/anchor) and exactly one
+matching creation Audit (entity, event ID/sequence and actor/reference linkage).
+Calling `map_bootstrap()` only consumes SQL phase permissions; it cannot prove
+that artifacts exist or survived a caught SQL exception. Incomplete or mismatched
+Bootstrap artifacts roll back together. Reads, diagnostics, trusted migrations
+and SQLite backup remain separate from Workflow write authorization. Future recovery writers must
 use this same scope; no nonfenced compatibility fallback is provided.
 
 ## Dispatch, model calls and failure behavior
@@ -156,6 +167,8 @@ Ledger timeline entries. The boundary is protected within SQLite's integrity
 model; it does not defend against an administrator dropping triggers or replacing
 the database file.
 
+The three v4 Journal/Ledger audit triggers are explicitly defined in
+`leaseSchema.ts`; they are not produced by rewriting Migration 003 text.
 Migrations 001–003 are unchanged. DDL, boundary, migration ledger and `user_version`
 commit together. 0/1/2/3→4, v4 reopen, rollback, forced termination and future-schema
 refusal are tested. Existing Seed/Journal/Checkpoint/Action/Result/Evidence/Audit
@@ -196,7 +209,8 @@ test paths. Windows native execution remains unverified in this Linux environmen
 
 Use trusted local SQLite WAL storage on one host; mismatched clocks across hosts
 sharing a SQLite file are unsupported. A valid local handle may be deliberately
-shared with another connection in the same Runtime, but cannot be serialized to
+shared explicitly with another connection to the same canonical physical DB
+in the same Runtime, but cannot authorize a copied DB or be serialized to
 another process. Runtime code and database administration are trusted; this is
 not a sandbox against arbitrary code with driver/DDL or filesystem privileges.
 
@@ -209,7 +223,7 @@ outbox. COORD-5C-3 must add model call identity and budget accounting, decide ho
 record responses whose lease was lost, and retain these same fencing and explicit
 recovery-authorization boundaries.
 
-## Verification record (2026-10-25 JST)
+## Initial verification record (HEAD 6312e42, 2026-10-25 JST)
 
 Linux, Node.js v24.19.0, npm 11.9.0. All commands exited 0:
 
@@ -229,3 +243,27 @@ This Node test runner reports file-level totals for isolated tests. Direct
 per-file execution separately confirms 10 basic, 10 fencing, 9 migration and
 8 process cases, all passing. No tests were deleted or skipped. Windows native
 execution and Node 22 were not run in this environment.
+
+## PR #30 audit fixes (F-01 / F-02 / F-03)
+
+`coordination-lease-audit-fixes.test.ts` adds nine regression cases: phase-only
+Bootstrap with/without a Seed; a caught initial Journal/Audit statement failure
+after all SQL phases were consumed; inconsistent Seed, creation-event and Audit
+entity linkage; all handle authorization APIs against an ACTIVE-lease backup;
+explicit handle sharing across same-file connections; and the installed
+Journal/Ledger trigger metadata columns/values. Six F-01 cases and the F-02 copy
+case reproduced the original issues before the fixes. All nine pass afterward.
+The existing tests are retained. Schema stays 4; no automatic recovery, dispatch
+retry, COORD-5C-3 or COORD-5C-4 feature is added.
+
+Audit-fix validation on Linux / Node v24.19.0 / npm 11.9.0: `npm test` (41
+files), `test:durable` (11), `test:durable-execution` (7), `test:recovery-reader`
+(6), `test:runtime-lease` (5), typecheck, build and the diff check against main
+`7d6d254533e77267321d6de578aeb2f6a6ca383a` all pass. Direct per-file execution
+records 873/0/0 pass/fail/skip cases for the full suite, plus one existing
+assertion script that exits successfully without reporting case counts. The
+corresponding subset counts are 163, 111, 88 and 46 passes, all with zero
+fail/skip. The subsets overlap. Existing cases are retained without skip.
+Windows native execution remains unverified; extra test connections close before
+fixture directories are removed. Schema remains 4 and 5C-1 Reader/Audit contracts
+remain intact.

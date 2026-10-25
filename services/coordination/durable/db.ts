@@ -4,10 +4,12 @@ import { DATABASE_NOW_SQL } from './leaseSchema';
 import { DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_LEASE_TTL_MS, runtimeInstanceId } from './runtimeLease';
 import type { LeaseInspection, RuntimeLeaseManager, RuntimeLeaseOptions, WorkflowLease } from './runtimeLease';
 import type { SQLInputValue, SQLOutputValue } from 'node:sqlite';
-import { closeSync, chmodSync, existsSync, lstatSync, mkdirSync, openSync, statSync } from 'node:fs';
+import { closeSync, chmodSync, existsSync, lstatSync, mkdirSync, openSync, realpathSync, statSync } from 'node:fs';
 import { dirname, isAbsolute } from 'node:path';
 import { DurableStoreError, guarded, requireIntegrity } from './integrity';
 import { migrate } from './migrations';
+import { readJournal } from './restore';
+import { validateAuditRow } from './recoveryAudit';
 
 export type Row = Record<string, SQLOutputValue>;
 export interface DurableTransaction {
@@ -29,6 +31,7 @@ function protectPath(path: string): void {
 
 interface LeaseRecord {
   handle: WorkflowLease; capabilityHash: string; valid: boolean;
+  databaseIdentity: string;
   expiresAt: number; wall: number; monotonic: number;
 }
 // Neither a serialized DTO nor knowledge of owner/generation can populate this registry.
@@ -40,6 +43,7 @@ type WriteContext = { kind: 'lease'; record: LeaseRecord }
 /** One synchronous transaction owner. SQLite serializes writers across connections. */
 export class DurableDatabase {
   #db: DatabaseSync;
+  readonly #databaseIdentity: string;
   #context?: WriteContext;
   #fencingRejected = false;
   #active?: DurableTransaction;
@@ -50,6 +54,11 @@ export class DurableDatabase {
     if (!Number.isSafeInteger(timeout) || timeout < 0 || timeout > 60000) throw new DurableStoreError('INVALID_CONFIGURATION');
     this.#db = guarded('DATABASE_ERROR', () => { protectPath(options.path); return new DatabaseSync(options.path); });
     try {
+      // Process-local authority is tied to a canonical file, never to a copied DB row.
+      // File identity also distinguishes a replacement at the same path. These values
+      // are not persisted, so VACUUM INTO / filesystem copies cannot clone authority.
+      const file = statSync(options.path, { bigint: true });
+      this.#databaseIdentity = JSON.stringify([realpathSync.native(options.path), String(file.dev), String(file.ino)]);
       this.#db.exec(`PRAGMA busy_timeout=${timeout}; PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;`);
       requireIntegrity(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal');
       requireIntegrity(this.#db.prepare('PRAGMA synchronous').get()!.synchronous === 2);
@@ -102,7 +111,7 @@ export class DurableDatabase {
       if (result && typeof (result as { then?: unknown }).then === 'function') throw new DurableStoreError('INVALID_TRANSACTION');
       if (this.#fencingRejected) throw new DurableStoreError('LEASE_FENCED');
       if (context?.kind === 'lease') this.#assertLease(context.record);
-      if (context?.kind === 'bootstrap' && !(context.seed && context.journal && context.audit)) throw new DurableStoreError('LEASE_FENCED');
+      if (context?.kind === 'bootstrap') this.#assertBootstrap(tx, context);
       this.#db.exec('COMMIT'); begun = false;
       return result;
     } catch (error) {
@@ -124,7 +133,7 @@ export class DurableDatabase {
   /** Explicit scope, checked at entry, every SQL mutation (triggers), and before COMMIT. */
   writeWithLease<T>(lease: WorkflowLease | undefined, workflowRunId: string, fn: (tx: DurableTransaction) => T): T {
     const record = lease && leaseHandles.get(lease);
-    if (!record?.valid || lease!.workflowRunId !== workflowRunId) this.#fenced();
+    if (!record?.valid || record.databaseIdentity !== this.#databaseIdentity || lease!.workflowRunId !== workflowRunId) this.#fenced();
     try { return this.#transaction(true, fn, { kind: 'lease', record }); }
     catch (error) {
       if (error instanceof DurableStoreError && ['LEASE_FENCED','DATABASE_BUSY'].includes(error.code)) record.valid = false;
@@ -137,6 +146,29 @@ export class DurableDatabase {
       if (tx.get('SELECT workflow_run_id FROM workflow_seeds WHERE workflow_run_id = ?', workflowRunId)) throw new DurableStoreError('WORKFLOW_EXISTS');
       return fn(tx);
     }, { kind: 'bootstrap', workflowRunId, seed: false, journal: false, audit: false });
+  }
+  #assertBootstrap(tx: DurableTransaction, context: Extract<WriteContext, { kind: 'bootstrap' }>): void {
+    if (!(context.seed && context.journal && context.audit)) this.#fenced();
+    try {
+      // Reuse canonical Seed/Journal validation, including digests, ownership,
+      // creation-event equality, sequence/head and anchor. Phase calls alone
+      // provide no evidence that the corresponding SQL statements survived.
+      const journal = readJournal(tx, context.workflowRunId);
+      const creation = journal.events[0];
+      requireIntegrity(journal.events.length === 1 && creation.type === 'WorkflowRunCreated');
+      const audits = tx.all('SELECT * FROM runtime_audit_events WHERE workflow_run_id = ? ORDER BY audit_sequence LIMIT 2', context.workflowRunId);
+      requireIntegrity(audits.length === 1);
+      const audit = audits[0];
+      requireIntegrity(audit.event_kind === 'JOURNAL_APPENDED' && audit.entity_kind === 'WORKFLOW'
+        && audit.entity_id === context.workflowRunId && audit.journal_event_id === creation.eventId
+        && audit.journal_sequence === 1 && audit.session_id === null && audit.task_id === null
+        && audit.action_id === null && audit.attempt_id === null && audit.subject_agent_id === null
+        && audit.runtime_instance_id === null && audit.runtime_generation === null);
+      validateAuditRow(tx, audit);
+    } catch (error) {
+      if (error instanceof DurableStoreError && ['DATABASE_ERROR','DATABASE_BUSY'].includes(error.code)) throw error;
+      this.#fenced();
+    }
   }
   #fenced(): never {
     if (this.#active) this.#fencingRejected = true;
@@ -154,7 +186,7 @@ export class DurableDatabase {
   }
   #matches(record: LeaseRecord, row: Row | undefined, now: number): boolean {
     const handle = record.handle;
-    return record.valid && this.#clockValid(record, now) && !!row
+    return record.valid && record.databaseIdentity === this.#databaseIdentity && this.#clockValid(record, now) && !!row
       && row.workflow_run_id === handle.workflowRunId && row.owner_instance_id === handle.runtimeInstanceId
       && row.generation === handle.generation && row.lease_capability_hash === record.capabilityHash
       && row.lease_state === 'ACTIVE' && Number(row.expires_at) > now;
@@ -191,7 +223,7 @@ export class DurableDatabase {
       || !Number.isSafeInteger(interval) || interval < 1 || interval >= ttl) throw new DurableStoreError('INVALID_CONFIGURATION');
     const recordFor = (lease: WorkflowLease): LeaseRecord => {
       const record = leaseHandles.get(lease);
-      if (!record?.valid || lease.runtimeInstanceId !== runtimeInstanceId) throw new DurableStoreError('LEASE_FENCED');
+      if (!record?.valid || record.databaseIdentity !== this.#databaseIdentity || lease.runtimeInstanceId !== runtimeInstanceId) this.#fenced();
       return record;
     };
     const current = (lease: WorkflowLease) => {
@@ -234,7 +266,7 @@ export class DurableDatabase {
           return { workflowRunId, runtimeInstanceId, generation, acquiredAt: now, expiresAt: now + ttl };
         }, { kind: 'management', workflowRunId });
         // Registry insertion is deliberately AFTER acknowledged COMMIT. A lost response grants nothing.
-        const record: LeaseRecord = { handle: undefined!, capabilityHash, valid: true, expiresAt: metadata.expiresAt,
+        const record: LeaseRecord = { handle: undefined!, capabilityHash, valid: true, databaseIdentity: this.#databaseIdentity, expiresAt: metadata.expiresAt,
           wall: metadata.acquiredAt, monotonic: performance.now() };
         const handle = Object.freeze({ ...metadata, get expiresAt() { return record.expiresAt; } });
         record.handle = handle; leaseHandles.set(handle, record);

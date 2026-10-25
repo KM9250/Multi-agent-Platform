@@ -1,5 +1,3 @@
-import { RECOVERY_AUDIT_SQL } from './recoverySchema';
-
 export const DATABASE_NOW_SQL = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
 const fence = (workflow: string) => `EXISTS (SELECT 1 FROM runtime_leases AS lease
   WHERE lease.workflow_run_id = ${workflow} AND map_fence_valid(lease.workflow_run_id,
@@ -10,10 +8,54 @@ CREATE TRIGGER fence_${table}_${operation.toLowerCase()} BEFORE ${operation} ON 
 WHEN NOT (${fence(operation === 'DELETE' ? 'OLD.workflow_run_id' : 'NEW.workflow_run_id')}${operation === 'UPDATE' ? ` AND ${fence('OLD.workflow_run_id')}` : ''}${bootstrap ? ` OR (${bootstrap})` : ''})
 BEGIN SELECT RAISE(ABORT, 'LEASE_FENCED'); END;`;
 const bootstrap = (kind: string) => `map_bootstrap(NEW.workflow_run_id, '${kind}') = 1`;
-// Keep 003 byte-for-byte unchanged. Only future trigger-owned records get metadata.
-const auditTriggers = RECOVERY_AUDIT_SQL.slice(RECOVERY_AUDIT_SQL.indexOf('CREATE TRIGGER journal_audit_insert'))
-  .replaceAll('occurred_at, recorded_at, schema_version', 'occurred_at, recorded_at, schema_version, runtime_instance_id, runtime_generation')
-  .replaceAll(', 1);', ', 1, map_runtime_id(), map_runtime_generation());');
+// Explicit v4 definitions. Migration 003 remains unchanged; no text rewriting
+// couples its legacy trigger body to the fenced Runtime metadata contract.
+const subjectAgent = `(SELECT json_extract(payload, '$.payload.assigneeAgentId') FROM journal_events
+  WHERE workflow_run_id = NEW.workflow_run_id AND event_type = 'TaskAssigned'
+    AND json_extract(payload, '$.payload.taskId') = NEW.task_id ORDER BY sequence DESC LIMIT 1)`;
+const ledgerColumns = `audit_event_id, workflow_run_id, event_kind, entity_kind, entity_id,
+  session_id, task_id, action_id, attempt_id, subject_agent_id, previous_state, next_state,
+  reason_code, journal_event_id, journal_sequence, occurred_at, recorded_at, schema_version,
+  runtime_instance_id, runtime_generation`;
+const ledgerValues = (previous: 'NULL' | 'OLD.state') => `lower(hex(randomblob(16))), NEW.workflow_run_id,
+  'EXECUTION_CHANGED', 'ACTION', NEW.action_id, NEW.session_id, NEW.task_id, NEW.action_id,
+  NEW.attempt_id, ${subjectAgent}, ${previous}, NEW.state, NEW.review_reason,
+  NEW.finalized_event_id, (SELECT sequence FROM journal_events WHERE workflow_run_id = NEW.workflow_run_id
+    AND event_id = NEW.finalized_event_id), NEW.updated_at, ${DATABASE_NOW_SQL}, 1,
+  map_runtime_id(), map_runtime_generation()`;
+const auditTriggers = `
+CREATE TRIGGER journal_audit_insert AFTER INSERT ON journal_events BEGIN
+  INSERT INTO runtime_audit_events (audit_event_id, workflow_run_id, event_kind, entity_kind, entity_id,
+    session_id, task_id, actor_agent_id, subject_agent_id, journal_event_id, journal_sequence,
+    occurred_at, recorded_at, schema_version, runtime_instance_id, runtime_generation)
+  VALUES (lower(hex(randomblob(16))), NEW.workflow_run_id, 'JOURNAL_APPENDED',
+    CASE WHEN NEW.event_type IN ('TaskAssigned','TaskCompleted','TaskFailed','TaskCancelled') THEN 'TASK'
+      WHEN NEW.session_id IS NOT NULL THEN 'SESSION' ELSE 'WORKFLOW' END,
+    CASE WHEN NEW.event_type IN ('TaskAssigned','TaskCompleted','TaskFailed','TaskCancelled')
+      THEN json_extract(NEW.payload, '$.payload.taskId') ELSE coalesce(NEW.session_id, NEW.workflow_run_id) END,
+    NEW.session_id,
+    CASE WHEN NEW.event_type IN ('TaskAssigned','TaskCompleted','TaskFailed','TaskCancelled')
+      THEN json_extract(NEW.payload, '$.payload.taskId') END,
+    NEW.actor_agent_id,
+    CASE WHEN NEW.event_type IN ('TaskAssigned','TaskCompleted','TaskFailed','TaskCancelled') THEN
+      (SELECT json_extract(payload, '$.payload.assigneeAgentId') FROM journal_events
+        WHERE workflow_run_id = NEW.workflow_run_id AND event_type = 'TaskAssigned'
+          AND json_extract(payload, '$.payload.taskId') = json_extract(NEW.payload, '$.payload.taskId')
+        ORDER BY sequence DESC LIMIT 1) END,
+    NEW.event_id, NEW.sequence, NEW.event_timestamp, ${DATABASE_NOW_SQL}, 1,
+    map_runtime_id(), map_runtime_generation());
+END;
+CREATE TRIGGER ledger_audit_insert AFTER INSERT ON execution_ledger BEGIN
+  INSERT INTO runtime_audit_events (${ledgerColumns}) VALUES (${ledgerValues('NULL')});
+END;
+CREATE TRIGGER ledger_audit_update AFTER UPDATE ON execution_ledger WHEN
+  NEW.state IS NOT OLD.state OR NEW.review_reason IS NOT OLD.review_reason OR
+  NEW.result_ref IS NOT OLD.result_ref OR NEW.result_digest IS NOT OLD.result_digest OR
+  NEW.finalized_event_id IS NOT OLD.finalized_event_id OR NEW.attempt_id IS NOT OLD.attempt_id
+BEGIN
+  INSERT INTO runtime_audit_events (${ledgerColumns}) VALUES (${ledgerValues('OLD.state')});
+END;
+`;
 
 export const RUNTIME_LEASE_SQL = `
 CREATE TABLE runtime_leases (
