@@ -1,9 +1,10 @@
+import { waitForLeaseAvailability } from './lease-fixture.ts';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { TestContext } from 'node:test';
-import { DurableDatabase, SqliteCoordinationRunnerStore } from '../services/coordination/durable/index.ts';
+import { DurableDatabase, SqliteCoordinationRunnerStore, createRuntimeLeaseManager } from '../services/coordination/durable/index.ts';
 import { appendEvent, evaluateCommitmentGate } from '../services/coordination/index.ts';
 import type { CoordinationEvent, CoordinationEventType, CoordinationSession, CoordinationSnapshot } from '../services/coordination/types.ts';
 import { fresh, event } from './notification-fixture.ts';
@@ -12,10 +13,22 @@ export function fixture(t: TestContext, seed = fresh()) {
   const dir = mkdtempSync(join(tmpdir(), 'map-durable-')), path = join(dir, 'journal.sqlite');
   const connections: { close(): void }[] = [];
   t.after(() => { for (const c of connections.reverse()) c.close(); rmSync(dir, { recursive: true, force: true }); });
-  const open = () => { const db = new DurableDatabase({ path }); connections.push(db); return { db, store: new SqliteCoordinationRunnerStore(db) }; };
+  let lease: import('../services/coordination/durable/runtimeLease.ts').WorkflowLease | undefined;
+  const open = () => { const db = new DurableDatabase({ path }); connections.push(db); return { db, store: new SqliteCoordinationRunnerStore(db, lease) }; };
   const raw = () => { const db = new DatabaseSync(path); connections.push(db); return db; };
   const current = open(); current.store.createWorkflow(seed);
-  return { dir, path, open, raw, ...current };
+  const manager = createRuntimeLeaseManager(current.db);
+  lease = manager.acquire(seed.run.runId);
+  current.store = current.store.withLease(lease);
+  const release = () => manager.release(lease!);
+  const acquire = (db = current.db) => { lease = createRuntimeLeaseManager(db).acquire(seed.run.runId); return lease; };
+  const openOwned = async () => {
+    await waitForLeaseAvailability(path);
+    const connection = open();
+    connection.store = connection.store.withLease(acquire(connection.db));
+    return connection;
+  };
+  return { dir, path, open, openOwned, raw, manager, lease, release, acquire, ...current };
 }
 export function history(seed = fresh()): CoordinationSnapshot {
   let s = seed;
@@ -58,4 +71,11 @@ export function saveHistory(store: SqliteCoordinationRunnerStore, snapshot: Coor
 export const plain = <T>(value: T): T => JSON.parse(JSON.stringify(value));
 export function usage(s: CoordinationSnapshot, id = 'usage'): CoordinationEvent {
   return { ...event(s, 'UsageRecorded', { llmCalls: 1, inputTokens: 2, outputTokens: 3, estimatedCost: 0.01 }), eventId: id, idempotencyKey: id };
+}
+
+/** Test-only corruption requires bypassing DB protections deliberately; never normal writes. */
+export function bypassFencingForCorruption(raw: DatabaseSync): void {
+  for (const row of raw.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND (name LIKE 'fence_%' OR name = 'ledger_audit_update')").all()) {
+    raw.exec(`DROP TRIGGER "${String(row.name).replaceAll('"', '""')}"`);
+  }
 }

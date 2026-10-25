@@ -13,8 +13,8 @@ test('seed and original creation identity survive a fresh connection; repeated i
   const seed = fresh(); seed.events[0].eventId = 'custom-creation'; seed.events[0].idempotencyKey = 'creation';
   const f = fixture(t, seed); f.db.close();
   const reopened = f.open(); assert.deepEqual(reopened.store.getSnapshot('run'), seed);
-  assert.equal(f.raw().prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, 3);
-  assert.equal(f.raw().prepare('PRAGMA user_version').get()!.user_version, 3);
+  assert.equal(f.raw().prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, 4);
+  assert.equal(f.raw().prepare('PRAGMA user_version').get()!.user_version, 4);
 });
 test('all projections, usage/progress and terminal commitment equal Kernel replay', t => {
   const f = fixture(t), expected = history(); saveHistory(f.store, expected); f.db.close();
@@ -125,7 +125,7 @@ test('cross collisions remain rejected after closing and reopening the SQLite co
 test('cross collision propagates through shared writer and rolls back preceding participant writes', t => {
   const f = identicalCommittedOperations(t), before = f.persisted(), raw = f.raw();
   raw.exec('CREATE TABLE extension_fixture (id TEXT PRIMARY KEY)');
-  assert.throws(() => f.db.write(tx => {
+  assert.throws(() => f.store.writeWorkflow('run', tx => {
     tx.run('INSERT INTO extension_fixture VALUES (?)', 'provisional');
     f.store.appendInTransaction(tx, usage(before.snapshot, 'provisional-event'));
     f.store.appendInTransaction(tx, { ...f.a, idempotencyKey: f.b.idempotencyKey });
@@ -143,7 +143,7 @@ test('workflow ownership, listing, missing IDs and duplicate seed refusal', t =>
   const f = fixture(t); f.store.createWorkflow(fresh('other'));
   assert.deepEqual(f.store.listWorkflowIds(), ['other', 'run']);
   assert.throws(() => f.store.createWorkflow(fresh()), { code: 'WORKFLOW_EXISTS' });
-  assert.throws(() => f.store.append({ ...usage(fresh()), workflowRunId: 'missing' }), { code: 'WORKFLOW_NOT_FOUND' });
+  assert.throws(() => f.store.append({ ...usage(fresh()), workflowRunId: 'missing' }), { code: 'LEASE_FENCED' });
   f.store.append(usage(fresh())); assert.deepEqual(f.store.getSnapshot('other'), fresh('other'));
 });
 test('only canonical initial snapshots can be registered', t => {
@@ -167,12 +167,12 @@ test('late SQL failure rolls back inserted event and shared writer participants'
   assert.throws(() => f.store.append(usage(fresh())), { code: 'DATABASE_ERROR', message: 'DATABASE_ERROR' });
   assert.deepEqual(f.store.getSnapshot('run'), fresh()); raw.exec('DROP TRIGGER fail_head');
   raw.exec('CREATE TABLE extension_fixture (id TEXT PRIMARY KEY)');
-  assert.throws(() => f.db.write(tx => {
+  assert.throws(() => f.store.writeWorkflow('run', tx => {
     f.store.appendInTransaction(tx, usage(fresh())); tx.run('INSERT INTO extension_fixture VALUES (?)', 'x'); throw new Error('private-goal');
   }), { code: 'DATABASE_ERROR' });
   assert.equal(raw.prepare('SELECT count(*) AS n FROM extension_fixture').get()!.n, 0);
   assert.deepEqual(f.store.getSnapshot('run'), fresh());
-  f.db.write(tx => { f.store.appendInTransaction(tx, usage(fresh())); tx.run('INSERT INTO extension_fixture VALUES (?)', 'x'); });
+  f.store.writeWorkflow('run', tx => { f.store.appendInTransaction(tx, usage(fresh())); tx.run('INSERT INTO extension_fixture VALUES (?)', 'x'); });
   assert.equal(f.store.getSnapshot('run').events.length, 2);
   assert.equal(raw.prepare('SELECT count(*) AS n FROM extension_fixture').get()!.n, 1);
 });
@@ -186,12 +186,13 @@ test('transaction capabilities expire, reject nesting/async/control SQL and fore
   assert.throws(() => f.db.read(tx => f.store.appendInTransaction(tx, usage(fresh()))), { code: 'INVALID_TRANSACTION' });
   const other = f.open(); assert.throws(() => other.db.write(tx => f.store.appendInTransaction(tx, usage(fresh()))), { code: 'INVALID_TRANSACTION' });
 });
-test('bounded busy writer fails safely and can be retried after lock release', t => {
+test('bounded busy writer invalidates the handle and fails closed after lock release', t => {
   const f = fixture(t), contender = new DurableDatabase({ path: f.path, busyTimeoutMs: 10 });
-  t.after(() => contender.close()); const store = new SqliteCoordinationRunnerStore(contender);
+  t.after(() => contender.close()); const store = new SqliteCoordinationRunnerStore(contender, f.lease);
   const raw = f.raw(); raw.exec('BEGIN IMMEDIATE');
   assert.throws(() => store.append(usage(fresh())), { code: 'DATABASE_BUSY' }); raw.exec('ROLLBACK');
-  assert.equal(store.append(usage(fresh())).events.length, 2);
+  assert.throws(() => store.append(usage(fresh())), { code: 'LEASE_FENCED' });
+  assert.equal(store.getSnapshot('run').events.length, 1);
 });
 test('immutable SQL constraints and ownership foreign keys protect committed rows', t => {
   const f = fixture(t), raw = f.raw(); raw.exec('PRAGMA foreign_keys=ON');

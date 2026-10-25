@@ -4,13 +4,13 @@ import { appendRuntimeAuditInTransaction } from '../services/coordination/durabl
 import { executionFixture, registration, record } from './durable-execution-fixture.ts';
 import { reader, contents } from './recovery-fixture.ts';
 
-test('Ledger transitions and Journal INSERTs share one ordered audit sequence with actual subject and unknown Runtime', async t => {
+test('Ledger transitions and Journal INSERTs share one ordered audit sequence with actual Agent subject and verified Runtime', async t => {
   const f = executionFixture(t), task = f.register(); await f.coordinator.dispatch('run', task); f.coordinator.finalizeResult('run', task);
   const rows = f.db.read(tx => tx.all('SELECT * FROM runtime_audit_events ORDER BY audit_sequence'));
   const ledger = rows.filter(r => r.event_kind === 'EXECUTION_CHANGED');
   assert.deepEqual(ledger.map(r => r.next_state), ['PREPARED','DISPATCH_RESERVED','RESULT_RECORDED','FINALIZED']);
   assert.deepEqual(ledger.map(r => r.previous_state), [null,'PREPARED','DISPATCH_RESERVED','RESULT_RECORDED']);
-  assert.ok(ledger.every(r => r.subject_agent_id === 'supervisor' && r.actor_agent_id === null && r.runtime_instance_id === null && r.runtime_generation === null));
+  assert.ok(ledger.every(r => r.subject_agent_id === 'supervisor' && r.actor_agent_id === null && r.runtime_instance_id === f.lease.runtimeInstanceId && r.runtime_generation === f.lease.generation));
   assert.ok(ledger.slice(1).every(r => r.attempt_id === ledger[1].attempt_id));
   assert.equal(ledger.at(-1)!.journal_event_id, f.snapshot().events.at(-1)!.eventId);
   for (const row of rows.filter(r => r.event_kind === 'JOURNAL_APPENDED')) {
@@ -22,8 +22,8 @@ test('Ledger transitions and Journal INSERTs share one ordered audit sequence wi
 test('REVIEW_REQUIRED changes record review reasons; same-state no-op UPDATE adds no audit', t => {
   const f = executionFixture(t), task = f.register(); f.coordinator.reserveDispatch('run', task); f.coordinator.requireReview('run', task, 'EXECUTION_UNCERTAIN');
   const count = () => f.db.read(tx => tx.get('SELECT count(*) AS n FROM runtime_audit_events')!.n);
-  const initial = count(); f.db.write(tx => tx.run("UPDATE execution_ledger SET updated_at=20 WHERE action_id='action'")); assert.equal(count(), initial);
-  f.db.write(tx => tx.run("UPDATE execution_ledger SET review_reason='RESULT_INTEGRITY_UNAVAILABLE' WHERE action_id='action'")); assert.equal(count(), Number(initial) + 1);
+  const initial = count(); f.store.writeWorkflow('run', tx => tx.run("UPDATE execution_ledger SET updated_at=20 WHERE action_id='action'")); assert.equal(count(), initial);
+  f.store.writeWorkflow('run', tx => tx.run("UPDATE execution_ledger SET review_reason='RESULT_INTEGRITY_UNAVAILABLE' WHERE action_id='action'")); assert.equal(count(), Number(initial) + 1);
   assert.equal(reader(f).inspect('run').executionStates[0].reviewReason, 'RESULT_INTEGRITY_UNAVAILABLE');
 });
 test('direct UPDATE, DELETE, duplicate IDs and invalid references/transitions are rejected', t => {
@@ -60,12 +60,12 @@ for (const mutation of ["schema_version=99", "previous_state='FINALIZED'", "audi
   });
 test('internal Audit Writer validates a strict metadata-only contract inside the caller transaction', t => {
   const f = executionFixture(t), input = { workflowRunId: 'run', entityKind: 'WORKFLOW' as const, entityId: 'run', eventKind: 'RUNTIME_OBSERVATION', reasonCode: 'OBSERVED', occurredAt: 10 };
-  f.db.write(tx => appendRuntimeAuditInTransaction(f.db, tx, input));
+  f.store.writeWorkflow('run', tx => appendRuntimeAuditInTransaction(f.db, tx, input));
   const entries = reader(f).getWorkflowTimeline('run').entries; assert.equal(entries.at(-1)!.source, 'RUNTIME_AUDIT');
-  assert.equal(entries.at(-1)!.actorAgentId, undefined); assert.equal(entries.at(-1)!.runtimeInstanceId, undefined);
+  assert.equal(entries.at(-1)!.actorAgentId, undefined); assert.equal(entries.at(-1)!.runtimeInstanceId, f.lease.runtimeInstanceId);
   assert.throws(() => f.db.read(tx => appendRuntimeAuditInTransaction(f.db, tx, input)), { code: 'INVALID_TRANSACTION' });
-  assert.throws(() => f.db.write(tx => appendRuntimeAuditInTransaction(f.db, tx, { ...input, payload: 'secret' } as any)));
-  assert.throws(() => f.db.write(tx => appendRuntimeAuditInTransaction(f.db, tx, { ...input, eventKind: 'EXECUTION_CHANGED' })));
-  const before = contents(f); assert.throws(() => f.db.write(tx => { appendRuntimeAuditInTransaction(f.db, tx, input); throw Error('rollback'); }));
+  assert.throws(() => f.store.writeWorkflow('run', tx => appendRuntimeAuditInTransaction(f.db, tx, { ...input, payload: 'secret' } as any)));
+  assert.throws(() => f.store.writeWorkflow('run', tx => appendRuntimeAuditInTransaction(f.db, tx, { ...input, eventKind: 'EXECUTION_CHANGED' })));
+  const before = contents(f); assert.throws(() => f.store.writeWorkflow('run', tx => { appendRuntimeAuditInTransaction(f.db, tx, input); throw Error('rollback'); }));
   assert.deepEqual(contents(f), before);
 });

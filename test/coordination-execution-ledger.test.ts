@@ -35,7 +35,7 @@ test('reservation uses exact latest Action Approval ref and rejects unrelated la
   f.add('WorkflowSuspended',{}); f.add('WorkflowResumed',{authorization:{type:'user',reference:approval.approvalRef}});
   const reservation = f.coordinator.reserveDispatch('run',task); assert.ok(reservation.attemptId);
   const snapshot = f.snapshot();
-  assert.throws(() => f.db.write(tx => tx.run("UPDATE execution_ledger SET state='PREPARED',attempt_id=NULL,reserved_at=NULL WHERE action_id='action'")));
+  assert.throws(() => f.store.writeWorkflow('run', tx => tx.run("UPDATE execution_ledger SET state='PREPARED',attempt_id=NULL,reserved_at=NULL WHERE action_id='action'")));
   assert.deepEqual(f.snapshot(),snapshot);
   await assert.rejects(f.coordinator.dispatch('run',task)); assert.equal(f.calls.execute,0);
 });

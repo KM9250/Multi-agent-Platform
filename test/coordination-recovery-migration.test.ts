@@ -15,8 +15,8 @@ for (const version of [0,1,2] as const) test(`v${version} -> v3 migration preser
     try {
       const raw = new DatabaseSync(path);
       try {
-        assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 3);
-        assert.deepEqual(raw.prepare('SELECT schema_version FROM schema_migrations ORDER BY schema_version').all().map(r => r.schema_version), [1,2,3]);
+        assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 4);
+        assert.deepEqual(raw.prepare('SELECT schema_version FROM schema_migrations ORDER BY schema_version').all().map(r => r.schema_version), [1,2,3,4]);
         assert.equal(raw.prepare('SELECT count(*) AS n FROM runtime_audit_events').get()!.n, 0);
         for (const [table, rows] of Object.entries(before)) assert.deepEqual(raw.prepare(`SELECT * FROM ${table}`).all(), rows);
       } finally { raw.close(); }
@@ -40,7 +40,7 @@ test('migration DDL exception rolls back all tables/triggers/version records and
   assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 2);
   assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, 2);
   assert.equal(raw.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name LIKE '%audit%'").get()!.n, 0);
-  const db = new DurableDatabase({ path }); db.close(); assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 3);
+  const db = new DurableDatabase({ path }); db.close(); assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 4);
 });
 test('unsupported schema is rejected before schema mutation', t => {
   const f = executionFixture(t); const raw = f.raw(); raw.exec('PRAGMA user_version=999');

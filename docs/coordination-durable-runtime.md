@@ -1,9 +1,10 @@
 # Durable coordination foundation (COORD-5A)
 
-The current additive COORD-5B migration advances the database schema to 2 while
+The current additive COORD-5C-2 migration advances the database schema to 4 while
 retaining the version-1 Seed/Journal/Checkpoint payloads described here. See
 [durable execution](coordination-durable-execution.md) for mandatory Coordinator
-wiring: a durable Store alone is no longer a valid Runner execution setup.
+wiring and [Runtime Lease/Fencing](coordination-runtime-lease.md) for mandatory
+write authority: a durable Store alone is no longer a valid Runner execution setup.
 
 This Node-only module saves a Workflow seed and committed Journal in SQLite and
 restores a validated Kernel projection after restart. It does **not** recover
@@ -34,7 +35,7 @@ place a WAL database on a network share. Get the absolute path from trusted
 server deployment configuration, never from a model, webpage or user payload.
 
 ```ts
-import { DurableDatabase, SqliteCoordinationRunnerStore } from
+import { DurableDatabase, SqliteCoordinationRunnerStore, createRuntimeLeaseManager } from
   '../services/coordination/durable/index';
 import { createWorkflow } from '../services/coordination/kernel';
 
@@ -42,20 +43,24 @@ const db = new DurableDatabase({
   path: '/srv/map-private/coordination.sqlite', // Windows: C:\\MapPrivate\\coordination.sqlite
   busyTimeoutMs: 5000, // finite, 0..60000 ms
 });
-const store = new SqliteCoordinationRunnerStore(db);
+const admin = new SqliteCoordinationRunnerStore(db);
+const leases = createRuntimeLeaseManager(db);
 try {
   const seed = createWorkflow(trustedWorkflowInput);
-  store.createWorkflow(seed); // only a canonical initial snapshot, with one creation event
+  admin.createWorkflow(seed); // only a canonical initial snapshot, with one creation event
+  const lease = leases.acquire(seed.run.runId);
+  const store = admin.withLease(lease);
   const current = store.getSnapshot(seed.run.runId);
   const next = store.append(trustedEventFor(current));
   store.createCheckpoint(next.run.runId); // explicit; no timer or background runtime
+  leases.release(lease);
 } finally {
   db.close();
 }
 ```
 
 Opening the database explicitly configures and verifies `journal_mode=WAL`,
-`synchronous=FULL`, `foreign_keys=ON`, and `busy_timeout` on that connection.
+`synchronous=FULL`, `foreign_keys=ON`, `recursive_triggers=ON`, and `busy_timeout` on that connection.
 Initialization/migration runs inside `BEGIN IMMEDIATE`; failure closes the
 connection. `quick_check` and foreign-key validation run before use. Broken
 checkpoint references are excluded from fatal foreign-key errors because they

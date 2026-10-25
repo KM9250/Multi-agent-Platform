@@ -4,6 +4,9 @@ COORD-5B records where an external Action stopped. Its dispatch contract is
 **at most once per Action**. It does not promise exactly-once effects in an
 external system, and does not automatically restart or recover Workflows.
 
+Schema 4 additionally requires an explicit [Runtime Lease](coordination-runtime-lease.md)
+for every Workflow mutation. Acquisition does not grant recovery authorization.
+
 ## Trusted server integration
 
 Use Node >=22.13 with `node:sqlite` / `DatabaseSync`. Only the server entry point
@@ -13,18 +16,23 @@ application and browser barrel do not import SQLite or AsyncLocalStorage.
 ```ts
 import {
   DurableDatabase, SqliteCoordinationRunnerStore, SqliteRunnerEvidenceStore,
-  DurableExecutionCoordinator, createDurableCoordinationRunner,
+  DurableExecutionCoordinator, createDurableCoordinationRunner, createRuntimeLeaseManager,
 } from '../services/coordination/durable/index';
 import { createBrowserPocExecutor } from '../services/coordination/runner/browser/browserExecutor';
 
 const db = new DurableDatabase({ path: trustedAbsolutePrivateDatabasePath });
-const store = new SqliteCoordinationRunnerStore(db);
-const evidenceStore = new SqliteRunnerEvidenceStore(db);
+const admin = new SqliteCoordinationRunnerStore(db);
+admin.createWorkflow(trustedInitialSnapshot);
+const leases = createRuntimeLeaseManager(db);
+const lease = leases.acquire(trustedInitialSnapshot.run.runId);
+const store = admin.withLease(lease);
+const evidenceStore = new SqliteRunnerEvidenceStore(db, lease);
 const browser = createBrowserPocExecutor({ driver: trustedBrowserDriver, evidenceStore });
 const executors = { get: (id: string) => id === browser.id ? browser : undefined };
 const coordinator = new DurableExecutionCoordinator(store, executors, { evidenceStore });
 const runner = createDurableCoordinationRunner({ coordinator, supervisorProvider });
-// Create a new Workflow explicitly, then run only through a trusted invocation.
+// The host explicitly manages heartbeat, abort, release and connection cleanup.
+// Run only through a trusted invocation; see the linked Lease lifecycle example.
 // Do not enumerate restored RUNNING Workflows and feed them to runUntilStop().
 ```
 

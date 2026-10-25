@@ -9,6 +9,7 @@ import type { WorkflowCheckpoint } from './checkpoint';
 import { canonicalJson, digest, DurableStoreError, guarded, jsonCopy, requireIntegrity } from './integrity';
 import { nextAnchor, readJournal, validateSeed } from './restore';
 import { JOURNAL_SCHEMA_VERSION } from './schema';
+import type { WorkflowLease } from './runtimeLease';
 
 export interface DurableCoordinationAdministration {
   createWorkflow(snapshot: CoordinationSnapshot): void;
@@ -26,10 +27,16 @@ function insertEvent(tx: DurableTransaction, event: CoordinationEvent): void {
 /** Server-only persistence. Construction/restore never creates or invokes a Runner. */
 export class SqliteCoordinationRunnerStore implements CoordinationRunnerStore, DurableCoordinationAdministration {
   readonly persistence = 'durable' as const;
-  constructor(readonly database: DurableDatabase) {}
+  constructor(readonly database: DurableDatabase, readonly lease?: WorkflowLease) {}
+  withLease(lease: WorkflowLease): SqliteCoordinationRunnerStore { return new SqliteCoordinationRunnerStore(this.database, lease); }
+  assertLease(id: string): void {
+    if (!this.lease || this.lease.workflowRunId !== id) throw new DurableStoreError('LEASE_FENCED');
+    this.database.createLeaseManager().assertCurrent(this.lease);
+  }
+  writeWorkflow<T>(id: string, fn: (tx: DurableTransaction) => T): T { return this.database.writeWithLease(this.lease, id, fn); }
   createWorkflow(input: CoordinationSnapshot): void {
     const seed = validateSeed(input);
-    this.database.write(tx => {
+    this.database.bootstrapWorkflow(seed.run.runId, tx => {
       const id = seed.run.runId;
       if (tx.get('SELECT workflow_run_id FROM workflow_seeds WHERE workflow_run_id = ?', id)) throw new DurableStoreError('WORKFLOW_EXISTS');
       tx.run('INSERT INTO workflow_seeds VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', id, JOURNAL_SCHEMA_VERSION,
@@ -57,13 +64,13 @@ export class SqliteCoordinationRunnerStore implements CoordinationRunnerStore, D
     return state;
   }
   append(event: CoordinationEvent): CoordinationSnapshot {
-    return this.database.write(tx => this.appendInTransaction(tx, event));
+    return this.writeWorkflow(event.workflowRunId, tx => this.appendInTransaction(tx, event));
   }
   /** Trusted future participants share the writer; result is provisional until write() returns.
    * No independent COMMIT, nested transaction, async work or external effects are permitted.
    */
   appendInTransaction(tx: DurableTransaction, input: CoordinationEvent): CoordinationSnapshot {
-    this.database.assertTransaction(tx, true);
+    this.database.assertWorkflowWrite(tx, input.workflowRunId);
     canonicalJson(input.payload); // Undefined payload roots are never silently dropped.
     const event = jsonCopy(input);
     const journal = readJournal(tx, event.workflowRunId);
@@ -92,7 +99,7 @@ export class SqliteCoordinationRunnerStore implements CoordinationRunnerStore, D
     return next;
   }
   createCheckpoint(id: string): WorkflowCheckpoint {
-    return this.database.write(tx => writeCheckpoint(tx, readJournal(tx, id)));
+    return this.writeWorkflow(id, tx => writeCheckpoint(tx, readJournal(tx, id)));
   }
   loadCheckpoint(id: string): WorkflowCheckpoint | undefined {
     return this.database.read(tx => findCheckpoint(tx, readJournal(tx, id)));

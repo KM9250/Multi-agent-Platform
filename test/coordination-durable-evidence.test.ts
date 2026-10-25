@@ -18,14 +18,14 @@ test('Evidence requires trusted scoped owner, survives reconnection, and uses co
 test('concurrent async Evidence scopes never mix Workflow/Task ownership', async t => {
   const f = executionFixture(t), taskA = f.register(); f.coordinator.reserveDispatch('run',taskA);
   f.store.createWorkflow(executionSeed('ALLOW','other'));
-  const r = {...record,workflowRunId:'other'}, taskB = f.register(r); f.coordinator.reserveDispatch('other',taskB);
+  const other = f.forWorkflow('other'), r = {...record,workflowRunId:'other'}, taskB = other.register(r); other.coordinator.reserveDispatch('other',taskB);
   const store = f.coordinator.evidenceStore;
   const refs = await Promise.all([owner,{...owner,workflowRunId:'other'}].map((owned,i) => store.withOwner(owned,async () => {
     await new Promise(resolve => setImmediate(resolve));
     const ref = await store.put({kind:'test',content:{index:i},createdAt:10});
     await new Promise(resolve => setImmediate(resolve));
     assert.equal((await store.get(ref))!.content['index'],i); return ref;
-  })));
+  }, i === 0 ? f.lease : other.lease)));
   assert.notEqual(refs[0],refs[1]);
   await assert.rejects(f.coordinator.getOwnedEvidence('run',taskA,refs[1]));
   await assert.rejects(f.coordinator.getOwnedEvidence('other',taskB,refs[0]));
@@ -62,8 +62,8 @@ test('missing or foreign result Evidence enters REVIEW_REQUIRED instead of succe
 
 test('Result referencing another Workflow Evidence is refused and leaves both Journals unchanged',async t=>{
   const f=executionFixture(t),task=f.register(),attempt=f.coordinator.reserveDispatch('run',task);
-  f.store.createWorkflow(executionSeed('ALLOW','other'));const other=f.register({...record,workflowRunId:'other'});f.coordinator.reserveDispatch('other',other);
-  const ref=await f.coordinator.evidenceStore.withOwner({...owner,workflowRunId:'other'},()=>f.coordinator.evidenceStore.put({kind:'test',content:'other payload',createdAt:10}));
+  f.store.createWorkflow(executionSeed('ALLOW','other'));const owned=f.forWorkflow('other'),other=owned.register({...record,workflowRunId:'other'});owned.coordinator.reserveDispatch('other',other);
+  const ref=await f.coordinator.evidenceStore.withOwner({...owner,workflowRunId:'other'},()=>f.coordinator.evidenceStore.put({kind:'test',content:'other payload',createdAt:10}),owned.lease);
   assert.throws(()=>f.coordinator.recordResult('run',task,attempt.attemptId,{status:'succeeded',summary:'done',resultRef:ref}));
   assert.equal(f.snapshot().tasks.task.status,'ASSIGNED');assert.equal(f.store.getSnapshot('other').tasks.task.status,'ASSIGNED');
 });

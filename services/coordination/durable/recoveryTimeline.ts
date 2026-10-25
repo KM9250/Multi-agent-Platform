@@ -84,7 +84,8 @@ export class RecoveryAuditReader {
         if (key.phase === 1) {
           const row = tx.get('SELECT * FROM runtime_audit_events WHERE workflow_run_id = ? AND audit_sequence = ?', id, key.n)!;
           validateAuditRow(tx, row);
-          const audit = { auditEventId: String(row.audit_event_id), auditSequence: Number(row.audit_sequence), recordedAt: Number(row.recorded_at) };
+          const audit = { auditEventId: String(row.audit_event_id), auditSequence: Number(row.audit_sequence), recordedAt: Number(row.recorded_at), runtimeInstanceId: optional(row, 'runtime_instance_id'),
+            generation: row.runtime_generation === null ? undefined : Number(row.runtime_generation) };
           if (row.event_kind === 'JOURNAL_APPENDED') return { ...journalEntry(tx, tx.get('SELECT * FROM journal_events WHERE workflow_run_id = ? AND event_id = ?', id, row.journal_event_id)!, optional(key, 'action_id')), ...audit };
           return { source: row.event_kind === 'EXECUTION_CHANGED' ? 'EXECUTION_AUDIT' : 'RUNTIME_AUDIT', eventKind: String(row.event_kind), workflowRunId: id,
             sessionId: optional(row, 'session_id'), taskId: optional(row, 'task_id'), actionId: optional(row, 'action_id'), attemptId: optional(row, 'attempt_id'),

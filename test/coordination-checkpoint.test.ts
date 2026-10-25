@@ -1,3 +1,4 @@
+import { bypassFencingForCorruption } from './durable-fixture.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { fixture, fresh, usage, history, saveHistory, plain } from './durable-fixture.ts';
@@ -34,7 +35,7 @@ for (const [name, sql, params] of [
   test(`corrupt checkpoint ${name} falls back to an older checkpoint or full replay`, t => {
     const f = fixture(t), first = f.store.createCheckpoint('run');
     const expected = f.store.append(usage(fresh())), second = f.store.createCheckpoint('run');
-    const raw = f.raw(); raw.exec('PRAGMA foreign_keys=OFF');
+    const raw = f.raw(); bypassFencingForCorruption(raw); raw.exec('PRAGMA foreign_keys=OFF');
     raw.prepare(`UPDATE workflow_checkpoints SET ${sql} WHERE checkpoint_id = ?`).run(...params, second.checkpointId);
     assert.equal(f.store.loadCheckpoint('run')!.checkpointId, first.checkpointId);
     assert.deepEqual(f.store.getSnapshot('run'), expected);
@@ -47,7 +48,7 @@ for (const [name, sql, params] of [
 }
 test('a recomputed digest cannot legitimize a projection or foreign-workflow mismatch', t => {
   const f = fixture(t), expected = history(); saveHistory(f.store, expected);
-  const cp = f.store.createCheckpoint('run'), raw = f.raw();
+  const cp = f.store.createCheckpoint('run'), raw = f.raw(); bypassFencingForCorruption(raw);
   for (const changed of [
     { ...cp.snapshot, tasks: { ...cp.snapshot.tasks, t: { ...cp.snapshot.tasks.t, title: 'invented' } } },
     { ...cp.snapshot, run: { ...cp.snapshot.run, runId: 'foreign' } },

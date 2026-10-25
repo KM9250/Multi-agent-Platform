@@ -27,7 +27,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
     options: { evidenceStore?: SqliteRunnerEvidenceStore; clock?: RunnerClock } = {}) {
     requireIntegrity(store instanceof SqliteCoordinationRunnerStore && !!executors?.get);
     this.pendingActions = new SqliteRunnerPendingActionStore(store.database);
-    this.evidenceStore = options.evidenceStore ?? new SqliteRunnerEvidenceStore(store.database);
+    this.evidenceStore = options.evidenceStore ?? new SqliteRunnerEvidenceStore(store.database, store.lease);
     requireIntegrity(this.evidenceStore.database === store.database);
     this.clock = options.clock ?? { now: Date.now };
   }
@@ -35,7 +35,9 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
     const unknown = tx.get("SELECT action_id FROM execution_ledger WHERE workflow_run_id = ? AND (state = 'DISPATCH_RESERVED' OR (state = 'REVIEW_REQUIRED' AND review_reason <> 'SECURITY_REVIEW_REQUIRED'))", id);
     if (unknown) throw new DurableStoreError('EXECUTION_REVIEW_REQUIRED');
   }
+  assertLease(id: string): void { this.store.assertLease(id); }
   assertCanPlan(id: string): void {
+    this.assertLease(id);
     this.store.database.read(tx => { readJournal(tx, id); this.assertNoUnknownExecution(tx, id); });
   }
   validatePreparedAction(input: unknown, executorId: string) {
@@ -57,7 +59,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
     const record = validateAction(input), action = record.action;
     // Identity is stable across a lost response. No replacement Action or Round is generated here.
     const registrationDigest = digest([record, expected.events.at(-1), expected.policy, sessionEvent, taskEvent]);
-    return this.store.database.write(tx => {
+    return this.store.writeWorkflow(record.workflowRunId, tx => {
       let s = readJournal(tx, record.workflowRunId).snapshot;
       const prior = tx.get('SELECT * FROM pending_actions WHERE workflow_run_id = ? AND (action_id = ? OR task_id = ? OR session_id = ? OR round_key = ?)',
         record.workflowRunId, action.actionId, record.taskId, record.sessionId, String((sessionEvent.payload as { contextRef?: string }).contextRef ?? ''));
@@ -93,7 +95,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
   }
   /** Only this successful, acknowledged COMMIT permits the immediately following dispatch. */
   reserveDispatch(id: string, task: CoordinationTask): { record: RunnerPendingActionRecord; attemptId: string } {
-    return this.store.database.write(tx => {
+    return this.store.writeWorkflow(id, tx => {
       const s = readJournal(tx, id).snapshot, r = this.record(tx, id, task);
       validateActionOwner(s, r);
       requireIntegrity(s.run.status === 'RUNNING' && s.run.executionMode === 'supervised_autonomous'
@@ -115,12 +117,14 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
   }
   async dispatch(id: string, task: CoordinationTask, signal?: AbortSignal): Promise<RunnerExecutionResult> {
     // A historical reservation is NEVER reused to authorize a new Executor call.
+    this.assertLease(id);
     const saved = this.getResult(id, task);
     if (saved) return saved;
     if (signal?.aborted) throw new DurableStoreError('EXECUTION_REVIEW_REQUIRED');
     const { record, attemptId } = this.reserveDispatch(id, task);
     const executor = this.executors.get(record.action.executorId);
     requireIntegrity(executor?.id === record.action.executorId);
+    this.assertLease(id); // Reservation COMMIT acknowledged; recheck immediately before the external boundary.
     return this.evidenceStore.withOwner(this.owner(record), async () => {
       let raw: unknown, result: RunnerExecutionResult | undefined;
       try {
@@ -149,12 +153,12 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
       } catch (error) {
         // Never translate persistence faults into TaskFailed or another planning round.
         // Database errors retain the committed reservation. Semantic failures can be diagnosed durably.
-        if (error instanceof DurableStoreError && !['DATABASE_ERROR','DATABASE_BUSY','INVALID_TRANSACTION'].includes(error.code)) {
+        if (error instanceof DurableStoreError && !['DATABASE_ERROR','DATABASE_BUSY','INVALID_TRANSACTION','LEASE_FENCED'].includes(error.code)) {
           this.requireReview(id, task, 'RESULT_INTEGRITY_UNAVAILABLE');
         }
         throw error;
       }
-    });
+    }, this.store.lease);
   }
   recordResult(id: string, task: CoordinationTask, attemptId: string, input: RunnerExecutionResult): RunnerExecutionResult {
     executionJson(input, EXECUTION_LIMITS.result);
@@ -164,7 +168,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
       const binding = parseSecurityReviewRef(result.safetyHold.reviewRef);
       requireIntegrity(binding?.workflowRunId === id && binding.taskId === task.taskId);
     }
-    return this.store.database.write(tx => {
+    return this.store.writeWorkflow(id, tx => {
       const r = this.record(tx, id, task), row = readExecution(tx, r);
       validateActionOwner(readJournal(tx, id).snapshot, r);
       requireIntegrity(row.state === 'DISPATCH_RESERVED' && row.attempt_id === attemptId && row.result_ref === null);
@@ -179,7 +183,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
     });
   }
   requireReview(id: string, task: CoordinationTask, reason: 'RESULT_INTEGRITY_UNAVAILABLE' | 'EXECUTION_UNCERTAIN'): void {
-    this.store.database.write(tx => {
+    this.store.writeWorkflow(id, tx => {
       const r = this.record(tx, id, task), row = readExecution(tx, r);
       requireIntegrity(row.state === 'DISPATCH_RESERVED');
       tx.run("UPDATE execution_ledger SET state = 'REVIEW_REQUIRED', review_reason = ?, updated_at = ? WHERE workflow_run_id = ? AND action_id = ?", reason, this.now(), id, r.action.actionId);
@@ -194,7 +198,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
     });
   }
   finalizeResult(id: string, task: CoordinationTask): void {
-    this.store.database.write(tx => {
+    this.store.writeWorkflow(id, tx => {
       const s = readJournal(tx, id).snapshot, r = this.record(tx, id, task); validateActionOwner(s, r);
       const row = readExecution(tx, r), result = readExecutionResult(tx, r, this.evidenceStore); requireIntegrity(result);
       const event = recordedResultEvent(s, r, result, this.clock);
@@ -214,7 +218,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
   }
   /** Complete only a committed uncertain Task failure. Never dispatch, resume, or change its Ledger. */
   completeUncertainBlock(id: string): { reason: string; progressRecorded: boolean } | undefined {
-    return this.store.database.write(tx => {
+    return this.store.writeWorkflow(id, tx => {
       let s = readJournal(tx, id).snapshot;
       if (s.run.status !== 'RUNNING') return;
       requireIntegrity(!runnerSecurityReviewReason(s) && !runnerEvidenceReviewReason(s));

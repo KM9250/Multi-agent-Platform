@@ -1,6 +1,6 @@
 import type { TestContext } from 'node:test';
 import { createWorkflow, createRunnerEvent, appendEvent } from '../services/coordination/index.ts';
-import { DurableExecutionCoordinator, createDurableCoordinationRunner } from '../services/coordination/durable/index.ts';
+import { DurableExecutionCoordinator, createDurableCoordinationRunner, createRuntimeLeaseManager } from '../services/coordination/durable/index.ts';
 import type { SqliteCoordinationRunnerStore } from '../services/coordination/durable/index.ts';
 import type { PreparedRunnerAction, RunnerPendingActionRecord, RunnerExecutionResult, RunnerActionExecutor, RunnerSupervisorProvider } from '../services/coordination/runner/types.ts';
 import { runnerActionRef } from '../services/coordination/runner/policyGuard.ts';
@@ -45,6 +45,12 @@ export function executionFixture(t: TestContext, risk: 'ALLOW' | 'DENY' | 'NEEDS
   const register = (r = record) => { const request = registration(f.store, r); coordinator.registerAction(r, request.expected, request.sessionEvent, request.taskEvent); return f.store.getSnapshot(r.workflowRunId).tasks[r.taskId]; };
   const snapshot = () => f.store.getSnapshot('run');
   const add = (type: Parameters<typeof createRunnerEvent>[1], payload: unknown) => f.store.append(createRunnerEvent(snapshot(), type, payload, clock, { nextId: () => `user-${++serial}` }));
-  return { ...f, coordinator, registry, executor, provider, runner, calls, register, snapshot, add };
+  const forWorkflow = (id: string) => {
+    const lease = createRuntimeLeaseManager(f.db).acquire(id), store = f.store.withLease(lease);
+    const coordinator = new DurableExecutionCoordinator(store, registry, { clock });
+    const register = (r: RunnerPendingActionRecord) => { const request = registration(store, r); coordinator.registerAction(r, request.expected, request.sessionEvent, request.taskEvent); return store.getSnapshot(id).tasks[r.taskId]; };
+    return { lease, store, coordinator, register };
+  };
+  return { ...f, forWorkflow, coordinator, registry, executor, provider, runner, calls, register, snapshot, add };
 }
 export const succeeded: RunnerExecutionResult = { status: 'succeeded', summary: 'Execution succeeded.' };

@@ -97,6 +97,7 @@ export interface RunnerEvidence { kind: string; content: unknown; createdAt: num
 export interface RunnerEvidenceStore { put(evidence: RunnerEvidence): Promise<string>; get(ref: string): Promise<RunnerEvidence | undefined> }
 /** Node-free contract; implementations live only in the durable server entry point. */
 export interface RunnerDurableExecution {
+  assertLease(workflowRunId: string): void;
   readonly store: CoordinationRunnerStore;
   readonly pendingActions: RunnerPendingActionStore;
   readonly evidenceStore: RunnerEvidenceStore;

@@ -6,6 +6,9 @@ This Node-only foundation reads persisted facts and diagnoses possible next step
 lease, makes a recovery decision, appends a Workflow event, invokes a Runner,
 dispatches an Executor, or calls a model.
 
+The current schema is **4**. [COORD-5C-2 Runtime Lease/Fencing](coordination-runtime-lease.md)
+adds ownership audits and verified Runtime metadata while preserving this read-only contract.
+
 ## Server API
 
 ```ts
@@ -149,16 +152,18 @@ the state change. Rollback or pre-COMMIT SIGKILL rolls back both. After-COMMIT
 SIGKILL retains both. Idempotent registration, Journal retransmission and
 finalization add no duplicate audit events. A read never appends audit records.
 
-Ledger audit `actor_agent_id`, Runtime ID and Generation are NULL because 5C-1
-cannot establish those identities. `subject_agent_id` comes from the committed
+Legacy 5C-1 Ledger audit Runtime ID and Generation remain NULL. Schema-4
+Journal/Ledger audit includes verified Runtime metadata, with the initial
+Workflow creation event as the sole bootstrap exception. Ledger `actor_agent_id`
+remains NULL. `subject_agent_id` comes from the committed
 TaskAssigned event. Journal audit actor comes directly from the original event.
 Task assignment never becomes evidence of the identity of the acting Runtime.
 
 The internal `appendRuntimeAuditInTransaction()` contract is metadata-only,
 validates references, field names, schema and reason/state formats, and requires
-the active writable transaction. Trigger-owned event kinds cannot be written
-through it. Future participants must establish actor/ownership authorization
-before supplying identities. The writer is not exported from the public barrel.
+the active verified Workflow write scope. Trigger-owned event kinds cannot be
+written through it. Runtime identity is derived from the verified handle;
+caller-supplied mismatches are rejected. The writer is not exported from the public barrel.
 
 No historical Ledger transitions are backfilled. Migration leaves all existing
 Seeds, Journals, Checkpoints, Actions, Ledger rows, Result/Evidence data and
@@ -202,9 +207,9 @@ SIGKILL at before-statement, after-statement/pre-COMMIT and after-COMMIT boundar
 The existing durable and full suites, typecheck, build and diff checks also apply.
 Windows native process/filesystem behavior requires separate validation.
 
-COORD-5C-2 can add verified Runtime identity, Lease/Generation/Fencing events
-through this audit contract. Apply fencing to existing Journal/Ledger mutation
-paths and fail the state transition when audit recording fails. Record meaningful
-ownership changes rather than every heartbeat. Lease acquisition, fencing,
-Model Call Ledger, recovery decisions and automatic Workflow continuation are
-outside this implementation.
+COORD-5C-2 now supplies verified Runtime identity, Lease/Generation/Fencing and
+ownership events through this audit contract. Ownership changes and audits
+commit atomically; heartbeats do not enlarge the audit history. Model Call
+Ledger, budget reservations, recovery decisions and automatic Workflow
+continuation remain outside this implementation. See the linked Lease document
+for the immutable migration boundary and COORD-5C-3 handoff.

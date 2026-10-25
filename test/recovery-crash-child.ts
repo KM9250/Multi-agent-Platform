@@ -1,6 +1,6 @@
 // Fault injection only in this child process; production code has no crash hooks.
 import { DatabaseSync } from 'node:sqlite';
-import { DurableDatabase, SqliteCoordinationRunnerStore, DurableExecutionCoordinator } from '../services/coordination/durable/index.ts';
+import { DurableDatabase, SqliteCoordinationRunnerStore, DurableExecutionCoordinator, createRuntimeLeaseManager } from '../services/coordination/durable/index.ts';
 import { createRunnerEvent } from '../services/coordination/runner/eventFactory.ts';
 import { clock } from './durable-execution-fixture.ts';
 const [path, operation, boundary, resultRef] = process.argv.slice(2);
@@ -33,7 +33,8 @@ DatabaseSync.prototype.exec = function(sql: string) {
   if (sql === 'COMMIT' && armed && boundary === 'after-commit') pause();
 };
 try {
-  const db = new DurableDatabase({ path }), store = new SqliteCoordinationRunnerStore(db);
+  const db = new DurableDatabase({ path });
+  const store = new SqliteCoordinationRunnerStore(db, operation === 'migration' ? undefined : createRuntimeLeaseManager(db, { ttlMs: 1000 }).acquire('run'));
   const coordinator = new DurableExecutionCoordinator(store, { get(id) { return id === 'test' ? { id: 'test', async prepare() { throw Error('Unexpected prepare'); }, async execute() { process.send!({ error: 'UNEXPECTED_EXECUTOR' }); throw Error('Unexpected execute'); } } : undefined; } }, { clock });
   const s = store.getSnapshot('run'), task = s.tasks.task;
   if (operation === 'reserve') coordinator.reserveDispatch('run', task);

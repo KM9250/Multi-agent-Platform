@@ -1,3 +1,4 @@
+import { bypassFencingForCorruption } from './durable-fixture.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
@@ -9,7 +10,7 @@ import { DurableDatabase } from '../services/coordination/durable/index.ts';
 import type { CoordinationEvent } from '../services/coordination/types.ts';
 
 function rewrite(raw: DatabaseSync, change: (e: CoordinationEvent) => void) {
-  raw.exec('DROP TRIGGER journal_no_update');
+  bypassFencingForCorruption(raw); raw.exec('DROP TRIGGER journal_no_update');
   const rows = raw.prepare('SELECT * FROM journal_events ORDER BY sequence').all();
   let anchor = '';
   for (const row of rows) {
@@ -51,7 +52,7 @@ test('missing middle sequence and missing seed creation are refused', t => {
   assert.throws(() => f.store.getSnapshot('run'), { code: 'INTEGRITY_ERROR' });
 });
 test('policy copy or seed tampering is detected without substitution', t => {
-  const f = fixture(t), raw = f.raw(); raw.exec('DROP TRIGGER seed_immutable');
+  const f = fixture(t), raw = f.raw(); bypassFencingForCorruption(raw); raw.exec('DROP TRIGGER seed_immutable');
   raw.prepare('UPDATE workflow_seeds SET policy_payload=?').run('{}');
   assert.throws(() => f.store.getSnapshot('run'), { code: 'INTEGRITY_ERROR' });
   raw.prepare('UPDATE workflow_seeds SET policy_payload=?, seed_payload=?').run(canonicalJson(fresh().policy), '{');
@@ -60,10 +61,10 @@ test('policy copy or seed tampering is detected without substitution', t => {
 test('future database/seed schemas and inconsistent migration ledgers are refused', t => {
   const f = fixture(t), raw = f.raw(); f.db.close();
   raw.exec('PRAGMA user_version=999'); assert.throws(() => f.open(), { code: 'SCHEMA_UNSUPPORTED' });
-  raw.exec('PRAGMA user_version=3'); raw.prepare('UPDATE schema_migrations SET migration_id=? WHERE schema_version=1').run('future');
+  raw.exec('PRAGMA user_version=4'); raw.prepare('UPDATE schema_migrations SET migration_id=? WHERE schema_version=1').run('future');
   assert.throws(() => f.open(), { code: 'INTEGRITY_ERROR' });
   raw.prepare('UPDATE schema_migrations SET migration_id=? WHERE schema_version=1').run('001_durable_coordination');
-  raw.exec('DROP TRIGGER seed_immutable; UPDATE workflow_seeds SET schema_version=999');
+  bypassFencingForCorruption(raw); raw.exec('DROP TRIGGER seed_immutable; UPDATE workflow_seeds SET schema_version=999');
   assert.throws(() => f.open().store.getSnapshot('run'), { code: 'SCHEMA_UNSUPPORTED' });
 });
 test('failure after migration DDL rolls back schema and ledger, and a clean retry succeeds', t => {
