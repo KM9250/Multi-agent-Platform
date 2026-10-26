@@ -18,3 +18,6 @@ export { RecoveryReader } from './recoveryReader';
 export { RecoveryAuditReader } from './recoveryTimeline';
 export type { RecoveryDisposition, RecoveryNextStep, RecoveryInspection, ExecutionStateSummary,
   RecoveryAuthorizationRequirement, TimelineQueryOptions, WorkflowTimelineEntry, WorkflowTimelinePage } from './recoveryTypes';
+
+export { createRuntimeLeaseManager, runtimeInstanceId, DEFAULT_LEASE_TTL_MS, DEFAULT_HEARTBEAT_INTERVAL_MS } from './runtimeLease';
+export type { WorkflowLease, LeaseInspection, RuntimeLeaseManager, RuntimeLeaseOptions } from './runtimeLease';

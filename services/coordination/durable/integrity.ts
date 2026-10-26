@@ -3,7 +3,8 @@ import { createHash } from 'node:crypto';
 export type DurableErrorCode = 'INVALID_CONFIGURATION' | 'DATABASE_ERROR' | 'DATABASE_BUSY'
   | 'SCHEMA_UNSUPPORTED' | 'INTEGRITY_ERROR' | 'INVALID_JSON' | 'INVALID_SEED'
   | 'INVALID_EVENT' | 'WORKFLOW_NOT_FOUND' | 'WORKFLOW_EXISTS' | 'EVENT_COLLISION'
-  | 'SEQUENCE_CONFLICT' | 'INVALID_TRANSACTION' | 'EXECUTION_REVIEW_REQUIRED';
+  | 'SEQUENCE_CONFLICT' | 'INVALID_TRANSACTION' | 'EXECUTION_REVIEW_REQUIRED'
+  | 'LEASE_FENCED' | 'LEASE_HELD' | 'LEASE_GENERATION_EXHAUSTED';
 
 /** Only fixed codes cross this boundary; never attach raw SQLite/Kernel errors. */
 export class DurableStoreError extends Error {

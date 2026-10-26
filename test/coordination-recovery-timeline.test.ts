@@ -21,10 +21,10 @@ test('cursor pages contain no duplicates and upper bounds exclude later appended
 });
 test('filters for Workflow, Action, Event Kind and inclusive occurred-time range are applied in SQL', t => {
   const f = executionFixture(t); f.register(); f.store.createWorkflow(executionSeed('ALLOW', 'second'));
-  const other = { ...record, workflowRunId: 'second' }, request = registration(f.store, other); f.coordinator.registerAction(other, request.expected, request.sessionEvent, request.taskEvent);
+  const other = { ...record, workflowRunId: 'second' }, owned = f.forWorkflow('second'), request = registration(owned.store, other); owned.coordinator.registerAction(other, request.expected, request.sessionEvent, request.taskEvent);
   const r = reader(f), page = r.getWorkflowTimeline('run', { actionId: 'action', eventKind: 'TaskAssigned', fromTimestamp: 10, toTimestamp: 10 });
   assert.equal(page.entries.length, 1); assert.equal(page.entries[0].workflowRunId, 'run'); assert.equal(page.entries[0].eventKind, 'TaskAssigned');
-  assert.equal(r.getWorkflowTimeline('run', { fromTimestamp: 11 }).entries.length, 0);
+  assert.deepEqual(r.getWorkflowTimeline('run', { fromTimestamp: 11 }).entries.map(e => e.eventKind), ['LEASE_ACQUIRED']);
   assert.equal(r.getActionHistory('run', 'missing').entries.length, 0);
 });
 for (const options of [{ limit: 0 }, { limit: 101 }, { limit: 1.5 }, { fromTimestamp: -1 }, { fromTimestamp: 11, toTimestamp: 10 }, { cursor: 'bad' }, { eventKind: 'x;SELECT' }])

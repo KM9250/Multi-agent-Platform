@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import type { DurableDatabase, DurableTransaction, Row } from './db';
 import { DurableStoreError, requireIntegrity } from './integrity';
+import { MIGRATIONS, SCHEMA_VERSION } from './schema';
+import { DATABASE_NOW_SQL } from './leaseSchema';
 
 const states = ['PREPARED','DISPATCH_RESERVED','RESULT_RECORDED','FINALIZED','REVIEW_REQUIRED'];
 export function validExecutionTransition(previous: unknown, next: unknown): boolean {
@@ -10,10 +12,12 @@ export function validExecutionTransition(previous: unknown, next: unknown): bool
 }
 export function assertRecoverySchema(tx: DurableTransaction): void {
   const rows = tx.all('SELECT schema_version, migration_id FROM schema_migrations ORDER BY schema_version');
-  if (tx.get('SELECT user_version FROM pragma_user_version')?.user_version !== 3
-    || rows.length !== 3 || rows[0].schema_version !== 1 || rows[1].schema_version !== 2
-    || rows[0].migration_id !== '001_durable_coordination' || rows[1].migration_id !== '002_durable_execution'
-    || rows[2].schema_version !== 3 || rows[2].migration_id !== '003_recovery_audit_foundation') throw new DurableStoreError('SCHEMA_UNSUPPORTED');
+  if (tx.get('SELECT user_version FROM pragma_user_version')?.user_version !== SCHEMA_VERSION
+    || rows.length !== SCHEMA_VERSION || rows.some((row, index) => row.schema_version !== MIGRATIONS[index]?.version
+      || row.migration_id !== MIGRATIONS[index]?.id)) throw new DurableStoreError('SCHEMA_UNSUPPORTED');
+  const boundary = tx.all('SELECT * FROM runtime_fencing_boundary');
+  requireIntegrity(boundary.length === 1 && boundary[0].singleton === 1
+    && Number.isSafeInteger(boundary[0].legacy_audit_sequence) && Number(boundary[0].legacy_audit_sequence) >= 0);
 }
 export function validateAuditRow(tx: DurableTransaction, row: Row): void {
   requireIntegrity(Number.isSafeInteger(row.audit_sequence) && Number(row.audit_sequence) > 0 && row.schema_version === 1);
@@ -28,6 +32,39 @@ export function validateAuditRow(tx: DurableTransaction, row: Row): void {
   requireIntegrity(row.runtime_generation === null || Number.isSafeInteger(row.runtime_generation) && Number(row.runtime_generation) >= 0);
   requireIntegrity(row.reason_code === null || /^[A-Z][A-Z0-9_]{0,79}$/.test(String(row.reason_code)));
   for (const key of ['previous_state','next_state']) requireIntegrity(row[key] === null || /^[A-Z][A-Z0-9_]{0,79}$/.test(String(row[key])));
+  const boundary = tx.get('SELECT legacy_audit_sequence FROM runtime_fencing_boundary WHERE singleton = 1');
+  requireIntegrity(boundary);
+  const legacy = Number(row.audit_sequence) <= Number(boundary.legacy_audit_sequence);
+  const bootstrap = row.event_kind === 'JOURNAL_APPENDED' && row.journal_sequence === 1
+    && tx.get("SELECT event_type FROM journal_events WHERE workflow_run_id = ? AND sequence = 1", row.workflow_run_id)?.event_type === 'WorkflowRunCreated';
+  if (!legacy && !bootstrap) {
+    requireIntegrity(typeof row.runtime_instance_id === 'string' && Number.isSafeInteger(row.runtime_generation) && Number(row.runtime_generation) >= 1);
+    if (!String(row.event_kind).startsWith('LEASE_')) {
+      const owner = tx.get("SELECT * FROM runtime_audit_events WHERE workflow_run_id = ? AND event_kind IN ('LEASE_ACQUIRED','LEASE_TAKEN_OVER','LEASE_RELEASED') AND audit_sequence < ? ORDER BY audit_sequence DESC LIMIT 1", row.workflow_run_id, row.audit_sequence);
+      requireIntegrity(owner && owner.next_state === 'ACTIVE' && owner.runtime_instance_id === row.runtime_instance_id && owner.runtime_generation === row.runtime_generation);
+    }
+  }
+  if (!legacy && bootstrap) requireIntegrity(row.runtime_instance_id === null && row.runtime_generation === null);
+  if (String(row.event_kind).startsWith('LEASE_')) {
+    requireIntegrity(!legacy && row.entity_kind === 'RUNTIME' && row.entity_id === row.runtime_instance_id
+      && row.actor_agent_id === null && row.subject_agent_id === null && row.session_id === null && row.task_id === null
+      && row.action_id === null && row.attempt_id === null && row.journal_event_id === null);
+    const prior = tx.get("SELECT * FROM runtime_audit_events WHERE workflow_run_id = ? AND event_kind IN ('LEASE_ACQUIRED','LEASE_TAKEN_OVER','LEASE_RELEASED') AND audit_sequence < ? ORDER BY audit_sequence DESC LIMIT 1", row.workflow_run_id, row.audit_sequence);
+    if (row.event_kind === 'LEASE_RELEASED') {
+      requireIntegrity(prior && prior.next_state === 'ACTIVE' && row.previous_state === 'ACTIVE' && row.next_state === 'RELEASED'
+        && row.reason_code === 'OWNER_RELEASE' && prior.runtime_instance_id === row.runtime_instance_id && prior.runtime_generation === row.runtime_generation);
+    } else {
+      requireIntegrity(row.next_state === 'ACTIVE' && Number(row.runtime_generation) === (prior ? Number(prior.runtime_generation) + 1 : 1));
+      if (!prior) requireIntegrity(row.event_kind === 'LEASE_ACQUIRED' && row.previous_state === null && row.reason_code === 'INITIAL_ACQUIRE');
+      else if (prior.next_state === 'RELEASED') requireIntegrity(row.event_kind === 'LEASE_ACQUIRED' && row.previous_state === 'RELEASED' && row.reason_code === 'REACQUIRE_AFTER_RELEASE');
+      else requireIntegrity(row.event_kind === 'LEASE_TAKEN_OVER' && row.previous_state === 'EXPIRED' && row.reason_code === 'LEASE_EXPIRED');
+    }
+    const next = tx.get("SELECT audit_sequence FROM runtime_audit_events WHERE workflow_run_id = ? AND event_kind IN ('LEASE_ACQUIRED','LEASE_TAKEN_OVER','LEASE_RELEASED') AND audit_sequence > ? LIMIT 1", row.workflow_run_id, row.audit_sequence);
+    if (!next) {
+      const lease = tx.get('SELECT * FROM runtime_leases WHERE workflow_run_id = ?', row.workflow_run_id);
+      requireIntegrity(lease && lease.owner_instance_id === row.runtime_instance_id && lease.generation === row.runtime_generation && lease.lease_state === row.next_state);
+    }
+  }
   requireIntegrity((row.journal_event_id === null) === (row.journal_sequence === null));
   if (row.journal_event_id !== null) {
     requireIntegrity(Number.isSafeInteger(row.journal_sequence) && Number(row.journal_sequence) > 0);
@@ -52,7 +89,7 @@ export function validateAuditRow(tx: DurableTransaction, row: Row): void {
   if (row.event_kind === 'EXECUTION_CHANGED') {
     requireIntegrity(row.action_id !== null && row.entity_kind === 'ACTION' && row.entity_id === row.action_id
       && states.includes(String(row.next_state)) && validExecutionTransition(row.previous_state, row.next_state)
-      && row.actor_agent_id === null && row.runtime_instance_id === null && row.runtime_generation === null);
+      && row.actor_agent_id === null && (!legacy || row.runtime_instance_id === null && row.runtime_generation === null));
     const ledger = tx.get('SELECT * FROM execution_ledger WHERE workflow_run_id = ? AND action_id = ?', row.workflow_run_id, row.action_id);
     requireIntegrity(ledger && (row.attempt_id === null || row.attempt_id === ledger.attempt_id));
     if (row.journal_event_id !== null) {
@@ -77,16 +114,20 @@ export interface RuntimeAuditInput {
   journalEventId?: string; journalSequence?: number; occurredAt: number;
 }
 export function appendRuntimeAuditInTransaction(db: DurableDatabase, tx: DurableTransaction, input: RuntimeAuditInput): void {
-  db.assertTransaction(tx, true);
-  requireIntegrity(!['JOURNAL_APPENDED','EXECUTION_CHANGED'].includes(input.eventKind));
+  db.assertWorkflowWrite(tx, input.workflowRunId);
+  requireIntegrity(!['JOURNAL_APPENDED','EXECUTION_CHANGED'].includes(input.eventKind) && !input.eventKind.startsWith('LEASE_'));
   const columns: Record<string, keyof RuntimeAuditInput> = { workflow_run_id: 'workflowRunId', event_kind: 'eventKind', entity_kind: 'entityKind', entity_id: 'entityId',
     session_id: 'sessionId', task_id: 'taskId', action_id: 'actionId', attempt_id: 'attemptId', actor_agent_id: 'actorAgentId', subject_agent_id: 'subjectAgentId',
     runtime_instance_id: 'runtimeInstanceId', runtime_generation: 'runtimeGeneration', previous_state: 'previousState', next_state: 'nextState', reason_code: 'reasonCode',
     journal_event_id: 'journalEventId', journal_sequence: 'journalSequence', occurred_at: 'occurredAt' };
   requireIntegrity(Object.keys(input).every(key => Object.values(columns).includes(key as keyof RuntimeAuditInput)));
-  const row: Row = { audit_sequence: 1, audit_event_id: randomUUID(), schema_version: 1, recorded_at: Date.now() };
+  const row: Row = { audit_sequence: Number(tx.get("SELECT coalesce((SELECT seq FROM sqlite_sequence WHERE name = 'runtime_audit_events'), 0) AS n")!.n) + 1, audit_event_id: randomUUID(), schema_version: 1, recorded_at: Number(tx.get(`SELECT ${DATABASE_NOW_SQL} AS now`)!.now) };
   for (const [column, key] of Object.entries(columns)) row[column] = input[key] ?? null;
   requireIntegrity(tx.get('SELECT workflow_run_id FROM workflow_seeds WHERE workflow_run_id = ?', input.workflowRunId));
+  const owner = tx.get('SELECT map_runtime_id() AS id, map_runtime_generation() AS generation')!;
+  requireIntegrity((input.runtimeInstanceId === undefined || input.runtimeInstanceId === owner.id)
+    && (input.runtimeGeneration === undefined || input.runtimeGeneration === owner.generation));
+  row.runtime_instance_id = owner.id; row.runtime_generation = owner.generation;
   validateAuditRow(tx, row);
   const keys = Object.keys(row).filter(key => key !== 'audit_sequence');
   tx.run(`INSERT INTO runtime_audit_events (${keys.join(',')}) VALUES (${keys.map(() => '?').join(',')})`, ...keys.map(key => row[key]));

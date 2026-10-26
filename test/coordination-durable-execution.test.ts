@@ -1,3 +1,4 @@
+import { bypassFencingForCorruption } from './durable-fixture.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
@@ -32,9 +33,9 @@ for (const where of ['journal','ledger'] as const) test(`Journal reflection roll
   f.coordinator.finalizeResult('run',task); assert.equal(f.calls.execute,1);
 });
 test('COMMIT response loss in reservation forbids a fresh dispatch even when reservation committed', async t => {
-  const f = executionFixture(t), task = f.register(), write = f.db.write.bind(f.db);
+  const f = executionFixture(t), task = f.register(), write = f.store.writeWorkflow.bind(f.store);
   let once = true;
-  f.db.write = fn => {const value=write(fn); if(once){once=false;throw Error('lost response');}return value;};
+  f.store.writeWorkflow = (id, fn) => {const value=write(id, fn); if(once){once=false;throw Error('lost response');}return value;};
   await assert.rejects(f.coordinator.dispatch('run',task));
   assert.equal(f.calls.execute,0); assert.equal(f.coordinator.inspectExecution('run','action')!.state,'DISPATCH_RESERVED');
   await assert.rejects(f.coordinator.dispatch('run',task)); assert.equal(f.calls.execute,0);
@@ -45,9 +46,9 @@ for (const stage of ['registration','result','finalize'] as const) test(`COMMIT 
   const register = () => f.coordinator.registerAction(record,request!.expected,request!.sessionEvent,request!.taskEvent);
   let task = stage==='registration' ? undefined : f.register();
   if(stage==='finalize') await f.coordinator.dispatch('run',task!);
-  const write=f.db.write.bind(f.db); let lost=false;
-  f.db.write = fn => {
-    const value=write(fn);
+  const write=f.store.writeWorkflow.bind(f.store); let lost=false;
+  f.store.writeWorkflow = (id, fn) => {
+    const value=write(id, fn);
     const count = stage==='registration' ? f.snapshot().events.length===3
       : stage==='result' ? f.coordinator.inspectExecution('run','action')!.state==='RESULT_RECORDED'
       : f.coordinator.inspectExecution('run','action')!.state==='FINALIZED';
@@ -56,7 +57,7 @@ for (const stage of ['registration','result','finalize'] as const) test(`COMMIT 
   if(stage==='registration') {assert.throws(register); task=f.snapshot().tasks.task;}
   else if(stage==='result') await assert.rejects(f.coordinator.dispatch('run',task!));
   else assert.throws(() => f.coordinator.finalizeResult('run',task!));
-  f.db.write=write;
+  f.store.writeWorkflow=write;
   if(stage==='registration') {register(); await f.coordinator.dispatch('run',task!);}
   f.coordinator.finalizeResult('run',task!); f.coordinator.finalizeResult('run',task!);
   assert.equal(f.calls.execute,1); assert.equal(f.snapshot().events.filter(e=>e.type==='TaskCompleted').length,1);
@@ -178,9 +179,9 @@ for (const failure of ['SessionResolved','ProgressRecorded','WorkflowBlocked'] a
   assert.equal(f.snapshot().run.usage.rounds, 1); assert.equal(f.calls.execute, 1); assert.equal(f.calls.plan, 0);
 });
 test('lost completion COMMIT acknowledgement reuses the committed block and unchanged Ledger', async t => {
-  const f = await partialUncertain(t), ledger = f.ledger(), write = f.db.write.bind(f.db);
-  f.db.write = fn => { const result = write(fn); throw Error('lost response'); };
-  assert.throws(() => f.coordinator.completeUncertainBlock('run')); f.db.write = write;
+  const f = await partialUncertain(t), ledger = f.ledger(), write = f.store.writeWorkflow.bind(f.store);
+  f.store.writeWorkflow = (id, fn) => { const result = write(id, fn); throw Error('lost response'); };
+  assert.throws(() => f.coordinator.completeUncertainBlock('run')); f.store.writeWorkflow = write;
   const after = f.snapshot(); assert.equal(after.run.status, 'BLOCKED');
   await f.runner.runOneRound('run'); f.coordinator.completeUncertainBlock('run');
   assert.deepEqual(f.snapshot(), after); assert.deepEqual(f.ledger(), ledger); assert.equal(f.calls.execute, 1);
@@ -225,15 +226,16 @@ test('uncertain completion cannot alter a terminal RESOLVED Workflow', async t =
   f.coordinator.completeUncertainBlock('run'); await f.runner.runOneRound('run'); assert.deepEqual(f.snapshot(), before);
 });
 test('uncertain completion is Workflow-scoped even when another Workflow reuses Action IDs', async t => {
-  const f = await partialUncertain(t); f.store.createWorkflow(executionSeed('ALLOW', 'other')); f.register({ ...record, workflowRunId: 'other' });
-  const before = f.store.getSnapshot('other'); assert.equal(f.coordinator.completeUncertainBlock('other'), undefined);
-  assert.deepEqual(f.store.getSnapshot('other'), before); assert.throws(() => f.coordinator.completeUncertainBlock('missing'), { code: 'WORKFLOW_NOT_FOUND' });
+  const f = await partialUncertain(t); f.store.createWorkflow(executionSeed('ALLOW', 'other')); const other = f.forWorkflow('other'); other.register({ ...record, workflowRunId: 'other' });
+  const before = f.store.getSnapshot('other'); assert.equal(other.coordinator.completeUncertainBlock('other'), undefined);
+  assert.deepEqual(f.store.getSnapshot('other'), before); assert.throws(() => f.coordinator.completeUncertainBlock('missing'), { code: 'LEASE_FENCED' });
   await f.runner.runOneRound('run'); assert.deepEqual(f.store.getSnapshot('other'), before);
 });
 test('uncertain completion refuses foreign Ledger ownership without adding any Event', async t => {
   const f = await partialUncertain(t); f.store.createWorkflow(executionSeed('ALLOW', 'other'));
-  const raw = f.raw(); raw.exec('PRAGMA foreign_keys=OFF; DROP TRIGGER ledger_transition'); raw.exec("UPDATE execution_ledger SET workflow_run_id='other'");
-  const before = f.store.getSnapshot('other'); assert.throws(() => f.coordinator.completeUncertainBlock('other'), { code: 'INTEGRITY_ERROR' });
+  const other = f.forWorkflow('other');
+  const raw = f.raw(); bypassFencingForCorruption(raw); raw.exec('PRAGMA foreign_keys=OFF; DROP TRIGGER ledger_transition'); raw.exec("UPDATE execution_ledger SET workflow_run_id='other'");
+  const before = f.store.getSnapshot('other'); assert.throws(() => other.coordinator.completeUncertainBlock('other'), { code: 'INTEGRITY_ERROR' });
   assert.deepEqual(f.store.getSnapshot('other'), before);
 });
 test('uncertain Result without TaskFailed still uses normal finalization and then completes the safety stop', async t => {

@@ -148,6 +148,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     }
   }
   private safePoint(ctx: RoundContext): RunnerRunResult | undefined {
+    if (this.deps.durableExecution) this.durable(() => this.deps.durableExecution!.assertLease(ctx.id));
     const s = this.snapshot(ctx);
     if (TERMINAL_WORKFLOW_STATUSES.has(s.run.status)) {
       this.cleanupTerminal(s);
@@ -221,6 +222,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     this.cancelEmptyRunnerSession(ctx, sessionId);
   }
   private async model<T>(ctx: RoundContext, phase: string, call: () => Promise<RunnerModelResult<T>>): Promise<{ value: T; stale: boolean; cursor: string }> {
+    if (this.deps.durableExecution) this.durable(() => this.deps.durableExecution!.assertLease(ctx.id));
     const base = cursor(this.snapshot(ctx));
     let response: RunnerModelResult<T>;
     try {
@@ -234,6 +236,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
             if (ctx.signal.aborted || cursor(this.snapshot(ctx)) !== base || this.budget(ctx)) {
               throw new ModelDispatchDeferred();
             }
+            if (this.deps.durableExecution) this.durable(() => this.deps.durableExecution!.assertLease(ctx.id));
             return call();
           } })
         : await call();
@@ -242,6 +245,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       if (usage !== undefined) this.recordUsage(ctx, usage, phase);
       throw error;
     }
+    if (this.deps.durableExecution) this.durable(() => this.deps.durableExecution!.assertLease(ctx.id));
     const stale = cursor(this.snapshot(ctx)) !== base;
     this.recordUsage(ctx, response.usage, phase);
     runnerText(response.provider); runnerText(response.model);

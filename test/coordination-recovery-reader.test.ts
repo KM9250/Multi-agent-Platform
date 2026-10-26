@@ -1,3 +1,4 @@
+import { bypassFencingForCorruption } from './durable-fixture.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
@@ -64,19 +65,19 @@ for (const target of ['journal','result','evidence','owner','state','finalized']
   const f = executionFixture(t), task = f.register();
   if (['result','evidence','finalized'].includes(target)) await f.coordinator.dispatch('run', task);
   if (target === 'finalized') f.coordinator.finalizeResult('run', task);
-  const raw = f.raw(); raw.exec('PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON');
+  const raw = f.raw(); bypassFencingForCorruption(raw); raw.exec('PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON');
   if (target === 'journal') raw.exec("DROP TRIGGER journal_no_update; UPDATE journal_events SET payload_digest='broken' WHERE sequence=1");
   if (target === 'result') raw.exec("DROP TRIGGER execution_results_no_update; UPDATE execution_results SET result_digest='broken'");
   if (target === 'evidence') raw.exec("DROP TRIGGER runner_evidence_no_update; UPDATE runner_evidence SET content_digest='broken'");
   if (target === 'owner') raw.exec("DROP TRIGGER ledger_transition; UPDATE execution_ledger SET session_id='foreign'");
-  if (target === 'state') raw.exec("DROP TRIGGER ledger_transition; DROP TRIGGER ledger_audit_update; UPDATE execution_ledger SET state='FUTURE'");
-  if (target === 'finalized') raw.exec("DROP TRIGGER ledger_transition; DROP TRIGGER ledger_audit_update; UPDATE execution_ledger SET finalized_event_id='missing'");
+  if (target === 'state') raw.exec("DROP TRIGGER ledger_transition; DROP TRIGGER IF EXISTS ledger_audit_update; UPDATE execution_ledger SET state='FUTURE'");
+  if (target === 'finalized') raw.exec("DROP TRIGGER ledger_transition; DROP TRIGGER IF EXISTS ledger_audit_update; UPDATE execution_ledger SET finalized_event_id='missing'");
   const before = contents(f), result = reader(f).inspect('run'); assert.equal(result.disposition, 'RECOVERY_FAILED'); assert.deepEqual(contents(f), before);
 });
 test('inspectAll isolates corrupt Workflow and same Action ID across Workflows', t => {
   const f = executionFixture(t); f.register(); f.store.createWorkflow(executionSeed('ALLOW', 'second'));
-  const other = { ...record, workflowRunId: 'second' }, request = registration(f.store, other);
-  f.coordinator.registerAction(other, request.expected, request.sessionEvent, request.taskEvent);
+  const other = { ...record, workflowRunId: 'second' }, owned = f.forWorkflow('second'), request = registration(owned.store, other);
+  owned.coordinator.registerAction(other, request.expected, request.sessionEvent, request.taskEvent);
   f.raw().exec("DROP TRIGGER journal_no_update; UPDATE journal_events SET payload_digest='bad' WHERE workflow_run_id='run' AND sequence=1");
   const results = reader(f).inspectAll(); assert.deepEqual(results.map(r => r.disposition), ['RECOVERY_FAILED','READY_TO_RESUME']);
   assert.equal(results[1].journalCursor, 3); assert.equal(results[1].executionStates[0].actionId, 'action');
@@ -132,7 +133,7 @@ test('a mismatched Security Review reason cannot disguise a persisted unknown ex
   const f = executionFixture(t), task = f.register(); f.executor.execute = async () => ({ status: 'uncertain', summary: 'unknown' });
   await f.coordinator.dispatch('run', task); f.coordinator.finalizeResult('run', task); f.coordinator.completeUncertainBlock('run');
   f.add('WorkflowResumed', { authorization: { type: 'user', reference: 'manual' } });
-  f.db.write(tx => tx.run("UPDATE execution_ledger SET review_reason='SECURITY_REVIEW_REQUIRED' WHERE action_id='action'"));
+  f.store.writeWorkflow('run', tx => tx.run("UPDATE execution_ledger SET review_reason='SECURITY_REVIEW_REQUIRED' WHERE action_id='action'"));
   const before = contents(f); assert.equal(reader(f).inspect('run').disposition, 'RECOVERY_FAILED'); assert.deepEqual(contents(f), before);
 });
 test('all Actions contribute to a Workflow classification, including historical FINALIZED work', async t => {

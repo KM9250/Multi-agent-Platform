@@ -1,11 +1,12 @@
 // Test-only fault injection through the actual SQLite driver. No production crash hooks.
 import { DatabaseSync } from 'node:sqlite';
 import { appendFileSync } from 'node:fs';
-import { DurableDatabase, SqliteCoordinationRunnerStore, DurableExecutionCoordinator, createDurableCoordinationRunner } from '../services/coordination/durable/index.ts';
+import { DurableDatabase, SqliteCoordinationRunnerStore, DurableExecutionCoordinator, createDurableCoordinationRunner, createRuntimeLeaseManager } from '../services/coordination/durable/index.ts';
 import { createRunnerEvent } from '../services/coordination/runner/eventFactory.ts';
 import { registration, record, clock, model } from './durable-execution-fixture.ts';
 const [path, mode, effectPath] = process.argv.slice(2);
-const db = new DurableDatabase({path}), store = new SqliteCoordinationRunnerStore(db);
+const db = new DurableDatabase({path}); let store = new SqliteCoordinationRunnerStore(db);
+const manager = createRuntimeLeaseManager(db, { ttlMs: 1000 });
 const pause = () => {process.send!({stage:mode});Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0);};
 let boundary = '';
 const prepare = DatabaseSync.prototype.prepare;
@@ -40,10 +41,12 @@ const executor = {id:'test',async prepare(){return record.action;},async execute
   if(mode==='external-after') pause();
   return {status:mode.startsWith('uncertain-')?'uncertain' as const:'succeeded' as const,summary:'done'};
 }};
-const coordinator=new DurableExecutionCoordinator(store,{get:id=>id==='test'?executor:undefined},{clock});
+let coordinator: DurableExecutionCoordinator;
 process.on('message',async()=>{
   try{
     let outcome;
+    if (mode !== 'inspect') store = store.withLease(manager.acquire('run'));
+    coordinator = new DurableExecutionCoordinator(store,{get:id=>id==='test'?executor:undefined},{clock});
     if(mode.startsWith('uncertain-legacy-')){
       const task=store.getSnapshot('run').tasks.task;
       await coordinator.dispatch('run',task);coordinator.finalizeResult('run',task);
@@ -71,8 +74,9 @@ process.on('message',async()=>{
       await coordinator.dispatch('run',task);
       coordinator.finalizeResult('run',task);
     }
+    if (store.lease) manager.release(store.lease);
     db.close();process.send!({done:true,outcome});
-  }catch(error){db.close();process.send!({done:true,code:(error as any).code});}
+  }catch(error){if(store.lease){try{manager.release(store.lease);}catch{}} db.close();process.send!({done:true,code:(error as any).code});}
   process.disconnect();
 });
 process.send!({ready:true});
