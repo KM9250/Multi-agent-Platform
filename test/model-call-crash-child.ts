@@ -15,7 +15,7 @@ if(stage==='migration') {
  };
  new DurableDatabase({path});
 } else {
- const db=new DurableDatabase({path}),lease=db.createLeaseManager({ttlMs:60000}).acquire('run'),store=new SqliteCoordinationRunnerStore(db,lease),l=new ModelCallLedger(store);
+ const db=new DurableDatabase({path}),lease=db.createLeaseManager({ttlMs:60000}).acquire('run'),store=new SqliteCoordinationRunnerStore(db,lease),l=new ModelCallLedger(store,{now:()=>10});
  const s=store.getSnapshot('run'),x={workflowRunId:'run',modelCallId:'crash-call',attemptId:'crash-attempt',providerId:'test',modelId:'test',phase:'PLAN' as const,roundKey:'crash-round',requestCursor:s.events.length,requestEventId:s.events.at(-1)!.eventId,
  quote:{providerId:'test',modelId:'test',maxAttempts:1 as const,inputTokens:1,maxOutputTokens:1,maxEstimatedCost:0,pricingId:'test-zero',conditions:'test-only',requestDigest:'a'.repeat(64)}};
  if(stage!=='reservation')l.reserve(x);

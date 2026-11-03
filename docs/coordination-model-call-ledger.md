@@ -45,20 +45,25 @@ Server-only exports are in `services/coordination/durable/index.ts`.
 
 | API | Contract |
 | --- | --- |
-| `reserve` | Validate quote, workflow, current Journal head, coverage, lease and all four budget limits in `BEGIN IMMEDIATE`; exact same identity returns the saved reservation |
-| `markDispatchIntent` | RESERVED → DISPATCH_INTENT once; revalidate workflow/head; a saved intent never authorizes another API attempt |
+| `reserve` | Validate quote, workflow, current Journal head, coverage, lease, all Policy stop conditions and reserved budgets in `BEGIN IMMEDIATE`; exact same identity returns the saved reservation |
+| `markDispatchIntent` | RESERVED → DISPATCH_INTENT once; revalidate workflow/head, Policy stops and committed plus outstanding budgets in the same transaction; a saved intent never authorizes another API attempt |
 | `settle` | Complete single-attempt usage, UsageRecorded, seed anchor, attempt state and audit in one COMMIT; exact duplicate is idempotent; conflicting identity/usage is rejected |
 | `markReviewRequired` | DISPATCH_INTENT → REVIEW_REQUIRED; retain safe partial numeric facts and the full reservation |
 | `cancelBeforeDispatch` | Only RESERVED → CANCELLED_PRE_DISPATCH; abort after intent cannot release budget |
 | `markApplied` | Synchronous business event callback plus APPLIED receipt in one transaction, beginning at the settled usage cursor; store a digest, start cursor and final event ID |
 | `inspectApplication` | Validate the saved receipt against an exact supplied event batch without repeating the callback |
-| `markDiscarded` | Preserve settled usage and record a fixed invalid/stale/abort reason; identical repeats are idempotent |
+| `markDiscarded` | Preserve settled usage and record a fixed invalid/stale/abort/budget/workflow-stop reason; identical repeats are idempotent |
 | `inspect`, `getBudgetPosition` | Read-only ledger and reconstructed committed/outstanding budget information |
 
 An identical `markApplied` retry with the saved start cursor verifies the persisted
-receipt and does not invoke the callback again. It returns `undefined`; fresh
-application returns the callback result. Callers needing confirmation use
-`inspectApplication`, not an attempted replay of external effects. Callbacks are
+receipt and does not invoke the callback again. Both `markApplied` and coordinator
+`apply` return `{status: 'ALREADY_APPLIED', receipt}` for this case. Fresh application
+returns `{status: 'APPLIED', receipt, value}`; a callback returning `undefined` is
+valid. The receipt identifies the call, start cursor, final event and event digest.
+After ACK loss, an explicit API retry can confirm this receipt without adding
+business events. `inspectApplication` also validates an exact supplied event batch.
+Runner stops on `ALREADY_APPLIED`; this result grants no automatic application,
+Action dispatch or Model API retry. Callbacks are
 trusted synchronous internal code; async work and external effects are forbidden.
 
 Every row carries workflow, call, attempt, round, phase, provider/model, request
@@ -90,6 +95,12 @@ Outstanding includes RESERVED, DISPATCH_INTENT and REVIEW_REQUIRED, independent
 of time or lease expiry. SETTLED contributes through the Journal only, avoiding
 double counting. No mutable in-memory counter is authoritative. Independent SQLite
 connections serialize reservations under the same lease-bound writer.
+
+Reservation and dispatch-intent writes also check `maxWallTimeMs`, `maxRounds`,
+`maxConsecutiveErrors` and `maxNoProgressCycles` against the committed workflow
+restored inside that SQLite transaction. The trusted clock is sampled there;
+synthetic-time fixtures must inject their clock. The intent check includes its
+own existing reservation exactly once. Runner prechecks are not authoritative.
 
 Costs remain numbers in WorkflowUsage and UsageRecorded. DB reservation, settlement
 and comparisons use safe integer micro-USD. Decimal-string/BigInt conversion rounds
@@ -147,3 +158,35 @@ old generations, legacy workflows, stale RESERVED rows, and pending application
 without response bodies. It must also define how terminal workflows account for
 late usage without reopening the existing Journal contract. No operator API or
 automatic repair is supplied here.
+
+## PR #31 audit fixes (F-01–F-03)
+
+After usage settlement, PLAN and VERIFY explicitly discard responses that cannot
+be used, including state changes during asynchronous Action preparation:
+
+| Known exit condition | Discard reason |
+| --- | --- |
+| Budget exhausted before PLAN application or complete usage exceeds quote | `BUDGET_EXHAUSTED` |
+| Abort | `ABORTED` |
+| Workflow stopped, suspended, blocked or cancelled | `WORKFLOW_STOPPED` |
+| Journal cursor or task context changed | `STALE_RESPONSE` |
+| Invalid response or invalid prepared Action | `INVALID_RESPONSE` |
+
+Usage remains settled. A normal PLAN response with `maxLlmCalls=1` does not leave
+pending application or dispatch an Action. VERIFY may apply its final permitted
+call because completing that evaluation needs no additional model call or Action.
+An over-quote response retains its budget-violation flag even after discard.
+
+`PENDING_APPLICATION` remains necessary after a crash, a failed or uncertain
+application transaction, lease loss that prevents the old owner from writing, or
+failure to persist discard and its audit. These cases cannot safely claim either
+application or discard and remain diagnostic Recovery work. There is no automatic
+replay or COORD-5C-4 execution authorization.
+
+The still-unmerged migration 005 extends its reason enum with `BUDGET_EXHAUSTED`
+and `WORKFLOW_STOPPED`; the draft schema version remains 5. This is not an upgrade
+migration for an already-deployed schema 5 database.
+
+`coordination-model-call-audit.test.ts` adds 47 tests: 24 for F-01 exit/retention
+boundaries, 3 for F-02 application receipt/ACK idempotency, and 20 for F-03 direct
+coordinator Policy and outstanding-budget enforcement.

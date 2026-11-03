@@ -11,7 +11,7 @@ import { createRunnerEvent, runnerTimestamp } from './eventFactory';
 import { runnerText, validatePreparedRunnerAction, validateRunnerExecution, validateRunnerPlan, validateRunnerUsage, validateRunnerVerification } from './model';
 import { evaluateRunnerActionRisk, parseRunnerActionRef, runnerActionRef, runnerPendingApproval } from './policyGuard';
 import { defaultRunnerIds } from './stores';
-import type { CoordinationRunner, CoordinationRunnerDependencies, CoordinationRunnerStore, PreparedRunnerAction, RunnerClock, RunnerExecutionResult, RunnerIdGenerator, RunnerModelResult, RunnerPendingApproval, RunnerRunOptions, RunnerRunResult, RunnerStopReason, RunnerPlanRequest, RunnerVerifyRequest } from './types';
+import type { CoordinationRunner, CoordinationRunnerDependencies, CoordinationRunnerStore, PreparedRunnerAction, RunnerClock, RunnerExecutionResult, RunnerIdGenerator, RunnerModelResult, RunnerPendingApproval, RunnerRunOptions, RunnerRunResult, RunnerStopReason, RunnerPlanRequest, RunnerVerifyRequest, RunnerModelDiscardReason } from './types';
 
 const RUNNER_SESSION_PREFIX = 'map.runner.v1:';
 // Shared across runner instances in this JS runtime; deliberately not a distributed lock.
@@ -26,6 +26,7 @@ interface RetainedRunnerResult {
 type RunnerResultMap = Map<string, Map<string, RetainedRunnerResult>>;
 const collected = new WeakMap<CoordinationRunnerStore, RunnerResultMap>();
 class DurableRunnerStop extends Error {}
+class ModelApplicationAlreadyApplied extends Error {}
 class ModelDispatchDeferred extends Error {}
 class RunnerVerifyEvidenceUnavailable extends Error {}
 class RegistrationCleanupError extends AggregateError {
@@ -78,6 +79,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
         if (!loop || result.reason !== 'round_completed') return { ...result, roundsCompleted: rounds };
       } while (true); // Every new PLAN consumes budget; every completed round records Progress.
     } catch (error) {
+      if(error instanceof ModelApplicationAlreadyApplied) return {...this.result(ctx,'stopped',undefined,'RUNNER_MODEL_APPLICATION_ALREADY_APPLIED'),roundsCompleted:rounds+ctx.completed};
       if (this.deps.durableExecution || error instanceof DurableRunnerStop) return { ...this.result(ctx, 'error', undefined, 'RUNNER_DURABLE_EXECUTION_STOPPED'), roundsCompleted: rounds + ctx.completed };
       const stopped = this.safePoint(ctx);
       if (stopped) return { ...stopped, roundsCompleted: rounds + ctx.completed };
@@ -272,12 +274,17 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     const completed=ctx.completed;
     try {
       const result=this.durable(()=>this.deps.durableModelCalls!.apply(ctx.id,ctx.modelCallId!,this.snapshot(ctx).events.length,fn));
-      ctx.modelCallId=undefined; return result;
+      ctx.modelCallId=undefined;
+      if(result.status==='ALREADY_APPLIED') throw new ModelApplicationAlreadyApplied();
+      return result.value;
     } catch(error) {ctx.completed=completed;throw error;}
   }
-  private discardModel(ctx:RoundContext,reason:'INVALID_RESPONSE'|'STALE_RESPONSE'|'ABORTED'):void {
+  private discardModel(ctx:RoundContext,reason:RunnerModelDiscardReason):void {
     if(ctx.modelCallId && this.deps.durableModelCalls) this.durable(()=>this.deps.durableModelCalls!.discard(ctx.id,ctx.modelCallId!,reason));
     ctx.modelCallId=undefined;
+  }
+  private discardStoppedModel(ctx:RoundContext):void {
+    this.discardModel(ctx,ctx.signal.aborted ? 'ABORTED' : 'WORKFLOW_STOPPED');
   }
   private recordUsage(ctx: RoundContext, value: unknown, phase: string): void {
     const usage = validateRunnerUsage(value);
@@ -373,9 +380,9 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       const s = this.snapshot(ctx);
       const request=runnerPlanRequest(s,this.now(s),ctx.signal);
       const response = await this.model(ctx, 'plan', () => this.deps.supervisorProvider.plan(request),request);
-      const stopped = this.safePoint(ctx); if (stopped) return stopped;
-      if (response.stale || cursor(this.snapshot(ctx)) !== response.cursor) return this.decide(ctx);
-      const exhausted = this.budget(ctx); if (exhausted) return this.block(ctx, `RUNNER_BUDGET_EXHAUSTED:${exhausted}`);
+      const stopped = this.safePoint(ctx); if (stopped) {this.discardStoppedModel(ctx);return stopped;}
+      if (response.stale || cursor(this.snapshot(ctx)) !== response.cursor) {this.discardModel(ctx,'STALE_RESPONSE');return this.decide(ctx);}
+      const exhausted = this.budget(ctx); if (exhausted) {this.discardModel(ctx,'BUDGET_EXHAUSTED');return this.block(ctx, `RUNNER_BUDGET_EXHAUSTED:${exhausted}`);}
       const proposal = validateRunnerPlan(response.value);
       if (proposal.kind !== 'execute') {
         return this.applyModel(ctx,()=>{
@@ -390,11 +397,11 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       const base = cursor(this.snapshot(ctx));
       const prepared = await executor.prepare(proposal.action);
       const action = this.deps.durableExecution
-        ? this.durable(() => this.deps.durableExecution!.validatePreparedAction(prepared, executor.id))
+        ? this.deps.durableExecution!.validatePreparedAction(prepared, executor.id)
         : validatePreparedRunnerAction(prepared, executor.id);
-      const after = this.safePoint(ctx); if (after) return after;
-      if (cursor(this.snapshot(ctx)) !== base) return this.decide(ctx);
-      const budget = this.budget(ctx); if (budget) return this.block(ctx, `RUNNER_BUDGET_EXHAUSTED:${budget}`);
+      const after = this.safePoint(ctx); if (after) {this.discardStoppedModel(ctx);return after;}
+      if (cursor(this.snapshot(ctx)) !== base) {this.discardModel(ctx,'STALE_RESPONSE');return this.decide(ctx);}
+      const budget = this.budget(ctx); if (budget) {this.discardModel(ctx,'BUDGET_EXHAUSTED');return this.block(ctx, `RUNNER_BUDGET_EXHAUSTED:${budget}`);}
       const current = this.snapshot(ctx);
       if (Object.values(current.tasks).some(task => parseRunnerActionRef(task.inputRefs)?.actionId === action.actionId)) throw new Error('Action ID already used.');
       const sessionId = this.ids.nextId('session'); const taskId = this.ids.nextId('task'); const now = this.now(current);
@@ -427,7 +434,8 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       }
       return this.execute(ctx, this.snapshot(ctx).tasks[taskId], false);
     } catch (error) {
-      if (error instanceof DurableRunnerStop) throw error;
+      // A failed/unknown application COMMIT or lost lease must retain its receipt for inspection.
+      if (error instanceof DurableRunnerStop || error instanceof ModelApplicationAlreadyApplied) throw error;
       this.discardModel(ctx,'INVALID_RESPONSE');
       const stopped = this.safePoint(ctx); if (stopped) return stopped;
       if (error instanceof ModelDispatchDeferred) return this.decide(ctx);
@@ -561,8 +569,8 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
         task: structuredClone(task), evidence, audit: runnerAudit(s, this.now(s)), systemContract: RUNNER_PROVIDER_SYSTEM_CONTRACT, signal: ctx.signal,
       };
       const response=await this.model(ctx,'verify',()=>this.deps.supervisorProvider.verify(request),request);
-      const after = this.safePoint(ctx); if (after) return after;
-      if (response.stale || cursor(this.snapshot(ctx)) !== response.cursor || !this.taskWritable(ctx, task)) return this.decide(ctx);
+      const after = this.safePoint(ctx); if (after) {this.discardStoppedModel(ctx);return after;}
+      if (response.stale || cursor(this.snapshot(ctx)) !== response.cursor || !this.taskWritable(ctx, task)) {this.discardModel(ctx,'STALE_RESPONSE');return this.decide(ctx);}
       const verification = validateRunnerVerification(response.value, this.snapshot(ctx).run.acceptanceCriteria);
       const current = this.snapshot(ctx);
       const applied=this.applyModel(ctx,()=>{
@@ -581,7 +589,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       });
       return applied;
     } catch (error) {
-      if(error instanceof DurableRunnerStop) throw error;
+      if(error instanceof DurableRunnerStop || error instanceof ModelApplicationAlreadyApplied) throw error;
       this.discardModel(ctx,'INVALID_RESPONSE');
       const after = this.safePoint(ctx); if (after) return after;
       if (error instanceof ModelDispatchDeferred) return this.decide(ctx);

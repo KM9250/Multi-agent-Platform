@@ -45,7 +45,7 @@ CREATE TABLE model_call_ledger (
  usage_event_id TEXT UNIQUE,
  application_status TEXT NOT NULL CHECK(application_status IN ('PENDING_APPLICATION','APPLIED','DISCARDED','NOT_APPLICABLE')),
  application_event_id TEXT, application_digest TEXT, application_start_cursor INTEGER,
- reason_code TEXT CHECK(reason_code IN ('USAGE_UNKNOWN','USAGE_PARTIAL','BUDGET_VIOLATION','PRE_DISPATCH_CANCELLED','INVALID_RESPONSE','STALE_RESPONSE','ABORTED','API_ERROR')),
+ reason_code TEXT CHECK(reason_code IN ('USAGE_UNKNOWN','USAGE_PARTIAL','BUDGET_VIOLATION','PRE_DISPATCH_CANCELLED','INVALID_RESPONSE','STALE_RESPONSE','ABORTED','BUDGET_EXHAUSTED','WORKFLOW_STOPPED','API_ERROR')),
  budget_violation INTEGER NOT NULL DEFAULT 0 CHECK(budget_violation IN (0,1)),
  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, settled_at INTEGER,
  UNIQUE(workflow_run_id,round_key,phase), UNIQUE(workflow_run_id,model_call_id),
@@ -64,7 +64,7 @@ CREATE TABLE model_call_attempts (
  attempt_number INTEGER NOT NULL CHECK(attempt_number=1), dispatch_intent_at INTEGER,
  state TEXT NOT NULL CHECK(state IN ('RESERVED','DISPATCH_INTENT','SETTLED','CANCELLED_PRE_DISPATCH','REVIEW_REQUIRED')),
  completeness TEXT NOT NULL CHECK(completeness IN ('UNKNOWN','PARTIAL','COMPLETE')),
- reason_code TEXT CHECK(reason_code IN ('USAGE_UNKNOWN','USAGE_PARTIAL','BUDGET_VIOLATION','PRE_DISPATCH_CANCELLED','INVALID_RESPONSE','STALE_RESPONSE','ABORTED','API_ERROR')),
+ reason_code TEXT CHECK(reason_code IN ('USAGE_UNKNOWN','USAGE_PARTIAL','BUDGET_VIOLATION','PRE_DISPATCH_CANCELLED','INVALID_RESPONSE','STALE_RESPONSE','ABORTED','BUDGET_EXHAUSTED','WORKFLOW_STOPPED','API_ERROR')),
  FOREIGN KEY(workflow_run_id,model_call_id) REFERENCES model_call_ledger(workflow_run_id,model_call_id)
 ) STRICT;
 ALTER TABLE runtime_audit_events ADD COLUMN model_call_id TEXT REFERENCES model_call_ledger(model_call_id);
@@ -89,7 +89,7 @@ CREATE TRIGGER model_call_transition BEFORE UPDATE ON model_call_ledger WHEN NOT
  OR ${['model_call_id','workflow_run_id','round_key','phase','runtime_instance_id','generation','provider_id','model_id','request_cursor','request_event_id','attempt_id','quote_json','reserved_calls','reserved_input','reserved_output','reserved_cost','created_at'].map(k=>`NEW.${k} IS NOT OLD.${k}`).join(' OR ')}
  OR (OLD.state='DISPATCH_INTENT' AND NEW.state='SETTLED' AND NEW.application_status NOT IN ('PENDING_APPLICATION','NOT_APPLICABLE'))
  OR (NEW.application_status='APPLIED' AND (NEW.budget_violation<>0 OR NEW.reason_code IS NOT OLD.reason_code))
- OR (NEW.application_status='DISCARDED' AND NEW.reason_code NOT IN ('INVALID_RESPONSE','STALE_RESPONSE','ABORTED'))
+ OR (NEW.application_status='DISCARDED' AND NEW.reason_code NOT IN ('INVALID_RESPONSE','STALE_RESPONSE','ABORTED','BUDGET_EXHAUSTED','WORKFLOW_STOPPED'))
  OR (OLD.state='SETTLED' AND (${['usage_json','usage_cost','usage_event_id','settled_at','completeness','budget_violation'].map(k=>`NEW.${k} IS NOT OLD.${k}`).join(' OR ')}))
 BEGIN SELECT RAISE(ABORT,'INVALID_MODEL_TRANSITION'); END;
 CREATE TRIGGER model_settlement_fresh_event BEFORE UPDATE ON model_call_ledger WHEN

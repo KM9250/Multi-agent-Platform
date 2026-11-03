@@ -1,6 +1,6 @@
 import { validateRunnerUsage } from '../runner/model';
 import { randomUUID } from 'node:crypto';
-import type { RunnerSupervisorProvider, RunnerPlanRequest, RunnerVerifyRequest, RunnerModelResult, RunnerDurableModelCalls } from '../runner/types';
+import type { RunnerSupervisorProvider, RunnerPlanRequest, RunnerVerifyRequest, RunnerModelResult, RunnerDurableModelCalls, RunnerModelApplicationResult, RunnerModelDiscardReason } from '../runner/types';
 import { digest, DurableStoreError, requireIntegrity } from './integrity';
 import { ModelCallLedger, validateQuote } from './modelCallLedger';
 import type { ModelBudgetQuote, ModelCallIdentity } from './modelCallLedger';
@@ -70,7 +70,10 @@ export class DurableModelCallCoordinator implements RunnerDurableModelCalls {
   }
   try {response.usage=validateRunnerUsage(response.usage);} catch {this.ledger.markReviewRequired(x,'UNKNOWN');throw new DurableStoreError('MODEL_INVALID_USAGE');}
   const row=this.ledger.settle(x,response.usage,true);
-  if(row.budget_violation) throw new DurableStoreError('MODEL_REVIEW_REQUIRED');
+  if(row.budget_violation) {
+   this.ledger.markDiscarded(x,'BUDGET_EXHAUSTED');
+   throw new DurableStoreError('MODEL_REVIEW_REQUIRED'); // Violation flag still prohibits subsequent calls.
+  }
   if(response.provider!==x.providerId || response.model!==x.modelId || !Number.isFinite(response.latencyMs) || response.latencyMs<0) {
    this.ledger.markDiscarded(x,'INVALID_RESPONSE');throw new DurableStoreError('MODEL_REVIEW_REQUIRED');
   }
@@ -81,6 +84,6 @@ export class DurableModelCallCoordinator implements RunnerDurableModelCalls {
   const r=this.ledger.inspect(id,callId)[0];requireIntegrity(r);
   return {workflowRunId:id,modelCallId:callId,attemptId:String(r.attempt_id),providerId:String(r.provider_id),modelId:String(r.model_id)};
  }
- apply<T>(id:string,callId:string,cursor:number,fn:()=>T):T {const result=this.ledger.markApplied(this.identity(id,callId),cursor,fn);requireIntegrity(result!==undefined);return result;}
- discard(id:string,callId:string,reason:'INVALID_RESPONSE'|'STALE_RESPONSE'|'ABORTED'):void {this.ledger.markDiscarded(this.identity(id,callId),reason);}
+ apply<T>(id:string,callId:string,cursor:number,fn:()=>T):RunnerModelApplicationResult<T> {return this.ledger.markApplied(this.identity(id,callId),cursor,fn);}
+ discard(id:string,callId:string,reason:RunnerModelDiscardReason):void {this.ledger.markDiscarded(this.identity(id,callId),reason);}
 }

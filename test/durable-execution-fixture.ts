@@ -1,4 +1,5 @@
 import { testModel } from './model-call-fixture.ts';
+import type { WorkflowBudget } from '../services/coordination/types.ts';
 import type { TestContext } from 'node:test';
 import { createWorkflow, createRunnerEvent, appendEvent } from '../services/coordination/index.ts';
 import { DurableExecutionCoordinator, createDurableCoordinationRunner, createRuntimeLeaseManager } from '../services/coordination/durable/index.ts';
@@ -11,11 +12,11 @@ export const clock = { now: () => 10 };
 export const prepared: PreparedRunnerAction = { actionId: 'action', executorId: 'test', operation: 'read', actionClass: 'read', fingerprint: 'fingerprint',
   retrySafety: 'safe', publicSummary: 'Public action', payload: { query: 'ordinary input' } };
 export const record: RunnerPendingActionRecord = { workflowRunId: 'run', sessionId: 'session', taskId: 'task', action: prepared };
-export function executionSeed(risk: 'ALLOW' | 'DENY' | 'NEEDS_USER' = 'ALLOW', runId = 'run') {
+export function executionSeed(risk: 'ALLOW' | 'DENY' | 'NEEDS_USER' = 'ALLOW', runId = 'run', budgets: Partial<WorkflowBudget> = {}) {
   const s = fresh(runId);
   return createWorkflow({ runId, roomId: 'room', goal: 'Goal', acceptanceCriteria: ['done'], supervisorAgentId: 'supervisor',
     participantAgentIds: ['supervisor'], executionMode: 'supervised_autonomous', now: 1,
-    policy: { ...s.policy, riskRules: { read: risk } } });
+    policy: { ...s.policy, budgets: {...s.policy.budgets,...budgets}, riskRules: { read: risk } } });
 }
 export function registration(store: SqliteCoordinationRunnerStore, r = record, round = 'round') {
   const expected = store.getSnapshot(r.workflowRunId), ids = { nextId: (kind: string) => `${round}-${kind}-${r.action.actionId}` };
@@ -32,8 +33,8 @@ export function registration(store: SqliteCoordinationRunnerStore, r = record, r
   return { expected, sessionEvent, taskEvent, record: r };
 }
 export const model = <T>(value: T) => ({ value, usage: { llmCalls: 1, inputTokens: 1, outputTokens: 1, estimatedCost: 0 }, provider: 'test', model: 'test', latencyMs: 0 });
-export function executionFixture(t: TestContext, risk: 'ALLOW' | 'DENY' | 'NEEDS_USER' = 'ALLOW') {
-  const f = fixture(t, executionSeed(risk)), calls = { execute: 0, plan: 0, verify: 0 };
+export function executionFixture(t: TestContext, risk: 'ALLOW' | 'DENY' | 'NEEDS_USER' = 'ALLOW', budgets: Partial<WorkflowBudget> = {}) {
+  const f = fixture(t, executionSeed(risk,'run',budgets)), calls = { execute: 0, plan: 0, verify: 0 };
   const executor: RunnerActionExecutor = { id: 'test', async prepare() { return structuredClone(prepared); }, async execute() { calls.execute++; return { status: 'succeeded', summary: 'raw private result' }; } };
   const registry = { get: (id: string) => id === 'test' ? executor : undefined };
   const provider: RunnerSupervisorProvider = {

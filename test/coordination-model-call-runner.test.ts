@@ -35,12 +35,12 @@ test('queue abort creates no reservation and makes no model call',async t=>{
  assert.equal(f.calls.plan,0);assert.equal(new ModelCallLedger(f.store).inspect('run').length,0);
 });
 test('abort after intent retains reservation without provider dispatch',async t=>{
- const f=executionFixture(t),c=new DurableModelCallCoordinator(f.store,testModel(f.provider)),abort=new AbortController();
+ const f=executionFixture(t),c=new DurableModelCallCoordinator(f.store,testModel(f.provider),clock),abort=new AbortController();
  const mark=c.ledger.markDispatchIntent.bind(c.ledger);c.ledger.markDispatchIntent=x=>{mark(x);abort.abort();};
  await assert.rejects(c.call(input(f,abort.signal)));assert.equal(f.calls.plan,0);assert.equal(c.ledger.inspect('run')[0].state,'REVIEW_REQUIRED');assert.equal(c.ledger.getBudgetPosition('run').outstanding.llmCalls,1);
 });
 test('usage received after lease loss cannot settle or transfer generation',async t=>{
- const f=executionFixture(t),c=new DurableModelCallCoordinator(f.store,testModel(f.provider));
+ const f=executionFixture(t),c=new DurableModelCallCoordinator(f.store,testModel(f.provider),clock);
  f.provider.plan=async()=>{f.release();f.acquire();return model({kind:'finish',summary:'done'});};
  await assert.rejects(c.call(input(f)),{code:'LEASE_FENCED'});assert.equal(c.ledger.inspect('run')[0].state,'DISPATCH_INTENT');assert.equal(f.snapshot().run.usage.llmCalls,0);
 });
@@ -49,7 +49,7 @@ test('invalid PLAN retains settled usage with discarded response and no action',
  const r=new ModelCallLedger(f.store).inspect('run')[0];assert.equal(r.state,'SETTLED');assert.equal(r.application_status,'DISCARDED');assert.equal(f.calls.execute,0);
 });
 test('pending application refuses automatic replan under a fresh round id',async t=>{
- const f=executionFixture(t),c=new DurableModelCallCoordinator(f.store,testModel(f.provider));await c.call(input(f));
+ const f=executionFixture(t),c=new DurableModelCallCoordinator(f.store,testModel(f.provider),clock);await c.call(input(f));
  await assert.rejects(c.call({...input(f),roundKey:'different'}));assert.equal(f.calls.plan,1);
 });
 test('PLAN needs_user and finish create atomic application receipts',async t=>{
@@ -65,14 +65,14 @@ test('VERIFY event failure rolls back evaluation, criteria, session, progress an
  assert.equal(f.snapshot().events.filter(e=>e.type==='EvaluationAdded').length,0);assert.equal(f.snapshot().run.usage.llmCalls,2);
 });
 for(const stage of ['reserve','markDispatchIntent'] as const)for(const committed of [false,true])test(`${stage} ${committed?'lost COMMIT ACK':'write failure'} cannot authorize external call`,async t=>{
- const f=executionFixture(t),c=new DurableModelCallCoordinator(f.store,testModel(f.provider)),original=c.ledger[stage].bind(c.ledger);
+ const f=executionFixture(t),c=new DurableModelCallCoordinator(f.store,testModel(f.provider),clock),original=c.ledger[stage].bind(c.ledger);
  (c.ledger as any)[stage]=(x:any)=>{if(committed)original(x);throw Error('write acknowledgement unavailable');};
  await assert.rejects(c.call(input(f)));assert.equal(f.calls.plan,0);
  if(committed)assert.equal(c.ledger.inspect('run')[0].state,stage==='reserve'?'RESERVED':'DISPATCH_INTENT');
 });
 test('invalid complete usage fails closed into review with no zero settlement',async t=>{
  const f=executionFixture(t);f.provider.plan=async()=>({...model({kind:'finish',summary:'done'}),usage:undefined as any});
- const c=new DurableModelCallCoordinator(f.store,testModel(f.provider));await assert.rejects(c.call(input(f)));
+ const c=new DurableModelCallCoordinator(f.store,testModel(f.provider),clock);await assert.rejects(c.call(input(f)));
  assert.equal(c.ledger.inspect('run')[0].state,'REVIEW_REQUIRED');assert.equal(f.snapshot().run.usage.llmCalls,0);
 });
 test('scheduler queue wait rechecks elapsed budget before reservation',async t=>{
