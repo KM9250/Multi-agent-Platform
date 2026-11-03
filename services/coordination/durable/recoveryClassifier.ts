@@ -5,6 +5,7 @@ import type { ExecutionStateSummary, RecoveryAuthorizationRequirement, RecoveryD
 
 export interface RecoveryFacts {
   workflowRunId: string; inspectedAt: number; snapshot?: CoordinationSnapshot;
+  modelCalls?: import('./modelCallRecovery').ModelCallSummary; modelCallCoverage?: 'TRACKED_FROM_CREATION'|'LEGACY_UNTRACKED';
   executions: ExecutionStateSummary[]; missingHistoricalLedger?: boolean;
   integrityReason?: string; unresolvedSecurityReview?: boolean; unresolvedEvidenceReview?: boolean;
   authorizationRequirements?: RecoveryAuthorizationRequirement[];
@@ -20,13 +21,14 @@ export function classifyRecovery(facts: RecoveryFacts): RecoveryInspection {
     journalCursor: s?.events.at(-1)?.sequence ?? 0, journalTimestamp: s?.events.at(-1)?.timestamp, inspectedAt,
     pendingActionIds: executions.filter(e => e.state !== 'FINALIZED').map(e => e.actionId), executionStates: executions,
     recordedUsage: { ...(s?.run.usage ?? emptyWorkflowUsage()) }, budgetStatus,
-    modelCallCoverage: 'NOT_TRACKED_YET', requiresExplicitAuthorization: disposition !== 'INACTIVE',
+    modelCallCoverage: facts.modelCallCoverage ?? 'UNVERIFIED', modelCalls:facts.modelCalls, requiresExplicitAuthorization: disposition !== 'INACTIVE',
     authorizationRequirements: (facts.authorizationRequirements ?? []).map(requirement => ({ ...requirement })),
     stopJournalEventId: s ? [...s.events].reverse().find(event => ['WorkflowBlocked','WorkflowSuspended'].includes(event.type))?.eventId : undefined,
     reasonCodes: [...new Set([reason, ...reasons, ...(budgetStatus === 'RECORDED_LIMIT_EXHAUSTED' ? ['RECORDED_BUDGET_EXHAUSTED'] : []),
-      'MODEL_CALL_COVERAGE_NOT_TRACKED', 'EXECUTION_NOT_AUTHORIZED'])], executable: false, executionAllowed: false,
+      ...(facts.modelCallCoverage==='LEGACY_UNTRACKED'?['MODEL_CALL_LEGACY_UNTRACKED']:[]), 'EXECUTION_NOT_AUTHORIZED'])], executable: false, executionAllowed: false,
   });
   if (facts.integrityReason || !s) return finish('RECOVERY_FAILED', 'REQUIRE_OPERATOR_REVIEW', facts.integrityReason ?? 'SAVED_DATA_INVALID');
+  if(facts.modelCalls && (facts.modelCalls.reserved+facts.modelCalls.dispatchIntent+facts.modelCalls.reviewRequired+facts.modelCalls.pendingApplication+facts.modelCalls.budgetViolations)>0) return finish('REVIEW_REQUIRED','REQUIRE_OPERATOR_REVIEW','MODEL_CALL_REVIEW_REQUIRED');
   for (const e of executions) if (e.reviewReason) reasons.push(e.reviewReason);
   const unknown = executions.some(e => e.state === 'DISPATCH_RESERVED' || e.state === 'REVIEW_REQUIRED' && e.reviewReason !== 'SECURITY_REVIEW_REQUIRED');
   if (unknown) return finish('REVIEW_REQUIRED', s.run.status === 'RUNNING' && executions.some(e => e.safetyStopIncomplete)

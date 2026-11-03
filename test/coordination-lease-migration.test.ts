@@ -21,7 +21,9 @@ function legacyV3(f: ReturnType<typeof executionFixture>, path: string) {
   raw.exec("UPDATE execution_ledger SET state='DISPATCH_RESERVED',attempt_id='legacy-attempt',reserved_at=10,updated_at=10 WHERE action_id='action'");
   return raw;
 }
-const all = (raw: DatabaseSync) => Object.fromEntries(['workflow_seeds','journal_events','workflow_checkpoints','pending_actions','execution_ledger','execution_results','runner_evidence','runtime_audit_events'].map(table => [table, raw.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]));
+// Compare original v4 columns; v5 adds a nullable model-call audit reference.
+const legacyRows=(rows:Record<string,unknown>[])=>rows.map(row=>{const copy={...row};delete copy.model_call_id;return copy;});
+const all = (raw: DatabaseSync) => Object.fromEntries(['workflow_seeds','journal_events','workflow_checkpoints','pending_actions','execution_ledger','execution_results','runner_evidence','runtime_audit_events'].map(table => [table, legacyRows(raw.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all())]));
 for (const version of [0,1,2,3] as const) test(`Migration ${version}→4 preserves artifacts and history and never grants a lease to RUNNING work`, t => {
   const f = executionFixture(t); f.register(); f.store.createCheckpoint('run');
   const path = join(f.dir, `v${version}.sqlite`);
@@ -32,12 +34,12 @@ for (const version of [0,1,2,3] as const) test(`Migration ${version}→4 preserv
   const tables = version === 0 ? [] : ['workflow_seeds','journal_events','workflow_checkpoints',
     ...(version >= 2 ? ['pending_actions','execution_ledger','execution_results','runner_evidence'] : []),
     ...(version >= 3 ? ['runtime_audit_events'] : [])];
-  const before = Object.fromEntries(tables.map(table => [table, raw.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]));
+  const before = Object.fromEntries(tables.map(table => [table, legacyRows(raw.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all())]));
   const db = new DurableDatabase({ path });
   try {
-    assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 4);
+    assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 5);
     assert.deepEqual(raw.prepare('SELECT migration_id FROM schema_migrations ORDER BY schema_version').all().map(row => row.migration_id), MIGRATIONS.map(m => m.id));
-    for (const [table, rows] of Object.entries(before)) assert.deepEqual(raw.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all(), rows);
+    for (const [table, rows] of Object.entries(before)) assert.deepEqual(legacyRows(raw.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()), rows);
     assert.equal(raw.prepare('SELECT count(*) AS n FROM runtime_leases').get()!.n, 0);
     if (version) {
       assert.equal(new SqliteCoordinationRunnerStore(db).getSnapshot('run').run.status, 'RUNNING');
@@ -47,7 +49,7 @@ for (const version of [0,1,2,3] as const) test(`Migration ${version}→4 preserv
     }
   } finally { db.close(); }
   const again = new DurableDatabase({ path }); again.close();
-  assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, 4);
+  assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, 5);
 });
 test('Immutable migration boundary distinguishes genuine NULL Runtime 5C-1 audit from fenced 5C-2 changes', t => {
   const f = executionFixture(t); f.register(); const path = join(f.dir, 'legacy.sqlite'), raw = legacyV3(f, path); t.after(() => raw.close());
@@ -91,10 +93,10 @@ for (const boundary of ['before-ddl','after-ddl','after-commit']) test(`${termin
   const stage = new Promise<any>((resolve, reject) => { timer = setTimeout(() => reject(Error('Migration child timeout')), 10_000); child.once('message', resolve); child.once('error', reject); child.once('exit', () => reject(Error('Migration child exited'))); });
   t.after(async () => { clearTimeout(timer); if (child.exitCode === null && child.signalCode === null) terminateChild(child); await closed; });
   assert.deepEqual(await stage, { stage: boundary }); clearTimeout(timer); terminateChild(child); await closed;
-  const version = boundary === 'after-commit' ? 4 : 3;
+  const version = boundary === 'after-commit' ? 5 : 3;
   assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, version);
   assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, version);
-  assert.equal(raw.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name='runtime_fencing_boundary'").get()!.n, version === 4 ? 1 : 0);
+  assert.equal(raw.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name='runtime_fencing_boundary'").get()!.n, version === 5 ? 1 : 0);
   assert.deepEqual(all(raw), before);
   const db = new DurableDatabase({ path }); try { assert.notEqual(new RecoveryReader(db, clock).inspect('run').disposition, 'RECOVERY_FAILED'); } finally { db.close(); }
 });

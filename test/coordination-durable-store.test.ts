@@ -1,3 +1,4 @@
+import { testModel } from './model-call-fixture.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
@@ -13,8 +14,8 @@ test('seed and original creation identity survive a fresh connection; repeated i
   const seed = fresh(); seed.events[0].eventId = 'custom-creation'; seed.events[0].idempotencyKey = 'creation';
   const f = fixture(t, seed); f.db.close();
   const reopened = f.open(); assert.deepEqual(reopened.store.getSnapshot('run'), seed);
-  assert.equal(f.raw().prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, 4);
-  assert.equal(f.raw().prepare('PRAGMA user_version').get()!.user_version, 4);
+  assert.equal(f.raw().prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, 5);
+  assert.equal(f.raw().prepare('PRAGMA user_version').get()!.user_version, 5);
 });
 test('all projections, usage/progress and terminal commitment equal Kernel replay', t => {
   const f = fixture(t), expected = history(); saveHistory(f.store, expected); f.db.close();
@@ -219,7 +220,7 @@ test('actual Browser Runner accepts synchronous durable store; reads never auto-
   const executor = createBrowserPocExecutor({ driver: browser.driver, evidenceStore: coordinator.evidenceStore, clock: browser.deps.clock });
   const execute = executor.execute; executor.execute = async (...args) => { browser.calls.execute++; return execute(...args); };
   browser.deps.executors.get = id => id === 'browser' ? executor : undefined;
-  const runner = createDurableCoordinationRunner({ coordinator, supervisorProvider: browser.deps.supervisorProvider, clock: browser.deps.clock, ids: browser.deps.ids });
+  const runner = createDurableCoordinationRunner({ coordinator, supervisorProvider: testModel(browser.deps.supervisorProvider,'fake'), clock: browser.deps.clock, ids: browser.deps.ids });
   assert.equal((await runner.runOneRound('run')).reason, 'round_completed');
   assert.equal(browser.calls.execute, 1);
   const before = { ...browser.calls }, snapshot = f.store.getSnapshot('run'); f.db.close();

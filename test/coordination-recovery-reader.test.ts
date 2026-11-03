@@ -14,7 +14,7 @@ test('construction, repeated inspection and all four read APIs leave all durable
   for (let i = 0; i < 3; i++) {
     const result = r.inspect('run'); assert.equal(result.nextStep, 'REVALIDATE_PREPARED_ACTION');
     assert.equal(result.executable, false); assert.equal(result.executionAllowed, false);
-    assert.equal(result.modelCallCoverage, 'NOT_TRACKED_YET'); assert.equal(result.requiresExplicitAuthorization, true);
+    assert.equal(result.modelCallCoverage, 'TRACKED_FROM_CREATION'); assert.equal(result.requiresExplicitAuthorization, true);
     assert.equal(r.inspectAll().length, 1); r.getWorkflowTimeline('run'); r.getActionHistory('run', 'action');
   }
   assert.deepEqual(contents(f), before); assert.deepEqual(f.calls, calls);

@@ -1,3 +1,4 @@
+import { testModel } from './model-call-fixture.ts';
 import type { TestContext } from 'node:test';
 import { createWorkflow, createRunnerEvent, appendEvent } from '../services/coordination/index.ts';
 import { DurableExecutionCoordinator, createDurableCoordinationRunner, createRuntimeLeaseManager } from '../services/coordination/durable/index.ts';
@@ -41,7 +42,7 @@ export function executionFixture(t: TestContext, risk: 'ALLOW' | 'DENY' | 'NEEDS
   };
   const coordinator = new DurableExecutionCoordinator(f.store, registry, { clock });
   let serial = 0;
-  const runner = createDurableCoordinationRunner({ coordinator, supervisorProvider: provider, clock, ids: { nextId: kind => `${kind}-${++serial}` } });
+  const runner = createDurableCoordinationRunner({ coordinator, supervisorProvider: testModel(provider), clock, ids: { nextId: kind => `${kind}-${++serial}` } });
   const register = (r = record) => { const request = registration(f.store, r); coordinator.registerAction(r, request.expected, request.sessionEvent, request.taskEvent); return f.store.getSnapshot(r.workflowRunId).tasks[r.taskId]; };
   const snapshot = () => f.store.getSnapshot('run');
   const add = (type: Parameters<typeof createRunnerEvent>[1], payload: unknown) => f.store.append(createRunnerEvent(snapshot(), type, payload, clock, { nextId: () => `user-${++serial}` }));

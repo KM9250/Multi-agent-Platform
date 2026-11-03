@@ -11,7 +11,7 @@ import { createRunnerEvent, runnerTimestamp } from './eventFactory';
 import { runnerText, validatePreparedRunnerAction, validateRunnerExecution, validateRunnerPlan, validateRunnerUsage, validateRunnerVerification } from './model';
 import { evaluateRunnerActionRisk, parseRunnerActionRef, runnerActionRef, runnerPendingApproval } from './policyGuard';
 import { defaultRunnerIds } from './stores';
-import type { CoordinationRunner, CoordinationRunnerDependencies, CoordinationRunnerStore, PreparedRunnerAction, RunnerClock, RunnerExecutionResult, RunnerIdGenerator, RunnerModelResult, RunnerPendingApproval, RunnerRunOptions, RunnerRunResult, RunnerStopReason } from './types';
+import type { CoordinationRunner, CoordinationRunnerDependencies, CoordinationRunnerStore, PreparedRunnerAction, RunnerClock, RunnerExecutionResult, RunnerIdGenerator, RunnerModelResult, RunnerPendingApproval, RunnerRunOptions, RunnerRunResult, RunnerStopReason, RunnerPlanRequest, RunnerVerifyRequest } from './types';
 
 const RUNNER_SESSION_PREFIX = 'map.runner.v1:';
 // Shared across runner instances in this JS runtime; deliberately not a distributed lock.
@@ -33,7 +33,7 @@ class RegistrationCleanupError extends AggregateError {
     super([registrationError, cleanupError], 'Runner registration cleanup failed.', { cause: registrationError });
   }
 }
-interface RoundContext { id: string; key: string; signal: AbortSignal; completed: number }
+interface RoundContext { id: string; key: string; signal: AbortSignal; completed: number; modelCallId?: string }
 const cursor = (s: CoordinationSnapshot): string => `${s.events.at(-1)!.sequence}:${s.events.at(-1)!.eventId}`;
 const active = (s: CoordinationSession): boolean => s.state === 'OPEN' || s.state === 'SUSPENDED';
 const owned = (s: CoordinationSession): boolean => !!s.contextRef?.startsWith(RUNNER_SESSION_PREFIX);
@@ -45,7 +45,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
   private readonly results: RunnerResultMap;
   constructor(deps: CoordinationRunnerDependencies) {
     if ((deps.store.persistence === 'durable' || deps.durableExecution) &&
-      (deps.store.persistence !== 'durable' || !deps.durableExecution || deps.durableExecution.store !== deps.store
+      (deps.store.persistence !== 'durable' || !deps.durableExecution || !deps.durableModelCalls || deps.durableModelCalls.store !== deps.store || deps.durableExecution.store !== deps.store
         || deps.durableExecution.pendingActions !== deps.pendingActions || deps.durableExecution.evidenceStore !== deps.evidenceStore
         || deps.durableExecution.executors !== deps.executors)) throw new Error('RUNNER_DURABLE_CONFIGURATION_REQUIRED');
     this.deps = deps; this.clock = deps.clock ?? { now: Date.now }; this.ids = deps.ids ?? defaultRunnerIds;
@@ -221,9 +221,24 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     this.deps.pendingActions.delete(ctx.id, actionId);
     this.cancelEmptyRunnerSession(ctx, sessionId);
   }
-  private async model<T>(ctx: RoundContext, phase: string, call: () => Promise<RunnerModelResult<T>>): Promise<{ value: T; stale: boolean; cursor: string }> {
+  private async model<T>(ctx: RoundContext, phase: string, call: () => Promise<RunnerModelResult<T>>, request?: RunnerPlanRequest|RunnerVerifyRequest): Promise<{ value: T; stale: boolean; cursor: string }> {
     if (this.deps.durableExecution) this.durable(() => this.deps.durableExecution!.assertLease(ctx.id));
     const base = cursor(this.snapshot(ctx));
+    if (this.deps.durableModelCalls) {
+      const snapshot=this.snapshot(ctx);
+      const execute=async () => {
+        if(ctx.signal.aborted || cursor(this.snapshot(ctx))!==base || this.budget(ctx)) throw new DurableRunnerStop();
+        try {
+          return await this.deps.durableModelCalls!.call({workflowRunId:ctx.id,roundKey:ctx.key,phase:phase==='plan'?'PLAN':'VERIFY',
+            requestCursor:snapshot.events.at(-1)!.sequence,requestEventId:snapshot.events.at(-1)!.eventId,request:request!});
+        } catch { throw new DurableRunnerStop(); }
+      };
+      const result=this.deps.scheduler ? await this.deps.scheduler.schedule({...this.deps.supervisorProvider.scheduling!,kind:'coordination',signal:ctx.signal,
+        execute: async control=>{control.markOutputStarted();return execute();}}) : await execute();
+      ctx.modelCallId=result.modelCallId;
+      const current=this.snapshot(ctx);
+      return {value:result.value as T,stale:current.events.length!==snapshot.events.length+1,cursor:cursor(current)};
+    }
     let response: RunnerModelResult<T>;
     try {
       response = this.deps.scheduler
@@ -252,6 +267,18 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     if (!Number.isFinite(response.latencyMs) || response.latencyMs < 0) throw new Error('Invalid model latency.');
     return { value: response.value, stale, cursor: cursor(this.snapshot(ctx)) };
   }
+  private applyModel<T>(ctx:RoundContext,fn:()=>T):T {
+    if(!ctx.modelCallId || !this.deps.durableModelCalls) return fn();
+    const completed=ctx.completed;
+    try {
+      const result=this.durable(()=>this.deps.durableModelCalls!.apply(ctx.id,ctx.modelCallId!,this.snapshot(ctx).events.length,fn));
+      ctx.modelCallId=undefined; return result;
+    } catch(error) {ctx.completed=completed;throw error;}
+  }
+  private discardModel(ctx:RoundContext,reason:'INVALID_RESPONSE'|'STALE_RESPONSE'|'ABORTED'):void {
+    if(ctx.modelCallId && this.deps.durableModelCalls) this.durable(()=>this.deps.durableModelCalls!.discard(ctx.id,ctx.modelCallId!,reason));
+    ctx.modelCallId=undefined;
+  }
   private recordUsage(ctx: RoundContext, value: unknown, phase: string): void {
     const usage = validateRunnerUsage(value);
     // Kernel forbids all events after terminalization, including usage. Never reopen it.
@@ -270,6 +297,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     const s = this.snapshot(ctx); validateCoordinationSnapshot(s);
     if (s.run.executionMode !== 'supervised_autonomous') return this.result(ctx, 'stopped', undefined, 'RUNNER_EXECUTION_MODE');
     const stopped = this.safePoint(ctx); if (stopped) return stopped;
+    if(this.deps.durableModelCalls) this.durable(()=>this.deps.durableModelCalls!.assertCanRun(ctx.id));
     const securityBlock = this.securityPreflight(ctx); if (securityBlock) return securityBlock;
     const evidenceBlock = this.verifyEvidencePreflight(ctx); if (evidenceBlock) return evidenceBlock;
     const uncertainBlock = this.completeUncertainBlock(ctx); if (uncertainBlock) return uncertainBlock;
@@ -343,14 +371,17 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     try {
       if (this.deps.durableExecution) this.durable(() => this.deps.durableExecution!.assertCanPlan(ctx.id));
       const s = this.snapshot(ctx);
-      const response = await this.model(ctx, 'plan', () => this.deps.supervisorProvider.plan(runnerPlanRequest(s, this.now(s), ctx.signal)));
+      const request=runnerPlanRequest(s,this.now(s),ctx.signal);
+      const response = await this.model(ctx, 'plan', () => this.deps.supervisorProvider.plan(request),request);
       const stopped = this.safePoint(ctx); if (stopped) return stopped;
       if (response.stale || cursor(this.snapshot(ctx)) !== response.cursor) return this.decide(ctx);
       const exhausted = this.budget(ctx); if (exhausted) return this.block(ctx, `RUNNER_BUDGET_EXHAUSTED:${exhausted}`);
       const proposal = validateRunnerPlan(response.value);
       if (proposal.kind !== 'execute') {
+        return this.applyModel(ctx,()=>{
         this.progress(ctx, 'NO_PROGRESS', proposal.kind === 'finish' ? 'Planner finish did not satisfy the commitment gate.' : 'Planner requires user input.');
         return proposal.kind === 'needs_user' ? this.block(ctx, `RUNNER_INFORMATION_REQUIRED:${proposal.reason}`) : this.decide(ctx);
+        });
       }
       const executor = this.deps.executors.get(proposal.action.executorId);
       if (!executor || executor.id !== proposal.action.executorId) throw new Error('Unknown executor.');
@@ -380,7 +411,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       };
       if (this.deps.durableExecution) {
         const taskEvent = createRunnerEvent({ ...current, events: [...current.events, sessionEvent] }, 'TaskAssigned', taskPayload, this.clock, this.ids, { sessionId });
-        this.durable(() => this.deps.durableExecution!.registerAction({ workflowRunId: ctx.id, sessionId, taskId, action }, current, sessionEvent, taskEvent));
+        this.applyModel(ctx,()=>this.durable(() => this.deps.durableExecution!.registerAction({ workflowRunId: ctx.id, sessionId, taskId, action }, current, sessionEvent, taskEvent)));
       } else {
         this.deps.pendingActions.put({ workflowRunId: ctx.id, sessionId, taskId, action });
         try {
@@ -397,6 +428,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       return this.execute(ctx, this.snapshot(ctx).tasks[taskId], false);
     } catch (error) {
       if (error instanceof DurableRunnerStop) throw error;
+      this.discardModel(ctx,'INVALID_RESPONSE');
       const stopped = this.safePoint(ctx); if (stopped) return stopped;
       if (error instanceof ModelDispatchDeferred) return this.decide(ctx);
       this.progress(ctx, 'ERROR', 'Runner planning or preparation failed.');
@@ -524,14 +556,16 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       const budget = this.budget(ctx);
       if (budget) { this.close(ctx, task, 'NO_PROGRESS'); return this.decide(ctx); }
       const s = this.snapshot(ctx);
-      const response = await this.model(ctx, 'verify', () => this.deps.supervisorProvider.verify({
+      const request: RunnerVerifyRequest = {
         workflowRunId: ctx.id, goal: s.run.goal, acceptanceCriteria: [...s.run.acceptanceCriteria],
         task: structuredClone(task), evidence, audit: runnerAudit(s, this.now(s)), systemContract: RUNNER_PROVIDER_SYSTEM_CONTRACT, signal: ctx.signal,
-      }));
+      };
+      const response=await this.model(ctx,'verify',()=>this.deps.supervisorProvider.verify(request),request);
       const after = this.safePoint(ctx); if (after) return after;
       if (response.stale || cursor(this.snapshot(ctx)) !== response.cursor || !this.taskWritable(ctx, task)) return this.decide(ctx);
       const verification = validateRunnerVerification(response.value, this.snapshot(ctx).run.acceptanceCriteria);
       const current = this.snapshot(ctx);
+      const applied=this.applyModel(ctx,()=>{
       const evaluation = this.append(ctx, 'EvaluationAdded', {
         evaluationId: this.ids.nextId('evaluation'), workflowRunId: ctx.id, sessionId: task.sessionId,
         evaluatorAgentId: current.run.supervisorAgentId, target: { type: 'task', id: task.taskId },
@@ -544,7 +578,11 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       const passed = task.status === 'COMPLETED' && verification.taskOutcome === 'PASS';
       this.close(ctx, task, task.status === 'FAILED' ? 'ERROR' : passed ? 'PROGRESS' : 'NO_PROGRESS', passed);
       return this.decide(ctx);
+      });
+      return applied;
     } catch (error) {
+      if(error instanceof DurableRunnerStop) throw error;
+      this.discardModel(ctx,'INVALID_RESPONSE');
       const after = this.safePoint(ctx); if (after) return after;
       if (error instanceof ModelDispatchDeferred) return this.decide(ctx);
       if (!this.taskWritable(ctx, task)) return this.result(ctx, 'stopped');

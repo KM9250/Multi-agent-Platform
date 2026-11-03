@@ -111,7 +111,15 @@ export interface RunnerDurableExecution {
   finalizeResult(workflowRunId: string, task: CoordinationTask): void;
   getOwnedEvidence(workflowRunId: string, task: CoordinationTask, ref: string): Promise<RunnerEvidence | undefined>;
 }
+export interface RunnerDurableModelCalls {
+ readonly store: CoordinationRunnerStore;
+ assertCanRun(workflowRunId:string):void;
+ call(input: {workflowRunId:string; roundKey:string; phase:'PLAN'|'VERIFY'; requestCursor:number; requestEventId:string; request:RunnerPlanRequest|RunnerVerifyRequest}): Promise<{value:unknown; modelCallId:string}>;
+ apply<T>(id:string,callId:string,cursor:number,fn:()=>T):T;
+ discard(id:string,callId:string,reason:'INVALID_RESPONSE'|'STALE_RESPONSE'|'ABORTED'):void;
+}
 export interface CoordinationRunnerDependencies {
+  durableModelCalls?: RunnerDurableModelCalls;
   durableExecution?: RunnerDurableExecution;
   store: CoordinationRunnerStore; supervisorProvider: RunnerSupervisorProvider; executors: RunnerExecutorRegistry;
   pendingActions: RunnerPendingActionStore; evidenceStore: RunnerEvidenceStore;

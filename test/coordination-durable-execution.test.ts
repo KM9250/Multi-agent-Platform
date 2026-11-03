@@ -1,3 +1,4 @@
+import { testModel } from './model-call-fixture.ts';
 import { bypassFencingForCorruption } from './durable-fixture.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -119,7 +120,7 @@ test('RESULT_RECORDED remains inspectable during BLOCKED/SUSPENDED and never sta
   const f=executionFixture(t),task=f.register();await f.coordinator.dispatch('run',task);f.add('WorkflowSuspended',{});
   const before=f.snapshot(),second=f.open(),c=new DurableExecutionCoordinator(second.store,f.registry,{clock});
   assert.equal(c.inspectExecution('run','action')!.state,'RESULT_RECORDED');assert.throws(()=>c.finalizeResult('run',task));
-  const runner=createDurableCoordinationRunner({coordinator:c,supervisorProvider:f.provider,clock});assert.equal((await runner.runUntilStop('run')).reason,'stopped');
+  const runner=createDurableCoordinationRunner({coordinator:c,supervisorProvider:testModel(f.provider),clock});assert.equal((await runner.runUntilStop('run')).reason,'stopped');
   assert.equal(f.calls.execute,1);assert.equal(f.calls.plan,0);assert.deepEqual(f.snapshot(),before);
 });
 

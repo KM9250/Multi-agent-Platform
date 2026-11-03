@@ -27,13 +27,25 @@ function insertEvent(tx: DurableTransaction, event: CoordinationEvent): void {
 /** Server-only persistence. Construction/restore never creates or invokes a Runner. */
 export class SqliteCoordinationRunnerStore implements CoordinationRunnerStore, DurableCoordinationAdministration {
   readonly persistence = 'durable' as const;
+  #applicationTx?: DurableTransaction;
+  /** Synchronous business events and application receipt share one lease-fenced COMMIT. */
+  atomicApplication<T>(id: string, fn: (tx: DurableTransaction) => T): T {
+    if (this.#applicationTx) throw new DurableStoreError('INVALID_TRANSACTION');
+    return this.writeWorkflow(id, tx => {
+      this.#applicationTx = tx;
+      try { return fn(tx); } finally { this.#applicationTx = undefined; }
+    });
+  }
   constructor(readonly database: DurableDatabase, readonly lease?: WorkflowLease) {}
   withLease(lease: WorkflowLease): SqliteCoordinationRunnerStore { return new SqliteCoordinationRunnerStore(this.database, lease); }
+  readWorkflow<T>(fn:(tx:DurableTransaction)=>T):T { return this.#applicationTx ? fn(this.#applicationTx) : this.database.read(fn); }
   assertLease(id: string): void {
+    if(this.#applicationTx) {this.database.assertWorkflowWrite(this.#applicationTx,id);return;}
     if (!this.lease || this.lease.workflowRunId !== id) throw new DurableStoreError('LEASE_FENCED');
     this.database.createLeaseManager().assertCurrent(this.lease);
   }
-  writeWorkflow<T>(id: string, fn: (tx: DurableTransaction) => T): T { return this.database.writeWithLease(this.lease, id, fn); }
+  writeWorkflow<T>(id: string, fn: (tx: DurableTransaction) => T): T { if (this.#applicationTx) { this.database.assertWorkflowWrite(this.#applicationTx, id); return fn(this.#applicationTx); }
+    return this.database.writeWithLease(this.lease, id, fn); }
   createWorkflow(input: CoordinationSnapshot): void {
     const seed = validateSeed(input);
     this.database.bootstrapWorkflow(seed.run.runId, tx => {
@@ -50,6 +62,7 @@ export class SqliteCoordinationRunnerStore implements CoordinationRunnerStore, D
   }
   getSnapshot(id: string): CoordinationSnapshot { return this.restoreWorkflow(id); }
   restoreWorkflow(id: string): CoordinationSnapshot {
+    if (this.#applicationTx) return this.restoreWorkflowInTransaction(this.#applicationTx, id);
     return this.database.read(tx => this.restoreWorkflowInTransaction(tx, id));
   }
   restoreWorkflowInTransaction(tx: DurableTransaction, id: string): CoordinationSnapshot {

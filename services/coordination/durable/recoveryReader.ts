@@ -1,3 +1,4 @@
+import { inspectModelCalls } from './modelCallRecovery';
 import type { CoordinationSnapshot } from '../types';
 import { parseRunnerActionRef, runnerPendingApproval } from '../runner/policyGuard';
 import { runnerActionApproved, runnerEvidenceReviewReason, runnerSecurityReviewReason } from '../runner/dispatchGuard';
@@ -107,7 +108,9 @@ export class RecoveryReader {
           if (owner?.workflowRunId === workflowRunId && s.tasks[owner.taskId]) authorizationRequirements.push({ kind: 'EVIDENCE_REVIEW', reference, satisfied: !runnerEvidenceReviewReason(s) });
         }
         if (['BLOCKED','SUSPENDED'].includes(s.run.status)) authorizationRequirements.push({ kind: 'EXPLICIT_RESUME', satisfied: false });
-        return classifyRecovery({ workflowRunId, inspectedAt, snapshot: s, executions, authorizationRequirements,
+        reason='MODEL_CALL_INTEGRITY_INVALID';
+        const models=inspectModelCalls(tx,this.store,workflowRunId);
+        return classifyRecovery({ modelCalls:models.summary,modelCallCoverage:models.coverage, workflowRunId, inspectedAt, snapshot: s, executions, authorizationRequirements,
           missingHistoricalLedger: Object.values(s.tasks).some(task => !ownedTasks.has(task.taskId)),
           unresolvedSecurityReview: !!runnerSecurityReviewReason(s)
             || executions.some(e => e.reviewReason === 'SECURITY_REVIEW_REQUIRED' && !e.finalizedEventId),

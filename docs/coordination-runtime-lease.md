@@ -1,7 +1,8 @@
 # Workflow Runtime Lease and Fencing (COORD-5C-2)
 
-Schema **4**, based on `7d6d254533e77267321d6de578aeb2f6a6ca383a` (COORD-5C-1 / PR #29).
-This adds durable Workflow ownership across Node.js processes. It does not grant
+COORD-5C-2 introduced schema **4**, based on `7d6d254533e77267321d6de578aeb2f6a6ca383a` (COORD-5C-1 / PR #29).
+The current schema is **5**; [COORD-5C-3](coordination-model-call-ledger.md) extends
+these fences to model calls. COORD-5C-2 adds durable Workflow ownership across Node.js processes. It does not grant
 recovery authorization or automatically resume stored RUNNING Workflows.
 `RecoveryInspection.executionAllowed` and `executable` remain `false`.
 
@@ -127,8 +128,7 @@ for review. No replacement Action or Attempt is generated.
 
 Runner safe points and PLAN/VERIFY boundaries check the lease, including after
 scheduler queue waits and after provider responses. A response returned after
-lease loss cannot become usage, evaluation or another state change. This is not
-a complete Model Call Ledger or budget reservation system.
+lease loss cannot become usage, evaluation or another state change. COORD-5C-3 additionally records these boundaries in a durable Model Call Ledger.
 
 Renewal errors and DB Busy invalidate the affected handle. Expiration and clock
 anomalies also invalidate it; a later heartbeat cannot revive it. Normal SQL
@@ -216,12 +216,10 @@ not a sandbox against arbitrary code with driver/DDL or filesystem privileges.
 
 COMMIT and external dispatch have an unavoidable race window. Arbitrary external
 APIs are not fenced, and external exactly-once is not guaranteed. Lease loss
-cannot cancel an already accepted external operation. There is no Model Call
-Ledger, durable model budget reservation/settlement, automatic Recovery Decision,
-automatic resume, redispatch of unknown results, admin HTTP/UI, or notification
-outbox. COORD-5C-3 must add model call identity and budget accounting, decide how to
-record responses whose lease was lost, and retain these same fencing and explicit
-recovery-authorization boundaries.
+cannot cancel an already accepted external operation. COORD-5C-3 adds Model Call identity and durable budget reservation/settlement while
+retaining these fences. Late usage after lease loss remains unresolved for COORD-5C-4.
+There is no automatic Recovery Decision, automatic resume, redispatch of unknown
+results, admin HTTP/UI, or notification outbox extension.
 
 ## Initial verification record (HEAD 6312e42, 2026-10-25 JST)
 

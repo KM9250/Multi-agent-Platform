@@ -23,7 +23,7 @@ for (const exhausted of [false,true]) test(`recorded budget ${exhausted ? 'exhau
   const snapshot = executionSeed(); if (exhausted) snapshot.run.usage.llmCalls = snapshot.run.budget.maxLlmCalls;
   const result = classifyRecovery({ workflowRunId: 'run', inspectedAt: 10, snapshot, executions: [] });
   assert.equal(result.budgetStatus, exhausted ? 'RECORDED_LIMIT_EXHAUSTED' : 'WITHIN_RECORDED_LIMITS');
-  assert.equal(result.modelCallCoverage, 'NOT_TRACKED_YET'); assert.equal(result.executable, false);
+  assert.equal(result.modelCallCoverage, 'UNVERIFIED'); assert.equal(result.executable, false);
 });
 test('unverified budget is explicit when saved data cannot be validated', () => {
   const result = classifyRecovery({ workflowRunId: 'run', inspectedAt: 10, executions: [], integrityReason: 'JOURNAL_INVALID' });

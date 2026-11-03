@@ -6,6 +6,8 @@ external system, and does not automatically restart or recover Workflows.
 
 Schema 4 additionally requires an explicit [Runtime Lease](coordination-runtime-lease.md)
 for every Workflow mutation. Acquisition does not grant recovery authorization.
+Schema 5 adds mandatory [Model Call compatibility and budget reservation](coordination-model-call-ledger.md);
+ordinary production Supervisor providers are rejected until their transport and bounds are verified.
 
 ## Trusted server integration
 
