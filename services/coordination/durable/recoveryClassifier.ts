@@ -28,7 +28,7 @@ export function classifyRecovery(facts: RecoveryFacts): RecoveryInspection {
       ...(facts.modelCallCoverage==='LEGACY_UNTRACKED'?['MODEL_CALL_LEGACY_UNTRACKED']:[]), 'EXECUTION_NOT_AUTHORIZED'])], executable: false, executionAllowed: false,
   });
   if (facts.integrityReason || !s) return finish('RECOVERY_FAILED', 'REQUIRE_OPERATOR_REVIEW', facts.integrityReason ?? 'SAVED_DATA_INVALID');
-  if(facts.modelCalls && (facts.modelCalls.reserved+facts.modelCalls.dispatchIntent+facts.modelCalls.reviewRequired+facts.modelCalls.pendingApplication+facts.modelCalls.budgetViolations)>0) return finish('REVIEW_REQUIRED','REQUIRE_OPERATOR_REVIEW','MODEL_CALL_REVIEW_REQUIRED');
+  if(facts.modelCalls && ((facts.modelCalls.effectiveReserved ?? facts.modelCalls.reserved)+facts.modelCalls.dispatchIntent+facts.modelCalls.reviewRequired+(facts.modelCalls.effectivePendingApplication ?? facts.modelCalls.pendingApplication)+facts.modelCalls.budgetViolations)>0) return finish('REVIEW_REQUIRED','REQUIRE_OPERATOR_REVIEW','MODEL_CALL_REVIEW_REQUIRED');
   for (const e of executions) if (e.reviewReason) reasons.push(e.reviewReason);
   const unknown = executions.some(e => e.state === 'DISPATCH_RESERVED' || e.state === 'REVIEW_REQUIRED' && e.reviewReason !== 'SECURITY_REVIEW_REQUIRED');
   if (unknown) return finish('REVIEW_REQUIRED', s.run.status === 'RUNNING' && executions.some(e => e.safetyStopIncomplete)

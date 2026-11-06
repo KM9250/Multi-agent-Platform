@@ -90,6 +90,8 @@ export class RecoveryAuditReader {
           return { source: row.event_kind === 'EXECUTION_CHANGED' ? 'EXECUTION_AUDIT' : 'RUNTIME_AUDIT', eventKind: String(row.event_kind), workflowRunId: id,
             modelCallId: optional(row,'model_call_id'), recoveryPlanId: optional(row,'recovery_plan_id'),
             authorizationId: optional(row,'recovery_authorization_id'), recoveryActorId: optional(row,'recovery_actor_id'),
+            executionPlanId: optional(row,'execution_plan_id'), executionAuthorizationId: optional(row,'execution_authorization_id'),
+            recoveryOperationId: optional(row,'recovery_operation_id'),
             recoveryHoldRevision: row.recovery_hold_revision === null ? undefined : Number(row.recovery_hold_revision),
             sessionId: optional(row, 'session_id'), taskId: optional(row, 'task_id'), actionId: optional(row, 'action_id'), attemptId: optional(row, 'attempt_id'),
             actorAgentId: optional(row, 'actor_agent_id'), subjectAgentId: optional(row, 'subject_agent_id'), runtimeInstanceId: optional(row, 'runtime_instance_id'),

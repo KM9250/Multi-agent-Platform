@@ -8,6 +8,18 @@ import { digest, requireIntegrity } from './integrity';
 import { EXECUTION_LIMITS, executionJson, parseExecutionJson } from './executionIntegrity';
 
 export interface EvidenceOwner { workflowRunId: string; sessionId: string; taskId: string; actionId: string }
+/** Pure saved-evidence reader; it confers no write or execution authority. */
+export function readOwnedEvidenceInTransaction(tx: DurableTransaction, owner: EvidenceOwner, ref: string): RunnerEvidence | undefined {
+  const row = tx.get('SELECT * FROM runner_evidence WHERE evidence_ref = ?', ref);
+  if (!row) return;
+  requireIntegrity(row.workflow_run_id === owner.workflowRunId && row.task_id === owner.taskId
+    && row.action_id === owner.actionId && row.session_id === owner.sessionId && row.schema_version === 1);
+  const item = parseExecutionJson<RunnerEvidence>(row.content_json, EXECUTION_LIMITS.evidence);
+  requireIntegrity(item && row.content_digest === digest(item) && row.kind === item.kind && row.created_at === item.createdAt
+    && typeof item.kind === 'string' && !!item.kind.trim() && Object.hasOwn(item, 'content')
+    && Number.isFinite(item.createdAt) && item.createdAt >= 0);
+  return item;
+}
 export class SqliteRunnerEvidenceStore implements RunnerEvidenceStore {
   private readonly owners = new AsyncLocalStorage<{ owner: EvidenceOwner; lease?: WorkflowLease }>();
   constructor(readonly database: DurableDatabase, readonly lease?: WorkflowLease) {}
@@ -39,14 +51,6 @@ export class SqliteRunnerEvidenceStore implements RunnerEvidenceStore {
   }
   getOwnedInTransaction(tx: DurableTransaction, owner: EvidenceOwner, ref: string): RunnerEvidence | undefined {
     this.database.assertTransaction(tx);
-    const row = tx.get('SELECT * FROM runner_evidence WHERE evidence_ref = ?', ref);
-    if (!row) return;
-    requireIntegrity(row.workflow_run_id === owner.workflowRunId && row.task_id === owner.taskId
-      && row.action_id === owner.actionId && row.session_id === owner.sessionId && row.schema_version === 1);
-    const item = parseExecutionJson<RunnerEvidence>(row.content_json, EXECUTION_LIMITS.evidence);
-    requireIntegrity(item && row.content_digest === digest(item) && row.kind === item.kind && row.created_at === item.createdAt
-      && typeof item.kind === 'string' && !!item.kind.trim() && Object.hasOwn(item, 'content')
-      && Number.isFinite(item.createdAt) && item.createdAt >= 0);
-    return item;
+    return readOwnedEvidenceInTransaction(tx, owner, ref);
   }
 }

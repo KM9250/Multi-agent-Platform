@@ -9,14 +9,18 @@ import { SqliteRunnerEvidenceStore } from './evidenceStore';
 import { readExecution } from './executionLedger';
 import { canonicalJson, digest, guarded, requireIntegrity } from './integrity';
 import { EXECUTION_LIMITS, parseExecutionJson } from './executionIntegrity';
+import type { SqliteCoordinationRunnerStore } from './durableCoordinationStore';
+import { readJournal } from './restore';
+import { validateActionOwner } from './pendingActionStore';
 export const executionOwner = (r: RunnerPendingActionRecord) => ({ workflowRunId: r.workflowRunId, sessionId: r.sessionId, taskId: r.taskId, actionId: r.action.actionId });
-export function validateExecutionEvidence(tx: DurableTransaction, r: RunnerPendingActionRecord, result: RunnerExecutionResult, evidenceStore: SqliteRunnerEvidenceStore): void {
+type ExecutionEvidenceReader = Pick<SqliteRunnerEvidenceStore, 'getOwnedInTransaction'>;
+export function validateExecutionEvidence(tx: DurableTransaction, r: RunnerPendingActionRecord, result: RunnerExecutionResult, evidenceStore: ExecutionEvidenceReader): void {
   requireIntegrity(!!result.resultRef);
   for (const ref of new Set([result.resultRef!, ...(result.evidenceRefs ?? [])])) {
     requireIntegrity(evidenceStore.getOwnedInTransaction(tx, executionOwner(r), ref));
   }
 }
-export function readExecutionResult(tx: DurableTransaction, r: RunnerPendingActionRecord, evidenceStore: SqliteRunnerEvidenceStore): RunnerExecutionResult | undefined {
+export function readExecutionResult(tx: DurableTransaction, r: RunnerPendingActionRecord, evidenceStore: ExecutionEvidenceReader): RunnerExecutionResult | undefined {
   const row = readExecution(tx, r);
   if (!row.result_ref) return;
   const saved = tx.get('SELECT * FROM execution_results WHERE result_ref = ?', row.result_ref);
@@ -50,6 +54,30 @@ export function recordedResultEvent(s: CoordinationSnapshot, r: RunnerPendingAct
       sessionId: r.sessionId, actorAgentId: success ? task.assigneeAgentId : s.run.supervisorAgentId,
       idempotencyKey: `durable-result:${digest([r.workflowRunId, r.action.actionId])}`,
     });
+}
+
+/** Fixed transaction participant shared by normal finalization and authorized recovery.
+ * The caller owns the writer and any required recovery scope; this function grants none. */
+export function finalizeRecordedResultInTransaction(store: SqliteCoordinationRunnerStore, tx: DurableTransaction,
+  r: RunnerPendingActionRecord, evidenceStore: SqliteRunnerEvidenceStore, clock: RunnerClock): CoordinationEvent {
+  const s = readJournal(tx, r.workflowRunId).snapshot;
+  validateActionOwner(s, r);
+  const row = readExecution(tx, r), result = readExecutionResult(tx, r, evidenceStore);
+  requireIntegrity(result);
+  const event = recordedResultEvent(s, r, result, clock);
+  if (row.finalized_event_id) {
+    const existing = s.events.find(e => e.eventId === row.finalized_event_id);
+    requireIntegrity(existing && existing.eventId === event.eventId && existing.type === event.type && existing.sessionId === event.sessionId
+      && existing.actorAgentId === event.actorAgentId && existing.idempotencyKey === event.idempotencyKey
+      && canonicalJson(existing.payload) === canonicalJson(event.payload));
+    return existing;
+  }
+  requireIntegrity(['RESULT_RECORDED','REVIEW_REQUIRED'].includes(String(row.state)) && s.run.status === 'RUNNING'
+    && s.sessions[r.sessionId].state === 'OPEN' && s.tasks[r.taskId].status === 'ASSIGNED');
+  store.appendInTransaction(tx, event);
+  tx.run('UPDATE execution_ledger SET state = ?, finalized_event_id = ?, updated_at = ? WHERE workflow_run_id = ? AND action_id = ?',
+    row.state === 'REVIEW_REQUIRED' ? 'REVIEW_REQUIRED' : 'FINALIZED', event.eventId, clock.now(), r.workflowRunId, r.action.actionId);
+  return event;
 }
 
 /** Shared validation of the legacy uncertain-stop prefix; never appends its missing suffix. */

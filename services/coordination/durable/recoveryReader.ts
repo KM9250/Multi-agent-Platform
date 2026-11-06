@@ -11,10 +11,11 @@ import { SqliteRunnerEvidenceStore } from './evidenceStore';
 import { readExecution } from './executionLedger';
 import type { DurableExecutionState } from './executionLedger';
 import { executionOwner, inspectUncertainStop, readExecutionResult, recordedResultEvent } from './executionReader';
-import { canonicalJson, DurableStoreError, requireIntegrity } from './integrity';
+import { canonicalJson, digest, DurableStoreError, parseJson, requireIntegrity } from './integrity';
 import { classifyRecovery } from './recoveryClassifier';
 import { assertRecoverySchema, validateAuditRow } from './recoveryAudit';
 import { RecoveryAuditReader } from './recoveryTimeline';
+import { readSafeRecoveryReceipt } from './safeRecoveryStore';
 import type { ExecutionStateSummary, RecoveryAuthorizationRequirement, RecoveryInspection, TimelineQueryOptions } from './recoveryTypes';
 
 /** No Runner, Coordinator, registry, model provider, or execution capability is accepted. */
@@ -118,7 +119,34 @@ export class RecoveryReader {
           unresolvedSecurityReview: !!runnerSecurityReviewReason(s)
             || executions.some(e => e.reviewReason === 'SECURITY_REVIEW_REQUIRED' && !e.finalizedEventId),
           unresolvedEvidenceReview: !!runnerEvidenceReviewReason(s) });
-        if (includeDecisions) { reason = 'RECOVERY_DECISION_INTEGRITY_INVALID'; inspection.recoveryDecisions = recoveryDecisionSummary(tx, workflowRunId); }
+        if (includeDecisions) {
+          reason = 'RECOVERY_DECISION_INTEGRITY_INVALID';
+          inspection.recoveryDecisions = recoveryDecisionSummary(tx, workflowRunId);
+          const hold = tx.get('SELECT * FROM recovery_holds WHERE workflow_run_id=?', workflowRunId);
+          const transitions = tx.all('SELECT * FROM recovery_hold_transitions WHERE workflow_run_id=? ORDER BY revision', workflowRunId);
+          const operations = tx.all('SELECT * FROM recovery_execution_operations WHERE workflow_run_id=? ORDER BY committed_at,operation_id', workflowRunId);
+          requireIntegrity(transitions.length === operations.length && (hold || !transitions.length));
+          let revision = Number(hold?.revision ?? 0);
+          for (const transition of transitions) {
+            requireIntegrity(transition.previous_revision === revision && transition.revision === revision + 1
+              && ['RECOVERY_STEP_APPLIED','READY_FOR_CONTINUATION_REVIEW'].includes(String(transition.state)));
+            const operation = operations.find(op => op.operation_id === transition.operation_id);
+            requireIntegrity(operation && operation.result_state === 'COMMITTED' && operation.contract_version === 'COORD-5C-4B:EXECUTE:1'
+              && operation.receipt_digest === digest(parseJson(operation.receipt_json)));
+            requireIntegrity(readSafeRecoveryReceipt(tx, String(operation.execution_plan_id))?.operationId === operation.operation_id);
+            revision++;
+          }
+          if (hold) inspection.safeRecovery = { holdRevision: revision,
+            holdState: transitions.at(-1)?.state as 'RECOVERY_STEP_APPLIED' | 'READY_FOR_CONTINUATION_REVIEW' ?? 'HELD',
+            operations: operations.map(operation => ({ operationId: String(operation.operation_id), executionPlanId: String(operation.execution_plan_id),
+              operationKind: String(operation.operation_kind), targetId: String(operation.target_id), receiptDigest: String(operation.receipt_digest), committedAt: Number(operation.committed_at) })),
+            executionAllowed: false };
+          if (transitions.at(-1)?.state === 'READY_FOR_CONTINUATION_REVIEW' && inspection.disposition === 'READY_TO_RESUME') {
+            inspection.disposition = 'READY_FOR_CONTINUATION_REVIEW';
+            inspection.nextStep = 'REQUIRE_OPERATOR_REVIEW';
+            inspection.reasonCodes = [...new Set([...inspection.reasonCodes, 'RECOVERY_HOLD_REQUIRES_CONTINUATION_REVIEW'])];
+          }
+        }
         return inspection;
     } catch (error) {
       if (!(error instanceof DurableStoreError) || ['DATABASE_ERROR','DATABASE_BUSY','SCHEMA_UNSUPPORTED','INVALID_TRANSACTION'].includes(error.code)) throw error;
