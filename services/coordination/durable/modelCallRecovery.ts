@@ -3,6 +3,7 @@ import type { SqliteCoordinationRunnerStore } from './durableCoordinationStore';
 import { requireIntegrity, canonicalJson, digest } from './integrity';
 import { modelBudgetPosition } from './modelCallLedger';
 import { costMicros } from './modelBudgetGuard';
+import { effectiveModelRows } from './safeRecoveryModelState';
 export function inspectModelCalls(tx:DurableTransaction,store:SqliteCoordinationRunnerStore,id:string) {
  const coverage=tx.get('SELECT coverage FROM model_call_coverage WHERE workflow_run_id=?',id)?.coverage;
  requireIntegrity(coverage==='TRACKED_FROM_CREATION'||coverage==='LEGACY_UNTRACKED');
@@ -27,10 +28,19 @@ export function inspectModelCalls(tx:DurableTransaction,store:SqliteCoordination
  }
  for(const event of snapshot.events) if(event.type==='UsageRecorded' && String((event.payload as {sourceRef?:string}).sourceRef).startsWith('map.runner.model.call.v1:')) requireIntegrity(rows.some(r=>r.usage_event_id===event.eventId && r.state==='SETTLED'));
  const count=(key:string,value:string)=>rows.filter(r=>r[key]===value).length;
+ const effective=effectiveModelRows(tx,id);
  const summary={total:rows.length,settled:count('state','SETTLED'),reserved:count('state','RESERVED'),dispatchIntent:count('state','DISPATCH_INTENT'),
   reviewRequired:count('state','REVIEW_REQUIRED'),unknownUsage:rows.filter(r=>['DISPATCH_INTENT','REVIEW_REQUIRED'].includes(String(r.state))).length,
   plan:count('phase','PLAN'),verify:count('phase','VERIFY'),pendingApplication:count('application_status','PENDING_APPLICATION'),
   budgetViolations:rows.filter(r=>r.budget_violation===1).length,latestReasonCode:rows.filter(r=>r.reason_code).at(-1)?.reason_code as string|undefined,
+  effectiveReserved:effective.filter(r=>r.historical.state==='RESERVED' && r.outstandingReservation).length,
+  effectivePendingApplication:effective.filter(r=>r.pendingApplication).length,
+  recoveryResolutions:effective.filter(r=>r.resolution).map(r=>({modelCallId:String(r.historical.model_call_id),
+   historicalState:String(r.historical.state),historicalApplication:String(r.historical.application_status),
+   resolutionKind:r.resolution!.resolution_kind as 'CANCELLED_UNSENT'|'DISCARDED_BY_RECOVERY',operationId:String(r.resolution!.operation_id),
+   originalRuntimeInstanceId:String(r.resolution!.original_runtime_instance_id),originalGeneration:Number(r.resolution!.original_generation),
+   effectiveOutstandingReservation:r.outstandingReservation ? {llmCalls:Number(r.historical.reserved_calls),inputTokens:Number(r.historical.reserved_input),outputTokens:Number(r.historical.reserved_output),costMicros:Number(r.historical.reserved_cost)} : {llmCalls:0,inputTokens:0,outputTokens:0,costMicros:0},
+   effectiveApplication:r.resolution!.resolution_kind==='DISCARDED_BY_RECOVERY'?'RESOLVED':String(r.historical.application_status)})),
   outstandingReservation:modelBudgetPosition(tx,store,id).outstanding};
  return {coverage:coverage as 'TRACKED_FROM_CREATION'|'LEGACY_UNTRACKED',summary};
 }

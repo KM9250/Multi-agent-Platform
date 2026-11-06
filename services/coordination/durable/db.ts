@@ -8,13 +8,15 @@ import { closeSync, chmodSync, existsSync, lstatSync, mkdirSync, openSync, realp
 import { dirname, isAbsolute } from 'node:path';
 import { digest, DurableStoreError, guarded, requireIntegrity } from './integrity';
 import { migrate } from './migrations';
-import { readJournal } from './restore';
+import { nextAnchor, readJournal } from './restore';
 import { validateAuditRow } from './recoveryAudit';
 import { verifyRecoveryIdentity } from './recoveryAuthorization';
 import { persistRecoveryDecision, inspectGrant, recoveryDecisionSummary } from './recoveryDecisionStore';
 import { recoveryGateReason, recoveryStartAllowed } from './recoveryExecutionGate';
 import { recoveryTime } from './recoveryPlanner';
-import { jsonCopy } from './integrity';
+import { canonicalJson, jsonCopy, parseJson } from './integrity';
+import { persistSafeRecoveryDecision, readSafeRecoveryReceipt } from './safeRecoveryStore';
+import type { SafeRecoveryCommand, SafeRecoveryIntent } from './safeRecoveryTypes';
 import type { RecoveryAuthorizationPolicy, RecoveryDecisionCommand, RecoveryGrantScope, RecoveryIdentityVerifier } from './recoveryDecisionTypes';
 import type { ModelCallIdentity } from './modelCallLedger';
 import type { RunnerModelApplicationResult } from '../runner/types';
@@ -58,6 +60,10 @@ interface ModelApplicationScope {
   requestCursor: number; requestEventId: string; startCursor: number; usageEventId: string;
   runtimeInstanceId: string; generation: number;
 }
+interface SafeRecoveryScope {
+  tx: DurableTransaction; intent: SafeRecoveryIntent;
+  seedUpdates: string[]; ledgerBefore?: Row;
+}
 
 /** One synchronous transaction owner. SQLite serializes writers across connections. */
 export class DurableDatabase {
@@ -73,6 +79,8 @@ export class DurableDatabase {
   #recoveryIntent?: { workflowRunId: string; kind: string; id: string; planId?: string; actorId?: string };
   #recoveryRejected = false;
   #modelApplication?: ModelApplicationScope;
+  #safeRecovery?: SafeRecoveryScope;
+  #safeRecoveryCommand = false;
   #timeAnchor = { wall: Date.now(), monotonic: performance.now() };
   constructor(options: DurableDatabaseOptions) {
     this.#recoveryVerifier = options.recoveryIdentityVerifier
@@ -120,23 +128,28 @@ export class DurableDatabase {
     const check = (sql: string, mutation: boolean) => {
       this.assertTransaction(tx, mutation);
       // No transaction/DDL/PRAGMA control escapes to participants.
-      if (!(mutation ? /^(INSERT|UPDATE|DELETE)\s/i : /^SELECT\s/i).test(sql.trim())) throw new DurableStoreError('INVALID_TRANSACTION');
+      if (!(mutation ? /^(INSERT|UPDATE|DELETE)\s/i : /^SELECT\s/i).test(sql.trim())) {
+        if (this.#safeRecoveryCommand) this.#recoveryRejected = true;
+        throw new DurableStoreError('INVALID_TRANSACTION');
+      }
     };
     const tx: DurableTransaction = {
-      get: (sql, ...params) => { check(sql, false); return this.#db.prepare(sql).get(...params); },
-      all: (sql, ...params) => { check(sql, false); return this.#db.prepare(sql).all(...params); },
+      get: (sql, ...params) => { try { check(sql, false); return this.#db.prepare(sql).get(...params); }
+        catch (error) { if (this.#safeRecoveryCommand) this.#recoveryRejected = true; throw error; } },
+      all: (sql, ...params) => { try { check(sql, false); return this.#db.prepare(sql).all(...params); }
+        catch (error) { if (this.#safeRecoveryCommand) this.#recoveryRejected = true; throw error; } },
       run: (sql, ...params) => {
         check(sql, true);
         try { this.#db.prepare(sql).run(...params); }
         catch (error) {
           const safe = this.safeError(error);
           if (safe.code === 'LEASE_FENCED') this.#fencingRejected = true;
-          if (safe.code.startsWith('RECOVERY_') || this.#modelApplication) this.#recoveryRejected = true;
+          if (safe.code.startsWith('RECOVERY_') || this.#modelApplication || this.#safeRecoveryCommand) this.#recoveryRejected = true;
           throw safe;
         }
       },
     };
-    let begun = false;
+    let begun = false, commitAttempted = false;
     try {
       this.#db.exec(write ? 'BEGIN IMMEDIATE' : 'BEGIN'); begun = true;
       this.#active = tx; this.#writable = write; this.#context = context; this.#fencingRejected = false;
@@ -147,19 +160,72 @@ export class DurableDatabase {
       if (this.#recoveryRejected) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
       if (context?.kind === 'lease') this.#assertLease(context.record);
       if (context?.kind === 'bootstrap') this.#assertBootstrap(tx, context);
-      this.#db.exec('COMMIT'); begun = false;
+      commitAttempted = true; this.#db.exec('COMMIT'); begun = false;
       return result;
     } catch (error) {
-      if (begun) {
+      // A successful COMMIT can lose its acknowledgement. Keep a usable connection
+      // only when SQLite confirms the transaction ended; the receipt reader decides
+      // the outcome. Older runtimes without this observation keep the closed fallback.
+      const endedAfterCommit = this.#safeRecoveryCommand && commitAttempted
+        && (this.#db as DatabaseSync & { isTransaction?: boolean }).isTransaction === false;
+      if (begun && !endedAfterCommit) {
         try { this.#db.exec('ROLLBACK'); }
         catch { this.#db.close(); this.#closed = true; }
       }
       throw this.safeError(error);
     } finally { this.#active = undefined; this.#writable = false; this.#context = undefined; this.#fencingRejected = false;
-      this.#recoveryIntent = undefined; this.#recoveryRejected = false; this.#modelApplication = undefined; }
+      this.#recoveryIntent = undefined; this.#recoveryRejected = false; this.#modelApplication = undefined;
+      this.#safeRecovery = undefined; this.#safeRecoveryCommand = false; }
   }
   read<T>(fn: (tx: DurableTransaction) => T): T { return this.#transaction(false, fn); }
   get recoveryPolicy(): RecoveryAuthorizationPolicy { return jsonCopy(this.#recoveryPolicy); }
+  /** Closed 4B dispatcher. No caller-supplied callback or authority token is accepted. */
+  safeRecoveryDecision(lease: WorkflowLease | undefined, credential: unknown, input: SafeRecoveryCommand) {
+    const command = jsonCopy(input);
+    if (command.kind === 'RECEIPT') return this.read(tx => {
+      verifyRecoveryIdentity(this.#recoveryVerifier, credential, recoveryTime(tx), 'VIEW');
+      return readSafeRecoveryReceipt(tx, command.executionPlanId);
+    });
+    if (!lease) throw new DurableStoreError('LEASE_FENCED');
+    if (!['CREATE_PLAN','AUTHORIZE','REVOKE','EXECUTE','RECEIPT'].includes(command.kind)) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
+    return this.writeWithLease(lease, lease.workflowRunId, tx => {
+      this.#safeRecoveryCommand = true;
+      const identity = verifyRecoveryIdentity(this.#recoveryVerifier, credential, recoveryTime(tx),
+        command.kind === 'EXECUTE' ? 'CREATE_PLAN' : command.kind === 'RECEIPT' ? 'VIEW' : command.kind);
+      const workflow = command.kind === 'CREATE_PLAN' ? command.input.workflowRunId
+        : command.kind === 'REVOKE' ? tx.get('SELECT workflow_run_id FROM recovery_execution_grants WHERE authorization_id=?', command.authorizationId)?.workflow_run_id
+        : tx.get('SELECT workflow_run_id FROM recovery_execution_plans WHERE execution_plan_id=?', command.executionPlanId)?.workflow_run_id;
+      if (workflow !== lease.workflowRunId) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
+      const result = persistSafeRecoveryDecision(this, tx, command, identity, lease, intent => {
+        requireIntegrity(!this.#safeRecovery && !this.#modelApplication && !this.#recoveryIntent);
+        const saved = jsonCopy(intent), seedUpdates: string[] = [];
+        requireIntegrity(saved.workflowRunId === lease.workflowRunId && saved.actorId === identity.actorId);
+        let ledgerBefore: Row | undefined;
+        if (saved.kind === 'EXECUTE') {
+          const plan = saved.plan!;
+          requireIntegrity(plan && plan.runtimeInstanceId === lease.runtimeInstanceId && plan.runtimeGeneration === lease.generation
+            && plan.executionPlanId === saved.executionPlanId && saved.operationId && saved.grantIds?.length);
+          const journal = readJournal(tx, lease.workflowRunId);
+          let anchor = journal.anchors.at(-1)!;
+          for (const event of saved.journalEvents ?? []) {
+            requireIntegrity(event.workflowRunId === lease.workflowRunId);
+            anchor = nextAnchor(anchor, event); seedUpdates.push(canonicalJson([event.sequence, anchor]));
+          }
+          if (['REFLECT_RECORDED_RESULT','COMPLETE_SAFETY_STOP'].includes(plan.operationKind))
+            ledgerBefore = tx.get('SELECT * FROM execution_ledger WHERE workflow_run_id=? AND action_id=?', lease.workflowRunId, plan.targetId);
+        }
+        this.#safeRecovery = { tx, intent: saved, seedUpdates, ledgerBefore };
+      });
+      const scope = this.#safeRecovery;
+      if (scope?.intent.kind === 'EXECUTE') {
+        const plan = scope.intent.plan!, expected = scope.intent.journalEvents ?? [];
+        requireIntegrity(canonicalJson(readJournal(tx, lease.workflowRunId).events.slice(plan.journalCursor)) === canonicalJson(expected));
+        requireIntegrity(tx.get('SELECT operation_id FROM recovery_execution_operations WHERE operation_id=? AND execution_plan_id=?',
+          scope.intent.operationId!, plan.executionPlanId));
+      }
+      return result;
+    });
+  }
   /** Only this closed command dispatcher can establish recovery-management context. */
   recoveryDecision(lease: WorkflowLease | undefined, credential: unknown, command: RecoveryDecisionCommand) {
     command = jsonCopy(command);
@@ -225,6 +291,7 @@ export class DurableDatabase {
       requireIntegrity(r && r.attempt_id === identity.attemptId && r.provider_id === identity.providerId && r.model_id === identity.modelId);
       const lease = this.#context!.kind === 'lease' ? this.#context!.record.handle : undefined;
       if (r.runtime_instance_id !== lease?.runtimeInstanceId || r.generation !== lease?.generation) this.#fenced();
+      requireIntegrity(!tx.get('SELECT model_call_id FROM recovery_model_resolutions WHERE workflow_run_id=? AND model_call_id=?', id, identity.modelCallId));
       const before = readJournal(tx, id).snapshot;
       if (r.application_status === 'APPLIED') {
         const end = before.events.findIndex(e => e.eventId === r.application_event_id) + 1;
@@ -371,6 +438,75 @@ export class DurableDatabase {
     }
   }
   #registerFencingFunctions(): void {
+    // Read-only predicates: SQL can inspect an installed scope, never create one.
+    this.#db.function('map_safe_recovery_actor', () => this.#safeRecovery?.intent.actorId ?? null);
+    this.#db.function('map_safe_recovery_management', (workflow, kind, id) => {
+      const scope = this.#safeRecovery, intent = scope?.intent;
+      return scope?.tx === this.#active && this.#context?.kind === 'lease'
+        && this.#context.record.handle.workflowRunId === workflow && intent?.workflowRunId === workflow
+        && intent.kind === kind && intent.kind !== 'EXECUTE' && intent.id === id ? 1 : 0;
+    });
+    this.#db.function('map_safe_recovery_write', (workflow, table, operation, target, detail) => {
+      const scope = this.#safeRecovery, intent = scope?.intent, plan = intent?.plan;
+      if (!scope || scope.tx !== this.#active || this.#context?.kind !== 'lease' || !plan
+        || intent!.kind !== 'EXECUTE' || intent!.workflowRunId !== workflow || plan.workflowRunId !== workflow
+        || this.#context.record.handle.workflowRunId !== workflow
+        || plan.runtimeInstanceId !== this.#context.record.handle.runtimeInstanceId
+        || plan.runtimeGeneration !== this.#context.record.handle.generation) return 0;
+      try {
+        if (table === 'journal_events') return operation === 'INSERT'
+          && (intent!.journalEvents ?? []).some(e => e.eventId === target && canonicalJson(e) === detail) ? 1 : 0;
+        if (table === 'workflow_seeds') return operation === 'UPDATE' && target === workflow
+          && scope.seedUpdates.includes(canonicalJson(parseJson(detail))) ? 1 : 0;
+        if (table === 'execution_ledger') {
+          const old = scope.ledgerBefore;
+          if (operation !== 'UPDATE' || target !== plan.targetId || !old || old.finalized_event_id
+            || !['REFLECT_RECORDED_RESULT','COMPLETE_SAFETY_STOP'].includes(plan.operationKind)) return 0;
+          const event = intent!.journalEvents?.find(e => ['TaskCompleted','TaskFailed'].includes(e.type));
+          if (!event) return 0;
+          const keys = ['state','review_reason','finalized_event_id','result_ref','result_digest','attempt_id','reserved_at','updated_at'];
+          const next = { ...old, state: plan.operationKind === 'REFLECT_RECORDED_RESULT' ? 'FINALIZED' : 'REVIEW_REQUIRED',
+            finalized_event_id: event.eventId, updated_at: event.timestamp };
+          return canonicalJson(parseJson(detail)) === canonicalJson({ old: keys.map(k => old[k]), next: keys.map(k => next[k as keyof typeof next]) }) ? 1 : 0;
+        }
+        if (table === 'recovery_execution_grants') return operation === 'UPDATE' && detail === 'CONSUMED'
+          && intent!.grantIds?.includes(String(target)) ? 1 : 0;
+        if (table === 'recovery_execution_operations') return operation === 'INSERT'
+          && target === intent!.operationId && detail === plan.executionPlanId ? 1 : 0;
+        if (table === 'recovery_operation_grants') return operation === 'INSERT' && detail === intent!.operationId
+          && intent!.grantIds?.includes(String(target)) ? 1 : 0;
+        if (table === 'recovery_hold_transitions') {
+          const value = parseJson<unknown[]>(detail);
+          return operation === 'INSERT' && target === intent!.operationId && value.length === 3
+            && value[0] === plan.recoveryHoldRevision && value[1] === plan.recoveryHoldRevision + 1
+            && ['RECOVERY_STEP_APPLIED','READY_FOR_CONTINUATION_REVIEW'].includes(String(value[2])) ? 1 : 0;
+        }
+        if (table === 'recovery_model_resolutions') return operation === 'INSERT' && target === plan.targetId
+          && (plan.operationKind === 'CANCEL_UNSENT_MODEL' && detail === 'CANCELLED_UNSENT'
+            || plan.operationKind === 'DISCARD_SETTLED_RESPONSE' && detail === 'DISCARDED_BY_RECOVERY') ? 1 : 0;
+      } catch { return 0; }
+      return 0;
+    });
+    this.#db.function('map_safe_recovery_audit', (workflow, event, plan, grant, operation, revision) => {
+      const scope = this.#safeRecovery, intent = scope?.intent;
+      if (!scope || scope.tx !== this.#active || this.#context?.kind !== 'lease' || !intent
+        || this.#context.record.handle.workflowRunId !== workflow || intent.workflowRunId !== workflow
+        || intent.executionPlanId !== plan) return 0;
+      if (intent.kind !== 'EXECUTE') {
+        const expected = { CREATE_PLAN: 'RECOVERY_EXECUTION_PLAN_CREATED', AUTHORIZE: 'RECOVERY_EXECUTION_AUTHORIZED', REVOKE: 'RECOVERY_EXECUTION_REVOKED' }[intent.kind];
+        return event === expected && operation === null && revision === null
+          && grant === (intent.kind === 'CREATE_PLAN' ? null : intent.id) ? 1 : 0;
+      }
+      if (operation !== intent.operationId) return 0;
+      if (event === 'RECOVERY_GRANT_CONSUMED') return intent.grantIds?.includes(String(grant)) && revision === null ? 1 : 0;
+      if (grant !== null) return 0;
+      if (event === 'RECOVERY_HOLD_STEP_APPLIED') return revision === intent.plan!.recoveryHoldRevision + 1 ? 1 : 0;
+      if (revision !== null) return 0;
+      if (event === 'RECOVERY_OPERATION_COMMITTED') return 1;
+      const expected = { CANCEL_UNSENT_MODEL: 'RECOVERY_MODEL_CANCELLED_UNSENT', DISCARD_SETTLED_RESPONSE: 'RECOVERY_MODEL_RESPONSE_DISCARDED',
+        COMPLETE_SAFETY_STOP: 'RECOVERY_SAFETY_STOP_COMPLETED', REFLECT_RECORDED_RESULT: 'RECOVERY_RESULT_REFLECTED' }[intent.plan!.operationKind];
+      return event === expected ? 1 : 0;
+    });
     this.#db.function('map_recovery_start', (workflow, route, target) => {
       if (this.#context?.kind !== 'lease' || !this.#active || this.#context.record.handle.workflowRunId !== workflow) return -1;
       try { return recoveryStartAllowed(this.#active, String(workflow), String(route), String(target),

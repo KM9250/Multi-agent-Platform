@@ -4,6 +4,7 @@ import { DurableStoreError, requireIntegrity } from './integrity';
 import { MIGRATIONS, SCHEMA_VERSION } from './schema';
 import { DATABASE_NOW_SQL } from './leaseSchema';
 import { validateRecoveryAudit } from './recoveryDecisionStore';
+import { validateSafeRecoveryAudit } from './safeRecoveryAudit';
 
 const states = ['PREPARED','DISPATCH_RESERVED','RESULT_RECORDED','FINALIZED','REVIEW_REQUIRED'];
 export function validExecutionTransition(previous: unknown, next: unknown): boolean {
@@ -21,7 +22,7 @@ export function assertRecoverySchema(tx: DurableTransaction): void {
     && Number.isSafeInteger(boundary[0].legacy_audit_sequence) && Number(boundary[0].legacy_audit_sequence) >= 0);
 }
 export function validateAuditRow(tx: DurableTransaction, row: Row): void {
-  validateRecoveryAudit(tx, row);
+  if (!validateSafeRecoveryAudit(tx, row)) validateRecoveryAudit(tx, row);
   requireIntegrity(Number.isSafeInteger(row.audit_sequence) && Number(row.audit_sequence) > 0 && row.schema_version === 1);
   for (const key of ['audit_event_id','workflow_run_id','event_kind','entity_kind','entity_id']) requireIntegrity(typeof row[key] === 'string' && !!String(row[key]).trim());
   requireIntegrity(/^[A-Z][A-Z0-9_]{0,79}$/.test(String(row.event_kind))

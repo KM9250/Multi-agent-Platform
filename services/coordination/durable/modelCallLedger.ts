@@ -9,6 +9,7 @@ import { SqliteCoordinationRunnerStore } from './durableCoordinationStore';
 import type { DurableTransaction, Row } from './db';
 import { addAmounts, costMicros, safeAmount, usageAmounts, zeroAmounts } from './modelBudgetGuard';
 import type { ModelAmounts } from './modelBudgetGuard';
+import { effectiveModelRows, readModelRecoveryResolution } from './safeRecoveryModelState';
 export interface ModelBudgetQuote {
  providerId: string; modelId: string; maxAttempts: 1; inputTokens: number; maxOutputTokens: number;
  maxEstimatedCost: number; pricingId: string; conditions: string; requestDigest: string;
@@ -31,7 +32,7 @@ export function modelBudgetPosition(tx: DurableTransaction, store: SqliteCoordin
   const u=e.payload as RunnerModelUsage;
   committed=addAmounts(committed,{llmCalls:safeAmount(u.llmCalls),inputTokens:safeAmount(u.inputTokens),outputTokens:safeAmount(u.outputTokens),costMicros:costMicros(u.estimatedCost)});
  }
- for(const r of tx.all("SELECT * FROM model_call_ledger WHERE workflow_run_id=? AND state IN ('RESERVED','DISPATCH_INTENT','REVIEW_REQUIRED')",id))
+ for(const {historical:r} of effectiveModelRows(tx,id).filter(row=>row.outstandingReservation))
   outstanding=addAmounts(outstanding,{llmCalls:Number(r.reserved_calls),inputTokens:Number(r.reserved_input),outputTokens:Number(r.reserved_output),costMicros:Number(r.reserved_cost)});
  const b=s.run.budget;
  return {committed,outstanding,limit:{llmCalls:b.maxLlmCalls,inputTokens:b.maxInputTokens,outputTokens:b.maxOutputTokens,costMicros:costMicros(b.maxEstimatedCost,'floor')}};
@@ -39,11 +40,13 @@ export function modelBudgetPosition(tx: DurableTransaction, store: SqliteCoordin
 export class ModelCallLedger {
  constructor(readonly store: SqliteCoordinationRunnerStore, private readonly clock={now:Date.now}) {}
  inspect(id: string, callId?: string): Row[] {return this.store.database.read(tx=>tx.all(`SELECT * FROM model_call_ledger WHERE workflow_run_id=?${callId?' AND model_call_id=?':''} ORDER BY created_at,model_call_id`,...callId?[id,callId]:[id]));}
+ inspectEffective(id: string) {return this.store.database.read(tx=>effectiveModelRows(tx,id));}
  getBudgetPosition(id: string) {return this.store.database.read(tx=>modelBudgetPosition(tx,this.store,id));}
  private owned(tx: DurableTransaction, x: ModelCallIdentity): Row {
   const r=tx.get('SELECT * FROM model_call_ledger WHERE model_call_id=? AND workflow_run_id=?',x.modelCallId,x.workflowRunId);
   requireIntegrity(r && r.attempt_id===x.attemptId && r.provider_id===x.providerId && r.model_id===x.modelId);
   if(r.runtime_instance_id!==this.store.lease?.runtimeInstanceId || r.generation!==this.store.lease?.generation) throw new DurableStoreError('LEASE_FENCED');
+  if(readModelRecoveryResolution(tx,x.workflowRunId,x.modelCallId)) throw new DurableStoreError('MODEL_REVIEW_REQUIRED');
   return r;
  }
  /** Called only inside the lease-fenced writer: policy and reservations share one DB snapshot. */
@@ -67,7 +70,7 @@ export class ModelCallLedger {
    const prior=tx.get('SELECT * FROM model_call_ledger WHERE workflow_run_id=? AND round_key=? AND phase=?',x.workflowRunId,x.roundKey,x.phase);
    if(prior) { requireIntegrity(prior.model_call_id===x.modelCallId); const r=this.owned(tx,x); requireIntegrity(r.quote_json===canonicalJson(x.quote) && r.request_cursor===x.requestCursor && r.request_event_id===x.requestEventId); return r; }
    if(tx.get('SELECT coverage FROM model_call_coverage WHERE workflow_run_id=?',x.workflowRunId)?.coverage!=='TRACKED_FROM_CREATION') throw new DurableStoreError('MODEL_REVIEW_REQUIRED');
-   if(tx.get("SELECT model_call_id FROM model_call_ledger WHERE workflow_run_id=? AND (state IN ('DISPATCH_INTENT','REVIEW_REQUIRED') OR application_status='PENDING_APPLICATION' OR budget_violation=1)",x.workflowRunId)) throw new DurableStoreError('MODEL_REVIEW_REQUIRED');
+   if(effectiveModelRows(tx,x.workflowRunId).some(r=>['DISPATCH_INTENT','REVIEW_REQUIRED'].includes(String(r.historical.state)) || r.pendingApplication || r.historical.budget_violation===1)) throw new DurableStoreError('MODEL_REVIEW_REQUIRED');
    const s=this.store.restoreWorkflowInTransaction(tx,x.workflowRunId);
    requireIntegrity(s.run.status==='RUNNING' && s.run.executionMode==='supervised_autonomous');
    this.assertBudget(tx,s,amounts);
@@ -88,7 +91,7 @@ export class ModelCallLedger {
   // This call's reservation is already outstanding: do not add it twice.
   this.assertBudget(tx,s);
   requireIntegrity(s.events.at(-1)!.sequence===r.request_cursor && s.events.at(-1)!.eventId===r.request_event_id);
-  if(tx.get("SELECT model_call_id FROM model_call_ledger WHERE workflow_run_id=? AND model_call_id<>? AND (state IN ('DISPATCH_INTENT','REVIEW_REQUIRED') OR application_status='PENDING_APPLICATION' OR budget_violation=1)",x.workflowRunId,x.modelCallId)) throw new DurableStoreError('MODEL_REVIEW_REQUIRED');
+  if(effectiveModelRows(tx,x.workflowRunId).some(r=>r.historical.model_call_id!==x.modelCallId && (['DISPATCH_INTENT','REVIEW_REQUIRED'].includes(String(r.historical.state)) || r.pendingApplication || r.historical.budget_violation===1))) throw new DurableStoreError('MODEL_REVIEW_REQUIRED');
   tx.run("UPDATE model_call_ledger SET state='DISPATCH_INTENT',updated_at=? WHERE model_call_id=?",Date.now(),x.modelCallId);
  });}
  settle(x: ModelCallIdentity, usage: RunnerModelUsage, success: boolean): Row {

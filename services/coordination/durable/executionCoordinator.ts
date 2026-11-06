@@ -17,7 +17,7 @@ import type { DurableExecutionInspection, DurableExecutionState } from './execut
 import { canonicalJson, digest, DurableStoreError, guarded, requireIntegrity } from './integrity';
 import { EXECUTION_LIMITS, executionJson, rejectEmbeddedCredentials } from './executionIntegrity';
 import { readJournal } from './restore';
-import { readExecutionResult, recordedResultEvent, validateExecutionEvidence, inspectUncertainStop } from './executionReader';
+import { readExecutionResult, validateExecutionEvidence, inspectUncertainStop, finalizeRecordedResultInTransaction } from './executionReader';
 
 export class DurableExecutionCoordinator implements RunnerDurableExecution {
   readonly pendingActions: SqliteRunnerPendingActionStore;
@@ -203,21 +203,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
   }
   finalizeResult(id: string, task: CoordinationTask): void {
     this.store.writeWorkflow(id, tx => {
-      const s = readJournal(tx, id).snapshot, r = this.record(tx, id, task); validateActionOwner(s, r);
-      const row = readExecution(tx, r), result = readExecutionResult(tx, r, this.evidenceStore); requireIntegrity(result);
-      const event = recordedResultEvent(s, r, result, this.clock);
-      if (row.finalized_event_id) {
-        const existing = s.events.find(e => e.eventId === row.finalized_event_id);
-        requireIntegrity(existing && existing.eventId === event.eventId && existing.type === event.type && existing.sessionId === event.sessionId
-          && existing.actorAgentId === event.actorAgentId && existing.idempotencyKey === event.idempotencyKey
-          && canonicalJson(existing.payload) === canonicalJson(event.payload));
-        return;
-      }
-      requireIntegrity(['RESULT_RECORDED','REVIEW_REQUIRED'].includes(String(row.state)) && s.run.status === 'RUNNING'
-        && s.sessions[r.sessionId].state === 'OPEN' && s.tasks[r.taskId].status === 'ASSIGNED');
-      this.store.appendInTransaction(tx, event);
-      tx.run('UPDATE execution_ledger SET state = ?, finalized_event_id = ?, updated_at = ? WHERE workflow_run_id = ? AND action_id = ?',
-        row.state === 'REVIEW_REQUIRED' ? 'REVIEW_REQUIRED' : 'FINALIZED', event.eventId, this.now(), id, r.action.actionId);
+      finalizeRecordedResultInTransaction(this.store, tx, this.record(tx, id, task), this.evidenceStore, { now: () => this.now() });
     });
   }
   /** Complete only a committed uncertain Task failure. Never dispatch, resume, or change its Ledger. */

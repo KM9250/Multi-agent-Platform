@@ -22,20 +22,24 @@ export function validateActionOwner(s: CoordinationSnapshot, r: RunnerPendingAct
     && session?.workflowRunId === r.workflowRunId && session.mode === 'map.coord.task.v1'
     && !!session.contextRef?.startsWith('map.runner.v1:') && ref?.actionId === r.action.actionId && ref.fingerprint === r.action.fingerprint);
 }
+/** Effect-free transaction reader shared with committed recovery receipt validation. */
+export function readPendingActionInTransaction(tx: DurableTransaction, id: string, actionId: string): RunnerPendingActionRecord | undefined {
+  const row = tx.get('SELECT * FROM pending_actions WHERE workflow_run_id = ? AND action_id = ?', id, actionId);
+  if (!row) return;
+  const action = parseExecutionJson<RunnerPendingActionRecord['action']>(row.prepared_action_json, EXECUTION_LIMITS.action);
+  const record = validateAction({ workflowRunId: id, sessionId: String(row.session_id), taskId: String(row.task_id), action });
+  requireIntegrity(row.schema_version === 1 && action.actionId === actionId && row.prepared_action_digest === digest(action)
+    && row.executor_id === action.executorId && row.operation === action.operation && row.action_class === action.actionClass
+    && row.fingerprint === action.fingerprint && row.retry_safety === action.retrySafety);
+  return record;
+}
 /** Read-compatible adapter. Registration is exclusively Coordinator-owned; audit rows are retained. */
 export class SqliteRunnerPendingActionStore implements RunnerPendingActionStore {
   constructor(readonly database: DurableDatabase, private readonly store?: import('./durableCoordinationStore').SqliteCoordinationRunnerStore) {}
   get(id: string, actionId: string): RunnerPendingActionRecord | undefined { return this.store ? this.store.readWorkflow(tx => this.getInTransaction(tx,id,actionId)) : this.database.read(tx => this.getInTransaction(tx, id, actionId)); }
   getInTransaction(tx: DurableTransaction, id: string, actionId: string): RunnerPendingActionRecord | undefined {
     this.database.assertTransaction(tx);
-    const row = tx.get('SELECT * FROM pending_actions WHERE workflow_run_id = ? AND action_id = ?', id, actionId);
-    if (!row) return;
-    const action = parseExecutionJson<RunnerPendingActionRecord['action']>(row.prepared_action_json, EXECUTION_LIMITS.action);
-    const record = validateAction({ workflowRunId: id, sessionId: String(row.session_id), taskId: String(row.task_id), action });
-    requireIntegrity(row.schema_version === 1 && action.actionId === actionId && row.prepared_action_digest === digest(action)
-      && row.executor_id === action.executorId && row.operation === action.operation && row.action_class === action.actionClass
-      && row.fingerprint === action.fingerprint && row.retry_safety === action.retrySafety);
-    return record;
+    return readPendingActionInTransaction(tx, id, actionId);
   }
   put(_record: RunnerPendingActionRecord): never { throw new DurableStoreError('INVALID_TRANSACTION'); }
   delete(_id: string, _actionId: string): void { /* Deliberately retain the immutable action and its audit linkage. */ }

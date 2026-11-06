@@ -36,13 +36,13 @@ export function legacy(f:ReturnType<typeof executionFixture>,path:string,version
 for(const version of [0,1,2,3,4])test(`schema ${version} to 5 and legacy coverage`,t=>{
  const f=executionFixture(t),path=join(f.dir,`legacy-${version}.sqlite`);legacy(f,path,version);
  const db=new DurableDatabase({path});try{
-  assert.equal(db.read(tx=>tx.get('SELECT user_version FROM pragma_user_version')?.user_version),6);
+  assert.equal(db.read(tx=>tx.get('SELECT user_version FROM pragma_user_version')?.user_version),7);
   if(version)assert.equal(new RecoveryReader(db).inspect('run').modelCallCoverage,'LEGACY_UNTRACKED');
  }finally{db.close();}
 });
 for(const boundary of ['before','during','after'])test(`migration 005 forced termination ${boundary}`,async t=>{
  const f=executionFixture(t),path=join(f.dir,'legacy.sqlite');legacy(f,path,4);await crash(t,path,'migration',boundary);
- const raw=new DatabaseSync(path);try{assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,boundary==='after'?6:4);}finally{raw.close();}
+ const raw=new DatabaseSync(path);try{assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,boundary==='after'?7:4);}finally{raw.close();}
  const db=new DurableDatabase({path});db.close();
 });
 test('migration 005 failure rolls back DDL and version',t=>{

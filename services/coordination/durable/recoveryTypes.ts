@@ -1,7 +1,7 @@
 import type { WorkflowUsage } from '../types';
 import type { DurableExecutionState } from './executionLedger';
 
-export type RecoveryDisposition = 'INACTIVE' | 'READY_TO_RESUME' | 'REVIEW_REQUIRED' | 'RECOVERY_FAILED';
+export type RecoveryDisposition = 'INACTIVE' | 'READY_TO_RESUME' | 'REVIEW_REQUIRED' | 'RECOVERY_FAILED' | 'READY_FOR_CONTINUATION_REVIEW';
 export type RecoveryNextStep = 'NONE' | 'REVALIDATE_PREPARED_ACTION' | 'REFLECT_RECORDED_RESULT'
   | 'CONTINUE_VERIFICATION' | 'COMPLETE_SAFETY_STOP' | 'CONSIDER_NEW_PLAN' | 'REQUIRE_OPERATOR_REVIEW';
 export interface RecoveryAuthorizationRequirement {
@@ -15,6 +15,11 @@ export interface ExecutionStateSummary {
 }
 export interface RecoveryInspection {
   recoveryDecisions?: ReturnType<typeof import('./recoveryDecisionStore').recoveryDecisionSummary>;
+  safeRecovery?: {
+    holdRevision: number; holdState: 'HELD' | 'RECOVERY_STEP_APPLIED' | 'READY_FOR_CONTINUATION_REVIEW';
+    operations: Array<{operationId:string;executionPlanId:string;operationKind:string;targetId:string;receiptDigest:string;committedAt:number}>;
+    executionAllowed: false;
+  };
   workflowRunId: string; workflowStatus: string; disposition: RecoveryDisposition; nextStep: RecoveryNextStep;
   journalCursor: number; journalTimestamp?: number; inspectedAt: number;
   pendingActionIds: string[]; executionStates: ExecutionStateSummary[];
@@ -31,6 +36,7 @@ export interface TimelineQueryOptions {
 }
 export interface WorkflowTimelineEntry {
   recoveryPlanId?: string; authorizationId?: string; recoveryActorId?: string; recoveryHoldRevision?: number;
+  executionPlanId?: string; executionAuthorizationId?: string; recoveryOperationId?: string;
   source: 'JOURNAL' | 'EXECUTION_AUDIT' | 'RUNTIME_AUDIT' | 'CURRENT_SNAPSHOT';
   eventKind: string; workflowRunId: string; sessionId?: string; taskId?: string; actionId?: string; attemptId?: string; modelCallId?: string;
   auditEventId?: string; auditSequence?: number; journalEventId?: string; journalSequence?: number;

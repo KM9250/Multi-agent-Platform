@@ -32,3 +32,8 @@ export { RecoveryExecutionGate } from './recoveryExecutionGate';
 export { RECOVERY_CONTRACT, RECOVERY_OPERATIONS, RECOVERY_ROLES } from './recoveryDecisionTypes';
 export type { RecoveryPlan, RecoveryAuthorization, RecoveryGrantScope, RecoveryIdentityVerifier,
   VerifiedRecoveryIdentity, RecoveryAuthorizationPolicy, RecoveryPreview, RecoveryOperationKind } from './recoveryDecisionTypes';
+
+export { SafeRecoveryPlanner, SafeRecoveryAuthorizer, SafeRecoveryExecutor } from './safeRecoveryExecutor';
+export { SAFE_RECOVERY_CONTRACT, SAFE_RECOVERY_OPERATIONS } from './safeRecoveryTypes';
+export type { RecoveryExecutionPlan, RecoveryExecutionGrant, RecoveryExecutionGrantScope,
+  RecoveryOperationReceipt, RecoveryExecutionPreview, CreateRecoveryExecutionPlan, SafeRecoveryOperationKind } from './safeRecoveryTypes';
