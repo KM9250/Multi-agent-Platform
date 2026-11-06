@@ -10,7 +10,7 @@ import { DurableDatabase } from '../services/coordination/durable/index.ts';
 import type { CoordinationEvent } from '../services/coordination/types.ts';
 
 function rewrite(raw: DatabaseSync, change: (e: CoordinationEvent) => void) {
-  bypassFencingForCorruption(raw); raw.exec('DROP TRIGGER journal_no_update');
+  bypassFencingForCorruption(raw); raw.exec('DROP TRIGGER journal_no_update; DROP INDEX model_usage_source');
   const rows = raw.prepare('SELECT * FROM journal_events ORDER BY sequence').all();
   let anchor = '';
   for (const row of rows) {
@@ -39,7 +39,7 @@ for (const [name, change] of [
 }
 test('invalid Journal JSON and mismatched event digest fail safely', t => {
   const f = fixture(t); f.store.append(usage(fresh()));
-  const raw = f.raw(); raw.exec('DROP TRIGGER journal_no_update');
+  const raw = f.raw(); raw.exec('DROP TRIGGER journal_no_update; DROP INDEX model_usage_source');
   raw.prepare('UPDATE journal_events SET payload=? WHERE sequence=2').run('{private-goal');
   assert.throws(() => f.store.getSnapshot('run'), { code: 'INTEGRITY_ERROR', message: 'INTEGRITY_ERROR' });
 });
@@ -61,7 +61,7 @@ test('policy copy or seed tampering is detected without substitution', t => {
 test('future database/seed schemas and inconsistent migration ledgers are refused', t => {
   const f = fixture(t), raw = f.raw(); f.db.close();
   raw.exec('PRAGMA user_version=999'); assert.throws(() => f.open(), { code: 'SCHEMA_UNSUPPORTED' });
-  raw.exec('PRAGMA user_version=4'); raw.prepare('UPDATE schema_migrations SET migration_id=? WHERE schema_version=1').run('future');
+  raw.exec('PRAGMA user_version=5'); raw.prepare('UPDATE schema_migrations SET migration_id=? WHERE schema_version=1').run('future');
   assert.throws(() => f.open(), { code: 'INTEGRITY_ERROR' });
   raw.prepare('UPDATE schema_migrations SET migration_id=? WHERE schema_version=1').run('001_durable_coordination');
   bypassFencingForCorruption(raw); raw.exec('DROP TRIGGER seed_immutable; UPDATE workflow_seeds SET schema_version=999');

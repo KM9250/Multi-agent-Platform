@@ -26,7 +26,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
   constructor(readonly store: SqliteCoordinationRunnerStore, readonly executors: RunnerExecutorRegistry,
     options: { evidenceStore?: SqliteRunnerEvidenceStore; clock?: RunnerClock } = {}) {
     requireIntegrity(store instanceof SqliteCoordinationRunnerStore && !!executors?.get);
-    this.pendingActions = new SqliteRunnerPendingActionStore(store.database);
+    this.pendingActions = new SqliteRunnerPendingActionStore(store.database, store);
     this.evidenceStore = options.evidenceStore ?? new SqliteRunnerEvidenceStore(store.database, store.lease);
     requireIntegrity(this.evidenceStore.database === store.database);
     this.clock = options.clock ?? { now: Date.now };

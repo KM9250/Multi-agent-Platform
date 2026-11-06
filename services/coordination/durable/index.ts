@@ -21,3 +21,6 @@ export type { RecoveryDisposition, RecoveryNextStep, RecoveryInspection, Executi
 
 export { createRuntimeLeaseManager, runtimeInstanceId, DEFAULT_LEASE_TTL_MS, DEFAULT_HEARTBEAT_INTERVAL_MS } from './runtimeLease';
 export type { WorkflowLease, LeaseInspection, RuntimeLeaseManager, RuntimeLeaseOptions } from './runtimeLease';
+
+export { ModelCallLedger } from './modelCallLedger';
+export { DurableModelCallCoordinator, createTestDurableModelAdapter } from './modelCallCoordinator';

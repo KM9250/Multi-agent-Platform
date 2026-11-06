@@ -86,6 +86,15 @@ export function validateAuditRow(tx: DurableTransaction, row: Row): void {
     const event = tx.get('SELECT * FROM journal_events WHERE workflow_run_id = ? AND event_id = ?', row.workflow_run_id, row.journal_event_id)!;
     requireIntegrity(row.session_id === event.session_id && row.actor_agent_id === event.actor_agent_id && row.occurred_at === event.event_timestamp);
   }
+  if (String(row.event_kind).startsWith('MODEL_')) {
+    const model=tx.get('SELECT * FROM model_call_ledger WHERE model_call_id=? AND workflow_run_id=?',row.model_call_id,row.workflow_run_id);
+    requireIntegrity(model && row.entity_kind==='WORKFLOW' && row.entity_id===row.workflow_run_id && row.action_id===null
+      && row.attempt_id===model.attempt_id && row.runtime_instance_id===model.runtime_instance_id && row.runtime_generation===model.generation);
+    const prior=tx.get('SELECT * FROM runtime_audit_events WHERE model_call_id=? AND audit_sequence<? ORDER BY audit_sequence DESC LIMIT 1',row.model_call_id,row.audit_sequence);
+    requireIntegrity(prior ? prior.next_state===row.previous_state : row.event_kind==='MODEL_CALL_RESERVED' && row.previous_state===null);
+    const next=tx.get('SELECT audit_sequence FROM runtime_audit_events WHERE model_call_id=? AND audit_sequence>? LIMIT 1',row.model_call_id,row.audit_sequence);
+    if(!next) requireIntegrity(model.state===row.next_state && model.reason_code===row.reason_code);
+  }
   if (row.event_kind === 'EXECUTION_CHANGED') {
     requireIntegrity(row.action_id !== null && row.entity_kind === 'ACTION' && row.entity_id === row.action_id
       && states.includes(String(row.next_state)) && validExecutionTransition(row.previous_state, row.next_state)

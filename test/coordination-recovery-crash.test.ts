@@ -57,11 +57,11 @@ for (const boundary of ['before-update','after-update','after-commit'] as const)
   const path = join(f.dir, 'migration-crash.sqlite'), before = historicalDatabase(f, path, 2);
   await killAt(t, path, 'migration', boundary);
   const raw = new DatabaseSync(path); t.after(() => raw.close()); const committed = boundary === 'after-commit';
-  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, committed ? 4 : 2);
-  assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, committed ? 4 : 2);
+  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, committed ? 5 : 2);
+  assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, committed ? 5 : 2);
   assert.equal(raw.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='trigger' AND name IN ('journal_audit_insert','ledger_audit_insert','ledger_audit_update')").get()!.n, committed ? 3 : 0);
   for (const [table, rows] of Object.entries(before)) assert.deepEqual(raw.prepare(`SELECT * FROM ${table}`).all(), rows);
   const db = new DurableDatabase({ path });
-  try { assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 4); assert.equal(new RecoveryReader(db, clock).inspect('run').executionStates[0].state, 'FINALIZED'); }
+  try { assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 5); assert.equal(new RecoveryReader(db, clock).inspect('run').executionStates[0].state, 'FINALIZED'); }
   finally { db.close(); }
 });

@@ -111,7 +111,23 @@ export interface RunnerDurableExecution {
   finalizeResult(workflowRunId: string, task: CoordinationTask): void;
   getOwnedEvidence(workflowRunId: string, task: CoordinationTask, ref: string): Promise<RunnerEvidence | undefined>;
 }
+export type RunnerModelDiscardReason = 'INVALID_RESPONSE' | 'STALE_RESPONSE' | 'ABORTED' | 'BUDGET_EXHAUSTED' | 'WORKFLOW_STOPPED';
+export interface RunnerModelApplicationReceipt {
+ modelCallId: string; startCursor: number; eventId: string; digest: string;
+}
+/** Only a fresh application has an in-memory callback value; neither result authorizes replay. */
+export type RunnerModelApplicationResult<T> =
+ | { status: 'APPLIED'; receipt: RunnerModelApplicationReceipt; value: T }
+ | { status: 'ALREADY_APPLIED'; receipt: RunnerModelApplicationReceipt };
+export interface RunnerDurableModelCalls {
+ readonly store: CoordinationRunnerStore;
+ assertCanRun(workflowRunId:string):void;
+ call(input: {workflowRunId:string; roundKey:string; phase:'PLAN'|'VERIFY'; requestCursor:number; requestEventId:string; request:RunnerPlanRequest|RunnerVerifyRequest}): Promise<{value:unknown; modelCallId:string}>;
+ apply<T>(id:string,callId:string,cursor:number,fn:()=>T):RunnerModelApplicationResult<T>;
+ discard(id:string,callId:string,reason:RunnerModelDiscardReason):void;
+}
 export interface CoordinationRunnerDependencies {
+  durableModelCalls?: RunnerDurableModelCalls;
   durableExecution?: RunnerDurableExecution;
   store: CoordinationRunnerStore; supervisorProvider: RunnerSupervisorProvider; executors: RunnerExecutorRegistry;
   pendingActions: RunnerPendingActionStore; evidenceStore: RunnerEvidenceStore;

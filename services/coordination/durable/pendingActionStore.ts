@@ -24,8 +24,8 @@ export function validateActionOwner(s: CoordinationSnapshot, r: RunnerPendingAct
 }
 /** Read-compatible adapter. Registration is exclusively Coordinator-owned; audit rows are retained. */
 export class SqliteRunnerPendingActionStore implements RunnerPendingActionStore {
-  constructor(readonly database: DurableDatabase) {}
-  get(id: string, actionId: string): RunnerPendingActionRecord | undefined { return this.database.read(tx => this.getInTransaction(tx, id, actionId)); }
+  constructor(readonly database: DurableDatabase, private readonly store?: import('./durableCoordinationStore').SqliteCoordinationRunnerStore) {}
+  get(id: string, actionId: string): RunnerPendingActionRecord | undefined { return this.store ? this.store.readWorkflow(tx => this.getInTransaction(tx,id,actionId)) : this.database.read(tx => this.getInTransaction(tx, id, actionId)); }
   getInTransaction(tx: DurableTransaction, id: string, actionId: string): RunnerPendingActionRecord | undefined {
     this.database.assertTransaction(tx);
     const row = tx.get('SELECT * FROM pending_actions WHERE workflow_run_id = ? AND action_id = ?', id, actionId);

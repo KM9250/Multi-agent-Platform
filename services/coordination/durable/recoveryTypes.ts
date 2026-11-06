@@ -19,7 +19,8 @@ export interface RecoveryInspection {
   pendingActionIds: string[]; executionStates: ExecutionStateSummary[];
   recordedUsage: WorkflowUsage;
   budgetStatus: 'WITHIN_RECORDED_LIMITS' | 'RECORDED_LIMIT_EXHAUSTED' | 'UNVERIFIED';
-  modelCallCoverage: 'NOT_TRACKED_YET'; requiresExplicitAuthorization: boolean;
+  modelCallCoverage: 'TRACKED_FROM_CREATION' | 'LEGACY_UNTRACKED' | 'UNVERIFIED';
+  modelCalls?: import('./modelCallRecovery').ModelCallSummary; requiresExplicitAuthorization: boolean;
   authorizationRequirements: RecoveryAuthorizationRequirement[]; stopJournalEventId?: string;
   reasonCodes: string[]; executable: false; executionAllowed: false;
 }
@@ -29,7 +30,7 @@ export interface TimelineQueryOptions {
 }
 export interface WorkflowTimelineEntry {
   source: 'JOURNAL' | 'EXECUTION_AUDIT' | 'RUNTIME_AUDIT' | 'CURRENT_SNAPSHOT';
-  eventKind: string; workflowRunId: string; sessionId?: string; taskId?: string; actionId?: string; attemptId?: string;
+  eventKind: string; workflowRunId: string; sessionId?: string; taskId?: string; actionId?: string; attemptId?: string; modelCallId?: string;
   auditEventId?: string; auditSequence?: number; journalEventId?: string; journalSequence?: number;
   actorAgentId?: string; subjectAgentId?: string; runtimeInstanceId?: string; generation?: number;
   previousState?: string; nextState?: string; reasonCode?: string; occurredAt: number; recordedAt?: number;

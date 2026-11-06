@@ -1,10 +1,12 @@
 # Durable coordination foundation (COORD-5A)
 
-The current additive COORD-5C-2 migration advances the database schema to 4 while
+The current additive COORD-5C-3 migration advances the database schema to 5 while
 retaining the version-1 Seed/Journal/Checkpoint payloads described here. See
 [durable execution](coordination-durable-execution.md) for mandatory Coordinator
 wiring and [Runtime Lease/Fencing](coordination-runtime-lease.md) for mandatory
-write authority: a durable Store alone is no longer a valid Runner execution setup.
+write authority. [Model Call Ledger](coordination-model-call-ledger.md) describes
+mandatory durable model compatibility and budget accounting; a durable Store alone
+is not a valid Runner execution setup.
 
 This Node-only module saves a Workflow seed and committed Journal in SQLite and
 restores a validated Kernel projection after restart. It does **not** recover

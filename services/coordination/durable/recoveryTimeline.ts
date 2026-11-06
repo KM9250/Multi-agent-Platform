@@ -88,6 +88,7 @@ export class RecoveryAuditReader {
             generation: row.runtime_generation === null ? undefined : Number(row.runtime_generation) };
           if (row.event_kind === 'JOURNAL_APPENDED') return { ...journalEntry(tx, tx.get('SELECT * FROM journal_events WHERE workflow_run_id = ? AND event_id = ?', id, row.journal_event_id)!, optional(key, 'action_id')), ...audit };
           return { source: row.event_kind === 'EXECUTION_CHANGED' ? 'EXECUTION_AUDIT' : 'RUNTIME_AUDIT', eventKind: String(row.event_kind), workflowRunId: id,
+            modelCallId: optional(row,'model_call_id'),
             sessionId: optional(row, 'session_id'), taskId: optional(row, 'task_id'), actionId: optional(row, 'action_id'), attemptId: optional(row, 'attempt_id'),
             actorAgentId: optional(row, 'actor_agent_id'), subjectAgentId: optional(row, 'subject_agent_id'), runtimeInstanceId: optional(row, 'runtime_instance_id'),
             generation: row.runtime_generation === null ? undefined : Number(row.runtime_generation), previousState: optional(row, 'previous_state'), nextState: optional(row, 'next_state'),

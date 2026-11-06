@@ -6,7 +6,7 @@ This Node-only foundation reads persisted facts and diagnoses possible next step
 lease, makes a recovery decision, appends a Workflow event, invokes a Runner,
 dispatches an Executor, or calls a model.
 
-The current schema is **4**. [COORD-5C-2 Runtime Lease/Fencing](coordination-runtime-lease.md)
+The current schema is **5**. [COORD-5C-2 Runtime Lease/Fencing](coordination-runtime-lease.md)
 adds ownership audits and verified Runtime metadata while preserving this read-only contract.
 
 ## Server API
@@ -108,8 +108,10 @@ requires review after cancellation.
 
 Recorded budget status uses the existing budget evaluator and recorded usage
 plus elapsed time. `WITHIN_RECORDED_LIMITS` does not guarantee real remaining
-budget. `modelCallCoverage` is always `NOT_TRACKED_YET`; no Model Call Ledger or
-Budget Guard is implemented. Candidates still need Policy, Approval, Lease and
+budget. [COORD-5C-3](coordination-model-call-ledger.md) now reports
+`TRACKED_FROM_CREATION`, `LEGACY_UNTRACKED`, or `UNVERIFIED` coverage, plus separate
+model state counts, pending application and outstanding reservations. Unknown
+model outcomes require review. Candidates still need Policy, Approval, Lease and
 Budget revalidation and explicit authorization in subsequent phases.
 
 `authorizationRequirements` identifies persisted Action approvals, owned Security
@@ -209,7 +211,6 @@ Windows native process/filesystem behavior requires separate validation.
 
 COORD-5C-2 now supplies verified Runtime identity, Lease/Generation/Fencing and
 ownership events through this audit contract. Ownership changes and audits
-commit atomically; heartbeats do not enlarge the audit history. Model Call
-Ledger, budget reservations, recovery decisions and automatic Workflow
-continuation remain outside this implementation. See the linked Lease document
+commit atomically; heartbeats do not enlarge the audit history. COORD-5C-3 adds the [Model Call Ledger and budget reservations](coordination-model-call-ledger.md).
+Recovery decisions and automatic Workflow continuation remain unimplemented. See the linked Lease document
 for the immutable migration boundary and COORD-5C-3 handoff.
