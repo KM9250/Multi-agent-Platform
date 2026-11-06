@@ -14,6 +14,7 @@ export interface ExecutionStateSummary {
   finalizedEventId?: string; safetyStopIncomplete?: boolean;
 }
 export interface RecoveryInspection {
+  recoveryDecisions?: ReturnType<typeof import('./recoveryDecisionStore').recoveryDecisionSummary>;
   workflowRunId: string; workflowStatus: string; disposition: RecoveryDisposition; nextStep: RecoveryNextStep;
   journalCursor: number; journalTimestamp?: number; inspectedAt: number;
   pendingActionIds: string[]; executionStates: ExecutionStateSummary[];
@@ -29,6 +30,7 @@ export interface TimelineQueryOptions {
   fromTimestamp?: number; toTimestamp?: number;
 }
 export interface WorkflowTimelineEntry {
+  recoveryPlanId?: string; authorizationId?: string; recoveryActorId?: string; recoveryHoldRevision?: number;
   source: 'JOURNAL' | 'EXECUTION_AUDIT' | 'RUNTIME_AUDIT' | 'CURRENT_SNAPSHOT';
   eventKind: string; workflowRunId: string; sessionId?: string; taskId?: string; actionId?: string; attemptId?: string; modelCallId?: string;
   auditEventId?: string; auditSequence?: number; journalEventId?: string; journalSequence?: number;

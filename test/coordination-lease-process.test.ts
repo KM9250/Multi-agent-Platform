@@ -32,7 +32,7 @@ test('Expired owner returns after takeover: old write, delayed heartbeat and del
   const before = saved(f);
   for (const command of ['append','renew','release']) assert.equal((await old.request(command)).code, 'LEASE_FENCED');
   assert.deepEqual(saved(f), before);
-  assert.equal((await next.request('append')).value, 2);
+  assert.equal((await next.request('append')).code, 'RECOVERY_HELD');
   assert.equal(saved(f).lease!.owner_instance_id, next.runtimeInstanceId);
   const row = saved(f).audit.at(-1)!;
   assert.equal(row.event_kind, 'LEASE_TAKEN_OVER'); assert.equal(row.reason_code, 'LEASE_EXPIRED');

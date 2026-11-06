@@ -3,6 +3,7 @@ import type { DurableDatabase, DurableTransaction, Row } from './db';
 import { DurableStoreError, requireIntegrity } from './integrity';
 import { MIGRATIONS, SCHEMA_VERSION } from './schema';
 import { DATABASE_NOW_SQL } from './leaseSchema';
+import { validateRecoveryAudit } from './recoveryDecisionStore';
 
 const states = ['PREPARED','DISPATCH_RESERVED','RESULT_RECORDED','FINALIZED','REVIEW_REQUIRED'];
 export function validExecutionTransition(previous: unknown, next: unknown): boolean {
@@ -20,6 +21,7 @@ export function assertRecoverySchema(tx: DurableTransaction): void {
     && Number.isSafeInteger(boundary[0].legacy_audit_sequence) && Number(boundary[0].legacy_audit_sequence) >= 0);
 }
 export function validateAuditRow(tx: DurableTransaction, row: Row): void {
+  validateRecoveryAudit(tx, row);
   requireIntegrity(Number.isSafeInteger(row.audit_sequence) && Number(row.audit_sequence) > 0 && row.schema_version === 1);
   for (const key of ['audit_event_id','workflow_run_id','event_kind','entity_kind','entity_id']) requireIntegrity(typeof row[key] === 'string' && !!String(row[key]).trim());
   requireIntegrity(/^[A-Z][A-Z0-9_]{0,79}$/.test(String(row.event_kind))
@@ -124,7 +126,7 @@ export interface RuntimeAuditInput {
 }
 export function appendRuntimeAuditInTransaction(db: DurableDatabase, tx: DurableTransaction, input: RuntimeAuditInput): void {
   db.assertWorkflowWrite(tx, input.workflowRunId);
-  requireIntegrity(!['JOURNAL_APPENDED','EXECUTION_CHANGED'].includes(input.eventKind) && !input.eventKind.startsWith('LEASE_'));
+  requireIntegrity(!['JOURNAL_APPENDED','EXECUTION_CHANGED'].includes(input.eventKind) && !input.eventKind.startsWith('LEASE_') && !input.eventKind.startsWith('RECOVERY_'));
   const columns: Record<string, keyof RuntimeAuditInput> = { workflow_run_id: 'workflowRunId', event_kind: 'eventKind', entity_kind: 'entityKind', entity_id: 'entityId',
     session_id: 'sessionId', task_id: 'taskId', action_id: 'actionId', attempt_id: 'attemptId', actor_agent_id: 'actorAgentId', subject_agent_id: 'subjectAgentId',
     runtime_instance_id: 'runtimeInstanceId', runtime_generation: 'runtimeGeneration', previous_state: 'previousState', next_state: 'nextState', reason_code: 'reasonCode',

@@ -36,7 +36,9 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
     if (unknown) throw new DurableStoreError('EXECUTION_REVIEW_REQUIRED');
   }
   assertLease(id: string): void { this.store.assertLease(id); }
+  assertRecoveryExecution(id: string): void { this.store.assertRecoveryExecution(id); }
   assertCanPlan(id: string): void {
+    this.assertRecoveryExecution(id);
     this.assertLease(id);
     this.store.database.read(tx => { readJournal(tx, id); this.assertNoUnknownExecution(tx, id); });
   }
@@ -56,6 +58,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
     return record;
   }
   registerAction(input: RunnerPendingActionRecord, expected: CoordinationSnapshot, sessionEvent: CoordinationEvent, taskEvent: CoordinationEvent): RunnerPendingActionRecord {
+    this.assertRecoveryExecution(input.workflowRunId);
     const record = validateAction(input), action = record.action;
     // Identity is stable across a lost response. No replacement Action or Round is generated here.
     const registrationDigest = digest([record, expected.events.at(-1), expected.policy, sessionEvent, taskEvent]);
@@ -95,6 +98,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
   }
   /** Only this successful, acknowledged COMMIT permits the immediately following dispatch. */
   reserveDispatch(id: string, task: CoordinationTask): { record: RunnerPendingActionRecord; attemptId: string } {
+    this.assertRecoveryExecution(id);
     return this.store.writeWorkflow(id, tx => {
       const s = readJournal(tx, id).snapshot, r = this.record(tx, id, task);
       validateActionOwner(s, r);

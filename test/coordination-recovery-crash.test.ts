@@ -17,30 +17,28 @@ async function killAt(t: TestContext, path: string, operation: string, boundary:
     execArgv: ['--experimental-transform-types','--loader',fileURLToPath(new URL('./ts-loader.mjs', import.meta.url))], stdio: ['ignore','ignore','ignore','ipc'],
   });
   const closed = new Promise<{ code: number | null; signal: string | null }>(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
-  let timer: ReturnType<typeof setTimeout>;
+  let timer: ReturnType<typeof setTimeout>, prepared: any;
   const boundaryReached = new Promise<any>((resolve, reject) => {
     timer = setTimeout(() => { terminateChild(child); reject(Error('Crash child timeout')); }, 15000);
-    child.once('error', reject); child.once('message', resolve);
+    child.once('error', reject); child.on('message',(message:any)=>{if(message.prepared)prepared=message.prepared;else resolve(message);});
     child.once('exit', () => reject(Error('Crash child exited before boundary')));
   });
   t.after(async () => { clearTimeout(timer); if (child.exitCode === null && child.signalCode === null) terminateChild(child); await closed; });
   const message = await boundaryReached; clearTimeout(timer); assert.deepEqual(message, { operation, boundary });
-  terminateChild(child); const exit = await closed; assert.equal(exit.signal, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL');
+  terminateChild(child); const exit = await closed; assert.equal(exit.signal, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL');return prepared;
 }
 for (const operation of ['reserve','result','review','finalize','journal'] as const) for (const boundary of ['before-update','after-update','after-commit'] as const)
   test(`${terminationName} ${operation}/${boundary}: state and audit commit atomically`, async t => {
     const f = executionFixture(t), task = f.register(); let resultRef = '';
-    if (operation === 'result' || operation === 'review') f.coordinator.reserveDispatch('run', task);
-    if (operation === 'result') resultRef = await f.coordinator.evidenceStore.withOwner({ workflowRunId: 'run', sessionId: 'session', taskId: 'task', actionId: 'action' },
-      () => f.coordinator.evidenceStore.put({ kind: 'runner.execution', content: { status: 'succeeded' }, createdAt: 10 }));
-    if (operation === 'finalize') await f.coordinator.dispatch('run', task);
     // Lease lifecycle has its own atomicity suite; compare the original Journal/Ledger audit boundary here.
     const withoutLeaseAudit = (rows: ReturnType<typeof contents>): ReturnType<typeof contents> => {
       const { runtime_leases, ...artifacts } = rows;
       return { ...artifacts, runtime_audit_events: rows.runtime_audit_events.filter(row => !String(row.event_kind).startsWith('LEASE_')) };
     };
-    const before = withoutLeaseAudit(contents(f)), calls = { ...f.calls }; f.release(); f.db.close();
-    await killAt(t, f.path, operation, boundary, resultRef);
+    const calls = { ...f.calls }; f.release(); f.db.close();
+    const prepared = await killAt(t, f.path, operation, boundary, resultRef);
+    // IPC serializes SQLite's null-prototype rows; restore their prototype for strict comparison.
+    const before = withoutLeaseAudit(Object.fromEntries(Object.entries(prepared).map(([table,rows])=>[table,(rows as object[]).map(row=>Object.assign(Object.create(null),row))])));
     const reopened = f.open(), after = withoutLeaseAudit(reopened.db.read(tx => Object.fromEntries(Object.keys(before).map(table => [table, tx.all(`SELECT * FROM ${table} ORDER BY rowid`)]))));
     if (boundary !== 'after-commit') assert.deepEqual(after, before);
     else {
@@ -57,11 +55,11 @@ for (const boundary of ['before-update','after-update','after-commit'] as const)
   const path = join(f.dir, 'migration-crash.sqlite'), before = historicalDatabase(f, path, 2);
   await killAt(t, path, 'migration', boundary);
   const raw = new DatabaseSync(path); t.after(() => raw.close()); const committed = boundary === 'after-commit';
-  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, committed ? 5 : 2);
-  assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, committed ? 5 : 2);
+  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, committed ? 6 : 2);
+  assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, committed ? 6 : 2);
   assert.equal(raw.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='trigger' AND name IN ('journal_audit_insert','ledger_audit_insert','ledger_audit_update')").get()!.n, committed ? 3 : 0);
   for (const [table, rows] of Object.entries(before)) assert.deepEqual(raw.prepare(`SELECT * FROM ${table}`).all(), rows);
   const db = new DurableDatabase({ path });
-  try { assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 5); assert.equal(new RecoveryReader(db, clock).inspect('run').executionStates[0].state, 'FINALIZED'); }
+  try { assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 6); assert.equal(new RecoveryReader(db, clock).inspect('run').executionStates[0].state, 'FINALIZED'); }
   finally { db.close(); }
 });

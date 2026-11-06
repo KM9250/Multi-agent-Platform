@@ -10,6 +10,12 @@ import { DurableStoreError, guarded, requireIntegrity } from './integrity';
 import { migrate } from './migrations';
 import { readJournal } from './restore';
 import { validateAuditRow } from './recoveryAudit';
+import { verifyRecoveryIdentity } from './recoveryAuthorization';
+import { persistRecoveryDecision, inspectGrant, recoveryDecisionSummary } from './recoveryDecisionStore';
+import { recoveryGateReason, recoveryStartAllowed } from './recoveryExecutionGate';
+import { recoveryTime } from './recoveryPlanner';
+import { jsonCopy } from './integrity';
+import type { RecoveryAuthorizationPolicy, RecoveryDecisionCommand, RecoveryGrantScope, RecoveryIdentityVerifier } from './recoveryDecisionTypes';
 
 export type Row = Record<string, SQLOutputValue>;
 export interface DurableTransaction {
@@ -17,7 +23,12 @@ export interface DurableTransaction {
   all(sql: string, ...params: SQLInputValue[]): Row[];
   run(sql: string, ...params: SQLInputValue[]): void;
 }
-export interface DurableDatabaseOptions { path: string; busyTimeoutMs?: number }
+export interface DurableDatabaseOptions {
+  path: string; busyTimeoutMs?: number;
+  /** Trusted host startup dependency. Never populate from an HTTP request or saved DTO. */
+  recoveryIdentityVerifier?: RecoveryIdentityVerifier;
+  recoveryAuthorizationPolicy?: RecoveryAuthorizationPolicy;
+}
 
 function protectPath(path: string): void {
   if (!isAbsolute(path)) throw new DurableStoreError('INVALID_CONFIGURATION');
@@ -49,7 +60,17 @@ export class DurableDatabase {
   #active?: DurableTransaction;
   #writable = false;
   #closed = false;
+  readonly #recoveryVerifier?: RecoveryIdentityVerifier;
+  readonly #recoveryPolicy: RecoveryAuthorizationPolicy;
+  #recoveryIntent?: { workflowRunId: string; kind: string; id: string; planId?: string; actorId?: string };
+  #recoveryRejected = false;
+  #timeAnchor = { wall: Date.now(), monotonic: performance.now() };
   constructor(options: DurableDatabaseOptions) {
+    this.#recoveryVerifier = options.recoveryIdentityVerifier
+      ? Object.freeze({ verify: options.recoveryIdentityVerifier.verify.bind(options.recoveryIdentityVerifier) }) : undefined;
+    this.#recoveryPolicy = jsonCopy(options.recoveryAuthorizationPolicy ?? {});
+    for (const p of Object.values(this.#recoveryPolicy)) requireIntegrity(Number.isSafeInteger(p.minimumApprovers)
+      && p.minimumApprovers >= 1 && p.minimumApprovers <= 100 && typeof p.forbidSelfApproval === 'boolean');
     const timeout = options.busyTimeoutMs ?? 5000;
     if (!Number.isSafeInteger(timeout) || timeout < 0 || timeout > 60000) throw new DurableStoreError('INVALID_CONFIGURATION');
     this.#db = guarded('DATABASE_ERROR', () => { protectPath(options.path); return new DatabaseSync(options.path); });
@@ -76,6 +97,9 @@ export class DurableDatabase {
   private safeError(error: unknown): DurableStoreError {
     if (error instanceof DurableStoreError) return error;
     if ((error as { message?: string })?.message === 'LEASE_FENCED') return new DurableStoreError('LEASE_FENCED');
+    const code = (error as { message?: string })?.message;
+    if (['RECOVERY_HELD','RECOVERY_UNAUTHORIZED','RECOVERY_IMMUTABLE','RECOVERY_EXECUTION_DISABLED'].includes(code ?? ''))
+      return new DurableStoreError(code as 'RECOVERY_HELD');
     const errno = (error as { errcode?: number })?.errcode;
     return new DurableStoreError(errno !== undefined && [5, 6].includes(errno & 255) ? 'DATABASE_BUSY' : 'DATABASE_ERROR');
   }
@@ -98,6 +122,7 @@ export class DurableDatabase {
         catch (error) {
           const safe = this.safeError(error);
           if (safe.code === 'LEASE_FENCED') this.#fencingRejected = true;
+          if (safe.code.startsWith('RECOVERY_')) this.#recoveryRejected = true;
           throw safe;
         }
       },
@@ -110,6 +135,7 @@ export class DurableDatabase {
       const result = fn(tx);
       if (result && typeof (result as { then?: unknown }).then === 'function') throw new DurableStoreError('INVALID_TRANSACTION');
       if (this.#fencingRejected) throw new DurableStoreError('LEASE_FENCED');
+      if (this.#recoveryRejected) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
       if (context?.kind === 'lease') this.#assertLease(context.record);
       if (context?.kind === 'bootstrap') this.#assertBootstrap(tx, context);
       this.#db.exec('COMMIT'); begun = false;
@@ -120,9 +146,56 @@ export class DurableDatabase {
         catch { this.#db.close(); this.#closed = true; }
       }
       throw this.safeError(error);
-    } finally { this.#active = undefined; this.#writable = false; this.#context = undefined; this.#fencingRejected = false; }
+    } finally { this.#active = undefined; this.#writable = false; this.#context = undefined; this.#fencingRejected = false;
+      this.#recoveryIntent = undefined; this.#recoveryRejected = false; }
   }
   read<T>(fn: (tx: DurableTransaction) => T): T { return this.#transaction(false, fn); }
+  get recoveryPolicy(): RecoveryAuthorizationPolicy { return jsonCopy(this.#recoveryPolicy); }
+  /** Only this closed command dispatcher can establish recovery-management context. */
+  recoveryDecision(lease: WorkflowLease | undefined, credential: unknown, command: RecoveryDecisionCommand) {
+    command = jsonCopy(command);
+    if (!lease) throw new DurableStoreError('LEASE_FENCED');
+    return this.writeWithLease(lease, lease.workflowRunId, tx => {
+      const identity = verifyRecoveryIdentity(this.#recoveryVerifier, credential, recoveryTime(tx), command.kind);
+      const workflow = command.kind === 'CREATE_PLAN' ? command.input.workflowRunId
+        : command.kind === 'REVOKE' ? tx.get('SELECT workflow_run_id FROM recovery_authorizations WHERE authorization_id=?', command.authorizationId)?.workflow_run_id
+        : tx.get('SELECT workflow_run_id FROM recovery_plans WHERE recovery_plan_id=?', command.recoveryPlanId)?.workflow_run_id;
+      if (workflow !== lease.workflowRunId) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
+      if (!['CREATE_PLAN','AUTHORIZE','REVOKE','INVALIDATE'].includes(command.kind)) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
+      return persistRecoveryDecision(this, tx, command, identity, (kind, id, planId) => {
+        this.#recoveryIntent = { workflowRunId: lease.workflowRunId, kind, id, planId, actorId: identity.actorId };
+      });
+    });
+  }
+  inspectRecoveryAuthorization(id: string, scope: RecoveryGrantScope) { return this.read(tx => inspectGrant(this, tx, id, scope)); }
+  viewRecoveryDecisions(credential: unknown, id: string) {
+    return this.read(tx => {
+      verifyRecoveryIdentity(this.#recoveryVerifier, credential, recoveryTime(tx), 'VIEW');
+      readJournal(tx, id);
+      return recoveryDecisionSummary(tx, id);
+    });
+  }
+  assertRecoveryExecution(lease: WorkflowLease | undefined, id: string, reservedModelId?: string): void {
+    const reason = this.writeWithLease(lease, id, tx => {
+      let reason;
+      try { reason = recoveryGateReason(tx, id, reservedModelId); }
+      catch (error) {
+        if (!(error instanceof DurableStoreError) || ['DATABASE_ERROR','DATABASE_BUSY'].includes(error.code)) throw error;
+        reason = 'INTEGRITY_UNVERIFIED' as const;
+      }
+      if (reason && !tx.get('SELECT workflow_run_id FROM recovery_holds WHERE workflow_run_id=?', id)) {
+        this.#recoveryIntent = { workflowRunId: id, kind: 'HOLD', id };
+        const now = recoveryTime(tx);
+        tx.run("INSERT INTO recovery_holds VALUES (?,1,?,?,?,'GATE',1)", id, reason, lease!.generation, now);
+        tx.run(`INSERT INTO runtime_audit_events (audit_event_id,workflow_run_id,event_kind,entity_kind,entity_id,
+          recovery_hold_revision,next_state,reason_code,occurred_at,recorded_at,schema_version,runtime_instance_id,runtime_generation)
+          VALUES (lower(hex(randomblob(16))),?,'RECOVERY_HOLD_CREATED','WORKFLOW',?,1,'HELD',?,?,?,1,?,?)`, id, id, reason, now, now, lease!.runtimeInstanceId, lease!.generation);
+      }
+      return reason;
+    });
+    // Throw after acknowledged COMMIT so the durable hold is not rolled back.
+    if (reason) throw new DurableStoreError('RECOVERY_HELD');
+  }
   write<T>(fn: (tx: DurableTransaction) => T): T { return this.#transaction(true, fn); }
   assertWorkflowWrite(tx: DurableTransaction, workflowRunId: string): void {
     this.assertTransaction(tx, true);
@@ -197,6 +270,30 @@ export class DurableDatabase {
     }
   }
   #registerFencingFunctions(): void {
+    this.#db.function('map_recovery_start', (workflow, route, target) => {
+      if (this.#context?.kind !== 'lease' || !this.#active || this.#context.record.handle.workflowRunId !== workflow) return -1;
+      try { return recoveryStartAllowed(this.#active, String(workflow), String(route), String(target)) ? 1 : 0; }
+      catch { return 0; }
+    });
+    this.#db.function('map_recovery_now', () => {
+      const now = this.#now(), monotonic = performance.now();
+      if (!Number.isSafeInteger(now) || now < this.#timeAnchor.wall - 1000
+        || Math.abs((now - this.#timeAnchor.wall) - (monotonic - this.#timeAnchor.monotonic)) > 2000) return -1;
+      this.#timeAnchor = { wall: now, monotonic }; return now;
+    });
+    this.#db.function('map_recovery_actor', () => this.#recoveryIntent?.actorId ?? null);
+    this.#db.function('map_recovery_management', (workflow, kind, id) => {
+      const intent = this.#recoveryIntent;
+      return this.#context?.kind === 'lease' && intent?.workflowRunId === workflow && intent.kind === kind && intent.id === id ? 1 : 0;
+    });
+    this.#db.function('map_recovery_audit', (workflow, event, plan, authorization, revision) => {
+      const intent = this.#recoveryIntent;
+      if (this.#context?.kind !== 'lease' || !intent || intent.workflowRunId !== workflow) return 0;
+      if (intent.kind === 'HOLD') return event === 'RECOVERY_HOLD_CREATED' && revision === 1 && plan === null && authorization === null ? 1 : 0;
+      const kind = { CREATE_PLAN: 'RECOVERY_PLAN_CREATED', INVALIDATE: 'RECOVERY_PLAN_INVALIDATED', AUTHORIZE: 'RECOVERY_AUTHORIZED', REVOKE: 'RECOVERY_REVOKED' }[intent.kind];
+      return event === kind && plan === intent.planId && revision === null
+        && authorization === (['AUTHORIZE','REVOKE'].includes(intent.kind) ? intent.id : null) ? 1 : 0;
+    });
     // Default directOnly=false permits trigger calls. No SQL function sets context.
     this.#db.function('map_fence_valid', (workflow, owner, generation, hash, state, expiry, now) => {
       const context = this.#context;

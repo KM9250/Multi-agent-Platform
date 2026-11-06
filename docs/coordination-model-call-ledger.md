@@ -1,12 +1,13 @@
 # Durable Model Call Ledger (COORD-5C-3)
 
-Schema **5**, migration `005_durable_model_call_budget`, based on
+Introduced in Schema **5**, migration `005_durable_model_call_budget`, based on
 `729b42d1e9410bb6d90bbe8a32781c5a139724c2` (COORD-5C-2).
 This tracks PLAN/VERIFY budget reservations, dispatch intentions, usage settlement,
 and response application. Recovery remains diagnostic only:
 `executionAllowed=false` and `executable=false`. No automatic resume, resend,
 manual reconciliation, shared budget pool, or external API exactly-once guarantee
-is introduced.
+is introduced. The current schema is **6**; the [4A recovery gate](coordination-recovery-authorization.md)
+adds persistent protection without enabling recovery execution.
 
 ## Supported adapter boundary
 
@@ -190,3 +191,14 @@ migration for an already-deployed schema 5 database.
 `coordination-model-call-audit.test.ts` adds 47 tests: 24 for F-01 exit/retention
 boundaries, 3 for F-02 application receipt/ACK idempotency, and 20 for F-03 direct
 coordinator Policy and outstanding-budget enforcement.
+
+## COORD-5C-4A integration
+
+Schema 6 adds a [durable recovery hold and record-only authorization contract](coordination-recovery-authorization.md).
+Model Coordinator calls and Ledger reservation/dispatch-intent writes pass the
+recovery gate; SQLite also rejects direct start attempts and held business writes.
+Normal current-lease settlement/application remains unchanged. Takeover and risky
+clean reacquisition preserve uncertainty with a hold, including pending responses,
+unknown usage and budget violations. A 4A grant cannot cancel a reservation,
+discard/apply a saved response or reconcile usage. Those recovery operations need
+the new 4B/4C executable contract and renewed approval.

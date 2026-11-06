@@ -44,6 +44,16 @@ export class SqliteCoordinationRunnerStore implements CoordinationRunnerStore, D
     if (!this.lease || this.lease.workflowRunId !== id) throw new DurableStoreError('LEASE_FENCED');
     this.database.createLeaseManager().assertCurrent(this.lease);
   }
+  assertRecoveryExecution(id: string, reservedModelId?: string): void {
+    // Normal, synchronous response application already owns the writer. Held
+    // workflows remain blocked by SQL; no recovery exception is established.
+    if (this.#applicationTx) {
+      this.database.assertWorkflowWrite(this.#applicationTx, id);
+      if (this.#applicationTx.get('SELECT workflow_run_id FROM recovery_holds WHERE workflow_run_id=?', id)) throw new DurableStoreError('RECOVERY_HELD');
+      return;
+    }
+    this.database.assertRecoveryExecution(this.lease, id, reservedModelId);
+  }
   writeWorkflow<T>(id: string, fn: (tx: DurableTransaction) => T): T { if (this.#applicationTx) { this.database.assertWorkflowWrite(this.#applicationTx, id); return fn(this.#applicationTx); }
     return this.database.writeWithLease(this.lease, id, fn); }
   createWorkflow(input: CoordinationSnapshot): void {
@@ -77,6 +87,7 @@ export class SqliteCoordinationRunnerStore implements CoordinationRunnerStore, D
     return state;
   }
   append(event: CoordinationEvent): CoordinationSnapshot {
+    if (['WorkflowResumed','TaskAssigned','SessionStarted'].includes(event.type)) this.assertRecoveryExecution(event.workflowRunId);
     return this.writeWorkflow(event.workflowRunId, tx => this.appendInTransaction(tx, event));
   }
   /** Trusted future participants share the writer; result is provisional until write() returns.

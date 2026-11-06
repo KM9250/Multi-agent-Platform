@@ -39,6 +39,7 @@ for (const mode of ['before-commit', 'after-commit', 'checkpoint']) {
     assert.equal(reopened.store.getSnapshot('run').events.length, expected);
     if (mode === 'checkpoint') assert.equal(reopened.store.loadCheckpoint('run'), undefined);
     // after-commit models loss of the API response; committed identity is retained on retry.
+    if(mode==='before-commit'){assert.throws(()=>reopened.store.append(e),{code:'RECOVERY_HELD'});assert.equal(reopened.store.getSnapshot('run').events.length,1);return;}
     const recovered = reopened.store.append(e); assert.equal(recovered.events.length, 2);
     assert.deepEqual(recovered.events[1], e);
   });

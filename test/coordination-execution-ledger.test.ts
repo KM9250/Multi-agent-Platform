@@ -27,17 +27,12 @@ for (const type of ['WorkflowBlocked','WorkflowSuspended','WorkflowCancelled'] a
   const f = executionFixture(t), task = f.register(); f.add(type, type === 'WorkflowBlocked' ? { reason:'manual' } : {});
   assert.throws(() => f.coordinator.reserveDispatch('run',task)); assert.equal(f.calls.execute,0);
 });
-test('reservation uses exact latest Action Approval ref and rejects unrelated later resume', async t => {
-  const f = executionFixture(t,'NEEDS_USER'), task = f.register(), approval = runnerPendingApproval('run',prepared);
-  f.add('WorkflowBlocked',{reason:`RUNNER_NEEDS_USER:${approval.approvalRef}`});
-  f.add('WorkflowResumed',{authorization:{type:'user',reference:'wrong'}});
-  assert.throws(() => f.coordinator.reserveDispatch('run',task));
-  f.add('WorkflowSuspended',{}); f.add('WorkflowResumed',{authorization:{type:'user',reference:approval.approvalRef}});
-  const reservation = f.coordinator.reserveDispatch('run',task); assert.ok(reservation.attemptId);
-  const snapshot = f.snapshot();
-  assert.throws(() => f.store.writeWorkflow('run', tx => tx.run("UPDATE execution_ledger SET state='PREPARED',attempt_id=NULL,reserved_at=NULL WHERE action_id='action'")));
-  assert.deepEqual(f.snapshot(),snapshot);
-  await assert.rejects(f.coordinator.dispatch('run',task)); assert.equal(f.calls.execute,0);
+test('4A refuses both exact and unrelated Action Approval resume without mutating PREPARED', t => {
+  const f=executionFixture(t,'NEEDS_USER'),task=f.register(),approval=runnerPendingApproval('run',prepared);
+  f.add('WorkflowBlocked',{reason:`RUNNER_NEEDS_USER:${approval.approvalRef}`});const before=f.snapshot();
+  for(const reference of ['wrong',approval.approvalRef])assert.throws(()=>f.add('WorkflowResumed',{authorization:{type:'user',reference}}),{code:'RECOVERY_HELD'});
+  assert.throws(()=>f.coordinator.reserveDispatch('run',task),{code:'RECOVERY_HELD'});
+  assert.deepEqual(f.snapshot(),before);assert.equal(f.calls.execute,0);assert.equal(f.coordinator.inspectExecution('run','action')!.state,'PREPARED');
 });
 for (const field of ['workflowRunId','sessionId','taskId','fingerprint','executorId'] as const) test(`reservation rejects crossed ${field}`, t => {
   const f = executionFixture(t), task = f.register();
@@ -76,8 +71,8 @@ test('Policy DENY ends Task without dispatch and retained PREPARED audit proves 
 test('direct reservation cannot bypass first-resume Security Review using a newly prepared Action',async t=>{
   const f=executionFixture(t);let reviewRef='';
   f.executor.execute=async(_a,c)=>{reviewRef=`map.runner.security-review.v1:run:${c.taskId}:sha256%3A${'a'.repeat(64)}`;return {status:'failed',summary:'hold',safetyHold:{kind:'untrusted-content',effectState:'applied',reasonCode:'CONTENT_REVIEW_REQUIRED',reviewRef,safeSummary:'Untrusted content requires user review.'}};};
-  await f.runner.runOneRound('run');f.add('WorkflowResumed',{authorization:{type:'user',reference:'wrong'}});
-  f.add('WorkflowSuspended',{});f.add('WorkflowResumed',{authorization:{type:'user',reference:reviewRef}});
-  const task=f.register({...record,sessionId:'second-session',taskId:'second-task',action:{...prepared,actionId:'second-action'}});
-  assert.throws(()=>f.coordinator.reserveDispatch('run',task));assert.equal(f.coordinator.inspectExecution('run','second-action')!.state,'PREPARED');
+  await f.runner.runOneRound('run');
+  assert.throws(()=>f.add('WorkflowResumed',{authorization:{type:'user',reference:reviewRef}}),{code:'RECOVERY_HELD'});
+  assert.throws(()=>f.coordinator.registerAction({...record,sessionId:'second-session',taskId:'second-task',action:{...prepared,actionId:'second-action'}},f.snapshot(),{} as any,{} as any),{code:'RECOVERY_HELD'});
+  assert.equal(f.coordinator.inspectExecution('run','second-action'),undefined);
 });

@@ -98,6 +98,7 @@ export interface RunnerEvidenceStore { put(evidence: RunnerEvidence): Promise<st
 /** Node-free contract; implementations live only in the durable server entry point. */
 export interface RunnerDurableExecution {
   assertLease(workflowRunId: string): void;
+  assertRecoveryExecution(workflowRunId: string): void;
   readonly store: CoordinationRunnerStore;
   readonly pendingActions: RunnerPendingActionStore;
   readonly evidenceStore: RunnerEvidenceStore;

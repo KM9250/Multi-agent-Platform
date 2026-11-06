@@ -3,7 +3,9 @@ import { RUNTIME_LEASE_SQL } from './leaseSchema';
 
 import { MODEL_CALL_SQL } from './modelCallSchema';
 
-export const SCHEMA_VERSION = 5;
+import { RECOVERY_DECISION_SQL } from './recoveryDecisionSchema';
+
+export const SCHEMA_VERSION = 6;
 // Persisted seed/checkpoint format is unchanged by the additive execution migration.
 export const JOURNAL_SCHEMA_VERSION = 1;
 export const MIGRATIONS = [{ version: 1, id: '001_durable_coordination', sql: `
@@ -160,4 +162,5 @@ CREATE TRIGGER ledger_transition BEFORE UPDATE ON execution_ledger WHEN
 BEGIN SELECT RAISE(ABORT, 'INVALID_EXECUTION_TRANSITION'); END;
 ` }, { version: 3, id: '003_recovery_audit_foundation', sql: RECOVERY_AUDIT_SQL },
 { version: 4, id: '004_runtime_lease_fencing', sql: RUNTIME_LEASE_SQL },
-{ version: 5, id: '005_durable_model_call_budget', sql: MODEL_CALL_SQL }] as const;
+{ version: 5, id: '005_durable_model_call_budget', sql: MODEL_CALL_SQL },
+{ version: 6, id: '006_recovery_decision_authorization', sql: RECOVERY_DECISION_SQL }] as const;

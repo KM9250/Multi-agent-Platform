@@ -39,6 +39,7 @@ export class DurableModelCallCoordinator implements RunnerDurableModelCalls {
  readonly ledger: ModelCallLedger;
  constructor(readonly store: SqliteCoordinationRunnerStore,readonly provider:RunnerSupervisorProvider,clock={now:Date.now}) {this.ledger=new ModelCallLedger(store,clock);}
  assertCanRun(id:string):void {
+  this.store.assertRecoveryExecution(id);
   this.store.assertLease(id);
   const coverage=this.store.database.read(tx=>tx.get('SELECT coverage FROM model_call_coverage WHERE workflow_run_id=?',id)?.coverage);
   if(coverage!=='TRACKED_FROM_CREATION' || this.ledger.inspect(id).some(r=>['RESERVED','DISPATCH_INTENT','REVIEW_REQUIRED'].includes(String(r.state)) || r.application_status==='PENDING_APPLICATION' || r.budget_violation)) throw new DurableStoreError('MODEL_REVIEW_REQUIRED');

@@ -60,6 +60,7 @@ export class ModelCallLedger {
    throw new DurableStoreError('MODEL_BUDGET_EXHAUSTED');
  }
  reserve(x: ReserveModelCall): Row {
+  this.store.assertRecoveryExecution(x.workflowRunId, x.modelCallId);
   requireIntegrity(Object.keys(x.quote).every(k=>['providerId','modelId','maxAttempts','inputTokens','maxOutputTokens','maxEstimatedCost','pricingId','conditions','requestDigest'].includes(k)));
   const amounts=validateQuote(x.quote); requireIntegrity(x.quote.providerId===x.providerId && x.quote.modelId===x.modelId);
   return this.store.writeWorkflow(x.workflowRunId,tx=>{
@@ -78,7 +79,9 @@ export class ModelCallLedger {
    return this.owned(tx,x);
   });
  }
- markDispatchIntent(x: ModelCallIdentity): void {this.store.writeWorkflow(x.workflowRunId,tx=>{
+ markDispatchIntent(x: ModelCallIdentity): void {
+  this.store.database.read(tx=>{ if(this.owned(tx,x).state!=='RESERVED') throw new DurableStoreError('MODEL_REVIEW_REQUIRED'); });
+  this.store.assertRecoveryExecution(x.workflowRunId,x.modelCallId);this.store.writeWorkflow(x.workflowRunId,tx=>{
   const r=this.owned(tx,x); if(r.state!=='RESERVED') throw new DurableStoreError('MODEL_REVIEW_REQUIRED');
   const s=this.store.restoreWorkflowInTransaction(tx,x.workflowRunId);
   requireIntegrity(s.run.status==='RUNNING' && s.run.executionMode==='supervised_autonomous');

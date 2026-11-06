@@ -25,8 +25,8 @@ async function child(t: TestContext,path:string,mode:string,effectPath:string){
 }
 const effects=(path:string)=>existsSync(path)?readFileSync(path,'utf8').trim().split('\n').filter(Boolean).length:0;
 for(const [mode,state,initialEffects,afterRetry] of [
-  ['registration-before',undefined,0,0],['registration-after','PREPARED',0,1],
-  ['reserve-before','PREPARED',0,1],['reserve-after','DISPATCH_RESERVED',0,0],
+  ['registration-before',undefined,0,0],['registration-after','PREPARED',0,0],
+  ['reserve-before','PREPARED',0,0],['reserve-after','DISPATCH_RESERVED',0,0],
   ['external-after','DISPATCH_RESERVED',1,1],['evidence-before','DISPATCH_RESERVED',1,1],
   ['result-before','DISPATCH_RESERVED',1,1],['result-after','RESULT_RECORDED',1,1],
   ['finalize-before','RESULT_RECORDED',1,1],['finalize-after','FINALIZED',1,1],
@@ -34,10 +34,6 @@ for(const [mode,state,initialEffects,afterRetry] of [
   const f=executionFixture(t),effectPath=join(f.dir,'effects.log');
   if(!mode.startsWith('registration-'))f.register();
   f.release();
-  // Stage finalization with an independently recorded external effect in a separate process.
-  if(mode.startsWith('finalize-')){
-    const stage=await child(t,f.path,'result-after',effectPath);await stage.ready;stage.process.send({});assert.equal((await stage.result).stage,'result-after');terminateChild(stage.process);await stage.closed;
-  }
   f.db.close();
   const crash=await child(t,f.path,mode,effectPath);await crash.ready;crash.process.send({});assert.equal((await crash.result).stage,mode);terminateChild(crash.process);await crash.closed;
   assert.equal(effects(effectPath),initialEffects);
@@ -46,7 +42,7 @@ for(const [mode,state,initialEffects,afterRetry] of [
   assert.equal(effects(effectPath),initialEffects); // Inspecting/reopening never runs an Executor.
   if(!state){const opened=f.open();assert.equal(opened.store.getSnapshot('run').events.length,1);return;}
   const retry=await child(t,f.path,'retry',effectPath);await retry.ready;retry.process.send({});const outcome=await retry.result;await retry.closed;
-  if(state==='DISPATCH_RESERVED')assert.equal(outcome.code,'EXECUTION_REVIEW_REQUIRED');else assert.equal(outcome.code,undefined);
+  if(state==='DISPATCH_RESERVED')assert.equal(outcome.code,'EXECUTION_REVIEW_REQUIRED');else if(state!=='FINALIZED')assert.equal(outcome.code,'RECOVERY_HELD');else assert.equal(outcome.code,undefined);
   assert.equal(effects(effectPath),afterRetry);assert.ok(effects(effectPath)<=1);
   const second=await child(t,f.path,'retry',effectPath);await second.ready;second.process.send({});await second.result;await second.closed;assert.equal(effects(effectPath),afterRetry);
 });
@@ -59,7 +55,7 @@ test('two Node processes racing the same Action produce at most one reservation 
 });
 
 
-for (const stage of ['task','session','progress'] as const) test(`${terminationName} after legacy uncertain ${stage} COMMIT: fresh explicit Runner completes one block without dispatch or PLAN`, async t => {
+for (const stage of ['task','session','progress'] as const) test(`${terminationName} after legacy uncertain ${stage} COMMIT: 4A retains the prefix and refuses all recovery writes`, async t => {
   const f=executionFixture(t),effectPath=join(f.dir,'uncertain-effects.log');f.register();f.release();f.db.close();
   const crash=await child(t,f.path,`uncertain-legacy-${stage}`,effectPath);await crash.ready;crash.process.send({});
   assert.equal((await crash.result).stage,`uncertain-legacy-${stage}`);terminateChild(crash.process);await crash.closed;
@@ -68,32 +64,27 @@ for (const stage of ['task','session','progress'] as const) test(`${terminationN
   const saved=ledger();assert.equal(saved!.state,'REVIEW_REQUIRED');assert.equal(saved!.review_reason,'EXECUTION_UNCERTAIN');
   assert.equal(before.run.status,'RUNNING');assert.equal(effects(effectPath),1);
   const recovery=await child(t,f.path,'uncertain-recover',effectPath);await recovery.ready;recovery.process.send({});
-  assert.equal((await recovery.result).outcome.reason,'needs_user');await recovery.closed;
-  const after=reopened.store.getSnapshot('run');assert.equal(after.run.status,'BLOCKED');assert.equal(after.run.statusReason,'RUNNER_EXECUTION_UNCERTAIN:action');
-  assert.deepEqual(after.events.slice(0,before.events.length),before.events);assert.deepEqual(ledger(),saved);
-  for(const type of ['TaskFailed','SessionResolved','ProgressRecorded','WorkflowBlocked'])assert.equal(after.events.filter(e=>e.type===type).length,1);
-  assert.equal(after.run.usage.rounds,1);assert.equal(after.run.usage.consecutiveErrors,1);
+  assert.equal((await recovery.result).outcome.errorCode,'RUNNER_DURABLE_EXECUTION_STOPPED');await recovery.closed;
+  const after=reopened.store.getSnapshot('run');assert.deepEqual(after,before);assert.deepEqual(ledger(),saved);
   const retry=await child(t,f.path,'uncertain-recover',effectPath);await retry.ready;retry.process.send({});await retry.result;await retry.closed;
   assert.deepEqual(reopened.store.getSnapshot('run'),after);assert.deepEqual(ledger(),saved);
   assert.equal(effects(effectPath),1);assert.equal(effects(effectPath+'.plan'),0);assert.equal(effects(effectPath+'.verify'),0);
 });
 for(const boundary of ['before','after'] as const) test(`${terminationName} ${boundary} uncertain completion COMMIT preserves atomic suffix and exactly one block on retry`,async t=>{
   const f=executionFixture(t),effectPath=join(f.dir,'atomic-uncertain-effects.log');f.register();f.release();f.db.close();
-  const stage=await child(t,f.path,'uncertain-legacy-task',effectPath);await stage.ready;stage.process.send({});await stage.result;terminateChild(stage.process);await stage.closed;
   const reopened=f.open(),before=reopened.store.getSnapshot('run');
-  const ledger=()=>reopened.db.read(tx=>tx.get("SELECT * FROM execution_ledger WHERE workflow_run_id='run' AND action_id='action'"));const saved=ledger();
+  const ledger=()=>reopened.db.read(tx=>tx.get("SELECT * FROM execution_ledger WHERE workflow_run_id='run' AND action_id='action'"));
   const crash=await child(t,f.path,`uncertain-atomic-${boundary}`,effectPath);await crash.ready;crash.process.send({});
   assert.equal((await crash.result).stage,`uncertain-atomic-${boundary}`);terminateChild(crash.process);await crash.closed;
   const committed=reopened.store.getSnapshot('run');
-  if(boundary==='before')assert.deepEqual(committed,before);
-  else{assert.equal(committed.run.status,'BLOCKED');assert.equal(committed.events.length,before.events.length+3);}
-  assert.deepEqual(ledger(),saved);
+  assert.equal(committed.events.length,before.events.length+(boundary==='before'?1:4));
+  assert.equal(committed.run.status,boundary==='before'?'RUNNING':'BLOCKED');
+  const saved=ledger();
   for(let i=0;i<2;i++){
     const retry=await child(t,f.path,'uncertain-recover',effectPath);await retry.ready;retry.process.send({});
-    assert.equal((await retry.result).outcome.reason,'needs_user');await retry.closed;
+    const outcome=(await retry.result).outcome;assert.equal(outcome.reason,boundary==='before'?'error':'needs_user');await retry.closed;
   }
-  const after=reopened.store.getSnapshot('run');assert.equal(after.events.length,before.events.length+3);
-  for(const type of ['TaskFailed','SessionResolved','ProgressRecorded','WorkflowBlocked'])assert.equal(after.events.filter(e=>e.type===type).length,1);
-  assert.equal(after.run.usage.rounds,1);assert.deepEqual(ledger(),saved);
+  const after=reopened.store.getSnapshot('run');assert.deepEqual(after,committed);
+  assert.equal(after.run.usage.rounds,boundary==='before'?0:1);assert.deepEqual(ledger(),saved);
   assert.equal(effects(effectPath),1);assert.equal(effects(effectPath+'.plan'),0);assert.equal(effects(effectPath+'.verify'),0);
 });
