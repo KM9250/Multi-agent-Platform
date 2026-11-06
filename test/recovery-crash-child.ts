@@ -2,19 +2,20 @@
 import { DatabaseSync } from 'node:sqlite';
 import { DurableDatabase, SqliteCoordinationRunnerStore, DurableExecutionCoordinator, createRuntimeLeaseManager } from '../services/coordination/durable/index.ts';
 import { createRunnerEvent } from '../services/coordination/runner/eventFactory.ts';
+import { tables } from './recovery-fixture.ts';
 import { clock } from './durable-execution-fixture.ts';
 const [path, operation, boundary, resultRef] = process.argv.slice(2);
 const pause = () => { process.send!({ operation, boundary }); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0); };
-let armed = false;
+let armed = false, testing = operation === 'migration';
 const originalPrepare = DatabaseSync.prototype.prepare;
 DatabaseSync.prototype.prepare = function(sql: string) {
   const statement = originalPrepare.call(this, sql), run = statement.run.bind(statement);
   statement.run = (...params: any[]) => {
-    const target = operation === 'journal' ? sql.startsWith('INSERT INTO journal_events')
+    const target = testing && (operation === 'journal' ? sql.startsWith('INSERT INTO journal_events')
       : operation === 'reserve' ? sql.startsWith("UPDATE execution_ledger SET state = 'DISPATCH_RESERVED'")
       : operation === 'review' ? sql.startsWith("UPDATE execution_ledger SET state = 'REVIEW_REQUIRED'")
       : ['result','finalize'].includes(operation) && sql.startsWith('UPDATE execution_ledger SET state = ?')
-        && params[0] === (operation === 'result' ? 'RESULT_RECORDED' : 'FINALIZED');
+        && params[0] === (operation === 'result' ? 'RESULT_RECORDED' : 'FINALIZED'));
     if (target && boundary === 'before-update') pause();
     const result = run(...params);
     if (target) { armed = true; if (boundary === 'after-update') pause(); }
@@ -37,9 +38,15 @@ try {
   const store = new SqliteCoordinationRunnerStore(db, operation === 'migration' ? undefined : createRuntimeLeaseManager(db, { ttlMs: 1000 }).acquire('run'));
   const coordinator = new DurableExecutionCoordinator(store, { get(id) { return id === 'test' ? { id: 'test', async prepare() { throw Error('Unexpected prepare'); }, async execute() { process.send!({ error: 'UNEXPECTED_EXECUTOR' }); throw Error('Unexpected execute'); } } : undefined; } }, { clock });
   const s = store.getSnapshot('run'), task = s.tasks.task;
+  let savedRef=resultRef;
+  if(['result','review','finalize'].includes(operation))coordinator.reserveDispatch('run',task);
+  if(['result','finalize'].includes(operation)) savedRef=await coordinator.evidenceStore.withOwner({workflowRunId:'run',sessionId:'session',taskId:'task',actionId:'action'},()=>coordinator.evidenceStore.put({kind:'runner.execution',content:{status:'succeeded'},createdAt:10}));
+  if(operation==='finalize')coordinator.recordResult('run',task,coordinator.inspectExecution('run','action')!.attemptId!,{status:'succeeded',summary:'done',resultRef:savedRef});
+  if(operation!=='migration')process.send!({prepared:db.read(tx=>Object.fromEntries(tables.map(table=>[table,tx.all(`SELECT * FROM ${table} ORDER BY rowid`)])))});
+  testing=true;
   if (operation === 'reserve') coordinator.reserveDispatch('run', task);
   if (operation === 'review') coordinator.requireReview('run', task, 'EXECUTION_UNCERTAIN');
-  if (operation === 'result') coordinator.recordResult('run', task, coordinator.inspectExecution('run', 'action')!.attemptId!, { status: 'succeeded', summary: 'done', resultRef });
+  if (operation === 'result') coordinator.recordResult('run', task, coordinator.inspectExecution('run', 'action')!.attemptId!, { status: 'succeeded', summary: 'done', resultRef: savedRef });
   if (operation === 'finalize') coordinator.finalizeResult('run', task);
   if (operation === 'journal') store.append(createRunnerEvent(s, 'UsageRecorded', { llmCalls: 1, inputTokens: 0, outputTokens: 0, estimatedCost: 0 }, clock, { nextId: () => 'crash-usage' }));
   throw Error('Expected crash boundary was not reached');

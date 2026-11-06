@@ -24,3 +24,11 @@ export type { WorkflowLease, LeaseInspection, RuntimeLeaseManager, RuntimeLeaseO
 
 export { ModelCallLedger } from './modelCallLedger';
 export { DurableModelCallCoordinator, createTestDurableModelAdapter } from './modelCallCoordinator';
+
+export { RecoveryPlanner } from './recoveryPlanner';
+export { RecoveryAuthorizer } from './recoveryAuthorization';
+export { RecoveryDecisionStore } from './recoveryDecisionStore';
+export { RecoveryExecutionGate } from './recoveryExecutionGate';
+export { RECOVERY_CONTRACT, RECOVERY_OPERATIONS, RECOVERY_ROLES } from './recoveryDecisionTypes';
+export type { RecoveryPlan, RecoveryAuthorization, RecoveryGrantScope, RecoveryIdentityVerifier,
+  VerifiedRecoveryIdentity, RecoveryAuthorizationPolicy, RecoveryPreview, RecoveryOperationKind } from './recoveryDecisionTypes';

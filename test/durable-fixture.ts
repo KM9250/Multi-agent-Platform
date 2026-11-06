@@ -75,7 +75,7 @@ export function usage(s: CoordinationSnapshot, id = 'usage'): CoordinationEvent 
 
 /** Test-only corruption requires bypassing DB protections deliberately; never normal writes. */
 export function bypassFencingForCorruption(raw: DatabaseSync): void {
-  for (const row of raw.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND (name LIKE 'fence_%' OR name = 'ledger_audit_update')").all()) {
+  for (const row of raw.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND (name LIKE 'fence_%' OR name = 'ledger_audit_update' OR name LIKE 'recovery_%')").all()) {
     raw.exec(`DROP TRIGGER "${String(row.name).replaceAll('"', '""')}"`);
   }
 }

@@ -60,6 +60,7 @@ export class ModelCallLedger {
    throw new DurableStoreError('MODEL_BUDGET_EXHAUSTED');
  }
  reserve(x: ReserveModelCall): Row {
+  this.store.assertRecoveryExecution(x.workflowRunId, x.modelCallId);
   requireIntegrity(Object.keys(x.quote).every(k=>['providerId','modelId','maxAttempts','inputTokens','maxOutputTokens','maxEstimatedCost','pricingId','conditions','requestDigest'].includes(k)));
   const amounts=validateQuote(x.quote); requireIntegrity(x.quote.providerId===x.providerId && x.quote.modelId===x.modelId);
   return this.store.writeWorkflow(x.workflowRunId,tx=>{
@@ -78,7 +79,9 @@ export class ModelCallLedger {
    return this.owned(tx,x);
   });
  }
- markDispatchIntent(x: ModelCallIdentity): void {this.store.writeWorkflow(x.workflowRunId,tx=>{
+ markDispatchIntent(x: ModelCallIdentity): void {
+  this.store.database.read(tx=>{ if(this.owned(tx,x).state!=='RESERVED') throw new DurableStoreError('MODEL_REVIEW_REQUIRED'); });
+  this.store.assertRecoveryExecution(x.workflowRunId,x.modelCallId);this.store.writeWorkflow(x.workflowRunId,tx=>{
   const r=this.owned(tx,x); if(r.state!=='RESERVED') throw new DurableStoreError('MODEL_REVIEW_REQUIRED');
   const s=this.store.restoreWorkflowInTransaction(tx,x.workflowRunId);
   requireIntegrity(s.run.status==='RUNNING' && s.run.executionMode==='supervised_autonomous');
@@ -129,21 +132,8 @@ export class ModelCallLedger {
  cancelBeforeDispatch(x: ModelCallIdentity): void {this.store.writeWorkflow(x.workflowRunId,tx=>{const r=this.owned(tx,x);requireIntegrity(r.state==='RESERVED');tx.run("UPDATE model_call_ledger SET state='CANCELLED_PRE_DISPATCH',reason_code='PRE_DISPATCH_CANCELLED',updated_at=? WHERE model_call_id=?",Date.now(),x.modelCallId);});}
  /** The callback is synchronous and uses this same store. APPLIED requires new business events. */
  markApplied<T>(x: ModelCallIdentity, expectedCursor: number, apply: ()=>T): RunnerModelApplicationResult<T> {
-  return this.store.atomicApplication(x.workflowRunId,tx=>{
-   const r=this.owned(tx,x);
-   if(r.application_status==='APPLIED') {
-    const s=this.store.restoreWorkflowInTransaction(tx,x.workflowRunId),end=s.events.findIndex(e=>e.eventId===r.application_event_id)+1;
-    requireIntegrity(expectedCursor===r.application_start_cursor && end>expectedCursor && digest(s.events.slice(expectedCursor,end))===r.application_digest);
-    return {status:'ALREADY_APPLIED',receipt:{modelCallId:x.modelCallId,startCursor:expectedCursor,eventId:String(r.application_event_id),digest:String(r.application_digest)}};
-   }
-   requireIntegrity(r.state==='SETTLED' && r.application_status==='PENDING_APPLICATION');
-   const before=this.store.restoreWorkflowInTransaction(tx,x.workflowRunId);requireIntegrity(before.events.length===expectedCursor && before.events.at(-1)!.eventId===r.usage_event_id && !r.budget_violation);
-   const result=apply();if(result && typeof (result as {then?:unknown}).then==='function') throw new DurableStoreError('INVALID_TRANSACTION');
-   const after=this.store.restoreWorkflowInTransaction(tx,x.workflowRunId), events=after.events.slice(expectedCursor);
-   requireIntegrity(events.length>0 && events.every(e=>e.type!=='UsageRecorded'));
-   tx.run("UPDATE model_call_ledger SET application_status='APPLIED',application_event_id=?,application_digest=?,application_start_cursor=?,updated_at=? WHERE model_call_id=?",events.at(-1)!.eventId,digest(events),expectedCursor,Date.now(),x.modelCallId);
-   return {status:'APPLIED',value:result,receipt:{modelCallId:x.modelCallId,startCursor:expectedCursor,eventId:events.at(-1)!.eventId,digest:digest(events)}};
-  });
+  return this.store.atomicApplication(x.workflowRunId,tx=>
+   this.store.database.commitModelApplication(tx,x,expectedCursor,apply));
  }
  /** Lost application ACK is resolved by the receipt; callback is never rerun. */
  inspectApplication(x: ModelCallIdentity, events: CoordinationEvent[]): boolean {return this.store.database.read(tx=>{const r=this.owned(tx,x);requireIntegrity(r.application_status==='APPLIED' && r.application_digest===digest(events));return true;});}

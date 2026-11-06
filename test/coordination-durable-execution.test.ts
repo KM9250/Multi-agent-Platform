@@ -77,7 +77,7 @@ for (const outcome of ['uncertain','aborted','throw','malformed'] as const) test
   const f=executionFixture(t); f.executor.execute=async()=>{f.calls.execute++;if(outcome==='throw')throw Error('private');return outcome==='malformed'?{} as any:{status:outcome,summary:'raw'};};
   const result=await f.runner.runUntilStop('run');assert.equal(result.reason,'needs_user'); assert.match(f.snapshot().run.statusReason!,/^RUNNER_EXECUTION_UNCERTAIN:/);
   assert.equal(f.coordinator.inspectExecution('run','action')!.state,'REVIEW_REQUIRED'); assert.equal(f.calls.verify,0); assert.equal(f.calls.plan,1);
-  f.add('WorkflowResumed',{authorization:{type:'user',reference:'manual'}});
+  assert.throws(()=>f.add('WorkflowResumed',{authorization:{type:'user',reference:'manual'}}),{code:'RECOVERY_HELD'});
   const task=Object.values(f.snapshot().tasks)[0]; await assert.rejects(f.coordinator.dispatch('run',task).then(()=>f.coordinator.reserveDispatch('run',task)));
   assert.equal(f.calls.execute,1);
 });
@@ -88,16 +88,16 @@ for (const effectState of ['not_dispatched','applied'] as const) test(`Security 
   await f.runner.runOneRound('run'); const ledger=f.coordinator.inspectExecution('run','action')!;
   assert.equal(ledger.state,'REVIEW_REQUIRED');assert.equal(ledger.result!.safetyHold!.effectState,effectState);assert.equal(f.calls.verify,0);
   assert.deepEqual(f.snapshot().events.slice(-4).map(e=>e.type),['TaskFailed','SessionResolved','ProgressRecorded','WorkflowBlocked']);
-  f.add('WorkflowResumed',{authorization:{type:'user',reference:'wrong'}}); f.add('WorkflowSuspended',{}); f.add('WorkflowResumed',{authorization:{type:'user',reference:reviewRef}});
+  for(const reference of ['wrong',reviewRef]) assert.throws(()=>f.add('WorkflowResumed',{authorization:{type:'user',reference}}),{code:'RECOVERY_HELD'});
   await f.runner.runOneRound('run'); assert.equal(f.calls.plan,1); assert.equal(f.calls.execute,1); assert.equal(f.snapshot().run.status,'BLOCKED');
 });
-test('exact Security Review first resume allows later planning but never redispatches reviewed Action', async t => {
+test('4A retains exact Security Review reference but refuses recovery resume and later planning', async t => {
   const f=executionFixture(t);let reviewRef='';
   f.executor.execute=async(_a,c)=>{f.calls.execute++;reviewRef=`map.runner.security-review.v1:run:${c.taskId}:sha256%3A${'b'.repeat(64)}`;
     return {status:'failed',summary:'hold',safetyHold:{kind:'untrusted-content',effectState:'applied',reasonCode:'CONTENT_REVIEW_REQUIRED',reviewRef,safeSummary:'Untrusted content requires user review.'}};};
-  await f.runner.runOneRound('run');f.add('WorkflowResumed',{authorization:{type:'user',reference:reviewRef}});
+  await f.runner.runOneRound('run');assert.throws(()=>f.add('WorkflowResumed',{authorization:{type:'user',reference:reviewRef}}),{code:'RECOVERY_HELD'});
   f.provider.plan=async()=>{f.calls.plan++;return model({kind:'needs_user',reason:'Next instruction'});};
-  await f.runner.runOneRound('run');assert.equal(f.calls.plan,2);assert.equal(f.calls.execute,1);
+  await f.runner.runOneRound('run');assert.equal(f.calls.plan,1);assert.equal(f.calls.execute,1);
 });
 test('FINALIZED still performs VERIFY and Evidence failure uses existing first-resume Evidence Review', async t => {
   const f=executionFixture(t); const get=f.coordinator.getOwnedEvidence.bind(f.coordinator);let unavailable=true;
@@ -105,16 +105,16 @@ test('FINALIZED still performs VERIFY and Evidence failure uses existing first-r
   const first=await f.runner.runOneRound('run');assert.equal(first.reason,'needs_user');assert.equal(f.calls.execute,1);assert.equal(f.calls.verify,0);
   assert.equal(f.coordinator.inspectExecution('run','action')!.state,'FINALIZED');
   const reason=f.snapshot().run.statusReason!,ref=reason.slice('RUNNER_VERIFY_EVIDENCE_UNAVAILABLE:'.length);
-  f.add('WorkflowResumed',{authorization:{type:'user',reference:'wrong'}});f.add('WorkflowSuspended',{});f.add('WorkflowResumed',{authorization:{type:'user',reference:ref}});
+  for(const reference of ['wrong',ref]) assert.throws(()=>f.add('WorkflowResumed',{authorization:{type:'user',reference}}),{code:'RECOVERY_HELD'});
   unavailable=false;await f.runner.runOneRound('run');assert.equal(f.calls.verify,0);assert.equal(f.calls.execute,1);assert.equal(f.snapshot().run.statusReason,reason);
 });
-test('exact Evidence Review first resume retries only VERIFY and closes existing round once', async t => {
+test('4A exact Evidence Review cannot resume VERIFY or close the stopped round', async t => {
   const f=executionFixture(t), get=f.coordinator.getOwnedEvidence.bind(f.coordinator);let fail=true;
   f.coordinator.getOwnedEvidence=async(...args)=>{if(fail)throw Error('offline');return get(...args);};
   await f.runner.runOneRound('run'); const ref=f.snapshot().run.statusReason!.slice('RUNNER_VERIFY_EVIDENCE_UNAVAILABLE:'.length);
-  fail=false;f.add('WorkflowResumed',{authorization:{type:'user',reference:ref}});
-  assert.equal((await f.runner.runOneRound('run')).reason,'completed');assert.equal(f.calls.execute,1);assert.equal(f.calls.plan,1);assert.equal(f.calls.verify,1);
-  assert.equal(f.snapshot().events.filter(e=>e.type==='ProgressRecorded').length,1);
+  fail=false;assert.throws(()=>f.add('WorkflowResumed',{authorization:{type:'user',reference:ref}}),{code:'RECOVERY_HELD'});
+  const before=f.snapshot();await f.runner.runOneRound('run');assert.equal(f.calls.execute,1);assert.equal(f.calls.plan,1);assert.equal(f.calls.verify,0);
+  assert.deepEqual(f.snapshot(),before);
 });
 test('RESULT_RECORDED remains inspectable during BLOCKED/SUSPENDED and never starts recovery automatically', async t => {
   const f=executionFixture(t),task=f.register();await f.coordinator.dispatch('run',task);f.add('WorkflowSuspended',{});
@@ -126,8 +126,8 @@ test('RESULT_RECORDED remains inspectable during BLOCKED/SUSPENDED and never sta
 
 test('manual Workflow resume after unknown execution does not clear Ledger uncertainty or create another PLAN',async t=>{
   const f=executionFixture(t);f.executor.execute=async()=>{f.calls.execute++;return {status:'uncertain',summary:'unknown'};};
-  await f.runner.runOneRound('run');f.add('WorkflowResumed',{authorization:{type:'user',reference:'manual'}});
-  const result=await f.runner.runUntilStop('run');assert.equal(result.errorCode,'RUNNER_DURABLE_EXECUTION_STOPPED');
+  await f.runner.runOneRound('run');assert.throws(()=>f.add('WorkflowResumed',{authorization:{type:'user',reference:'manual'}}),{code:'RECOVERY_HELD'});
+  const result=await f.runner.runUntilStop('run');assert.equal(result.reason,'needs_user');
   assert.equal(f.calls.execute,1);assert.equal(f.calls.plan,1);assert.equal(f.coordinator.inspectExecution('run','action')!.state,'REVIEW_REQUIRED');
 });
 test('stored Result digest corruption cannot finalize or trigger dispatch',async t=>{
@@ -167,8 +167,8 @@ for (const stage of ['task','session','progress'] as const) test(`explicit Runne
 test('legacy unkeyed WorkflowBlocked and later user resume never create a second block', async t => {
   const f = await partialUncertain(t, 'block'), before = f.snapshot(), ledger = f.ledger();
   assert.equal(f.coordinator.completeUncertainBlock('run'), undefined); assert.deepEqual(f.snapshot(), before);
-  f.add('WorkflowResumed', { authorization: { type: 'user', reference: 'manual' } }); const resumed = f.snapshot();
-  assert.equal((await f.runner.runUntilStop('run')).errorCode, 'RUNNER_DURABLE_EXECUTION_STOPPED');
+  assert.throws(()=>f.add('WorkflowResumed', { authorization: { type: 'user', reference: 'manual' } }),{code:'RECOVERY_HELD'}); const resumed = f.snapshot();
+  assert.equal((await f.runner.runUntilStop('run')).reason, 'needs_user');
   assert.deepEqual(f.snapshot(), resumed); assert.deepEqual(f.ledger(), ledger); assert.equal(f.calls.execute, 1); assert.equal(f.calls.plan, 0);
 });
 for (const failure of ['SessionResolved','ProgressRecorded','WorkflowBlocked'] as const) test(`uncertain completion rollback at ${failure} retains prior TaskFailed and allows a later explicit retry`, async t => {
@@ -213,8 +213,8 @@ for (const stop of ['WorkflowSuspended','WorkflowBlocked','WorkflowCancelled'] a
   const before = f.snapshot(), ledger = f.ledger(); f.coordinator.completeUncertainBlock('run'); await f.runner.runOneRound('run');
   assert.deepEqual(f.snapshot(), before); assert.deepEqual(f.ledger(), ledger); assert.equal(f.calls.execute, 1); assert.equal(f.calls.plan, 0);
   if (stop === 'WorkflowSuspended') {
-    f.add('WorkflowResumed', { authorization: { type: 'user', reference: 'manual' } });
-    assert.equal((await f.runner.runOneRound('run')).reason, 'needs_user'); assert.equal(f.snapshot().run.statusReason, 'RUNNER_EXECUTION_UNCERTAIN:action');
+    assert.throws(()=>f.add('WorkflowResumed', { authorization: { type: 'user', reference: 'manual' } }),{code:'RECOVERY_HELD'});
+    assert.equal((await f.runner.runOneRound('run')).reason, 'stopped'); assert.deepEqual(f.snapshot(),before);
   }
 });
 test('uncertain completion cannot alter a terminal RESOLVED Workflow', async t => {
@@ -239,32 +239,27 @@ test('uncertain completion refuses foreign Ledger ownership without adding any E
   const before = f.store.getSnapshot('other'); assert.throws(() => other.coordinator.completeUncertainBlock('other'), { code: 'INTEGRITY_ERROR' });
   assert.deepEqual(f.store.getSnapshot('other'), before);
 });
-test('uncertain Result without TaskFailed still uses normal finalization and then completes the safety stop', async t => {
+test('4A Runner cannot recover an uncertain Result without TaskFailed', async t => {
   const f = executionFixture(t), task = f.register(); f.executor.execute = async () => { f.calls.execute++; return { status: 'uncertain', summary: 'unknown' }; };
   await f.coordinator.dispatch('run', task); const before = f.snapshot();
   assert.equal(f.coordinator.completeUncertainBlock('run'), undefined); assert.deepEqual(f.snapshot(), before);
-  assert.equal((await f.runner.runOneRound('run')).reason, 'needs_user'); assert.equal(f.calls.execute, 1); assert.equal(f.calls.plan, 0);
+  assert.equal((await f.runner.runOneRound('run')).errorCode, 'RUNNER_DURABLE_EXECUTION_STOPPED'); assert.equal(f.calls.execute, 1); assert.equal(f.calls.plan, 0);
+  assert.deepEqual(f.snapshot(),before);
 });
 
-for (const review of ['security','evidence'] as const) test(`existing ${review} first-resume Review takes priority over uncertain completion`, async t => {
-  const f = await partialUncertain(t, 'progress'); let reason: string, ref: string;
-  if (review === 'security') {
-    const r = { ...record, sessionId: 'review-session', taskId: 'review-task', action: { ...record.action, actionId: 'review-action' } };
-    const request = registration(f.store, r, 'review-round'); f.coordinator.registerAction(r, request.expected, request.sessionEvent, request.taskEvent);
-    ref = `map.runner.security-review.v1:run:review-task:sha256%3A${'a'.repeat(64)}`;
-    reason = formatSecurityHoldReason({ reviewRef: ref, effectState: 'applied' });
-    f.legacy('TaskFailed', { taskId: r.taskId, failureReason: reason }, r.sessionId);
-    f.legacy('SessionResolved', { outcome: 'FAILED' }, r.sessionId, 'runner:run:review-round:resolve');
+for (const review of ['security','evidence'] as const) test(`4A ${review} recovery cannot start another Action or override uncertainty`, async t => {
+  const f = await partialUncertain(t, 'progress'), before=f.snapshot(), ledger=f.ledger();
+  if(review==='security') {
+    const r={...record,sessionId:'review-session',taskId:'review-task',action:{...record.action,actionId:'review-action'}};
+    const request=registration(f.store,r,'review-round');
+    assert.throws(()=>f.coordinator.registerAction(r,request.expected,request.sessionEvent,request.taskEvent),{code:'RECOVERY_HELD'});
   } else {
-    ref = verifyEvidenceReviewRef('run', 'task', 'existing-review'); reason = `RUNNER_VERIFY_EVIDENCE_UNAVAILABLE:${ref}`;
+    const ref=verifyEvidenceReviewRef('run','task','existing-review');
+    f.add('WorkflowBlocked',{reason:`RUNNER_VERIFY_EVIDENCE_UNAVAILABLE:${ref}`});
+    assert.throws(()=>f.add('WorkflowResumed',{authorization:{type:'user',reference:ref}}),{code:'RECOVERY_HELD'});
   }
-  f.add('WorkflowBlocked', { reason }); f.add('WorkflowResumed', { authorization: { type: 'user', reference: 'wrong-first-resume' } });
-  f.add('WorkflowSuspended', {}); f.add('WorkflowResumed', { authorization: { type: 'user', reference: ref } });
-  const before = f.snapshot(), ledger = f.ledger();
-  assert.throws(() => f.coordinator.completeUncertainBlock('run'), { code: 'INTEGRITY_ERROR' }); assert.deepEqual(f.snapshot(), before);
-  assert.equal((await f.runner.runUntilStop('run')).reason, 'needs_user'); assert.equal(f.snapshot().run.statusReason, reason);
-  assert.equal(f.snapshot().events.filter(e => e.type === 'WorkflowBlocked' && (e.payload as any).reason === 'RUNNER_EXECUTION_UNCERTAIN:action').length, 0);
-  assert.deepEqual(f.ledger(), ledger); assert.equal(f.calls.execute, 1); assert.equal(f.calls.plan, 0); assert.equal(f.calls.verify, 0);
+  const stopped=f.snapshot();await f.runner.runUntilStop('run');assert.deepEqual(f.snapshot(),stopped);
+  assert.deepEqual(f.ledger(),ledger);assert.equal(f.calls.execute,1);assert.equal(f.calls.plan,0);assert.equal(f.calls.verify,0);
 });
 test('uncertainty completion precedes an otherwise satisfied commitment gate', async t => {
   const f = await partialUncertain(t, 'progress');

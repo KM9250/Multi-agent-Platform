@@ -3,7 +3,8 @@ import type { CoordinationSnapshot } from '../types';
 import { parseRunnerActionRef, runnerPendingApproval } from '../runner/policyGuard';
 import { runnerActionApproved, runnerEvidenceReviewReason, runnerSecurityReviewReason } from '../runner/dispatchGuard';
 import { parseVerifyEvidenceReviewRef, VERIFY_EVIDENCE_BLOCK_PREFIX } from '../runner/verifyEvidenceReview';
-import type { DurableDatabase } from './db';
+import type { DurableDatabase, DurableTransaction } from './db';
+import { recoveryDecisionSummary } from './recoveryDecisionStore';
 import { SqliteCoordinationRunnerStore } from './durableCoordinationStore';
 import { SqliteRunnerPendingActionStore, validateActionOwner } from './pendingActionStore';
 import { SqliteRunnerEvidenceStore } from './evidenceStore';
@@ -31,10 +32,12 @@ export class RecoveryReader {
   inspect(workflowRunId: string): RecoveryInspection {
     const inspectedAt = this.clock.now();
     requireIntegrity(typeof workflowRunId === 'string' && !!workflowRunId.trim() && Number.isFinite(inspectedAt) && inspectedAt >= 0);
+    return this.database.read(tx => this.inspectInTransaction(tx, workflowRunId, inspectedAt));
+  }
+  inspectInTransaction(tx: DurableTransaction, workflowRunId: string, inspectedAt: number, includeDecisions = true): RecoveryInspection {
     let snapshot: CoordinationSnapshot | undefined, reason = 'JOURNAL_INVALID';
     const executions: ExecutionStateSummary[] = [];
     try {
-      return this.database.read(tx => {
         assertRecoverySchema(tx);
         snapshot = this.store.restoreWorkflowInTransaction(tx, workflowRunId);
         const s = snapshot;
@@ -110,12 +113,13 @@ export class RecoveryReader {
         if (['BLOCKED','SUSPENDED'].includes(s.run.status)) authorizationRequirements.push({ kind: 'EXPLICIT_RESUME', satisfied: false });
         reason='MODEL_CALL_INTEGRITY_INVALID';
         const models=inspectModelCalls(tx,this.store,workflowRunId);
-        return classifyRecovery({ modelCalls:models.summary,modelCallCoverage:models.coverage, workflowRunId, inspectedAt, snapshot: s, executions, authorizationRequirements,
+        const inspection = classifyRecovery({ modelCalls:models.summary,modelCallCoverage:models.coverage, workflowRunId, inspectedAt, snapshot: s, executions, authorizationRequirements,
           missingHistoricalLedger: Object.values(s.tasks).some(task => !ownedTasks.has(task.taskId)),
           unresolvedSecurityReview: !!runnerSecurityReviewReason(s)
             || executions.some(e => e.reviewReason === 'SECURITY_REVIEW_REQUIRED' && !e.finalizedEventId),
           unresolvedEvidenceReview: !!runnerEvidenceReviewReason(s) });
-      });
+        if (includeDecisions) { reason = 'RECOVERY_DECISION_INTEGRITY_INVALID'; inspection.recoveryDecisions = recoveryDecisionSummary(tx, workflowRunId); }
+        return inspection;
     } catch (error) {
       if (!(error instanceof DurableStoreError) || ['DATABASE_ERROR','DATABASE_BUSY','SCHEMA_UNSUPPORTED','INVALID_TRANSACTION'].includes(error.code)) throw error;
       return classifyRecovery({ workflowRunId, inspectedAt, snapshot, executions: [],

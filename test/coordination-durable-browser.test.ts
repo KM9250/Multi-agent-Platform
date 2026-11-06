@@ -9,7 +9,7 @@ import { canonicalJson } from '../services/coordination/durable/integrity.ts';
 import { EXECUTION_LIMITS } from '../services/coordination/durable/executionIntegrity.ts';
 
 for(const operation of ['read','input','submit'] as const) test(`durable Browser ${operation}: existing prepared/result/evidence data fits persistence budgets`,async t=>{
-  const b=browserFixture(operation==='read'?{operation:'read'}:operation==='input'?{operation:'input',targetId:'query-input',value:'normal query'}:{operation:'submit',targetId:'submit-button'});
+  const b=browserFixture(operation==='read'?{operation:'read'}:operation==='input'?{operation:'input',targetId:'query-input',value:'normal query'}:{operation:'submit',targetId:'submit-button'}, {'browser.input':'ALLOW','browser.submit':'ALLOW'});
   const f=fixture(t,b.get()),evidenceStore=new SqliteRunnerEvidenceStore(f.db, f.lease);
   const executor=createBrowserPocExecutor({driver:b.driver,evidenceStore,clock:b.clock,ids:b.ids});
   const c=new DurableExecutionCoordinator(f.store,{get:id=>id==='browser'?executor:undefined},{evidenceStore,clock:b.clock});

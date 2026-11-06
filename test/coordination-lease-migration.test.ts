@@ -22,7 +22,7 @@ function legacyV3(f: ReturnType<typeof executionFixture>, path: string) {
   return raw;
 }
 // Compare original v4 columns; v5 adds a nullable model-call audit reference.
-const legacyRows=(rows:Record<string,unknown>[])=>rows.map(row=>{const copy={...row};delete copy.model_call_id;return copy;});
+const legacyRows=(rows:Record<string,unknown>[])=>rows.map(row=>{const copy={...row};delete copy.model_call_id;for(const k of Object.keys(copy))if(k.startsWith('recovery_'))delete copy[k];return copy;});
 const all = (raw: DatabaseSync) => Object.fromEntries(['workflow_seeds','journal_events','workflow_checkpoints','pending_actions','execution_ledger','execution_results','runner_evidence','runtime_audit_events'].map(table => [table, legacyRows(raw.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all())]));
 for (const version of [0,1,2,3] as const) test(`Migration ${version}→4 preserves artifacts and history and never grants a lease to RUNNING work`, t => {
   const f = executionFixture(t); f.register(); f.store.createCheckpoint('run');
@@ -37,7 +37,7 @@ for (const version of [0,1,2,3] as const) test(`Migration ${version}→4 preserv
   const before = Object.fromEntries(tables.map(table => [table, legacyRows(raw.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all())]));
   const db = new DurableDatabase({ path });
   try {
-    assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 5);
+    assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 6);
     assert.deepEqual(raw.prepare('SELECT migration_id FROM schema_migrations ORDER BY schema_version').all().map(row => row.migration_id), MIGRATIONS.map(m => m.id));
     for (const [table, rows] of Object.entries(before)) assert.deepEqual(legacyRows(raw.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()), rows);
     assert.equal(raw.prepare('SELECT count(*) AS n FROM runtime_leases').get()!.n, 0);
@@ -49,7 +49,7 @@ for (const version of [0,1,2,3] as const) test(`Migration ${version}→4 preserv
     }
   } finally { db.close(); }
   const again = new DurableDatabase({ path }); again.close();
-  assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, 5);
+  assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, 6);
 });
 test('Immutable migration boundary distinguishes genuine NULL Runtime 5C-1 audit from fenced 5C-2 changes', t => {
   const f = executionFixture(t); f.register(); const path = join(f.dir, 'legacy.sqlite'), raw = legacyV3(f, path); t.after(() => raw.close());
@@ -59,15 +59,15 @@ test('Immutable migration boundary distinguishes genuine NULL Runtime 5C-1 audit
   assert.deepEqual(all(raw), before);
   assert.equal(raw.prepare('SELECT legacy_audit_sequence AS n FROM runtime_fencing_boundary').get()!.n, legacy.at(-1)!.audit_sequence);
   const manager = createRuntimeLeaseManager(db), lease = manager.acquire('run'), store = new SqliteCoordinationRunnerStore(db, lease);
-  store.append({ ...usage(store.getSnapshot('run')), timestamp: 10 });
+  assert.throws(()=>store.append({ ...usage(store.getSnapshot('run')), timestamp: 10 }),{code:'RECOVERY_HELD'});
   const reader = new RecoveryReader(db, clock); assert.notEqual(reader.inspect('run').disposition, 'RECOVERY_FAILED');
   const timeline = reader.getWorkflowTimeline('run').entries;
   assert.ok(timeline.some(e => e.eventKind === 'EXECUTION_CHANGED' && e.runtimeInstanceId === undefined));
-  assert.ok(timeline.some(e => e.eventKind === 'UsageRecorded' && e.runtimeInstanceId === lease.runtimeInstanceId && e.generation === 1));
+  assert.ok(timeline.some(e => e.eventKind === 'LEASE_ACQUIRED' && e.runtimeInstanceId === lease.runtimeInstanceId && e.generation === 1));
   assert.equal(raw.prepare('SELECT schema_version FROM execution_ledger').get()!.schema_version, 1);
   // Reader must reject removal of verified metadata even when the immutable trigger is deliberately bypassed.
   raw.exec('DROP TRIGGER audit_no_update');
-  raw.exec("UPDATE runtime_audit_events SET runtime_instance_id=NULL,runtime_generation=NULL WHERE event_kind='JOURNAL_APPENDED'");
+  raw.exec("UPDATE runtime_audit_events SET runtime_instance_id=NULL,runtime_generation=NULL WHERE event_kind='LEASE_ACQUIRED'");
   assert.equal(reader.inspect('run').disposition, 'RECOVERY_FAILED');
 });
 test('Migration 004 failure rolls back all DDL, boundary, ledger and user_version', t => {
@@ -93,10 +93,10 @@ for (const boundary of ['before-ddl','after-ddl','after-commit']) test(`${termin
   const stage = new Promise<any>((resolve, reject) => { timer = setTimeout(() => reject(Error('Migration child timeout')), 10_000); child.once('message', resolve); child.once('error', reject); child.once('exit', () => reject(Error('Migration child exited'))); });
   t.after(async () => { clearTimeout(timer); if (child.exitCode === null && child.signalCode === null) terminateChild(child); await closed; });
   assert.deepEqual(await stage, { stage: boundary }); clearTimeout(timer); terminateChild(child); await closed;
-  const version = boundary === 'after-commit' ? 5 : 3;
+  const version = boundary === 'after-commit' ? 6 : 3;
   assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, version);
   assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, version);
-  assert.equal(raw.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name='runtime_fencing_boundary'").get()!.n, version === 5 ? 1 : 0);
+  assert.equal(raw.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name='runtime_fencing_boundary'").get()!.n, version === 6 ? 1 : 0);
   assert.deepEqual(all(raw), before);
   const db = new DurableDatabase({ path }); try { assert.notEqual(new RecoveryReader(db, clock).inspect('run').disposition, 'RECOVERY_FAILED'); } finally { db.close(); }
 });

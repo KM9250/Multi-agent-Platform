@@ -304,10 +304,11 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
     const s = this.snapshot(ctx); validateCoordinationSnapshot(s);
     if (s.run.executionMode !== 'supervised_autonomous') return this.result(ctx, 'stopped', undefined, 'RUNNER_EXECUTION_MODE');
     const stopped = this.safePoint(ctx); if (stopped) return stopped;
-    if(this.deps.durableModelCalls) this.durable(()=>this.deps.durableModelCalls!.assertCanRun(ctx.id));
     const securityBlock = this.securityPreflight(ctx); if (securityBlock) return securityBlock;
     const evidenceBlock = this.verifyEvidencePreflight(ctx); if (evidenceBlock) return evidenceBlock;
     const uncertainBlock = this.completeUncertainBlock(ctx); if (uncertainBlock) return uncertainBlock;
+    if (this.deps.durableExecution) this.durable(() => this.deps.durableExecution!.assertRecoveryExecution(ctx.id));
+    if(this.deps.durableModelCalls) this.durable(()=>this.deps.durableModelCalls!.assertCanRun(ctx.id));
     const sessions = Object.values(s.sessions).filter(active);
     if (sessions.length > 1) return this.result(ctx, 'stopped', undefined, 'RUNNER_AMBIGUOUS_PENDING_WORK');
     const session = sessions[0];

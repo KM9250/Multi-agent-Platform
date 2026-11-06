@@ -59,6 +59,7 @@ process.on('message',async()=>{
       append('ProgressRecorded',{outcome:'ERROR',summary:'Runner round error.'},'runner:run:round:progress');
       pause();
     }else if(mode==='uncertain-recover'||mode.startsWith('uncertain-atomic-')){
+      if(mode.startsWith('uncertain-atomic-')){const task=store.getSnapshot('run').tasks.task;await coordinator.dispatch('run',task);coordinator.finalizeResult('run',task);}
       const runner=createDurableCoordinationRunner({coordinator,clock,supervisorProvider:{
         async plan(){appendFileSync(effectPath+'.plan','plan\n');return model({kind:'needs_user',reason:'Unexpected PLAN'});},
         async verify(){appendFileSync(effectPath+'.verify','verify\n');return model({taskOutcome:'FAIL',summary:'Unexpected VERIFY',criteria:[]});},
@@ -68,7 +69,7 @@ process.on('message',async()=>{
       const request=registration(store);coordinator.registerAction(record,request.expected,request.sessionEvent,request.taskEvent);
     }else if(mode==='inspect'){
       const diagnostic=coordinator.inspectExecution('run','action');db.close();process.send!({done:true,diagnostic});process.disconnect();return;
-    }else if(mode.startsWith('finalize-')) coordinator.finalizeResult('run',store.getSnapshot('run').tasks.task);
+    }else if(mode.startsWith('finalize-')) {const task=store.getSnapshot('run').tasks.task;await coordinator.dispatch('run',task);coordinator.finalizeResult('run',task);}
     else {
       const task=store.getSnapshot('run').tasks.task;
       await coordinator.dispatch('run',task);

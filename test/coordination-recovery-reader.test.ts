@@ -1,3 +1,4 @@
+import { appendPreV6History } from './recovery-fixture.ts';
 import { bypassFencingForCorruption } from './durable-fixture.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -52,7 +53,7 @@ test('RESOLVED is inactive and historical Tasks are not dispatched', t => {
   assert.equal(new RecoveryReader(f.db, clock).inspect('run').disposition, 'INACTIVE');
 });
 test('SUSPENDED with a dispatch reservation retains the unresolved outcome diagnosis', t => {
-  const f = executionFixture(t), task = f.register(); f.coordinator.reserveDispatch('run', task); f.add('WorkflowSuspended', {});
+  const f = executionFixture(t), task = f.register(); f.coordinator.reserveDispatch('run', task); appendPreV6History(f,'WorkflowSuspended', {});
   const result = reader(f).inspect('run'); assert.equal(result.disposition, 'REVIEW_REQUIRED'); assert.equal(result.workflowStatus, 'SUSPENDED');
 });
 test('legacy Task without Pending Action/Ledger is reviewable; explicit missing Ledger is corrupt', t => {
@@ -114,8 +115,8 @@ for (const firstCorrect of [false,true]) test(`security Review retains first-res
       reasonCode: 'CONTENT_REVIEW_REQUIRED', reviewRef, safeSummary: 'Untrusted content requires user review.' } };
   };
   await f.runner.runOneRound('run'); assert.equal(reader(f).inspect('run').disposition, 'REVIEW_REQUIRED');
-  f.add('WorkflowResumed', { authorization: { type: 'user', reference: firstCorrect ? reviewRef : 'wrong' } });
-  if (!firstCorrect) { f.add('WorkflowSuspended', {}); f.add('WorkflowResumed', { authorization: { type: 'user', reference: reviewRef } }); }
+  appendPreV6History(f,'WorkflowResumed', { authorization: { type: 'user', reference: firstCorrect ? reviewRef : 'wrong' } });
+  if (!firstCorrect) { appendPreV6History(f,'WorkflowSuspended', {}); appendPreV6History(f,'WorkflowResumed', { authorization: { type: 'user', reference: reviewRef } }); }
   const before = contents(f), calls = { ...f.calls }, result = reader(f).inspect('run');
   assert.equal(result.disposition, firstCorrect ? 'READY_TO_RESUME' : 'REVIEW_REQUIRED', JSON.stringify(result)); assert.deepEqual(contents(f), before); assert.deepEqual(f.calls, calls);
   assert.deepEqual(result.authorizationRequirements.find(requirement => requirement.kind === 'SECURITY_REVIEW'),
@@ -125,14 +126,14 @@ test('Action approval diagnostics expose the existing bound approval reference w
   const f = executionFixture(t, 'NEEDS_USER'); await f.runner.runOneRound('run');
   const r = reader(f), result = r.inspect('run'), approval = result.authorizationRequirements.find(requirement => requirement.kind === 'ACTION_APPROVAL');
   assert.ok(approval?.reference?.startsWith('map.runner.approval.v1:')); assert.equal(approval.satisfied, false); assert.ok(result.stopJournalEventId);
-  f.add('WorkflowResumed', { authorization: { type: 'user', reference: approval.reference } });
+  appendPreV6History(f,'WorkflowResumed', { authorization: { type: 'user', reference: approval.reference } });
   const resumed = r.inspect('run'); assert.equal(resumed.authorizationRequirements.find(requirement => requirement.kind === 'ACTION_APPROVAL')!.satisfied, true);
   assert.equal(resumed.executable, false);
 });
 test('a mismatched Security Review reason cannot disguise a persisted unknown execution as a resumable candidate', async t => {
   const f = executionFixture(t), task = f.register(); f.executor.execute = async () => ({ status: 'uncertain', summary: 'unknown' });
   await f.coordinator.dispatch('run', task); f.coordinator.finalizeResult('run', task); f.coordinator.completeUncertainBlock('run');
-  f.add('WorkflowResumed', { authorization: { type: 'user', reference: 'manual' } });
+  appendPreV6History(f,'WorkflowResumed', { authorization: { type: 'user', reference: 'manual' } });
   f.store.writeWorkflow('run', tx => tx.run("UPDATE execution_ledger SET review_reason='SECURITY_REVIEW_REQUIRED' WHERE action_id='action'"));
   const before = contents(f); assert.equal(reader(f).inspect('run').disposition, 'RECOVERY_FAILED'); assert.deepEqual(contents(f), before);
 });

@@ -22,7 +22,8 @@ if(stage==='migration') {
  if(['settlement','application'].includes(stage))l.markDispatchIntent(x);
  if(stage==='application')l.settle(x,{llmCalls:1,inputTokens:1,outputTokens:1,estimatedCost:0},true);
  let writing=false;
- DatabaseSync.prototype.exec=function(sql:string){if(sql==='BEGIN IMMEDIATE')writing=true;if(writing&&sql==='COMMIT'&&boundary==='before')pause();original.call(this,sql);if(writing&&sql==='COMMIT'&&boundary==='after')pause();};
+ const prepare=DatabaseSync.prototype.prepare;DatabaseSync.prototype.prepare=function(sql:string){const st=prepare.call(this,sql),run=st.run.bind(st);st.run=(...args:any[])=>{const result=run(...args);if(sql.startsWith('INSERT INTO model_call_ledger')||sql.startsWith('UPDATE model_call_ledger'))writing=true;return result;};return st;};
+ DatabaseSync.prototype.exec=function(sql:string){if(sql==='BEGIN IMMEDIATE')writing=false;if(writing&&sql==='COMMIT'&&boundary==='before')pause();original.call(this,sql);if(writing&&sql==='COMMIT'&&boundary==='after')pause();};
  if(stage==='reservation')l.reserve(x);
  if(stage==='intent')l.markDispatchIntent(x);
  if(stage==='settlement')l.settle(x,{llmCalls:1,inputTokens:1,outputTokens:1,estimatedCost:0},true);

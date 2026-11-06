@@ -6,8 +6,10 @@ This Node-only foundation reads persisted facts and diagnoses possible next step
 lease, makes a recovery decision, appends a Workflow event, invokes a Runner,
 dispatches an Executor, or calls a model.
 
-The current schema is **5**. [COORD-5C-2 Runtime Lease/Fencing](coordination-runtime-lease.md)
+The current schema is **6**. [COORD-5C-2 Runtime Lease/Fencing](coordination-runtime-lease.md)
 adds ownership audits and verified Runtime metadata while preserving this read-only contract.
+[COORD-5C-4A](coordination-recovery-authorization.md) adds durable recovery decisions
+and authorization records while keeping all recovery execution disabled.
 
 ## Server API
 
@@ -212,5 +214,16 @@ Windows native process/filesystem behavior requires separate validation.
 COORD-5C-2 now supplies verified Runtime identity, Lease/Generation/Fencing and
 ownership events through this audit contract. Ownership changes and audits
 commit atomically; heartbeats do not enlarge the audit history. COORD-5C-3 adds the [Model Call Ledger and budget reservations](coordination-model-call-ledger.md).
-Recovery decisions and automatic Workflow continuation remain unimplemented. See the linked Lease document
-for the immutable migration boundary and COORD-5C-3 handoff.
+Recovery decisions are now recorded by COORD-5C-4A; automatic Workflow continuation
+remains unimplemented. See the linked Lease document for the immutable migration
+boundary and the 4A document for the next recovery phase.
+
+## COORD-5C-4A integration
+
+Schema 6 adds [Recovery Decision / Authorization / Execution Gate](coordination-recovery-authorization.md).
+The Reader includes `recoveryDecisions` (holds, plans, grants) in the same read
+transaction and validates the new audit provenance. All diagnostic execution
+flags remain false, including for AUTHORIZED grants and READY_TO_RESUME results.
+Expiration is derived without a write. Timeline entries include Plan, Authorization,
+Hold Revision and verified-actor references. Pre-v6 first-resume semantics remain
+diagnosable; persisting a new WorkflowResumed is disabled by the 4A gate.
