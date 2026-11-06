@@ -149,9 +149,33 @@ cleared by any public 4A API. Lease renewal, inspection and release still work.
 Protected paths include both Runner entry points, Action registration and
 reservation, Model Coordinator calls, Model Ledger reservation/dispatch intent,
 Task/Session registration, and Workflow resume. SQL start predicates inspect
-saved risk even if a caller bypasses the higher-level coordinator. Current PLAN
-response application may register its business events before its APPLIED receipt;
-that registration cannot dispatch while an unapplied response remains.
+saved risk even if a caller bypasses the higher-level coordinator.
+
+Pending responses alone never grant a registration exception. `markApplied()`
+uses `DurableDatabase.commitModelApplication()` inside the Store's writer. This
+closed participant validates the saved Model Call identity, phase, round, request
+cursor/event, settlement Usage event, current lease owner/generation, and absence
+of a durable hold before creating a private, transaction-bound application scope.
+The request must be immediately followed by its settlement Usage event, with no
+intervening Journal changes. The scope is never returned as a token or accepted
+from a DTO. The participant must also validate the resulting registration and
+write APPLIED before it can return; there is no standalone scope setter.
+
+Only a PLAN scope permits registration during PENDING_APPLICATION. New Session,
+Task, Pending Action and PREPARED Ledger records must form one complete registration
+bound to that PLAN's round, all inside the receipt's Journal range. This final
+validation occurs before the same COMMIT; an independent reader cannot observe
+the provisional prefix. VERIFY never gets this registration exception. Dispatch,
+existing holds and all other recovery restrictions remain enforced.
+
+`atomicApplication()` only composes a transaction and provides no exception by
+itself. Direct `writeWorkflow()`/`appendInTransaction()` and SQL start attempts
+are rejected without the private scope. Application failure or any SQL rejection
+inside a valid scope poisons the writer even if the callback catches the error;
+Session, Task, Action, Ledger, Receipt and audit all roll back. The scope is cleared
+on success and failure. Exact APPLIED retries retain the existing no-replay receipt
+contract. Migration 006 SQL is unchanged by this F-01 correction, so existing
+schema-6 databases receive the stricter predicate when opened by the updated code.
 
 All WorkflowResumed persistence is disabled in 4A. This also leaves stopped
 Action Approval, Security Review and Evidence Review flows stopped until 4B
@@ -210,6 +234,16 @@ connections and safe normal bootstrap. Real child processes receive SIGKILL
 before/after Plan, Authorization, Revocation, takeover and migration COMMIT.
 Independent SQLite readers check complete old/new state and matching audit.
 Migration tests cover 0/1/2/3/4/5 → 6, rollback, preserved artifacts and legacy holds.
+
+`coordination-recovery-authorization-application.test.ts` reproduces F-01 cases
+A/B/C, verifies full business-state immutability after denial, and exercises the
+legitimate PLAN receipt, registration/receipt/audit failures, caught SQL rejection,
+VERIFY, existing holds, identity/round/Journal/generation mismatch and scope cleanup.
+The four bypass tests fail against audit HEAD
+`f9d172886da5178e52ef45836444dc950bed0f0c` with missing expected exceptions.
+The standard `npm test` and `npm run test:recovery-reader` scripts now explicitly
+use `--test-concurrency=2` to limit overlapping crash workers. No tests, skip
+conditions, crash boundaries, timeouts or assertions were removed or relaxed.
 
 Existing tests retain their corruption, duplicate-effect, audit and fencing
 assertions. Schema expectations advance to six. Tests which previously resumed

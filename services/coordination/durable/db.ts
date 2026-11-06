@@ -6,7 +6,7 @@ import type { LeaseInspection, RuntimeLeaseManager, RuntimeLeaseOptions, Workflo
 import type { SQLInputValue, SQLOutputValue } from 'node:sqlite';
 import { closeSync, chmodSync, existsSync, lstatSync, mkdirSync, openSync, realpathSync, statSync } from 'node:fs';
 import { dirname, isAbsolute } from 'node:path';
-import { DurableStoreError, guarded, requireIntegrity } from './integrity';
+import { digest, DurableStoreError, guarded, requireIntegrity } from './integrity';
 import { migrate } from './migrations';
 import { readJournal } from './restore';
 import { validateAuditRow } from './recoveryAudit';
@@ -16,6 +16,9 @@ import { recoveryGateReason, recoveryStartAllowed } from './recoveryExecutionGat
 import { recoveryTime } from './recoveryPlanner';
 import { jsonCopy } from './integrity';
 import type { RecoveryAuthorizationPolicy, RecoveryDecisionCommand, RecoveryGrantScope, RecoveryIdentityVerifier } from './recoveryDecisionTypes';
+import type { ModelCallIdentity } from './modelCallLedger';
+import type { RunnerModelApplicationResult } from '../runner/types';
+import type { CoordinationEvent } from '../types';
 
 export type Row = Record<string, SQLOutputValue>;
 export interface DurableTransaction {
@@ -50,6 +53,11 @@ const leaseHandles = new WeakMap<WorkflowLease, LeaseRecord>();
 type WriteContext = { kind: 'lease'; record: LeaseRecord }
   | { kind: 'management'; workflowRunId: string }
   | { kind: 'bootstrap'; workflowRunId: string; seed: boolean; journal: boolean; audit: boolean };
+interface ModelApplicationScope {
+  tx: DurableTransaction; identity: ModelCallIdentity; phase: string; roundKey: string;
+  requestCursor: number; requestEventId: string; startCursor: number; usageEventId: string;
+  runtimeInstanceId: string; generation: number;
+}
 
 /** One synchronous transaction owner. SQLite serializes writers across connections. */
 export class DurableDatabase {
@@ -64,6 +72,7 @@ export class DurableDatabase {
   readonly #recoveryPolicy: RecoveryAuthorizationPolicy;
   #recoveryIntent?: { workflowRunId: string; kind: string; id: string; planId?: string; actorId?: string };
   #recoveryRejected = false;
+  #modelApplication?: ModelApplicationScope;
   #timeAnchor = { wall: Date.now(), monotonic: performance.now() };
   constructor(options: DurableDatabaseOptions) {
     this.#recoveryVerifier = options.recoveryIdentityVerifier
@@ -122,7 +131,7 @@ export class DurableDatabase {
         catch (error) {
           const safe = this.safeError(error);
           if (safe.code === 'LEASE_FENCED') this.#fencingRejected = true;
-          if (safe.code.startsWith('RECOVERY_')) this.#recoveryRejected = true;
+          if (safe.code.startsWith('RECOVERY_') || this.#modelApplication) this.#recoveryRejected = true;
           throw safe;
         }
       },
@@ -147,7 +156,7 @@ export class DurableDatabase {
       }
       throw this.safeError(error);
     } finally { this.#active = undefined; this.#writable = false; this.#context = undefined; this.#fencingRejected = false;
-      this.#recoveryIntent = undefined; this.#recoveryRejected = false; }
+      this.#recoveryIntent = undefined; this.#recoveryRejected = false; this.#modelApplication = undefined; }
   }
   read<T>(fn: (tx: DurableTransaction) => T): T { return this.#transaction(false, fn); }
   get recoveryPolicy(): RecoveryAuthorizationPolicy { return jsonCopy(this.#recoveryPolicy); }
@@ -195,6 +204,98 @@ export class DurableDatabase {
     });
     // Throw after acknowledged COMMIT so the durable hold is not rolled back.
     if (reason) throw new DurableStoreError('RECOVERY_HELD');
+  }
+  /** An existing writer gets no blanket exception. Only registration may use the private PLAN scope. */
+  assertRecoveryStartInTransaction(tx: DurableTransaction, id: string, registration: boolean): void {
+    this.assertWorkflowWrite(tx, id);
+    const reason = recoveryGateReason(tx, id);
+    if (reason && !(reason === 'PENDING_RESPONSE' && registration && this.#planApplicationCurrent(tx, id))) {
+      this.#recoveryRejected = true;
+      throw new DurableStoreError('RECOVERY_HELD');
+    }
+  }
+  /** Closed application participant used by markApplied. No scope token or setter escapes.
+   * The callback and APPLIED receipt must both succeed inside the existing fenced writer. */
+  commitModelApplication<T>(tx: DurableTransaction, input: ModelCallIdentity, expectedCursor: number, apply: () => T): RunnerModelApplicationResult<T> {
+    this.assertWorkflowWrite(tx, input.workflowRunId);
+    try {
+      if (this.#modelApplication) throw new DurableStoreError('INVALID_TRANSACTION');
+      const identity = jsonCopy(input), id = identity.workflowRunId;
+      const r = tx.get('SELECT * FROM model_call_ledger WHERE workflow_run_id=? AND model_call_id=?', id, identity.modelCallId);
+      requireIntegrity(r && r.attempt_id === identity.attemptId && r.provider_id === identity.providerId && r.model_id === identity.modelId);
+      const lease = this.#context!.kind === 'lease' ? this.#context!.record.handle : undefined;
+      if (r.runtime_instance_id !== lease?.runtimeInstanceId || r.generation !== lease?.generation) this.#fenced();
+      const before = readJournal(tx, id).snapshot;
+      if (r.application_status === 'APPLIED') {
+        const end = before.events.findIndex(e => e.eventId === r.application_event_id) + 1;
+        requireIntegrity(expectedCursor === r.application_start_cursor && end > expectedCursor && digest(before.events.slice(expectedCursor, end)) === r.application_digest);
+        return { status: 'ALREADY_APPLIED', receipt: { modelCallId: identity.modelCallId, startCursor: expectedCursor,
+          eventId: String(r.application_event_id), digest: String(r.application_digest) } };
+      }
+      requireIntegrity(r.state === 'SETTLED' && r.application_status === 'PENDING_APPLICATION' && r.completeness === 'COMPLETE'
+        && !r.budget_violation && ['PLAN','VERIFY'].includes(String(r.phase)) && typeof r.round_key === 'string' && !!r.round_key);
+      requireIntegrity(Number.isSafeInteger(expectedCursor) && expectedCursor === Number(r.request_cursor) + 1
+        && before.events.length === expectedCursor && before.events.at(-1)!.eventId === r.usage_event_id
+        && before.events[Number(r.request_cursor) - 1]?.eventId === r.request_event_id);
+      if (recoveryGateReason(tx, id) !== 'PENDING_RESPONSE' || tx.get('SELECT workflow_run_id FROM recovery_holds WHERE workflow_run_id=?', id))
+        throw new DurableStoreError('RECOVERY_HELD');
+      requireIntegrity(!tx.get(`SELECT model_call_id FROM model_call_ledger WHERE workflow_run_id=? AND model_call_id<>?
+        AND (application_status='PENDING_APPLICATION' OR state IN ('DISPATCH_INTENT','REVIEW_REQUIRED') OR budget_violation=1)`, id, identity.modelCallId));
+      const priorActions = new Set(tx.all('SELECT action_id FROM pending_actions WHERE workflow_run_id=?', id).map(a => a.action_id));
+      const scope: ModelApplicationScope = { tx, identity, phase: String(r.phase), roundKey: String(r.round_key),
+        requestCursor: Number(r.request_cursor), requestEventId: String(r.request_event_id), startCursor: expectedCursor,
+        usageEventId: String(r.usage_event_id), runtimeInstanceId: lease!.runtimeInstanceId, generation: lease!.generation };
+      this.#modelApplication = scope;
+      const value = apply();
+      if (value && typeof (value as { then?: unknown }).then === 'function') throw new DurableStoreError('INVALID_TRANSACTION');
+      this.#assertModelApplicationCurrent(scope);
+      const events = readJournal(tx, id).snapshot.events.slice(expectedCursor);
+      requireIntegrity(events.length > 0 && events.every(e => e.type !== 'UsageRecorded'));
+      this.#assertApplicationRegistration(scope, events, priorActions);
+      const receipt = { modelCallId: identity.modelCallId, startCursor: expectedCursor, eventId: events.at(-1)!.eventId, digest: digest(events) };
+      tx.run("UPDATE model_call_ledger SET application_status='APPLIED',application_event_id=?,application_digest=?,application_start_cursor=?,updated_at=? WHERE model_call_id=?",
+        receipt.eventId, receipt.digest, expectedCursor, Date.now(), identity.modelCallId);
+      return { status: 'APPLIED', value, receipt };
+    } catch (error) {
+      // Even a caller catching an application failure cannot commit a partial callback.
+      this.#recoveryRejected = true;
+      throw error;
+    } finally { this.#modelApplication = undefined; }
+  }
+  #assertModelApplicationCurrent(scope: ModelApplicationScope): void {
+    const { tx, identity, startCursor } = scope, id = identity.workflowRunId;
+    this.assertWorkflowWrite(tx, id);
+    requireIntegrity(this.#modelApplication === scope && this.#context?.kind === 'lease'
+      && this.#context.record.handle.runtimeInstanceId === scope.runtimeInstanceId && this.#context.record.handle.generation === scope.generation);
+    if (tx.get('SELECT workflow_run_id FROM recovery_holds WHERE workflow_run_id=?', id)) throw new DurableStoreError('RECOVERY_HELD');
+    const r = tx.get('SELECT * FROM model_call_ledger WHERE workflow_run_id=? AND model_call_id=?', id, identity.modelCallId);
+    requireIntegrity(r && r.state === 'SETTLED' && r.application_status === 'PENDING_APPLICATION' && !r.budget_violation
+      && r.phase === scope.phase && r.round_key === scope.roundKey && r.request_cursor === scope.requestCursor && r.request_event_id === scope.requestEventId
+      && r.usage_event_id === scope.usageEventId && r.runtime_instance_id === scope.runtimeInstanceId && r.generation === scope.generation
+      && r.attempt_id === identity.attemptId && r.provider_id === identity.providerId && r.model_id === identity.modelId);
+    const events = readJournal(tx, id).snapshot.events;
+    requireIntegrity(events[scope.requestCursor - 1]?.eventId === scope.requestEventId
+      && events[startCursor - 1]?.eventId === scope.usageEventId && events[startCursor - 1]?.type === 'UsageRecorded');
+  }
+  #planApplicationCurrent(tx: DurableTransaction, id: string): boolean {
+    const scope = this.#modelApplication;
+    if (!scope || scope.tx !== tx || scope.identity.workflowRunId !== id || scope.phase !== 'PLAN') return false;
+    this.#assertModelApplicationCurrent(scope);
+    return true;
+  }
+  #assertApplicationRegistration(scope: ModelApplicationScope, events: CoordinationEvent[], priorActions: Set<SQLOutputValue>): void {
+    const sessions = events.filter(e => e.type === 'SessionStarted'), tasks = events.filter(e => e.type === 'TaskAssigned');
+    const actions = scope.tx.all('SELECT * FROM pending_actions WHERE workflow_run_id=?', scope.identity.workflowRunId).filter(a => !priorActions.has(a.action_id));
+    if (!sessions.length && !tasks.length && !actions.length) return;
+    requireIntegrity(scope.phase === 'PLAN' && sessions.length === 1 && tasks.length === 1 && actions.length === 1);
+    const action = actions[0], session = sessions[0], task = tasks[0];
+    const sessionPayload = session.payload as { sessionId: string; contextRef: string }, taskPayload = task.payload as { taskId: string; sessionId: string };
+    requireIntegrity(action.round_key === `map.runner.v1:${scope.roundKey}` && sessionPayload.contextRef === action.round_key
+      && session.sessionId === action.session_id && sessionPayload.sessionId === action.session_id
+      && task.sessionId === action.session_id && taskPayload.sessionId === action.session_id && taskPayload.taskId === action.task_id);
+    requireIntegrity(scope.tx.get(`SELECT action_id FROM execution_ledger WHERE workflow_run_id=? AND action_id=?
+      AND session_id=? AND task_id=? AND fingerprint=? AND executor_id=? AND state='PREPARED'`,
+      scope.identity.workflowRunId, action.action_id, action.session_id, action.task_id, action.fingerprint, action.executor_id));
   }
   write<T>(fn: (tx: DurableTransaction) => T): T { return this.#transaction(true, fn); }
   assertWorkflowWrite(tx: DurableTransaction, workflowRunId: string): void {
@@ -272,7 +373,8 @@ export class DurableDatabase {
   #registerFencingFunctions(): void {
     this.#db.function('map_recovery_start', (workflow, route, target) => {
       if (this.#context?.kind !== 'lease' || !this.#active || this.#context.record.handle.workflowRunId !== workflow) return -1;
-      try { return recoveryStartAllowed(this.#active, String(workflow), String(route), String(target)) ? 1 : 0; }
+      try { return recoveryStartAllowed(this.#active, String(workflow), String(route), String(target),
+        route === 'REGISTER' && this.#planApplicationCurrent(this.#active, String(workflow))) ? 1 : 0; }
       catch { return 0; }
     });
     this.#db.function('map_recovery_now', () => {

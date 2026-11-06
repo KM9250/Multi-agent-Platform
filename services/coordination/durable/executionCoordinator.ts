@@ -58,7 +58,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
     return record;
   }
   registerAction(input: RunnerPendingActionRecord, expected: CoordinationSnapshot, sessionEvent: CoordinationEvent, taskEvent: CoordinationEvent): RunnerPendingActionRecord {
-    this.assertRecoveryExecution(input.workflowRunId);
+    this.store.assertRecoveryRegistration(input.workflowRunId);
     const record = validateAction(input), action = record.action;
     // Identity is stable across a lost response. No replacement Action or Round is generated here.
     const registrationDigest = digest([record, expected.events.at(-1), expected.policy, sessionEvent, taskEvent]);

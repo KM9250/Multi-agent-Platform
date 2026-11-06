@@ -28,7 +28,7 @@ function insertEvent(tx: DurableTransaction, event: CoordinationEvent): void {
 export class SqliteCoordinationRunnerStore implements CoordinationRunnerStore, DurableCoordinationAdministration {
   readonly persistence = 'durable' as const;
   #applicationTx?: DurableTransaction;
-  /** Synchronous business events and application receipt share one lease-fenced COMMIT. */
+  /** Transaction composition only; this method grants no application or recovery scope. */
   atomicApplication<T>(id: string, fn: (tx: DurableTransaction) => T): T {
     if (this.#applicationTx) throw new DurableStoreError('INVALID_TRANSACTION');
     return this.writeWorkflow(id, tx => {
@@ -45,14 +45,15 @@ export class SqliteCoordinationRunnerStore implements CoordinationRunnerStore, D
     this.database.createLeaseManager().assertCurrent(this.lease);
   }
   assertRecoveryExecution(id: string, reservedModelId?: string): void {
-    // Normal, synchronous response application already owns the writer. Held
-    // workflows remain blocked by SQL; no recovery exception is established.
     if (this.#applicationTx) {
-      this.database.assertWorkflowWrite(this.#applicationTx, id);
-      if (this.#applicationTx.get('SELECT workflow_run_id FROM recovery_holds WHERE workflow_run_id=?', id)) throw new DurableStoreError('RECOVERY_HELD');
+      this.database.assertRecoveryStartInTransaction(this.#applicationTx, id, false);
       return;
     }
     this.database.assertRecoveryExecution(this.lease, id, reservedModelId);
+  }
+  assertRecoveryRegistration(id: string): void {
+    if (this.#applicationTx) this.database.assertRecoveryStartInTransaction(this.#applicationTx, id, true);
+    else this.database.assertRecoveryExecution(this.lease, id);
   }
   writeWorkflow<T>(id: string, fn: (tx: DurableTransaction) => T): T { if (this.#applicationTx) { this.database.assertWorkflowWrite(this.#applicationTx, id); return fn(this.#applicationTx); }
     return this.database.writeWithLease(this.lease, id, fn); }
@@ -87,7 +88,8 @@ export class SqliteCoordinationRunnerStore implements CoordinationRunnerStore, D
     return state;
   }
   append(event: CoordinationEvent): CoordinationSnapshot {
-    if (['WorkflowResumed','TaskAssigned','SessionStarted'].includes(event.type)) this.assertRecoveryExecution(event.workflowRunId);
+    if (['TaskAssigned','SessionStarted'].includes(event.type)) this.assertRecoveryRegistration(event.workflowRunId);
+    if (event.type === 'WorkflowResumed') this.assertRecoveryExecution(event.workflowRunId);
     return this.writeWorkflow(event.workflowRunId, tx => this.appendInTransaction(tx, event));
   }
   /** Trusted future participants share the writer; result is provisional until write() returns.

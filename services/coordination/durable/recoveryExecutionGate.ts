@@ -34,11 +34,11 @@ export class RecoveryExecutionGate {
   assertCanStart(workflowRunId: string): void { this.database.assertRecoveryExecution(this.lease, workflowRunId); }
 }
 /** Read-only SQLite predicate. It cannot install authority or clear a hold. */
-export function recoveryStartAllowed(tx: DurableTransaction, id: string, route: string, target: string): boolean {
+export function recoveryStartAllowed(tx: DurableTransaction, id: string, route: string, target: string, verifiedPlanApplication = false): boolean {
   const reason = recoveryGateReason(tx, id);
-  // Registration during the current PLAN response application precedes its
-  // APPLIED receipt. Dispatch still requires the response to be applied.
-  if (reason && !(route === 'REGISTER' && reason === 'PENDING_RESPONSE')) return false;
+  // Only the database's private, receipt-bound PLAN application scope can
+  // permit registration before APPLIED. A saved pending response is not authority.
+  if (reason && !(route === 'REGISTER' && reason === 'PENDING_RESPONSE' && verifiedPlanApplication)) return false;
   const s = readJournal(tx,id).snapshot;
   if (s.run.status !== 'RUNNING') return false;
   if (route === 'ACTION') {

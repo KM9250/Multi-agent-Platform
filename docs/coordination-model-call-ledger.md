@@ -202,3 +202,11 @@ clean reacquisition preserve uncertainty with a hold, including pending response
 unknown usage and budget violations. A 4A grant cannot cancel a reservation,
 discard/apply a saved response or reconcile usage. Those recovery operations need
 the new 4B/4C executable contract and renewed approval.
+
+The 4A F-01 correction binds the pending-response registration exception to the
+private PLAN application scope created by the receipt-writing database participant
+used by `ModelCallLedger.markApplied()`. A direct `atomicApplication()` call grants
+no such scope. Workflow, Model Call, phase, round, request/settlement Journal
+positions and current Lease/Generation must match. Complete Action registration
+and APPLIED commit together; failed or caught registration/SQL errors roll both
+back. VERIFY and already-held Workflows cannot use the PLAN exception.
