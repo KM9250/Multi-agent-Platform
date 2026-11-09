@@ -30,6 +30,7 @@ import { assertDispatchSink, controlledVector, persistControlledDecision, persis
 import type { ControlledWriter } from './recoveryDispatchStore';
 import { inspectDispatchInTransaction } from './recoveryDispatchReader';
 import { collectControlledResult, unknownDispatchResult } from './recoveryDispatchCoordinator';
+import type { ControlledExecutionWindow } from './recoveryDispatchCoordinator';
 
 export type Row = Record<string, SQLOutputValue>;
 export interface DurableTransaction {
@@ -76,7 +77,7 @@ interface SafeRecoveryScope {
   seedUpdates: string[]; ledgerBefore?: Row;
 }
 interface ControlledSqlScope { tx: DurableTransaction; table: string; row: Row; old?: Row; actorId: string }
-interface DispatchSink { intent: DispatchIntent; lease: WorkflowLease; valid: boolean; collecting: boolean }
+interface DispatchSink { intent: DispatchIntent; lease: WorkflowLease; valid: boolean; collecting: boolean; execution: ControlledExecutionWindow }
 
 /** One synchronous transaction owner. SQLite serializes writers across connections. */
 export class DurableDatabase {
@@ -303,7 +304,7 @@ export class DurableDatabase {
     if (!reserved) return this.controlledRecoveryDecision(undefined,credential,{kind:'INSPECT',planId}) as DispatchInspection;
     const permit = Object.freeze({}); this.#sendPermits.add(permit);
     const {intent,record,executor} = reserved;
-    const sink: DispatchSink = {intent:jsonCopy(intent),lease,valid:true,collecting:true}; this.#resultSinks.add(sink);
+    const sink: DispatchSink = {intent:jsonCopy(intent),lease,valid:true,collecting:true,execution:{}}; this.#resultSinks.add(sink);
     // Synchronous consumption before any await, adapter callback, or re-entrant request.
     requireIntegrity(this.#sendPermits.delete(permit));
     try {
@@ -313,12 +314,13 @@ export class DurableDatabase {
         return recoveryTime(tx) < intent.sendDeadline && !signal?.aborted;
       });
       const result = canSend ? await this.#dispatchEvidence.run(sink,() => collectControlledResult(executor.execute,record.action,
-        {workflowRunId:intent.workflowRunId,sessionId:intent.sessionId,taskId:intent.taskId,signal},intent.executionTimeoutMs))
+        {workflowRunId:intent.workflowRunId,sessionId:intent.sessionId,taskId:intent.taskId,signal},intent.executionTimeoutMs,sink.execution))
         : unknownDispatchResult('RUNNER_DISPATCH_NOT_STARTED');
       sink.collecting = false;
       const normalized = jsonCopy({...result,resultRef:result.resultRef ?? intent.defaultEvidenceRef});
       const recordedAt = this.read(tx => recoveryTime(tx));
       // Only this captured, normalized Result can be saved. No public resume/save capability.
+      // B uses the collection deadline, so an expired execution can still record Timeout.
       try {
         this.#writeFenced(lease,intent.workflowRunId,tx => {
           requireIntegrity(sink.valid && this.#resultSinks.has(sink));
@@ -339,10 +341,17 @@ export class DurableDatabase {
   putControlledEvidence(owner: EvidenceOwner, evidence: RunnerEvidence): string | undefined {
     const sink = this.#dispatchEvidence.getStore(); if (!sink) return undefined;
     requireIntegrity(sink.valid && sink.collecting && this.#resultSinks.has(sink));
+    const executionDeadline = sink.execution.deadline;
+    requireIntegrity(executionDeadline !== undefined && performance.now() < executionDeadline);
     const i = sink.intent;
     requireIntegrity(owner.workflowRunId === i.workflowRunId && owner.sessionId === i.sessionId && owner.taskId === i.taskId && owner.actionId === i.actionId);
     const ref = `map.runner.evidence.v1:${randomBytes(16).toString('hex')}`;
-    return this.#writeFenced(sink.lease,i.workflowRunId,tx => persistDispatchEvidence(tx,i,ref,jsonCopy(evidence),this.#controlledWriter(tx,sink.lease,i.actorId,'RESULT')));
+    return this.#writeFenced(sink.lease,i.workflowRunId,tx => {
+      requireIntegrity(performance.now() < executionDeadline);
+      const saved = persistDispatchEvidence(tx,i,ref,jsonCopy(evidence),this.#controlledWriter(tx,sink.lease,i.actorId,'RESULT'));
+      requireIntegrity(performance.now() < executionDeadline);
+      return saved;
+    });
   }
   /** Closed 4B dispatcher. No caller-supplied callback or authority token is accepted. */
   safeRecoveryDecision(lease: WorkflowLease | undefined, credential: unknown, input: SafeRecoveryCommand) {

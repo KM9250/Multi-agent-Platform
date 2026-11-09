@@ -4,25 +4,40 @@
 
 Schema **8** / Migration **008_bounded_recovery_execution** / Contract **COORD-5C-4B2:CONTROLLED_EXECUTION:1**。有効化した操作は **ALLOW_PREPARED_DISPATCHのみ**。詳細設計・API・時間設定・制約は [coordination-recovery-dispatch.md](coordination-recovery-dispatch.md) を参照。
 
+## PR #34／F-01［P2］の修正検証
+
+修正基準HEAD: `c7f132cad3572bbc095e2663292587fa50faee14`。Executor呼出し直前に`performance.now()`で実行deadlineを固定し、応答の採用時とExecutor由来の先行Evidence書込み前後で再検証する。タイマー通知が遅れても、期限超過した正常応答を成功として確定しない。実行deadlineはプロセス内の非公開Sinkにのみ共有し、Intent再照会から再生成しない。
+
+実行deadlineと結果回収deadlineは別の制約である。Transaction Bは現在Lease・対象Attempt・結果回収deadlineを引き続き検証し、実行deadlineを超過したCoordinator生成のTimeout不確定結果と既定Evidenceを保存する。A/Bの原子性、Send Permitの単回消費、ACK喪失時の再送禁止、Hold維持、Schema/Contractを変更していない。4B-2B／4Cの機能追加はない。
+
+`coordination-recovery-dispatch.test.ts`に実行上限25ms・Executor内の`Atomics.wait(..., 90)`による同期停止の2ケースを追加した。正常応答を返すケースと、停止直後に先行Evidenceを追加して正常応答を返すケースの双方で、タイマーがまだ通知されていないことも確認する。
+
+| 同じ回帰試験 | pass | fail | skip | 確認した挙動 |
+| --- | ---: | ---: | ---: | --- |
+| 修正前の基準HEAD＋新規試験 | 0 | 2 | 0 | 期限超過の正常応答がRESULT_RECORDEDになり、期限超過後の先行Evidenceも保存された |
+| 修正後 | 2 | 0 | 0 | REVIEW_REQUIRED／RUNNER_EXECUTION_TIMEOUT。先行Evidenceを拒否し、Bによる既定Evidenceは1件だけ保存 |
+
+修正前後とも`node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-name-pattern='F-01:' test/coordination-recovery-dispatch.test.ts`で実行。新しい試験はReceiptとEvidenceのAttempt一致、結果回収期限内の保存、Grant消費、Hold/Journal/Taskの維持、再要求で外部呼出しが1回のままになることも検証する。F-01の差分は実装2・試験1・文書2の5ファイルで、公開対象の全体は引き続き34ファイル。
+
 ## 検証環境と結果
 
 Linux x64、kernel `6.18.57`、Node `v24.22.1`、SQLite `3.53.4`。すべて独立した一時DBと合成データを使用。既存運用DBへのMigration、実Executor・Model APIへの呼出しは行っていない。
 
-下表の「ファイル」はテスト実行対象ファイル数、「ケース」はNode test runnerの実ケース数。サブセットSuiteを集約Suiteへ重複加算しない。**重複なしの全体は57ファイル・1,290ケース、追加専用試験はその内数の4ファイル・104ケース**。
+下表はF-01修正後に再実行した結果。「ファイル」はテスト実行対象ファイル数、「ケース」はNode test runnerの実ケース数。サブセットSuiteを集約Suiteへ重複加算しない。**重複なしの全体は57ファイル・1,292ケース、追加専用試験はその内数の4ファイル・106ケース**。
 
 | 通常コマンド | ファイル | pass | fail | skip |
 | --- | ---: | ---: | ---: | ---: |
-| `npm test` | 57 | 1290 | 0 | 0 |
+| `npm test` | 57 | 1292 | 0 | 0 |
 | `npm run test:durable` | 11 | 163 | 0 | 0 |
 | `npm run test:durable-execution` | 7 | 111 | 0 | 0 |
-| `npm run test:recovery-reader` | 18 | 401 | 0 | 0 |
+| `npm run test:recovery-reader` | 18 | 403 | 0 | 0 |
 | `npm run test:runtime-lease` | 5 | 46 | 0 | 0 |
 | `npm run test:model-call-ledger` | 4 | 103 | 0 | 0 |
 | `npm run test:recovery-authorization` | 3 | 90 | 0 | 0 |
 | `npm run test:recovery-execution` | 5 | 119 | 0 | 0 |
-| `npm run test:recovery-dispatch` | 4 | 104 | 0 | 0 |
+| `npm run test:recovery-dispatch` | 4 | 106 | 0 | 0 |
 
-`npm ci`、`npm run typecheck`、`npm run build`、`git diff --check`、`git diff --cached --check`、基準mainから最終HEADへの`git diff --check`も成功。npmのキャッシュは作業用ディレクトリを指定。最終ビルドはAPIキーを渡さず実行し、生成物をコミットしない。Viteの既存500 KiB超チャンク警告は残るがビルドは成功。全Suiteでcancelled/todoも0。追加引数なしで各通常コマンドを実行し、既存の並列数設定を維持した。
+`npm run typecheck`、`npm run build`、`git diff --check`、`git diff --cached --check`、基準mainおよびF-01修正基準HEADから最終HEADへの`git diff --check`も成功。依存関係とロックファイルは今回変更せず、初回の`npm ci`で導入した環境を使用（npmキャッシュは作業用ディレクトリ）。最終ビルドはAPIキーを渡さず実行し、生成物をコミットしない。Viteの既存500 KiB超チャンク警告は残るがビルドは成功。全Suiteでcancelled/todoも0。追加引数なしで各通常コマンドを実行し、既存の並列数設定を維持した。
 
 ## 受入条件の証拠
 

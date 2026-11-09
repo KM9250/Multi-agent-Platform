@@ -105,6 +105,35 @@ test('timeout closes sink; a delayed success and Evidence cannot overwrite uncer
   f.hook(async()=>{await delay(80);late=f.put({late:true});await assert.rejects(late);return {status:'succeeded',summary:'late'};});
   assert.equal((await f.execute(p)).status,'REVIEW_REQUIRED');const before=dispatchContents(f.raw);await delay(100);assert.deepEqual(dispatchContents(f.raw),before);assert.equal(f.calls.execute,1);
 });
+for(const addEvidence of [false,true])test(`F-01: 25ms execution deadline rejects ${addEvidence?'prior Evidence':'success'} after 90ms synchronous blocking`,async t=>{
+  const f=fixture(t,{timing:{executionTimeoutMs:25}}),p=f.plan();f.authorize(p);
+  const hold=f.raw.prepare('SELECT * FROM recovery_holds').all(),journal=f.raw.prepare('SELECT * FROM journal_events').all();
+  let timerNotified:boolean|undefined,evidenceRef:string|undefined,evidenceError:unknown;
+  f.hook(async context=>{
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,90);
+    // No timer callback can run during the synchronous block or before this write.
+    timerNotified=context.signal?.aborted;
+    if(addEvidence)try{evidenceRef=await f.put({late:true});}catch(error){evidenceError=error;}
+    return {status:'succeeded',summary:'Late synchronous success.'};
+  });
+  const inspection=await f.execute(p);
+  assert.equal(timerNotified,false);
+  if(addEvidence){assert.equal(evidenceRef,undefined);assert.equal((evidenceError as {code?:string})?.code,'INTEGRITY_ERROR');}
+  assert.equal(inspection.status,'REVIEW_REQUIRED');assert.equal(inspection.taskStatus,'ASSIGNED');assert.equal(inspection.finalizedEventId,null);
+  const intent=inspection.intent!,receipt=inspection.receipt!;
+  const result=JSON.parse(String(f.raw.prepare('SELECT result_json FROM execution_results WHERE result_ref=?').get(intent.resultRef)!.result_json));
+  assert.equal(result.status,'uncertain');assert.equal(result.errorCode,'RUNNER_EXECUTION_TIMEOUT');
+  assert.equal(result.resultRef,intent.defaultEvidenceRef);assert.equal(receipt.attemptId,intent.attemptId);
+  assert.ok(receipt.recordedAt<intent.resultCollectionDeadline);
+  // Coordinator-generated Timeout/default Evidence still commits in B after execution expires.
+  assert.equal(count(f,'runner_evidence'),1);assert.equal(count(f,'recovery_dispatch_evidence'),1);
+  const evidence=f.raw.prepare('SELECT * FROM runner_evidence WHERE evidence_ref=?').get(intent.defaultEvidenceRef)!;
+  assert.deepEqual(JSON.parse(String(evidence.content_json)).content,result);
+  assert.equal(f.raw.prepare('SELECT attempt_id FROM recovery_dispatch_evidence').get()!.attempt_id,intent.attemptId);
+  assert.equal(inspection.grants[0].status,'CONSUMED');assert.equal(f.calls.execute,1);
+  assert.deepEqual(f.raw.prepare('SELECT * FROM recovery_holds').all(),hold);assert.deepEqual(f.raw.prepare('SELECT * FROM journal_events').all(),journal);
+  const saved=dispatchContents(f.raw);assert.deepEqual(await f.execute(p),inspection);assert.deepEqual(dispatchContents(f.raw),saved);assert.equal(f.calls.execute,1);
+});
 test('grant start expiry does not end a started result collection window',async t=>{
   const f=fixture(t,{timing:{executionTimeoutMs:1000}}),p=f.plan();f.authorize(p,undefined,200);f.hook(async()=>{await delay(240);return {status:'succeeded',summary:'after start expiry'};});
   assert.equal((await f.execute(p)).status,'RESULT_RECORDED');assert.equal(f.calls.execute,1);

@@ -32,24 +32,34 @@ export class RecoveryDispatchCoordinator {
   }
 }
 export const unknownDispatchResult=(errorCode:string):RunnerExecutionResult=>({status:'uncertain',summary:'Controlled execution requires review.',errorCode});
+/** Process-local monotonic execution window; never exposed to the executor or persisted. */
+export interface ControlledExecutionWindow { deadline?:number }
 /** No database or permit is accepted. Called only after the private send permit is consumed. */
 export async function collectControlledResult(execute:RunnerActionExecutor['execute'],action:PreparedRunnerAction,
-  context:RunnerExecutionContext,timeoutMs:number):Promise<RunnerExecutionResult>{
+  context:RunnerExecutionContext,timeoutMs:number,execution:ControlledExecutionWindow):Promise<RunnerExecutionResult>{
   const controller=new AbortController();let timer:ReturnType<typeof setTimeout>|undefined;
-  let stopped=false,stop!:(result:RunnerExecutionResult)=>void;
+  let stopped:RunnerExecutionResult|undefined,stop!:(result:RunnerExecutionResult)=>void;
   const interruption=new Promise<RunnerExecutionResult>(resolve=>{stop=resolve;});
-  const halt=(reason:string)=>{if(stopped)return;stopped=true;stop(unknownDispatchResult(reason));controller.abort();};
+  const halt=(reason:string)=>{if(stopped)return;stopped=unknownDispatchResult(reason);stop(stopped);controller.abort();};
+  const checkDeadline=()=>{
+    if(execution.deadline!==undefined && performance.now()>=execution.deadline)halt('RUNNER_EXECUTION_TIMEOUT');
+    return stopped;
+  };
   const abort=()=>halt('RUNNER_EXECUTION_ABORTED');
   context.signal?.addEventListener('abort',abort,{once:true});
   try{
     if(context.signal?.aborted)return unknownDispatchResult('RUNNER_DISPATCH_NOT_STARTED');
-    timer=setTimeout(()=>halt('RUNNER_EXECUTION_TIMEOUT'),timeoutMs);
     // This invocation occurs synchronously, before this function's first await.
     let pending:Promise<RunnerExecutionResult>;
-    try{pending=Promise.resolve(execute(jsonCopy(action),{...context,signal:controller.signal}));}
-    catch{return unknownDispatchResult('RUNNER_EXECUTOR_OUTCOME_UNKNOWN');}
+    try{
+      const prepared=jsonCopy(action),executionContext={...context,signal:controller.signal};
+      execution.deadline=performance.now()+timeoutMs;
+      timer=setTimeout(()=>halt('RUNNER_EXECUTION_TIMEOUT'),timeoutMs);
+      pending=Promise.resolve(execute(prepared,executionContext));
+    }
+    catch{return checkDeadline()??unknownDispatchResult('RUNNER_EXECUTOR_OUTCOME_UNKNOWN');}
     const outcome=pending.then(raw=>{
-      if(stopped)return unknownDispatchResult('RUNNER_EXECUTION_TIMEOUT');
+      const interrupted=checkDeadline();if(interrupted)return interrupted;
       try{
         executionJson(raw,EXECUTION_LIMITS.result);rejectEmbeddedCredentials(raw);
         const result=jsonCopy(validateRunnerExecution(raw));
@@ -57,9 +67,10 @@ export async function collectControlledResult(execute:RunnerActionExecutor['exec
         if(result.status==='aborted')return unknownDispatchResult('RUNNER_EXECUTION_ABORTED');
         if(result.safetyHold){const owner=parseSecurityReviewRef(result.safetyHold.reviewRef);
           if(owner?.workflowRunId!==context.workflowRunId || owner.taskId!==context.taskId || !['succeeded','failed'].includes(result.status))return unknownDispatchResult('RUNNER_SECURITY_REVIEW_OWNER_INVALID');}
-        return result;
-      }catch{return unknownDispatchResult('RUNNER_INVALID_EXECUTION_RESULT');}
-    },()=>unknownDispatchResult('RUNNER_EXECUTOR_OUTCOME_UNKNOWN'));
-    return await Promise.race([outcome,interruption]);
-  }finally{stopped=true;if(timer)clearTimeout(timer);context.signal?.removeEventListener('abort',abort);}
+        return checkDeadline()??result;
+      }catch{return checkDeadline()??unknownDispatchResult('RUNNER_INVALID_EXECUTION_RESULT');}
+    },()=>checkDeadline()??unknownDispatchResult('RUNNER_EXECUTOR_OUTCOME_UNKNOWN'));
+    const result=await Promise.race([outcome,interruption]);
+    return checkDeadline()??result;
+  }finally{if(timer)clearTimeout(timer);context.signal?.removeEventListener('abort',abort);}
 }
