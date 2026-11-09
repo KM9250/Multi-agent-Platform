@@ -70,9 +70,10 @@ export class RecoveryAuditReader {
           WHERE a.workflow_run_id = j.workflow_run_id AND a.event_kind = 'JOURNAL_APPENDED' AND a.journal_event_id = j.event_id)
         UNION ALL
         SELECT 1, a.audit_sequence, CASE WHEN a.event_kind = 'JOURNAL_APPENDED' THEN j.event_type ELSE a.event_kind END,
-          a.occurred_at, coalesce(a.action_id,p.action_id) FROM runtime_audit_events a
+          a.occurred_at, coalesce(a.action_id,p.action_id,cp.action_id) FROM runtime_audit_events a
           LEFT JOIN journal_events j ON j.workflow_run_id = a.workflow_run_id AND j.event_id = a.journal_event_id
           LEFT JOIN pending_actions p ON p.workflow_run_id = a.workflow_run_id AND p.task_id = a.task_id
+          LEFT JOIN recovery_controlled_plans cp ON cp.plan_id = a.controlled_plan_id
         WHERE a.workflow_run_id = ? AND a.audit_sequence <= ?
         UNION ALL
         SELECT 2, rowid, 'EXECUTION_CURRENT', updated_at, action_id FROM execution_ledger
@@ -84,6 +85,8 @@ export class RecoveryAuditReader {
         if (key.phase === 1) {
           const row = tx.get('SELECT * FROM runtime_audit_events WHERE workflow_run_id = ? AND audit_sequence = ?', id, key.n)!;
           validateAuditRow(tx, row);
+          const controlled = row.controlled_plan_id ? tx.get("SELECT action_id,json_extract(plan_json,'$.sessionId') AS session_id,json_extract(plan_json,'$.taskId') AS task_id FROM recovery_controlled_plans WHERE plan_id=?",row.controlled_plan_id) : undefined;
+          const dispatched = row.dispatch_operation_id ? tx.get('SELECT attempt_id FROM recovery_dispatch_intents WHERE operation_id=?',row.dispatch_operation_id) : undefined;
           const audit = { auditEventId: String(row.audit_event_id), auditSequence: Number(row.audit_sequence), recordedAt: Number(row.recorded_at), runtimeInstanceId: optional(row, 'runtime_instance_id'),
             generation: row.runtime_generation === null ? undefined : Number(row.runtime_generation) };
           if (row.event_kind === 'JOURNAL_APPENDED') return { ...journalEntry(tx, tx.get('SELECT * FROM journal_events WHERE workflow_run_id = ? AND event_id = ?', id, row.journal_event_id)!, optional(key, 'action_id')), ...audit };
@@ -92,8 +95,11 @@ export class RecoveryAuditReader {
             authorizationId: optional(row,'recovery_authorization_id'), recoveryActorId: optional(row,'recovery_actor_id'),
             executionPlanId: optional(row,'execution_plan_id'), executionAuthorizationId: optional(row,'execution_authorization_id'),
             recoveryOperationId: optional(row,'recovery_operation_id'),
+            controlledPlanId: optional(row,'controlled_plan_id'), controlledGrantId: optional(row,'controlled_grant_id'),
+            dispatchOperationId: optional(row,'dispatch_operation_id'),
             recoveryHoldRevision: row.recovery_hold_revision === null ? undefined : Number(row.recovery_hold_revision),
-            sessionId: optional(row, 'session_id'), taskId: optional(row, 'task_id'), actionId: optional(row, 'action_id'), attemptId: optional(row, 'attempt_id'),
+            sessionId: optional(row, 'session_id') ?? controlled?.session_id, taskId: optional(row, 'task_id') ?? controlled?.task_id,
+            actionId: optional(row, 'action_id') ?? controlled?.action_id, attemptId: optional(row, 'attempt_id') ?? dispatched?.attempt_id,
             actorAgentId: optional(row, 'actor_agent_id'), subjectAgentId: optional(row, 'subject_agent_id'), runtimeInstanceId: optional(row, 'runtime_instance_id'),
             generation: row.runtime_generation === null ? undefined : Number(row.runtime_generation), previousState: optional(row, 'previous_state'), nextState: optional(row, 'next_state'),
             reasonCode: optional(row, 'reason_code'), journalEventId: optional(row, 'journal_event_id'), journalSequence: row.journal_sequence === null ? undefined : Number(row.journal_sequence),

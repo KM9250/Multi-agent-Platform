@@ -28,6 +28,8 @@ export class SqliteRunnerEvidenceStore implements RunnerEvidenceStore {
   async put(evidence: RunnerEvidence): Promise<string> {
     const scope = this.owners.getStore(); requireIntegrity(scope);
     const { owner, lease } = scope;
+    const controlled = this.database.putControlledEvidence(owner,evidence);
+    if (controlled !== undefined) return controlled;
     const json = executionJson(evidence, EXECUTION_LIMITS.evidence);
     executionJson(evidence.content, EXECUTION_LIMITS.evidence);
     requireIntegrity(typeof evidence.kind === 'string' && !!evidence.kind.trim() && Object.hasOwn(evidence, 'content')

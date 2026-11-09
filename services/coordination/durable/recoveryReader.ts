@@ -16,6 +16,7 @@ import { classifyRecovery } from './recoveryClassifier';
 import { assertRecoverySchema, validateAuditRow } from './recoveryAudit';
 import { RecoveryAuditReader } from './recoveryTimeline';
 import { readSafeRecoveryReceipt } from './safeRecoveryStore';
+import { inspectDispatchInTransaction } from './recoveryDispatchReader';
 import type { ExecutionStateSummary, RecoveryAuthorizationRequirement, RecoveryInspection, TimelineQueryOptions } from './recoveryTypes';
 
 /** No Runner, Coordinator, registry, model provider, or execution capability is accepted. */
@@ -120,6 +121,11 @@ export class RecoveryReader {
             || executions.some(e => e.reviewReason === 'SECURITY_REVIEW_REQUIRED' && !e.finalizedEventId),
           unresolvedEvidenceReview: !!runnerEvidenceReviewReason(s) });
         if (includeDecisions) {
+          inspection.controlledDispatches = tx.all('SELECT plan_id FROM recovery_dispatch_intents WHERE workflow_run_id=? ORDER BY rowid',workflowRunId).map(row => {
+            const dispatch = inspectDispatchInTransaction(tx,String(row.plan_id)), i = dispatch.intent!;
+            return {planId:i.planId,operationId:i.operationId,actionId:i.actionId,attemptId:i.attemptId,status:dispatch.status,outcome:dispatch.outcome,
+              resultRef:dispatch.receipt?.resultRef,taskStatus:dispatch.taskStatus,finalizedEventId:dispatch.finalizedEventId};
+          });
           reason = 'RECOVERY_DECISION_INTEGRITY_INVALID';
           inspection.recoveryDecisions = recoveryDecisionSummary(tx, workflowRunId);
           const hold = tx.get('SELECT * FROM recovery_holds WHERE workflow_run_id=?', workflowRunId);

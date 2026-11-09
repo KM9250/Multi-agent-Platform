@@ -14,6 +14,7 @@ export interface ExecutionStateSummary {
   finalizedEventId?: string; safetyStopIncomplete?: boolean;
 }
 export interface RecoveryInspection {
+  controlledDispatches?: Array<{planId:string;operationId:string;actionId:string;attemptId:string;status:string;outcome:string;resultRef?:string;taskStatus:string;finalizedEventId:string|null}>;
   recoveryDecisions?: ReturnType<typeof import('./recoveryDecisionStore').recoveryDecisionSummary>;
   safeRecovery?: {
     holdRevision: number; holdState: 'HELD' | 'RECOVERY_STEP_APPLIED' | 'READY_FOR_CONTINUATION_REVIEW';
@@ -37,6 +38,7 @@ export interface TimelineQueryOptions {
 export interface WorkflowTimelineEntry {
   recoveryPlanId?: string; authorizationId?: string; recoveryActorId?: string; recoveryHoldRevision?: number;
   executionPlanId?: string; executionAuthorizationId?: string; recoveryOperationId?: string;
+  controlledPlanId?: string; controlledGrantId?: string; dispatchOperationId?: string;
   source: 'JOURNAL' | 'EXECUTION_AUDIT' | 'RUNTIME_AUDIT' | 'CURRENT_SNAPSHOT';
   eventKind: string; workflowRunId: string; sessionId?: string; taskId?: string; actionId?: string; attemptId?: string; modelCallId?: string;
   auditEventId?: string; auditSequence?: number; journalEventId?: string; journalSequence?: number;
