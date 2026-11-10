@@ -34,3 +34,14 @@ export function readExecution(tx: DurableTransaction, record: RunnerPendingActio
   requireIntegrity(!['PREPARED','DISPATCH_RESERVED'].includes(String(row.state)) || (row.result_ref === null && row.finalized_event_id === null));
   return row;
 }
+/** Transaction participant shared by ordinary and controlled dispatch. Grants no scope. */
+export function reserveExecutionInTransaction(tx: DurableTransaction, record: RunnerPendingActionRecord, attemptId: string, now: number): Row {
+  const before = readExecution(tx,record);
+  requireIntegrity(before.state === 'PREPARED' && before.attempt_id === null && before.reserved_at === null
+    && before.result_ref === null && before.finalized_event_id === null && !!attemptId);
+  tx.run("UPDATE execution_ledger SET state = 'DISPATCH_RESERVED', attempt_id = ?, reserved_at = ?, updated_at = ? WHERE workflow_run_id = ? AND action_id = ? AND state = 'PREPARED'",
+    attemptId,now,now,record.workflowRunId,record.action.actionId);
+  const after = readExecution(tx,record);
+  requireIntegrity(after.state === 'DISPATCH_RESERVED' && after.attempt_id === attemptId && after.reserved_at === now);
+  return after;
+}

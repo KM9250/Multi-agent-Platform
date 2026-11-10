@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomBytes } from 'node:crypto';
 import { DATABASE_NOW_SQL } from './leaseSchema';
 import { DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_LEASE_TTL_MS, runtimeInstanceId } from './runtimeLease';
@@ -21,6 +22,15 @@ import type { RecoveryAuthorizationPolicy, RecoveryDecisionCommand, RecoveryGran
 import type { ModelCallIdentity } from './modelCallLedger';
 import type { RunnerModelApplicationResult } from '../runner/types';
 import type { CoordinationEvent } from '../types';
+import type { RunnerEvidence } from '../runner/types';
+import type { EvidenceOwner } from './evidenceStore';
+import type { ControlledCommand, ControlledExecutorRegistry, ControlledTiming, DispatchInspection, DispatchIntent } from './controlledRecoveryTypes';
+import { controlledBinding, controlledTiming, preparedEligibility, dispatchPostState, assertControlledBudget } from './controlledRecoveryPlanner';
+import { assertDispatchSink, controlledVector, persistControlledDecision, persistDispatchEvidence, persistDispatchResult, readControlledPlan, reserveControlledDispatch } from './recoveryDispatchStore';
+import type { ControlledWriter } from './recoveryDispatchStore';
+import { inspectDispatchInTransaction } from './recoveryDispatchReader';
+import { collectControlledResult, unknownDispatchResult } from './recoveryDispatchCoordinator';
+import type { ControlledExecutionWindow } from './recoveryDispatchCoordinator';
 
 export type Row = Record<string, SQLOutputValue>;
 export interface DurableTransaction {
@@ -33,6 +43,8 @@ export interface DurableDatabaseOptions {
   /** Trusted host startup dependency. Never populate from an HTTP request or saved DTO. */
   recoveryIdentityVerifier?: RecoveryIdentityVerifier;
   recoveryAuthorizationPolicy?: RecoveryAuthorizationPolicy;
+  controlledExecutors?: ControlledExecutorRegistry;
+  controlledTiming?: Partial<ControlledTiming>;
 }
 
 function protectPath(path: string): void {
@@ -64,6 +76,8 @@ interface SafeRecoveryScope {
   tx: DurableTransaction; intent: SafeRecoveryIntent;
   seedUpdates: string[]; ledgerBefore?: Row;
 }
+interface ControlledSqlScope { tx: DurableTransaction; table: string; row: Row; old?: Row; actorId: string }
+interface DispatchSink { intent: DispatchIntent; lease: WorkflowLease; valid: boolean; collecting: boolean; execution: ControlledExecutionWindow }
 
 /** One synchronous transaction owner. SQLite serializes writers across connections. */
 export class DurableDatabase {
@@ -81,8 +95,29 @@ export class DurableDatabase {
   #modelApplication?: ModelApplicationScope;
   #safeRecovery?: SafeRecoveryScope;
   #safeRecoveryCommand = false;
+  readonly #controlledExecutors?: ControlledExecutorRegistry;
+  readonly #controlledTiming: ControlledTiming;
+  #controlledCommand = false;
+  #controlledScope?: ControlledSqlScope;
+  readonly #sendPermits = new WeakSet<object>();
+  readonly #resultSinks = new WeakSet<DispatchSink>();
+  readonly #dispatchEvidence = new AsyncLocalStorage<DispatchSink>();
   #timeAnchor = { wall: Date.now(), monotonic: performance.now() };
   constructor(options: DurableDatabaseOptions) {
+    const observedBindings = new Map<string,{executor:object;execute:unknown}>();
+    const registryGet = options.controlledExecutors?.get.bind(options.controlledExecutors);
+    this.#controlledExecutors = registryGet
+      ? Object.freeze({get: (id:string) => {
+        const binding = registryGet(id);
+        if (binding) {
+          const key = canonicalJson([id,binding.contractVersion,binding.implementationDigest]);
+          const prior = observedBindings.get(key);
+          requireIntegrity(!prior || prior.executor === binding.executor && prior.execute === binding.executor.execute);
+          observedBindings.set(key,{executor:binding.executor,execute:binding.executor.execute});
+        }
+        return binding;
+      }}) : undefined;
+    this.#controlledTiming = controlledTiming(options.controlledTiming);
     this.#recoveryVerifier = options.recoveryIdentityVerifier
       ? Object.freeze({ verify: options.recoveryIdentityVerifier.verify.bind(options.recoveryIdentityVerifier) }) : undefined;
     this.#recoveryPolicy = jsonCopy(options.recoveryAuthorizationPolicy ?? {});
@@ -129,22 +164,22 @@ export class DurableDatabase {
       this.assertTransaction(tx, mutation);
       // No transaction/DDL/PRAGMA control escapes to participants.
       if (!(mutation ? /^(INSERT|UPDATE|DELETE)\s/i : /^SELECT\s/i).test(sql.trim())) {
-        if (this.#safeRecoveryCommand) this.#recoveryRejected = true;
+        if (this.#safeRecoveryCommand || this.#controlledCommand) this.#recoveryRejected = true;
         throw new DurableStoreError('INVALID_TRANSACTION');
       }
     };
     const tx: DurableTransaction = {
       get: (sql, ...params) => { try { check(sql, false); return this.#db.prepare(sql).get(...params); }
-        catch (error) { if (this.#safeRecoveryCommand) this.#recoveryRejected = true; throw error; } },
+        catch (error) { if (this.#safeRecoveryCommand || this.#controlledCommand) this.#recoveryRejected = true; throw error; } },
       all: (sql, ...params) => { try { check(sql, false); return this.#db.prepare(sql).all(...params); }
-        catch (error) { if (this.#safeRecoveryCommand) this.#recoveryRejected = true; throw error; } },
+        catch (error) { if (this.#safeRecoveryCommand || this.#controlledCommand) this.#recoveryRejected = true; throw error; } },
       run: (sql, ...params) => {
         check(sql, true);
         try { this.#db.prepare(sql).run(...params); }
         catch (error) {
           const safe = this.safeError(error);
           if (safe.code === 'LEASE_FENCED') this.#fencingRejected = true;
-          if (safe.code.startsWith('RECOVERY_') || this.#modelApplication || this.#safeRecoveryCommand) this.#recoveryRejected = true;
+          if (safe.code.startsWith('RECOVERY_') || this.#modelApplication || this.#safeRecoveryCommand || this.#controlledCommand) this.#recoveryRejected = true;
           throw safe;
         }
       },
@@ -166,7 +201,7 @@ export class DurableDatabase {
       // A successful COMMIT can lose its acknowledgement. Keep a usable connection
       // only when SQLite confirms the transaction ended; the receipt reader decides
       // the outcome. Older runtimes without this observation keep the closed fallback.
-      const endedAfterCommit = this.#safeRecoveryCommand && commitAttempted
+      const endedAfterCommit = (this.#safeRecoveryCommand || this.#controlledCommand) && commitAttempted
         && (this.#db as DatabaseSync & { isTransaction?: boolean }).isTransaction === false;
       if (begun && !endedAfterCommit) {
         try { this.#db.exec('ROLLBACK'); }
@@ -175,10 +210,149 @@ export class DurableDatabase {
       throw this.safeError(error);
     } finally { this.#active = undefined; this.#writable = false; this.#context = undefined; this.#fencingRejected = false;
       this.#recoveryIntent = undefined; this.#recoveryRejected = false; this.#modelApplication = undefined;
-      this.#safeRecovery = undefined; this.#safeRecoveryCommand = false; }
+      this.#safeRecovery = undefined; this.#safeRecoveryCommand = false;
+      this.#controlledScope = undefined; this.#controlledCommand = false; }
   }
   read<T>(fn: (tx: DurableTransaction) => T): T { return this.#transaction(false, fn); }
   get recoveryPolicy(): RecoveryAuthorizationPolicy { return jsonCopy(this.#recoveryPolicy); }
+  #controlledWriter(tx: DurableTransaction, lease: WorkflowLease, actorId: string, phase: 'MANAGE'|'RESERVE'|'RESULT'): ControlledWriter {
+    this.#controlledCommand = true;
+    const tables = phase === 'MANAGE' ? ['recovery_controlled_plans','recovery_controlled_grants']
+      : phase === 'RESERVE' ? ['execution_ledger','recovery_controlled_grants','recovery_dispatch_intents','recovery_dispatch_grants']
+      : ['runner_evidence','recovery_dispatch_evidence','execution_results','execution_ledger','recovery_dispatch_receipts'];
+    return (table,row,old) => {
+      this.assertWorkflowWrite(tx,lease.workflowRunId);
+      requireIntegrity(tables.includes(table) && row.workflow_run_id === lease.workflowRunId && (!old || old.workflow_run_id === lease.workflowRunId)
+        && !this.#modelApplication && !this.#safeRecovery);
+      this.#controlledScope = {tx,table,row:jsonCopy(row),old:old && jsonCopy(old),actorId};
+    };
+  }
+  previewControlledDispatch(workflowRunId: string) {
+    return this.read(tx => {
+      readJournal(tx,workflowRunId);
+      const held = !!tx.get('SELECT workflow_run_id FROM recovery_holds WHERE workflow_run_id=?',workflowRunId);
+      const candidates = tx.all("SELECT action_id FROM execution_ledger WHERE workflow_run_id=? AND state='PREPARED'",workflowRunId).map(row => {
+        let reason: string | null = held ? null : 'HOLD_NOT_ESTABLISHED';
+        if (held) try { controlledBinding(this,tx,{workflowRunId,actionId:String(row.action_id)},this.#controlledExecutors,this.#controlledTiming); }
+        catch (error) { if (!(error instanceof DurableStoreError) || ['DATABASE_ERROR','DATABASE_BUSY'].includes(error.code)) throw error; reason = error.code; }
+        return {actionId:String(row.action_id),eligible:reason === null,reason,executable:false as const};
+      });
+      return {workflowRunId,candidates,executionAllowed:false as const};
+    });
+  }
+  /** Authenticated closed management API. DTOs never carry authority or callbacks. */
+  controlledRecoveryDecision(lease: WorkflowLease | undefined, credential: unknown, input: ControlledCommand) {
+    const command = jsonCopy(input);
+    if (command.kind === 'INSPECT') return this.read(tx => {
+      verifyRecoveryIdentity(this.#recoveryVerifier,credential,recoveryTime(tx),'VIEW');
+      return inspectDispatchInTransaction(tx,command.planId);
+    });
+    if (!lease) throw new DurableStoreError('LEASE_FENCED');
+    if (!['CREATE_PLAN','AUTHORIZE','REVOKE'].includes(command.kind)) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
+    return this.#writeFenced(lease,lease.workflowRunId,tx => {
+      this.#controlledCommand = true;
+      const identity = verifyRecoveryIdentity(this.#recoveryVerifier,credential,recoveryTime(tx),command.kind);
+      const workflow = command.kind === 'CREATE_PLAN' ? command.input.workflowRunId : command.kind === 'REVOKE'
+        ? tx.get('SELECT workflow_run_id FROM recovery_controlled_grants WHERE authorization_id=?',command.authorizationId)?.workflow_run_id
+        : tx.get('SELECT workflow_run_id FROM recovery_controlled_plans WHERE plan_id=?',command.planId)?.workflow_run_id;
+      if (workflow !== lease.workflowRunId) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
+      if (command.kind === 'CREATE_PLAN' && !tx.get('SELECT workflow_run_id FROM recovery_holds WHERE workflow_run_id=?',workflow)) {
+        // Identity and eligibility precede the first management write. Same transaction as the plan.
+        preparedEligibility(this,tx,command.input);
+        this.#recoveryIntent = {workflowRunId:workflow,kind:'HOLD',id:workflow};
+        const now = recoveryTime(tx);
+        tx.run("INSERT INTO recovery_holds VALUES (?,1,'STATE_CHANGED',?,?,'GATE',1)",workflow,lease.generation,now);
+        tx.run(`INSERT INTO runtime_audit_events (audit_event_id,workflow_run_id,event_kind,entity_kind,entity_id,
+          recovery_hold_revision,next_state,reason_code,occurred_at,recorded_at,schema_version,runtime_instance_id,runtime_generation)
+          VALUES (lower(hex(randomblob(16))),?,'RECOVERY_HOLD_CREATED','WORKFLOW',?,1,'HELD','STATE_CHANGED',?,?,1,?,?)`,workflow,workflow,now,now,lease.runtimeInstanceId,lease.generation);
+        this.#recoveryIntent = undefined;
+      }
+      return persistControlledDecision(this,tx,command,identity,lease,this.#controlledExecutors,this.#controlledTiming,
+        this.#controlledWriter(tx,lease,identity.actorId,'MANAGE'));
+    });
+  }
+  /** A saved Intent is a read result; only the private branch observing A's normal return can mint a permit. */
+  async executeControlledDispatch(lease: WorkflowLease | undefined, planId: string, credential: unknown, signal?: AbortSignal): Promise<DispatchInspection> {
+    const prior = this.read(tx => {
+      verifyRecoveryIdentity(this.#recoveryVerifier,credential,recoveryTime(tx),'CREATE_PLAN');
+      const inspection = inspectDispatchInTransaction(tx,planId);
+      return inspection.intent ? inspection : undefined;
+    });
+    if (prior) return prior;
+    if (!lease) throw new DurableStoreError('LEASE_FENCED');
+    if (signal?.aborted) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
+    let reserved: ReturnType<typeof reserveControlledDispatch> | undefined;
+    try {
+      const committed = this.#writeFenced(lease,lease.workflowRunId,tx => {
+        this.#controlledCommand = true;
+        const identity = verifyRecoveryIdentity(this.#recoveryVerifier,credential,recoveryTime(tx),'CREATE_PLAN');
+        const plan = readControlledPlan(tx,planId);
+        if (plan.workflowRunId !== lease.workflowRunId) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
+        if (tx.get('SELECT operation_id FROM recovery_dispatch_intents WHERE plan_id=?',planId)) return undefined;
+        const reserved = reserveControlledDispatch(this,tx,plan,identity,lease,this.#controlledExecutors,this.#controlledTiming,
+          this.#controlledWriter(tx,lease,identity.actorId,'RESERVE'));
+        requireIntegrity(canonicalJson(inspectDispatchInTransaction(tx,planId).intent) === canonicalJson(reserved.intent)
+          && recoveryTime(tx) < reserved.intent.sendDeadline);
+        return reserved;
+      });
+      reserved = committed;
+    } catch (error) {
+      // COMMIT ACK loss is never inferred to be a successful reservation for sending.
+      try { const saved = this.controlledRecoveryDecision(undefined,credential,{kind:'INSPECT',planId}) as DispatchInspection; if (saved.intent) return saved; } catch { /* Original fixed error. */ }
+      throw error;
+    }
+    if (!reserved) return this.controlledRecoveryDecision(undefined,credential,{kind:'INSPECT',planId}) as DispatchInspection;
+    const permit = Object.freeze({}); this.#sendPermits.add(permit);
+    const {intent,record,executor} = reserved;
+    const sink: DispatchSink = {intent:jsonCopy(intent),lease,valid:true,collecting:true,execution:{}}; this.#resultSinks.add(sink);
+    // Synchronous consumption before any await, adapter callback, or re-entrant request.
+    requireIntegrity(this.#sendPermits.delete(permit));
+    try {
+      const canSend = this.#writeFenced(lease,intent.workflowRunId,tx => {
+        assertDispatchSink(tx,intent); assertControlledBudget(tx,intent.workflowRunId);
+        requireIntegrity(dispatchPostState(tx,intent.workflowRunId) === intent.expectedStateDigest);
+        return recoveryTime(tx) < intent.sendDeadline && !signal?.aborted;
+      });
+      const result = canSend ? await this.#dispatchEvidence.run(sink,() => collectControlledResult(executor.execute,record.action,
+        {workflowRunId:intent.workflowRunId,sessionId:intent.sessionId,taskId:intent.taskId,signal},intent.executionTimeoutMs,sink.execution))
+        : unknownDispatchResult('RUNNER_DISPATCH_NOT_STARTED');
+      sink.collecting = false;
+      const normalized = jsonCopy({...result,resultRef:result.resultRef ?? intent.defaultEvidenceRef});
+      const recordedAt = this.read(tx => recoveryTime(tx));
+      // Only this captured, normalized Result can be saved. No public resume/save capability.
+      // B uses the collection deadline, so an expired execution can still record Timeout.
+      try {
+        this.#writeFenced(lease,intent.workflowRunId,tx => {
+          requireIntegrity(sink.valid && this.#resultSinks.has(sink));
+          const receipt = persistDispatchResult(tx,intent,normalized,recordedAt,this.#controlledWriter(tx,lease,intent.actorId,'RESULT'));
+          requireIntegrity(canonicalJson(inspectDispatchInTransaction(tx,planId).receipt) === canonicalJson(receipt)
+            && recoveryTime(tx) < intent.resultCollectionDeadline);
+          return receipt;
+        });
+      } catch (error) {
+        const saved = this.controlledRecoveryDecision(undefined,credential,{kind:'INSPECT',planId}) as DispatchInspection;
+        if (!saved.receipt) throw error; // B ACK loss: read, never rerun the executor.
+        requireIntegrity(saved.receipt.resultDigest === digest(normalized));
+      }
+      return this.controlledRecoveryDecision(undefined,credential,{kind:'INSPECT',planId}) as DispatchInspection;
+    } finally { sink.valid = false; sink.collecting = false; this.#resultSinks.delete(sink); }
+  }
+  /** Evidence Store participant: ordinary withOwner/IDs cannot populate this private async context. */
+  putControlledEvidence(owner: EvidenceOwner, evidence: RunnerEvidence): string | undefined {
+    const sink = this.#dispatchEvidence.getStore(); if (!sink) return undefined;
+    requireIntegrity(sink.valid && sink.collecting && this.#resultSinks.has(sink));
+    const executionDeadline = sink.execution.deadline;
+    requireIntegrity(executionDeadline !== undefined && performance.now() < executionDeadline);
+    const i = sink.intent;
+    requireIntegrity(owner.workflowRunId === i.workflowRunId && owner.sessionId === i.sessionId && owner.taskId === i.taskId && owner.actionId === i.actionId);
+    const ref = `map.runner.evidence.v1:${randomBytes(16).toString('hex')}`;
+    return this.#writeFenced(sink.lease,i.workflowRunId,tx => {
+      requireIntegrity(performance.now() < executionDeadline);
+      const saved = persistDispatchEvidence(tx,i,ref,jsonCopy(evidence),this.#controlledWriter(tx,sink.lease,i.actorId,'RESULT'));
+      requireIntegrity(performance.now() < executionDeadline);
+      return saved;
+    });
+  }
   /** Closed 4B dispatcher. No caller-supplied callback or authority token is accepted. */
   safeRecoveryDecision(lease: WorkflowLease | undefined, credential: unknown, input: SafeRecoveryCommand) {
     const command = jsonCopy(input);
@@ -373,6 +547,9 @@ export class DurableDatabase {
   }
   /** Explicit scope, checked at entry, every SQL mutation (triggers), and before COMMIT. */
   writeWithLease<T>(lease: WorkflowLease | undefined, workflowRunId: string, fn: (tx: DurableTransaction) => T): T {
+    return this.#writeFenced(lease,workflowRunId,fn);
+  }
+  #writeFenced<T>(lease: WorkflowLease | undefined, workflowRunId: string, fn: (tx: DurableTransaction) => T): T {
     const record = lease && leaseHandles.get(lease);
     if (!record?.valid || record.databaseIdentity !== this.#databaseIdentity || lease!.workflowRunId !== workflowRunId) this.#fenced();
     try { return this.#transaction(true, fn, { kind: 'lease', record }); }
@@ -438,6 +615,32 @@ export class DurableDatabase {
     }
   }
   #registerFencingFunctions(): void {
+    this.#db.function('map_controlled_actor', () => this.#controlledScope?.actorId ?? null);
+    this.#db.function('map_controlled_write', (table, before, after) => {
+      const s = this.#controlledScope;
+      if (!s || s.tx !== this.#active || this.#context?.kind !== 'lease' || !this.#controlledCommand
+        || s.table !== table || s.row.workflow_run_id !== this.#context.record.handle.workflowRunId) return 0;
+      try { return canonicalJson(before === null ? null : parseJson(before)) === canonicalJson(s.old ? parseJson(controlledVector(s.table,s.old)) : null)
+        && canonicalJson(parseJson(after)) === canonicalJson(parseJson(controlledVector(s.table,s.row))) ? 1 : 0; } catch { return 0; }
+    });
+    this.#db.function('map_controlled_audit', (workflow,event,plan,grant,operation,hash,actor) => {
+      const s = this.#controlledScope;
+      if (!s || s.tx !== this.#active || this.#context?.kind !== 'lease' || !this.#controlledCommand
+        || s.row.workflow_run_id !== workflow || workflow !== this.#context.record.handle.workflowRunId || actor !== s.actorId || s.row.plan_id !== plan) return 0;
+      const r = s.row;
+      if (s.table === 'recovery_controlled_plans') return event === 'RECOVERY_CONTROLLED_PLAN_CREATED' && grant === null && operation === null && hash === r.plan_digest ? 1 : 0;
+      if (s.table === 'recovery_controlled_grants') {
+        const kind = !s.old ? 'RECOVERY_CONTROLLED_AUTHORIZED' : r.status === 'CONSUMED' ? 'RECOVERY_CONTROLLED_GRANT_CONSUMED' : 'RECOVERY_CONTROLLED_REVOKED';
+        return event === kind && grant === r.authorization_id && operation === r.consumed_operation_id && hash === r.grant_digest ? 1 : 0;
+      }
+      if (s.table === 'recovery_dispatch_intents') return event === 'RECOVERY_DISPATCH_INTENT_COMMITTED' && grant === null && operation === r.operation_id && hash === r.intent_digest ? 1 : 0;
+      if (s.table === 'recovery_dispatch_receipts') {
+        const receipt = parseJson<{status:string}>(r.receipt_json);
+        return event === (receipt.status === 'REVIEW_REQUIRED' ? 'RECOVERY_DISPATCH_REVIEW_REQUIRED' : 'RECOVERY_DISPATCH_RESULT_RECORDED')
+          && grant === null && operation === r.operation_id && hash === r.receipt_digest ? 1 : 0;
+      }
+      return 0;
+    });
     // Read-only predicates: SQL can inspect an installed scope, never create one.
     this.#db.function('map_safe_recovery_actor', () => this.#safeRecovery?.intent.actorId ?? null);
     this.#db.function('map_safe_recovery_management', (workflow, kind, id) => {

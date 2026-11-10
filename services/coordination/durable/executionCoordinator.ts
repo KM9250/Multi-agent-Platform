@@ -12,7 +12,7 @@ import type { DurableTransaction } from './db';
 import { SqliteRunnerPendingActionStore, validateAction, validateActionOwner } from './pendingActionStore';
 import { SqliteRunnerEvidenceStore } from './evidenceStore';
 import type { EvidenceOwner } from './evidenceStore';
-import { readExecution } from './executionLedger';
+import { readExecution, reserveExecutionInTransaction } from './executionLedger';
 import type { DurableExecutionInspection, DurableExecutionState } from './executionLedger';
 import { canonicalJson, digest, DurableStoreError, guarded, requireIntegrity } from './integrity';
 import { EXECUTION_LIMITS, executionJson, rejectEmbeddedCredentials } from './executionIntegrity';
@@ -114,8 +114,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
       const row = readExecution(tx, r);
       if (row.state !== 'PREPARED') throw new DurableStoreError('EXECUTION_REVIEW_REQUIRED');
       const attemptId = randomUUID(), now = this.now();
-      tx.run("UPDATE execution_ledger SET state = 'DISPATCH_RESERVED', attempt_id = ?, reserved_at = ?, updated_at = ? WHERE workflow_run_id = ? AND action_id = ? AND state = 'PREPARED'",
-        attemptId, now, now, id, r.action.actionId);
+      reserveExecutionInTransaction(tx,r,attemptId,now);
       return { record: r, attemptId };
     });
   }

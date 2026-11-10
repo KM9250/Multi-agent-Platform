@@ -37,3 +37,7 @@ export { SafeRecoveryPlanner, SafeRecoveryAuthorizer, SafeRecoveryExecutor } fro
 export { SAFE_RECOVERY_CONTRACT, SAFE_RECOVERY_OPERATIONS } from './safeRecoveryTypes';
 export type { RecoveryExecutionPlan, RecoveryExecutionGrant, RecoveryExecutionGrantScope,
   RecoveryOperationReceipt, RecoveryExecutionPreview, CreateRecoveryExecutionPlan, SafeRecoveryOperationKind } from './safeRecoveryTypes';
+export { ControlledRecoveryPlanner, ControlledRecoveryAuthorizer, RecoveryDispatchCoordinator, controlledScopeOf } from './recoveryDispatchCoordinator';
+export { RecoveryDispatchReader } from './recoveryDispatchReader';
+export { CONTROLLED_RECOVERY_CONTRACT, CONTROLLED_LIMITS } from './controlledRecoveryTypes';
+export type { ControlledPlan, ControlledGrant, ControlledGrantScope, ControlledExecutorRegistry, ControlledExecutorBinding, DispatchIntent, DispatchReceipt, DispatchInspection } from './controlledRecoveryTypes';

@@ -16,7 +16,8 @@
     "test:runtime-lease": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/coordination-lease-*.test.ts",
     "test:model-call-ledger": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/coordination-model-call-*.test.ts",
     "test:recovery-authorization": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/coordination-recovery-authorization*.test.ts",
-    "test:recovery-execution": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/coordination-recovery-execution*.test.ts"
+    "test:recovery-execution": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/coordination-recovery-execution*.test.ts",
+    "test:recovery-dispatch": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/coordination-recovery-dispatch*.test.ts"
   },
   "dependencies": {
     "@google/genai": "^1.30.0",
