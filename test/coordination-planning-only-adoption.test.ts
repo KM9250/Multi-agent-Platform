@@ -11,7 +11,7 @@ import { digest } from '../services/coordination/durable/integrity.ts';
 const usage={llmCalls:1,inputTokens:1,outputTokens:1,estimatedCost:0};
 async function artifact(f:ReturnType<typeof continuationFixture>,read=false){
  if(read)f.hook(async r=>({value:r.reads.length?{kind:'plan',artifact:content}:{kind:'read_requests',requests:[{resourceId:'source',digest:f.reads.describe('source')!.digest}]},usage,completeness:'COMPLETE'}));
- const p=f.api().createPlan(f.input(read?'PLAN_READ_ONLY':'THINK_ONLY'),f.credential),r=await f.api().startAuthorized(p.planId,f.credential);f.api().recordReview(r.artifact!,'ACCEPTED_FOR_SCOPE',f.credential);return {p,r};
+ const p=f.api().createPlan(f.input(read?'PLAN_READ_ONLY':'THINK_ONLY'),f.credential),r=await f.api().startAuthorized(p.planId,f.credential);f.api().recordReview(r.artifact!,'ACCEPTED_FOR_SCOPE',f.credential,r.control.revision);return {p,r};
 }
 test('P09/I14: artifact acceptance, execution approval and initial dispatch are three separate commands',async t=>{
  const f=continuationFixture(t),{r}=await artifact(f);const x=executeInput(f);x.origin='USER_REQUEST';delete x.resume;x.artifact=r.artifact;
@@ -26,7 +26,7 @@ for(const change of ['resource','policy','provider','executor','version'] as con
  if(change==='policy')f.policy.version='new';
  if(change==='provider')f.provider.capabilities.adapterVersion='new';
  if(change==='executor')f.options.controlledExecutors.get('test')!.executor.execute=async()=>({status:'succeeded',summary:'changed'});
- if(change==='version'){const q=f.api().requestRevision(r.artifact!,f.input(),f.credential);await f.api().startAuthorized(q.planId,f.credential);assert.throws(()=>f.api().recordReview(r.artifact!,'REJECTED',f.credential));}
+ if(change==='version'){const q=f.api().requestRevision(r.artifact!,f.input(),f.credential);await f.api().startAuthorized(q.planId,f.credential);assert.throws(()=>f.api().recordReview(r.artifact!,'REJECTED',f.credential,r.control.revision));}
  await assert.rejects(f.api().startAuthorized(p.planId,f.credential));assert.equal(f.counts.action,0);assert.equal(f.counts.plan,0);
 });
 test('P12: independent approved snapshot planning does not resume, spend from, or copy authority from its stopped source',async t=>{

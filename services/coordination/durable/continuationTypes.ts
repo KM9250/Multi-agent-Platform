@@ -100,6 +100,8 @@ export interface PlanningInputRequest {
   questions: string[]; contentDigest: string; snapshots: InputSnapshot[]; dataClass: string; createdAt: number;
 }
 export type InvocationStatus = 'ACTIVE' | 'DRAINING' | 'COMPLETED' | 'STOPPED' | 'REVIEW_REQUIRED';
+/** Optimistic review binding; accepting content never authorizes execution. */
+export interface PlanningReviewTarget extends ArtifactRef { ownerId: string; controlRevision: number }
 export interface ContinuationInspection {
   plan: ContinuationPlan; invocation?: { invocationId: string; status: InvocationStatus; outcome: string | null };
   artifact?: PlanArtifact; inputRequest?: PlanningInputRequest;
@@ -108,7 +110,7 @@ export interface ContinuationInspection {
   usage: { committed: { inputTokens: number; outputTokens: number; costMicros: number }; outstanding: { inputTokens: number; outputTokens: number; costMicros: number } };
   remaining: { rounds:number;modelCalls:number;actionDispatches:number;readCalls:number };
   performed: { businessActionDispatches:number;localReadCalls:number;modelCalls:number;internalPersistence:true };
-  review: { state:'UNREVIEWED'|'ACCEPTED_FOR_SCOPE'|'REJECTED'|'SUPERSEDED'|'STALE';executionAuthorizationRequired:true };
+  review: { state:'UNREVIEWED'|'ACCEPTED_FOR_SCOPE'|'REJECTED'|'SUPERSEDED'|'STALE';target?:PlanningReviewTarget;executionAuthorizationRequired:true };
   executionAllowed: false;
 }
 export type ContinuationCommand =
@@ -117,4 +119,4 @@ export type ContinuationCommand =
   | { kind: 'REVOKE'; grantId: string }
   | { kind: 'INSPECT'; planId: string }
   | { kind: 'STOP'; planId: string }
-  | { kind: 'REVIEW'; artifact: ArtifactRef; decision: 'ACCEPTED_FOR_SCOPE' | 'REJECTED' | 'SUPERSEDED' };
+  | { kind: 'REVIEW'; artifact: ArtifactRef; decision: 'ACCEPTED_FOR_SCOPE' | 'REJECTED' | 'SUPERSEDED'; expectedControlRevision: number };

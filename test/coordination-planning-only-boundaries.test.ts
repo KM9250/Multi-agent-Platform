@@ -43,7 +43,7 @@ test('I01: independent connections cannot create overlapping active invocations'
 });
 test('P09/P10: accepting content never starts execution, and a newer version invalidates the older artifact',async t=>{
  const f=continuationFixture(t),p=f.api().createPlan(f.input(),f.credential),r=await f.api().startAuthorized(p.planId,f.credential);
- f.api().recordReview(r.artifact!,'ACCEPTED_FOR_SCOPE',f.credential);assert.equal(f.counts.action,0);assert.throws(()=>f.store.assertRecoveryExecution('run'));
+ f.api().recordReview(r.artifact!,'ACCEPTED_FOR_SCOPE',f.credential,r.control.revision);assert.equal(f.counts.action,0);assert.throws(()=>f.store.assertRecoveryExecution('run'));
  const revision=f.api().requestRevision(r.artifact!,f.input(),f.credential),next=await f.api().startAuthorized(revision.planId,f.credential);
  assert.equal(next.artifact?.version,2);assert.notEqual(next.artifact?.artifactId,r.artifact?.artifactId);assert.equal(f.api().inspect(p.planId,f.credential).artifact?.version,1);
  assert.equal(f.counts.draft,2);assert.equal(f.counts.action,0);

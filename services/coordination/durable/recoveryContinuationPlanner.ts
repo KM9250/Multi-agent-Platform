@@ -18,7 +18,7 @@ import { findExhaustedBudget } from '../policy';
 import { runnerSecurityReviewReason, runnerEvidenceReviewReason, runnerActionApproved } from '../runner/dispatchGuard';
 import { isValidatedPlanningReadRegistry } from './planningReadRegistry';
 import type { PlanningReadRegistry } from './planningReadRegistry';
-import { readArtifact } from './planningArtifactStore';
+import { readArtifact, readPlanningReviewTarget } from './planningArtifactStore';
 
 export function boundedTiming(input:Partial<InvocationTiming>={}):InvocationTiming {
   requireIntegrity(Object.keys(input).every(k=>k in DEFAULT_INVOCATION_TIMING));
@@ -42,9 +42,8 @@ export function validateContinuationInput(input:ContinuationPlanInput):Continuat
       &&Array.isArray(x.input.snapshots)&&x.input.snapshots.length<=64&&typeof x.input.dataClass==='string'&&typeof x.input.destination==='string');
     for(const s of x.input.snapshots) requireIntegrity(typeof s.id==='string'&&typeof s.revision==='string'&&/^[a-f0-9]{64}$/.test(s.digest)&&Number.isSafeInteger(s.observedAt)&&s.observedAt>=0);
   } else if(x.operation==='BOUNDED_CONTINUATION') {
-    requireIntegrity(x.mode==='BOUNDED_EXECUTE'&&x.limits.maxRounds>0&&x.limits.maxReadCalls===0&&['NEW_ROUND','RESUME_PREPARED','VERIFY_FINALIZED_RESULT'].includes(x.start!));
-    for(const key of ['artifact','previousArtifact'] as const)if(x[key]){const r=x[key]!;requireIntegrity(typeof r.artifactId==='string'&&Number.isSafeInteger(r.version)&&r.version>=1&&/^[a-f0-9]{64}$/.test(r.contentDigest));x[key]={artifactId:r.artifactId,version:r.version,contentDigest:r.contentDigest};}
-  requireIntegrity(x.origin==='RECOVERY'||!!x.artifact);
+    requireIntegrity(x.mode==='BOUNDED_EXECUTE'&&!x.previousArtifact&&x.limits.maxRounds>0&&x.limits.maxReadCalls===0&&['NEW_ROUND','RESUME_PREPARED','VERIFY_FINALIZED_RESULT'].includes(x.start!));
+    requireIntegrity(x.origin==='RECOVERY'||!!x.artifact);
     if(x.start==='NEW_ROUND')requireIntegrity(!x.taskId&&!x.actionId);
     if(x.start==='RESUME_PREPARED')requireIntegrity(typeof x.taskId==='string'&&typeof x.actionId==='string');
     if(x.start==='VERIFY_FINALIZED_RESULT')requireIntegrity(!x.actionId&&x.limits.maxRounds===1&&x.limits.maxActionDispatches===0&&x.limits.maxModelCalls===1&&x.taskId);
@@ -105,7 +104,10 @@ export function assertCleanState(db:DurableDatabase,tx:DurableTransaction,input:
   requireIntegrity(!findExhaustedBudget(s.run.budget,s.run.usage,Math.max(0,recoveryTime(tx)-s.run.createdAt)));
   requireIntegrity(Object.keys(budget.limit).every(k=>budget.committed[k as keyof typeof budget.limit]+budget.outstanding[k as keyof typeof budget.limit]<=budget.limit[k as keyof typeof budget.limit]));
   if(input.operation==='RELEASE_RECOVERY_HOLD')requireIntegrity(c.hold_state==='HELD'&&!c.planning_review_pending);
-  if(c.planning_review_pending)requireIntegrity(!!input.previousArtifact||!!input.artifact);
+  if(c.planning_review_pending) {
+    const target=readPlanningReviewTarget(tx,id)!,ref=input.operation==='PLANNING_ONLY'?input.previousArtifact:input.artifact;
+    requireIntegrity(ref&&ref.artifactId===target.artifactId&&ref.version===target.version&&ref.contentDigest===target.contentDigest);
+  }
 }
 export function planBinding(db:DurableDatabase,tx:DurableTransaction,input:ContinuationPlanInput,policy:ContinuationPolicy,
   provider:BoundedProvider|undefined,reads:PlanningReadRegistry|undefined,timing:InvocationTiming):Record<string,unknown> {

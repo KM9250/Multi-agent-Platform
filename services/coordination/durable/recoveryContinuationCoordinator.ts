@@ -14,7 +14,7 @@ import { recoveryTime } from './recoveryPlanner';
 import { readWorkflowControl } from './recoveryHoldLifecycle';
 import { readJournal } from './restore';
 import { SqliteCoordinationRunnerStore } from './durableCoordinationStore';
-import { readArtifact, readPlanningInputRequest, validateDraft, assertPlanningTextSafe } from './planningArtifactStore';
+import { readArtifact, readPlanningInputRequest, readPlanningReviewTarget, validateDraft, assertPlanningTextSafe } from './planningArtifactStore';
 import type { PlanningReadRegistry } from './planningReadRegistry';
 import { ModelCallLedger, modelBudgetPosition } from './modelCallLedger';
 import type { ModelCallIdentity } from './modelCallLedger';
@@ -196,8 +196,9 @@ export class BoundedRuntime {
       requireIntegrity(performance.now()<sink.deadline);return ref;
     }));
   }
-  #lifecycle(tx:DurableTransaction,id:string,change:{hold?:string;active?:string|null;review?:boolean},reason:string,generation:number):void {
+  #lifecycle(tx:DurableTransaction,id:string,change:{hold?:string;active?:string|null;review?:boolean},reason:string,generation:number,expectedRevision?:number):void {
     const c=readWorkflowControl(tx,id);
+    requireIntegrity(expectedRevision===undefined||c.control_revision===expectedRevision);
     tx.run('INSERT INTO recovery_hold_lifecycle VALUES(NULL,?,?,?,?,?,?,?,?,?)',id,c.hold_epoch,Number(c.control_revision)+1,
       change.hold??c.hold_state,change.active===undefined?c.active_invocation_id:change.active,change.review===undefined?c.planning_review_pending:change.review?1:0,reason,generation,recoveryTime(tx));
   }
@@ -222,6 +223,7 @@ export class BoundedRuntime {
     const command=jsonCopy(input);
     if(command.kind==='INSPECT')return this.#host.db.read(tx=>this.#inspect(tx,command.planId,credential));
     if(!lease)throw new DurableStoreError('LEASE_FENCED');
+    if(command.kind==='STOP')return this.#stop(lease,command.planId,credential);
     return this.#write(lease,tx=>{
       const who=this.#identity(tx,credential,lease.workflowRunId,'PLAN',command.kind==='AUTHORIZE'||command.kind==='REVOKE');
       if(command.kind==='CREATE_PLAN') {
@@ -247,19 +249,53 @@ export class BoundedRuntime {
       }
       if(command.kind==='REVIEW') {
         const a=readArtifact(tx,command.artifact);requireIntegrity(a.workflowRunId===lease.workflowRunId&&a.ownerId===who.actorId&&!readWorkflowControl(tx,a.workflowRunId).active_invocation_id);
-        requireIntegrity(readWorkflowControl(tx,a.workflowRunId).planning_review_pending&&!tx.get("SELECT artifact_id FROM planning_artifacts WHERE json_extract(artifact_json,'$.previousArtifact.artifactId')=?",a.artifactId)&&['ACCEPTED_FOR_SCOPE','REJECTED','SUPERSEDED'].includes(command.decision));
+        const target=readPlanningReviewTarget(tx,a.workflowRunId);
+        requireIntegrity(target&&target.artifactId===a.artifactId&&target.version===a.version&&target.contentDigest===a.contentDigest&&target.ownerId===who.actorId
+          &&Number.isSafeInteger(command.expectedControlRevision)&&target.controlRevision===command.expectedControlRevision
+          &&['ACCEPTED_FOR_SCOPE','REJECTED','SUPERSEDED'].includes(command.decision));
         tx.run('INSERT INTO planning_reviews VALUES(?,?,?,?,?,?)',randomUUID(),a.workflowRunId,a.artifactId,who.actorId,command.decision,recoveryTime(tx));
-        // Accepting content keeps the execution gate. Rejecting/superseding explicitly discards that review.
-        if(command.decision!=='ACCEPTED_FOR_SCOPE')this.#lifecycle(tx,a.workflowRunId,{review:false},'PLAN_DISCARDED',lease.generation);
+        // Every decision consumes the observed revision. Acceptance keeps the execution gate.
+        const accepted=command.decision==='ACCEPTED_FOR_SCOPE';
+        this.#lifecycle(tx,a.workflowRunId,{review:accepted},accepted?'PLAN_REVIEW_ACCEPTED':'PLAN_DISCARDED',lease.generation,command.expectedControlRevision);
         return;
       }
       const p=readContinuationPlan(tx,command.planId);requireIntegrity(p.workflowRunId===lease.workflowRunId);
-      if(command.kind==='AUTHORIZE') {requireIntegrity(command.planDigest===p.planDigest);this.#current(tx,p);return this.#grant(tx,p,who);}
-      requireIntegrity(command.kind==='STOP');
-      const i=tx.get('SELECT * FROM recovery_invocations WHERE plan_id=?',p.planId);requireIntegrity(i);
-      if(i.status==='ACTIVE'){tx.run("UPDATE recovery_invocations SET status='DRAINING',outcome='USER_STOP',revision=revision+1 WHERE invocation_id=?",i.invocation_id);this.#receipt(tx,p,'STOP',{invocationId:String(i.invocation_id),actor:who.actorId,outcome:'USER_STOP',at:recoveryTime(tx)});}
-      this.#active.get(String(i.invocation_id))?.abort.abort();return;
+      requireIntegrity(command.kind==='AUTHORIZE'&&command.planDigest===p.planDigest);this.#current(tx,p);return this.#grant(tx,p,who);
     });
+  }
+  #stop(lease:WorkflowLease,planId:string,credential:unknown):void {
+    let candidate:Row|undefined,committed:Row|undefined;
+    const authorize=(tx:DurableTransaction)=>{
+      const who=this.#identity(tx,credential,lease.workflowRunId,'VIEW'),p=readContinuationPlan(tx,planId);
+      requireIntegrity(p.workflowRunId===lease.workflowRunId);
+      const i=tx.get('SELECT * FROM recovery_invocations WHERE plan_id=?',planId);requireIntegrity(i);
+      if(i.owner_id!==who.actorId&&!who.roles.includes('RECOVERY_ADMIN'))throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
+      return {who,p,i};
+    };
+    try {committed=this.#write(lease,tx=>{
+      const {who,p,i}=authorize(tx);
+      if(i.status==='ACTIVE') {
+        tx.run("UPDATE recovery_invocations SET status='DRAINING',outcome='USER_STOP',revision=revision+1 WHERE invocation_id=?",i.invocation_id);
+        this.#receipt(tx,p,'STOP',{invocationId:String(i.invocation_id),actor:who.actorId,owner:String(i.owner_id),
+          authorization:i.owner_id===who.actorId?'OWNER':'RECOVERY_ADMIN',outcome:'USER_STOP',at:recoveryTime(tx)});
+      }
+      candidate=tx.get("SELECT * FROM recovery_continuation_receipts WHERE plan_id=? AND kind='STOP'",planId);
+      return candidate;
+    });}catch(error){
+      // A COMMIT ACK can be lost. Only this exact immutable STOP receipt proves the write committed.
+      // Rollback, failed authentication and failed Audit never justify a local abort.
+      if(!candidate)throw error;
+      committed=this.#host.db.read(tx=>{
+        authorize(tx);
+        const saved=tx.get('SELECT * FROM recovery_continuation_receipts WHERE receipt_id=?',candidate!.receipt_id);
+        return saved&&canonicalJson(saved)===canonicalJson(candidate)?saved:undefined;
+      });
+      if(!committed)throw error;
+    }
+    if(committed) {
+      const body=JSON.parse(String(committed.receipt_json));requireIntegrity(digest(body)===committed.receipt_digest);
+      this.withoutAuthority(()=>this.#active.get(body.invocationId)?.abort.abort());
+    }
   }
   #grant(tx:DurableTransaction,p:ContinuationPlan,who:VerifiedRecoveryIdentity):string {
     const rule=p.operation==='RELEASE_RECOVERY_HOLD'?this.#policy().releaseApprovals:this.#policy().recoveryApprovals;
@@ -295,7 +331,7 @@ export class BoundedRuntime {
       const invocationId=randomUUID(),now=recoveryTime(tx),admission=Math.min(now+p.timing.admissionMs,p.expiresAt,who.expiresAt,...grants.map(g=>Number(g.expires_at))),
         collection=admission+Math.max(p.timing.modelTimeoutMs,p.timing.actionTimeoutMs,p.timing.readTimeoutMs)+p.timing.collectionGraceMs+p.timing.finalizationMs;
       tx.run("INSERT INTO recovery_invocations VALUES(?,?,?,?,?,?,'ACTIVE',NULL,0,?,?,?,?)",invocationId,p.workflowRunId,p.planId,who.actorId,lease.runtimeInstanceId,lease.generation,executionState(tx,p.workflowRunId),now,admission,collection);
-      this.#lifecycle(tx,p.workflowRunId,{active:invocationId,review:false},'INVOCATION_STARTED',lease.generation);
+      this.#lifecycle(tx,p.workflowRunId,{active:invocationId,review:p.operation==='BOUNDED_CONTINUATION'&&p.artifact?false:undefined},'INVOCATION_STARTED',lease.generation);
       this.#receipt(tx,p,'START',{planId:p.planId,invocationId,actor:who.actorId,at:now});return {p,who,invocationId};
     });}catch(error){const saved=this.#host.db.read(tx=>tx.get('SELECT receipt_id FROM recovery_continuation_receipts WHERE plan_id=?',planId));if(saved)return this.#host.db.read(tx=>this.#inspect(tx,planId,credential));throw error;}
     if(!committed.invocationId)return this.#host.db.read(tx=>this.#inspect(tx,planId,credential));
@@ -367,7 +403,7 @@ export class BoundedRuntime {
     }
     const {llmCalls:_,...a}=committed,{llmCalls:__,...b}=outstanding;return {committed:a,outstanding:b};
   }
-  #finish(ctx:Context,status:'COMPLETED'|'STOPPED'|'REVIEW_REQUIRED',outcome:string,review=false,tx?:DurableTransaction):void {
+  #finish(ctx:Context,status:'COMPLETED'|'STOPPED'|'REVIEW_REQUIRED',outcome:string,review?:boolean,tx?:DurableTransaction):void {
     const finish=(t:DurableTransaction)=>{const r=t.get('SELECT * FROM recovery_invocations WHERE invocation_id=?',ctx.invocationId)!;
       if(!['ACTIVE','DRAINING'].includes(String(r.status)))return;
       t.run("UPDATE recovery_invocations SET status='DRAINING',revision=revision+1 WHERE invocation_id=?",ctx.invocationId);
@@ -387,9 +423,10 @@ export class BoundedRuntime {
     if(i)for(const r of tx.all('SELECT kind,count(*) AS n FROM recovery_invocation_debits WHERE invocation_id=? GROUP BY kind',i.invocation_id))
       counts[({ROUND:'rounds',MODEL:'modelCalls',ACTION:'actionDispatches',READ:'readCalls'} as const)[r.kind as 'ROUND']]=Number(r.n);
     const review=a?tx.get('SELECT decision FROM planning_reviews WHERE artifact_id=? ORDER BY rowid DESC LIMIT 1',a.artifact_id):undefined;
+    const target=readPlanningReviewTarget(tx,p.workflowRunId);
     return {remaining:{rounds:p.limits.maxRounds-counts.rounds,modelCalls:p.limits.maxModelCalls-counts.modelCalls,actionDispatches:p.limits.maxActionDispatches-counts.actionDispatches,readCalls:p.limits.maxReadCalls-counts.readCalls},
       performed:{businessActionDispatches:counts.actionDispatches,localReadCalls:counts.readCalls,modelCalls:counts.modelCalls,internalPersistence:true},
-      review:{state:(review?.decision??'UNREVIEWED') as 'UNREVIEWED',executionAuthorizationRequired:true},plan:p,invocation:i?{invocationId:String(i.invocation_id),status:i.status as 'ACTIVE',outcome:i.outcome as string|null}:undefined,
+      review:{state:(review?.decision??'UNREVIEWED') as 'UNREVIEWED',target:a&&target?.artifactId===a.artifact_id&&target.ownerId===who.actorId?target:undefined,executionAuthorizationRequired:true},plan:p,invocation:i?{invocationId:String(i.invocation_id),status:i.status as 'ACTIVE',outcome:i.outcome as string|null}:undefined,
       artifact:a?readArtifact(tx,{artifactId:String(a.artifact_id),version:Number(a.version),contentDigest:String(a.content_digest)}):undefined,
       inputRequest:q?readPlanningInputRequest(tx,String(q.input_request_id)):undefined,
       control:{holdState:String(c.hold_state),holdEpoch:Number(c.hold_epoch),revision:Number(c.control_revision),planningReviewPending:!!c.planning_review_pending},
@@ -430,8 +467,9 @@ export class BoundedRuntime {
         ledger.markReviewRequired(x,result?.completeness==='PARTIAL'?'PARTIAL':'UNKNOWN',result?.usage);
         throw new DurableStoreError('MODEL_REVIEW_REQUIRED');
       }
-      const row=ledger.settle(x,result.usage,!collected.timedOut&&!collected.aborted);
-      if(collected.timedOut||collected.aborted){this.#finish(ctx,'STOPPED',collected.aborted?'USER_STOP':'MODEL_TIMEOUT');return;}
+      const stopped=collected.aborted||this.#host.db.read(tx=>tx.get('SELECT status FROM recovery_invocations WHERE invocation_id=?',ctx.invocationId)?.status==='DRAINING');
+      const row=ledger.settle(x,result.usage,!collected.timedOut&&!stopped);
+      if(collected.timedOut||stopped){this.#finish(ctx,'STOPPED',stopped?'USER_STOP':'MODEL_TIMEOUT');return;}
       if(row.budget_violation){ledger.markDiscarded(x,'BUDGET_EXHAUSTED');throw new DurableStoreError('MODEL_BUDGET_EXHAUSTED');}
       let draft;
       try{draft=validateDraft(result.value);}catch{ledger.markDiscarded(x,'INVALID_RESPONSE');this.#finish(ctx,'STOPPED','PLAN_INCOMPLETE');return;}
@@ -468,7 +506,7 @@ export class BoundedRuntime {
           tx.run('INSERT INTO planning_input_requests (input_request_id,workflow_run_id,invocation_id,model_call_id,owner_id,content_digest,request_json) VALUES(?,?,?,?,?,?,?)',
             inputRequest.inputRequestId,p.workflowRunId,ctx.invocationId,x.modelCallId,inputRequest.ownerId,inputRequest.contentDigest,json);
           this.#applyPlanning(tx,ctx,x,'PlanningInputRequested',inputRequest.inputRequestId,inputRequest.contentDigest);
-          this.#finish(ctx,'STOPPED','PLAN_INCOMPLETE',false,tx);
+          this.#finish(ctx,'STOPPED','PLAN_INCOMPLETE',undefined,tx);
         });return;
       }
       const requests=draft.requests;
@@ -494,6 +532,7 @@ export class BoundedRuntime {
   }
   #applyPlanning(tx:DurableTransaction,ctx:Context,x:ModelCallIdentity,type:'PlanArtifactPublished'|'PlanningReadRequested'|'PlanningInputRequested',referenceId:string,contentDigest:string):void {
     const store=new SqliteCoordinationRunnerStore(this.#host.db,ctx.lease),s=readJournal(tx,x.workflowRunId).snapshot;
+    requireIntegrity(!ctx.abort.signal.aborted&&tx.get('SELECT status FROM recovery_invocations WHERE invocation_id=?',ctx.invocationId)?.status==='ACTIVE');
     const row=tx.get('SELECT * FROM model_call_ledger WHERE model_call_id=?',x.modelCallId)!;
     requireIntegrity(ctx.plan.operation==='PLANNING_ONLY'&&ctx.callId===x.modelCallId&&row.state==='SETTLED'&&row.application_status==='PENDING_APPLICATION'&&!row.budget_violation
       &&s.events.length===Number(row.request_cursor)+1&&s.events.at(-1)!.eventId===row.usage_event_id);
@@ -513,5 +552,5 @@ export class RecoveryContinuationCoordinator {
   inspect(planId:string,credential:unknown):ContinuationInspection {return this.database.continuationDecision(undefined,credential,{kind:'INSPECT',planId}) as ContinuationInspection;}
   startAuthorized(planId:string,credential:unknown,options:{signal?:AbortSignal}={}):Promise<ContinuationInspection> {return this.database.startContinuation(this.lease,planId,credential,options.signal);}
   requestStop(planId:string,credential:unknown):void {this.database.continuationDecision(this.lease,credential,{kind:'STOP',planId});}
-  recordReview(artifact:ArtifactRef,decision:'ACCEPTED_FOR_SCOPE'|'REJECTED'|'SUPERSEDED',credential:unknown):void {this.database.continuationDecision(this.lease,credential,{kind:'REVIEW',artifact,decision});}
+  recordReview(artifact:ArtifactRef,decision:'ACCEPTED_FOR_SCOPE'|'REJECTED'|'SUPERSEDED',credential:unknown,expectedControlRevision:number):void {this.database.continuationDecision(this.lease,credential,{kind:'REVIEW',artifact,decision,expectedControlRevision});}
 }

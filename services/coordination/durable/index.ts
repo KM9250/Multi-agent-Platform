@@ -47,6 +47,6 @@ export { PlanningCoordinator } from './planningCoordinator';
 export { createLocalPlanningReadRegistry } from './planningReadRegistry';
 export type { PlanningReadRegistry, PlanningReadResource } from './planningReadRegistry';
 export { BOUNDED_CONTRACT, DEFAULT_INVOCATION_TIMING } from './continuationTypes';
-export type { ContinuationPlanInput, ContinuationPlan, ContinuationPolicy, ContinuationInspection, PlanArtifact, ArtifactRef, PlanningInputRequest,
+export type { ContinuationPlanInput, ContinuationPlan, ContinuationPolicy, ContinuationInspection, PlanArtifact, ArtifactRef, PlanningInputRequest, PlanningReviewTarget,
   BoundedOperation, PlanningMode, PlanContent, PlanDraftResponse, BoundedProvider, BoundedProviderRegistry, ProviderCapabilities } from './continuationTypes';
 export { RecoveryContinuationReader } from './recoveryContinuationReader';

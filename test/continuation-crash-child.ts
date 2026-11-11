@@ -21,6 +21,8 @@ function install() {
    if(sql.includes("SET state='SETTLED'"))phase='usage';
    if(sql.startsWith('INSERT INTO planning_artifacts'))phase='artifact';
    if(sql.startsWith('INSERT INTO planning_input_requests'))phase='questions';
+   if(sql.startsWith('INSERT INTO planning_reviews'))phase='review';
+   if(sql.startsWith('INSERT INTO recovery_continuation_receipts')&&args.includes('STOP'))phase='stop';
    if(sql.startsWith('INSERT INTO planning_read_calls'))phase='read-intent';
    if(sql.startsWith('UPDATE planning_read_calls'))phase='read-result';
    if(sql.includes("SET state = 'DISPATCH_RESERVED'"))phase='action-intent';
@@ -62,10 +64,12 @@ if(mode==='race') {
  if(p.origin==='RECOVERY')f.api().authorize(p,f.approver);
  fs.writeFileSync(join(dir,'plan-id'),p.planId);
  f.hook(async r=>{if(boundary==='before-model-external')kill();fs.appendFileSync(counter,'model\n');if(boundary==='after-model-external')kill();
+  if(mode==='stop'){f.api().requestStop(p.planId,f.credential);throw Error('Missing STOP crash');}
   return {value:mode==='questions'?{kind:'needs_input',questions:['Which environment?','Which retention period?']}:mode==='read'&&!r.reads.length?{kind:'read_requests',requests:[{resourceId:'source',digest:f.reads.describe('source')!.digest}]}:{kind:'plan',artifact:content},usage:{llmCalls:1,inputTokens:1,outputTokens:1,estimatedCost:0},completeness:'COMPLETE'};});
  f.actionHook(async()=>{if(boundary==='before-action-external')kill();fs.appendFileSync(counter,'action\n');if(boundary==='after-action-external')kill();return {status:'succeeded',summary:'Synthetic action'};});
  if(mode==='read') {const originalRead=fs.readSync;fs.readSync=((fd,...args:any[])=>{const target=fs.readlinkSync(`/proc/self/fd/${fd}`);if(target===join(dir,'input.txt')){if(boundary==='before-read-external')kill();fs.appendFileSync(counter,'read\n');if(boundary==='after-read-external')kill();}return (originalRead as any)(fd,...args);}) as typeof fs.readSync;syncBuiltinESMExports();}
  if(mode==='rehold'){await f.api().startAuthorized(p.planId,f.credential);f.manager.release(f.lease);install();f.manager.acquire('run');}
- else {install();await f.api().startAuthorized(p.planId,f.credential);}
+ else {install();const result=await f.api().startAuthorized(p.planId,f.credential);
+  if(mode==='review')f.api().recordReview(result.artifact!,'REJECTED',f.credential,result.control.revision);}
  throw Error(`Missing crash boundary: ${boundary}`);
 }

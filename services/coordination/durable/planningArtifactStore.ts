@@ -1,7 +1,8 @@
 import type { DurableTransaction } from './db';
-import type { PlanArtifact, PlanContent, PlanDraftResponse, ArtifactRef, PlanningInputRequest } from './continuationTypes';
+import type { PlanArtifact, PlanContent, PlanDraftResponse, ArtifactRef, PlanningInputRequest, PlanningReviewTarget } from './continuationTypes';
 import { digest, jsonCopy, parseJson, requireIntegrity } from './integrity';
 import { executionJson, rejectEmbeddedCredentials } from './executionIntegrity';
+import { readWorkflowControl } from './recoveryHoldLifecycle';
 
 export function assertPlanningTextSafe(text:string):void {
   requireIntegrity(!/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\bsk-(?:proj-|live-)?[A-Za-z0-9_-]{24,}|\b(?:api[_-]?key|password|authorization)\s*[:=]\s*["']?[^\s"']{12,}|Bearer\s+[A-Za-z0-9_.-]{16,}/i.test(text));
@@ -36,6 +37,19 @@ export function readArtifact(tx:DurableTransaction, ref:ArtifactRef):PlanArtifac
   requireIntegrity(published.payload.referenceId===a.artifactId&&published.payload.contentDigest===a.contentDigest);
   assertPlanningTextSafe(executionJson(a,128*1024));rejectEmbeddedCredentials(a);
   validateDraft({kind:'plan',artifact:a.content});return a;
+}
+
+/** Single pending review, derived from immutable publication/review history in this transaction.
+ * A revision keeps its predecessor pending until the new Artifact is atomically published.
+ * Independent publications cannot start while a review is pending. Never fall back to an older Artifact.
+ */
+export function readPlanningReviewTarget(tx:DurableTransaction, workflowRunId:string):PlanningReviewTarget|undefined {
+  const c=readWorkflowControl(tx,workflowRunId);if(!c.planning_review_pending)return;
+  const r=tx.get('SELECT * FROM planning_artifacts WHERE workflow_run_id=? ORDER BY rowid DESC LIMIT 1',workflowRunId);requireIntegrity(r);
+  const a=readArtifact(tx,{artifactId:String(r.artifact_id),version:Number(r.version),contentDigest:String(r.content_digest)});
+  const review=tx.get('SELECT decision FROM planning_reviews WHERE artifact_id=? ORDER BY rowid DESC LIMIT 1',a.artifactId);
+  requireIntegrity(!review||review.decision==='ACCEPTED_FOR_SCOPE');
+  return {artifactId:a.artifactId,version:a.version,contentDigest:a.contentDigest,ownerId:a.ownerId,controlRevision:Number(c.control_revision)};
 }
 
 export function readPlanningInputRequest(tx:DurableTransaction, id:string):PlanningInputRequest {

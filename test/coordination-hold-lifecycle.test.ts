@@ -18,7 +18,7 @@ test('H01/H04/H05/H06: release is an atomic DB-only operation; subsequent genera
 });
 test('H03: completed planning review cannot be used to release or start the normal runner',async t=>{
  const f=continuationFixture(t),p=f.api().createPlan(f.input(),f.credential),r=await f.api().startAuthorized(p.planId,f.credential);
- f.api().recordReview(r.artifact!,'ACCEPTED_FOR_SCOPE',f.credential);assert.throws(()=>f.store.assertRecoveryExecution('run'));
+ f.api().recordReview(r.artifact!,'ACCEPTED_FOR_SCOPE',f.credential,r.control.revision);assert.throws(()=>f.store.assertRecoveryExecution('run'));
  assert.throws(()=>f.api().createPlan(releaseInput(),f.credential));assert.equal(f.counts.action,0);
 });
 test('H01/H03: a new safety stop after release reholds with a new epoch and preserves the original Hold',async t=>{
