@@ -130,6 +130,8 @@ Artifact採用のSnapshot再検証は固定descriptorのメタデータ検査で
 
 取得済みReadはResource ID・Digest・Revision・観測時刻とともに保持する。毎回の実Payloadを複製して固定し、入力本文・初回参照・累積Readについて現在のHost検査を予約前、Intent後の送信期限検査、親Scopeを外した外部呼出し直前に行う。`canSend` には現在の操作者・送信先・Data Classを渡し、取得時の許可を再利用しない。同じ入力集合をArtifactと質問の出所へ保存する。予約前の撤回では追加Model Debitを作らず、Intent後の撤回では送信を止めて既存の不確定予約を保持する。推測ゼロ精算や別IDへの再送は行わない。
 
+最後のHost許可検査自体が同期的に遅延したり、その中で停止要求が発生しても、期限後・停止後の送信を開始しない。検査の後で現在Lease、ACTIVE状態、受付期限・Step送信期限、単調時計の送信期限、AbortSignalを再確認してからProviderへ入る。
+
 ## Hold・互換性・責務
 
 `recovery_holds` 原本を更新・削除せず、追記専用LifecycleからControlを同一COMMITで投影する。holdEpoch、controlRevision、有効NONE/HELD/RELEASED、Active Invocation、Review Gateを持つ。投影・履歴の不一致は拒否する。通常Gate、SQL、Model/Action/Application、旧Recovery経路が同じ有効Controlを参照する。

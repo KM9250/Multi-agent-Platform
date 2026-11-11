@@ -18,10 +18,11 @@ Schemaは未マージの9を修正し、旧Migration 001〜008の生成SQLは変
 
 添付の3試験を監査基準HEADにそのまま追加して実行した結果は **3ケース、0 pass / 3 fail / skip・cancelled・todo 0**。F-01は撤回後のAを含む3回目の要求を検出、F-02は期限後の認可済みResult反映で拒否、F-03は初回結果に質問本文がないことを検出した。添付のSQL probeは独立Trigger検証であり、この実リポジトリの結果とは区別した。
 
-修正後、同じ3試験は成功。追加の境界試験を含む `coordination-pr35-audit-regressions.test.ts` は **18ケースすべて成功**。次を含む。
+修正後、同じ3試験は成功。追加の境界試験を含む `coordination-pr35-audit-regressions.test.ts` は **20ケースすべて成功**。次を含む。
 
 - Aを送った要求中に権限撤回→BのRead成功→次の要求を予約前に停止。Model Debit/Usageは2回分、Read2回、Action/prepare0。
 - Intent確定後の撤回と親Scope外の外部入口直前の撤回。外部送信せず、追加予約を保持。再照会・同じIDでの開始要求から再送しない。
+- 最後の許可検査が送信期限を超えて同期的に遅延した場合と、検査中に認証済み停止要求が入る場合も、追加Provider呼出し0。検査後にLease・ACTIVE状態・受付/送信期限・AbortSignalを再確認する。
 - 許可がある場合のRead成功と、実Payloadのメタデータ・Artifact出所の一致。
 - RESULT_RECORDEDで中断→元Application期限経過→新規4B-1承認→Task反映1件、追加Executor0回。Workflow/Action/Attempt/Result Digest/参照を変えた更新はScope内でも拒否。
 - 4B-1のCOMMIT前障害とACK喪失で、Grant・Ledger・Taskイベント・Receipt・Auditの整合を確認。
@@ -38,13 +39,15 @@ Schemaは未マージの9を修正し、旧Migration 001〜008の生成SQLは変
 
 最初の全体回帰は1,455ケース中1,451 pass / 4 fail、skip/cancelled/todo 0。`test:durable` も同じ原因で162 pass / 1 failとなった。既存の破損データ注入用SQLite接続に `map_safe_recovery_write` が未登録で、破損投入SQLのコンパイル時に失敗した。試験専用接続へ常に0（拒否）を返す5引数関数を登録し、Production Scope、Trigger、既存Assertionを変更せず対応した。関連2ファイル79ケースは修正後すべて成功。全体と失敗したDurable subsetを通常コマンドで再実行し、下表には最終結果だけを記載する。
 
+上記修正後に全体1,455ケースが成功した後、F-01で追加した最後のHost許可検査が遅延する場合・検査中に停止される場合を調べた。追加の2試験は0 pass / 2 fail、skip/cancelled/todo 0で、検査後の外部入口へ進めることを再現した。許可検査後にLease・ACTIVE状態・受付/送信期限・単調時計・AbortSignalを再確認するよう修正。同じ2試験と計画Suiteを含む72ケースがすべて成功した。追加変更を含む固定HEADで指定15コマンドを改めて一式実行し、その最終結果を下表に記載する。
+
 ## 最終一式の検証
 
-Linux 6.18.57 x86_64 / Node v24.19.0 / npm 11.9.0 / SQLite 3.53.3。実Provider・実業務Executor・実運用DBを使わない合成試験。最終一式のソース・試験HEADは `6572300843ee3dc75a5fc0a2382fd42cbd9d79a5`。以後の変更は設計・検証文書だけ。
+Linux 6.18.57 x86_64 / Node v24.19.0 / npm 11.9.0 / SQLite 3.53.3。実Provider・実業務Executor・実運用DBを使わない合成試験。最終一式のソース・試験HEADは `8d199a486c0fadc4d6c8fba6248b69bfe15cdcc7`。以後の変更は設計・検証文書だけ。
 
 | コマンド | ファイル数 | ケース数 | pass | fail | skip | cancelled | todo | Exit |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `npm test` | 70 | 1455 | 1455 | 0 | 0 | 0 | 0 | 0 |
+| `npm test` | 70 | 1457 | 1457 | 0 | 0 | 0 | 0 | 0 |
 | `npm run test:durable` | 11 | 163 | 163 | 0 | 0 | 0 | 0 | 0 |
 | `npm run test:durable-execution` | 7 | 111 | 111 | 0 | 0 | 0 | 0 | 0 |
 | `npm run test:recovery-reader` | 25 | 491 | 491 | 0 | 0 | 0 | 0 | 0 |
@@ -60,7 +63,7 @@ Linux 6.18.57 x86_64 / Node v24.19.0 / npm 11.9.0 / SQLite 3.53.3。実Provider�
 | `npm run typecheck` | — | — | — | — | — | — | — | 0 |
 | `npm run build` | — | — | — | — | — | — | — | 0 |
 
-全体は70ファイル・1,455ケース、全pass、fail/skip/cancelled/todo 0。MACPは別途9ケース成功。型検査・ビルドも成功した。
+全体は70ファイル・1,457ケース、全pass、fail/skip/cancelled/todo 0。MACPは別途9ケース成功。型検査・ビルドも成功した。
 
 各subsetはnpm testの内数であり、合算しない。MACPは固定commit `e88937d0c8132ae7d18098a24d01ee28bffda655`、既存のローカルvenvによる合成環境で成功した。既存の通常npmコマンド設定を維持し、skipの追加や既存テスト削除は行っていない。Viteの既存500 KiB超チャンク警告は残る。
 
