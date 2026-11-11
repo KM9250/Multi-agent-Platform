@@ -90,6 +90,8 @@ await execution.startAuthorized(approvedExecution.planId, operatorCredential);
 
 開始TransactionはIdentity・Role・Lease、全Plan Binding、二重Budget、Review、排他を再検証し、Grant消費・必要な単一Resume・Invocation・Control Lifecycle・Receipt・Auditを同時確定する。SQLiteの部分一意Indexにより、WorkflowごとのACTIVE/DRAININGは最大1件。Plan・Grant自身の保存やHeartbeatはBindingを失効させず、Generation、Policy、対象、Budget、Resource、Adapter版・実装変更は失効させる。
 
+PLANNING_ONLYの開始者は、OriginにかかわらずPlan作成者本人を要求する。管理者Roleだけで代理開始できない。読取りだけの再送経路でも本人を検査し、開始TransactionでもGrant消費・Resume・Invocation作成・モデル予約より前に再検査する。USER_REQUESTのplanningRoles、RECOVERYのOperator/Admin、ACL・Lease・承認の検査は別途維持する。これによりPlan作成者・Invocation本人・質問Ownerが一致する。質問Readerの所有者検査と、BOUNDED_CONTINUATION等の既存開始権限は変更しない。
+
 開始COMMITの正常returnを直接得た分岐だけが、DBインスタンスとGenerationに結び付く非公開Contextを持つ。開始ACK喪失、保存IDの再要求、別接続、別プロセス、DTO偽造から再生成しない。開始だけ確定して実行できなかったACTIVE行は診断対象として保全する。
 
 Roundは開始位置確定時、ModelはReservation、ActionはDispatch Reservation、ReadはIntentと同じTransactionで `recovery_invocation_steps` / `recovery_invocation_debits` を追記する。ModelのIntent ACKを直接確認する前に送信しない。回数枠を取消・失敗で返却しない。Usage集計は元LedgerとDebitから読み出し、独立した可変残高を正本にしない。
@@ -166,6 +168,6 @@ Provider能力はProvider/Model/Adapter版・実装Digest、Purpose、許可さ�
 
 このPRは合成Provider/Executorだけで検証する。GPT/Gemini/Claudeの本番Adapter、価格・課金・ストリーミング・opaque continuation blockの実装、Production Identity UIは未接続。既存テストAdapterを本番用として再Exportしていない。既定で利用可能なProviderはなく、必要な安全能力が不足すれば予約前に拒否する。Host Registry/ACL/Verifierは信頼境界であり、変更時は安定した版・Digest・Policy versionを更新する。
 
-Unknown Action/Usage、Crash後の未送信か送信済みかを判定できないIntent、失われた本文は4C向けに保全する。自動再送・推測精算・無制限解除は提供しない。最新の検証件数・追加認可境界は [RT-01/RT-02修正報告](coordination-pr35-redteam-corrections.md)、初回実装時の対応表は [検証報告](coordination-recovery-continuation-validation.md) を参照。
+Unknown Action/Usage、Crash後の未送信か送信済みかを判定できないIntent、失われた本文は4C向けに保全する。自動再送・推測精算・無制限解除は提供しない。最新の検証結果は [F-04修正報告](coordination-pr35-owner-binding-correction.md)、レビュー・停止の認可境界は [RT-01/RT-02修正報告](coordination-pr35-redteam-corrections.md)、初回実装時の対応表は [検証報告](coordination-recovery-continuation-validation.md) を参照。
 
 PR #35のF-01〜F-03修正と最新の検証結果は [監査修正報告](coordination-pr35-audit-corrections.md) を参照。

@@ -1,5 +1,7 @@
 # PR #35 RT-01／RT-02 追加監査修正報告
 
+本書はRT修正時点の検証記録。後続のF-04所有者契約の修正と全回帰再実行は [F-04修正報告](coordination-pr35-owner-binding-correction.md) を参照する。既存F-01〜F-03・RT-01／RT-02の契約と試験は維持している。
+
 作業開始HEADは `22f522ff58bf9a0cb02b44874b6579f424070ae8`。追補の監査対象 `995c186e123e0b96d2a072db09b6d5acf1f0c078` に続くF-01〜F-03修正を含む最新PRブランチに追加した。基準mainは `e4de47b6f5290ec566e26c6a7ffd22ae1e82ab5a`。検証日: 2026-11-11（Asia/Tokyo）。最終HEADは自己参照を避け、既存Draft PR #35本文に完全なSHAを記載する。
 
 ## 修正と契約
