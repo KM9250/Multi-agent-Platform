@@ -16,7 +16,7 @@ export interface ModelBudgetQuote {
 }
 export interface ModelCallIdentity { workflowRunId: string; modelCallId: string; attemptId: string; providerId: string; modelId: string }
 export interface ReserveModelCall extends ModelCallIdentity {
- roundKey: string; phase: 'PLAN' | 'VERIFY'; requestCursor: number; requestEventId: string; quote: ModelBudgetQuote;
+ roundKey: string; businessRoundKey?: string; phase: 'PLAN' | 'VERIFY'; requestCursor: number; requestEventId: string; quote: ModelBudgetQuote;
 }
 export type ModelCallReason = 'USAGE_UNKNOWN' | 'USAGE_PARTIAL' | 'BUDGET_VIOLATION' | 'PRE_DISPATCH_CANCELLED' | 'INVALID_RESPONSE' | 'STALE_RESPONSE' | 'ABORTED' | 'API_ERROR' | 'BUDGET_EXHAUSTED' | 'WORKFLOW_STOPPED';
 export function validateQuote(q: ModelBudgetQuote): ModelAmounts {
@@ -79,7 +79,7 @@ export class ModelCallLedger {
    tx.run(`INSERT INTO model_call_ledger (model_call_id,workflow_run_id,round_key,phase,runtime_instance_id,generation,provider_id,model_id,request_cursor,request_event_id,attempt_id,quote_json,state,completeness,reserved_calls,reserved_input,reserved_output,reserved_cost,application_status,created_at,updated_at)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'RESERVED','UNKNOWN',1,?,?,?,'NOT_APPLICABLE',?,?)`,x.modelCallId,x.workflowRunId,x.roundKey,x.phase,l.runtimeInstanceId,l.generation,x.providerId,x.modelId,x.requestCursor,x.requestEventId,x.attemptId,canonicalJson(x.quote),amounts.inputTokens,amounts.outputTokens,amounts.costMicros,now,now);
    tx.run("INSERT INTO model_call_attempts VALUES (?,?,?,?,?,1,NULL,'RESERVED','UNKNOWN',NULL)",x.attemptId,x.modelCallId,x.workflowRunId,l.runtimeInstanceId,l.generation);
-   this.store.database.participateInvocation(tx,'MODEL',x.modelCallId,amounts,x.roundKey);
+   this.store.database.participateInvocation(tx,'MODEL',x.modelCallId,amounts,x.businessRoundKey??x.roundKey);
    return this.owned(tx,x);
   });
  }

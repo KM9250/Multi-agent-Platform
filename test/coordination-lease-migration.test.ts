@@ -55,7 +55,7 @@ for (const version of [0,1,2,3] as const) test(`Migration ${version}→4 preserv
     }
   } finally { db.close(); }
   const again = new DurableDatabase({ path }); again.close();
-  assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, 8);
+  assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, 9);
 });
 test('Immutable migration boundary distinguishes genuine NULL Runtime 5C-1 audit from fenced 5C-2 changes', t => {
   const f = executionFixture(t); f.register(); const path = join(f.dir, 'legacy.sqlite'), raw = legacyV3(f, path); t.after(() => raw.close());

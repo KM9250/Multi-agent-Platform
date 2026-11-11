@@ -128,7 +128,7 @@ export class RecoveryReader {
           });
           reason = 'RECOVERY_DECISION_INTEGRITY_INVALID';
           inspection.recoveryDecisions = recoveryDecisionSummary(tx, workflowRunId);
-          const hold = tx.get('SELECT * FROM recovery_holds WHERE workflow_run_id=?', workflowRunId);
+          const hold = tx.get('SELECT * FROM recovery_effective_holds WHERE workflow_run_id=?', workflowRunId);
           const transitions = tx.all('SELECT * FROM recovery_hold_transitions WHERE workflow_run_id=? ORDER BY revision', workflowRunId);
           const operations = tx.all('SELECT * FROM recovery_execution_operations WHERE workflow_run_id=? ORDER BY committed_at,operation_id', workflowRunId);
           requireIntegrity(transitions.length === operations.length && (hold || !transitions.length));

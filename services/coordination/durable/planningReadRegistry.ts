@@ -7,8 +7,11 @@ export interface PlanningReadResource { resourceId: string; digest: string; revi
 export interface PlanningReadRegistry {
   readonly contract: 'LOCAL_PINNED_READ:1';
   describe(resourceId: string): PlanningReadResource | undefined;
+  assertCurrent(resourceId:string,digest:string,revision:string):void;
   read(resourceId: string, digest: string): { text: string; digest: string; sizeBytes: number };
 }
+const validated = new WeakSet<object>();
+export const isValidatedPlanningReadRegistry=(value:unknown):value is PlanningReadRegistry=>!!value&&typeof value==='object'&&validated.has(value);
 const hash = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
 /** Linux descriptor-relative traversal, no shell/network and no follow of symbolic links.
  * Unsupported platforms fail closed; this is not an arbitrary-code sandbox. */
@@ -22,7 +25,7 @@ export function createLocalPlanningReadRegistry(options: {
   let path='/';
   for(const part of rootParts) {path=join(path,part); const s=lstatSync(path);requireIntegrity(s.isDirectory()&&!s.isSymbolicLink());}
   const rootStat=lstatSync(root), files=new Map<string,{parts:string[]; metadata:PlanningReadResource}>();
-  const load=(parts:string[])=>{
+  const load=(parts:string[],metadataOnly=false)=>{
     const current=lstatSync(root);
     requireIntegrity(current.isDirectory()&&!current.isSymbolicLink() && current.dev===rootStat.dev && current.ino===rootStat.ino);
     const fds:number[]=[];
@@ -33,6 +36,7 @@ export function createLocalPlanningReadRegistry(options: {
         fd=openSync(`/proc/self/fd/${fd}/${parts[i]}`,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK|(i<parts.length-1?constants.O_DIRECTORY:0));fds.push(fd);
       }
       const before=fstatSync(fd,{bigint:true});requireIntegrity(before.isFile() && before.size<=BigInt(limit) && before.nlink===1n);
+      if(metadataOnly)return {text:'',digest:'',sizeBytes:Number(before.size),revision:[before.dev,before.ino,before.mtimeNs,before.ctimeNs,before.size].join(':')};
       const buffer=Buffer.alloc(Number(before.size)+1);let size=0,n:number;
       while(size<buffer.length && (n=readSync(fd,buffer,size,buffer.length-size,null))>0) size+=n;
       const after=fstatSync(fd,{bigint:true});
@@ -50,10 +54,12 @@ export function createLocalPlanningReadRegistry(options: {
     const rel=relative(root,resolve(root,file));requireIntegrity(rel!==''&&!rel.startsWith('..')&&!isAbsolute(rel));
     const read=load(parts);files.set(id,{parts,metadata:{resourceId:id,digest:read.digest,revision:read.revision,sizeBytes:read.sizeBytes,rootId:options.rootId}});
   }
-  return Object.freeze({contract:'LOCAL_PINNED_READ:1' as const,
+  const registry=Object.freeze({contract:'LOCAL_PINNED_READ:1' as const,
     describe(id:string){const r=files.get(id);return r&&structuredClone(r.metadata);},
+    assertCurrent(id:string,expected:string,revision:string){const r=files.get(id);if(!r||r.metadata.digest!==expected||r.metadata.revision!==revision||load(r.parts,true).revision!==revision)throw new DurableStoreError('PLANNING_READ_DENIED');},
     read(id:string,expected:string){const r=files.get(id);if(!r||r.metadata.digest!==expected)throw new DurableStoreError('PLANNING_READ_DENIED');
       const x=load(r.parts);if(x.digest!==expected||x.revision!==r.metadata.revision)throw new DurableStoreError('PLANNING_READ_DENIED');
       return {text:x.text,digest:x.digest,sizeBytes:x.sizeBytes};},
   });
+  validated.add(registry);return registry;
 }

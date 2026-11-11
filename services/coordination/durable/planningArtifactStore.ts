@@ -3,10 +3,13 @@ import type { PlanArtifact, PlanContent, PlanDraftResponse, ArtifactRef } from '
 import { digest, jsonCopy, parseJson, requireIntegrity } from './integrity';
 import { executionJson, rejectEmbeddedCredentials } from './executionIntegrity';
 
+export function assertPlanningTextSafe(text:string):void {
+  requireIntegrity(!/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\bsk-(?:proj-|live-)?[A-Za-z0-9_-]{24,}|\b(?:api[_-]?key|password|authorization)\s*[:=]\s*["']?[^\s"']{12,}|Bearer\s+[A-Za-z0-9_.-]{16,}/i.test(text));
+}
 const textFields=['objective','conclusion','rationale','impact'] as const;
 const listFields=['steps','assumptions','alternatives','risks','unknowns','requiredApprovals','changeTargets','validation','notPerformed'] as const;
 export function validateDraft(input: unknown): PlanDraftResponse {
-  executionJson(input,96*1024);rejectEmbeddedCredentials(input);
+  assertPlanningTextSafe(executionJson(input,96*1024));rejectEmbeddedCredentials(input);
   const r=jsonCopy(input) as PlanDraftResponse; requireIntegrity(r&&typeof r==='object');
   if(r.kind==='plan') {
     requireIntegrity(Object.keys(r).every(k=>['kind','artifact'].includes(k)));
@@ -25,6 +28,12 @@ export function readArtifact(tx:DurableTransaction, ref:ArtifactRef):PlanArtifac
   const a=parseJson<PlanArtifact>(r.artifact_json);
   requireIntegrity(a.artifactId===ref.artifactId && a.version===ref.version && a.contentDigest===ref.contentDigest
     && r.content_digest===a.contentDigest && digest(a.content)===a.contentDigest && r.workflow_run_id===a.workflowRunId
-    && r.model_call_id===a.modelCallId && r.owner_id===a.ownerId);
+    && r.model_call_id===a.modelCallId && r.owner_id===a.ownerId && r.version===a.version && r.invocation_id===a.invocationId);
+  const call=tx.get('SELECT * FROM model_call_ledger WHERE workflow_run_id=? AND model_call_id=?',a.workflowRunId,a.modelCallId);
+  const event=call&&tx.get('SELECT payload,event_type FROM journal_events WHERE workflow_run_id=? AND event_id=?',a.workflowRunId,call.application_event_id);
+  requireIntegrity(call?.application_status==='APPLIED'&&event?.event_type==='PlanArtifactPublished');
+  const published=parseJson<{payload:{referenceId:string;contentDigest:string}}>(event.payload);
+  requireIntegrity(published.payload.referenceId===a.artifactId&&published.payload.contentDigest===a.contentDigest);
+  assertPlanningTextSafe(executionJson(a,128*1024));rejectEmbeddedCredentials(a);
   validateDraft({kind:'plan',artifact:a.content});return a;
 }

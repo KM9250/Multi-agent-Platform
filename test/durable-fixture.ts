@@ -15,7 +15,9 @@ export function fixture(t: TestContext, seed = fresh()) {
   t.after(() => { for (const c of connections.reverse()) c.close(); rmSync(dir, { recursive: true, force: true }); });
   let lease: import('../services/coordination/durable/runtimeLease.ts').WorkflowLease | undefined;
   const open = () => { const db = new DurableDatabase({ path }); connections.push(db); return { db, store: new SqliteCoordinationRunnerStore(db, lease) }; };
-  const raw = () => { const db = new DatabaseSync(path); connections.push(db); return db; };
+  const raw = () => { const db = new DatabaseSync(path);
+    // Read-only negative predicate lets corruption fixtures compile v9 guards; it grants no bounded scope.
+    db.function('map_bounded_write',(_workflow,_table,_op,_target,_detail)=>0);connections.push(db); return db; };
   const current = open(); current.store.createWorkflow(seed);
   const manager = createRuntimeLeaseManager(current.db);
   lease = manager.acquire(seed.run.runId);

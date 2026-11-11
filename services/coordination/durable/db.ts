@@ -1,6 +1,6 @@
 import { BoundedRuntime } from './recoveryContinuationCoordinator';
 import type { BoundedRuntimeOptions } from './recoveryContinuationCoordinator';
-import type { ContinuationCommand, ContinuationPlan } from './continuationTypes';
+import type { ContinuationCommand, ContinuationPlan, ContinuationPlanInput } from './continuationTypes';
 import type { RunnerExecutorRegistry } from '../runner/types';
 import { DatabaseSync } from 'node:sqlite';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -110,7 +110,7 @@ export class DurableDatabase {
   readonly #dispatchEvidence = new AsyncLocalStorage<DispatchSink>();
   #timeAnchor = { wall: Date.now(), monotonic: performance.now() };
   constructor(options: DurableDatabaseOptions) {
-    const observedBindings = new Map<string,{executor:object;execute:unknown}>();
+    const observedBindings = new Map<string,{executor:object;execute:unknown;prepare:unknown}>();
     const registryGet = options.controlledExecutors?.get.bind(options.controlledExecutors);
     this.#controlledExecutors = registryGet
       ? Object.freeze({get: (id:string) => {
@@ -118,12 +118,15 @@ export class DurableDatabase {
         if (binding) {
           const key = canonicalJson([id,binding.contractVersion,binding.implementationDigest]);
           const prior = observedBindings.get(key);
-          requireIntegrity(!prior || prior.executor === binding.executor && prior.execute === binding.executor.execute);
-          observedBindings.set(key,{executor:binding.executor,execute:binding.executor.execute});
+          requireIntegrity(!prior || prior.executor === binding.executor && prior.execute === binding.executor.execute && prior.prepare === binding.executor.prepare);
+          observedBindings.set(key,{executor:binding.executor,execute:binding.executor.execute,prepare:binding.executor.prepare});
         }
         return binding;
       }}) : undefined;
-    this.#bounded = new BoundedRuntime({db:this,verifier:options.recoveryIdentityVerifier,write:(lease,fn)=>this.#writeFenced(lease,lease.workflowRunId,fn)},options.bounded);
+    this.#bounded = new BoundedRuntime({db:this,verifier:options.recoveryIdentityVerifier,executorBinding:input=>(input.actions??[]).map(a=>{
+      const b=this.#controlledExecutors?.get(a.executorId);requireIntegrity(b&&b.sideEffectRetries==='disabled');
+      return {executorId:a.executorId,contractVersion:b.contractVersion,implementationDigest:b.implementationDigest};
+    }),write:(lease,fn)=>this.#writeFenced(lease,lease.workflowRunId,fn)},options.bounded);
     this.#controlledTiming = controlledTiming(options.controlledTiming);
     this.#recoveryVerifier = options.recoveryIdentityVerifier
       ? Object.freeze({ verify: options.recoveryIdentityVerifier.verify.bind(options.recoveryIdentityVerifier) }) : undefined;
@@ -221,12 +224,16 @@ export class DurableDatabase {
       this.#safeRecovery = undefined; this.#safeRecoveryCommand = false;
       this.#controlledScope = undefined; this.#controlledCommand = false; }
   }
+  previewContinuation(input:ContinuationPlanInput,credential:unknown) {return this.#bounded.preview(input,credential);}
   continuationDecision(lease: WorkflowLease | undefined, credential: unknown, command: ContinuationCommand): unknown {
     return this.#bounded.command(lease,credential,command);
   }
   startContinuation(lease:WorkflowLease|undefined,planId:string,credential:unknown,signal?:AbortSignal) {
     return this.#bounded.start(lease,planId,credential,signal);
   }
+  validateInvocationAction(action:import('../runner/types').PreparedRunnerAction):void {this.#bounded.validateAction(action);}
+  putBoundedEvidence(owner:EvidenceOwner,evidence:RunnerEvidence):string|undefined {return this.#bounded.putEvidence(owner,evidence);}
+  collectInvocationModel<T>(invoke:()=>Promise<T>,signal?:AbortSignal) {return this.#bounded.collectModel(invoke,signal);}
   get boundedInvocationActive(): boolean { return this.#bounded.active; }
   outsideInvocation<T>(fn:()=>T):T { return this.#bounded.withoutAuthority(fn); }
   participateInvocation(tx:DurableTransaction,kind:'MODEL'|'ACTION',target:string,amounts:{inputTokens:number;outputTokens:number;costMicros:number},roundKey?:string):void {
@@ -237,7 +244,7 @@ export class DurableDatabase {
     return {get:(id:string)=>{
       const binding=this.#controlledExecutors?.get(id); if(!binding)return;
       requireIntegrity(binding.sideEffectRetries==='disabled');
-      return {id,prepare:proposal=>this.outsideInvocation(()=>binding.executor.prepare(proposal)),
+      return {id,prepare:proposal=>this.outsideInvocation(async()=>jsonCopy(await binding.executor.prepare(proposal))),
         execute:(action,context)=>this.#bounded.executeAction(binding.executor.execute.bind(binding.executor),action,context)};
     }};
   }
@@ -461,7 +468,7 @@ export class DurableDatabase {
         if (!(error instanceof DurableStoreError) || ['DATABASE_ERROR','DATABASE_BUSY'].includes(error.code)) throw error;
         reason = 'INTEGRITY_UNVERIFIED' as const;
       }
-      const control = tx.get('SELECT active_invocation_id,planning_review_pending FROM recovery_workflow_control WHERE workflow_run_id=?',id);
+      const control = tx.get('SELECT hold_state,active_invocation_id,planning_review_pending FROM recovery_workflow_control WHERE workflow_run_id=?',id);
       if (control?.active_invocation_id || control?.planning_review_pending) return reason;
       if (reason && !tx.get('SELECT workflow_run_id FROM recovery_holds WHERE workflow_run_id=?', id)) {
         this.#recoveryIntent = { workflowRunId: id, kind: 'HOLD', id };
@@ -470,6 +477,10 @@ export class DurableDatabase {
         tx.run(`INSERT INTO runtime_audit_events (audit_event_id,workflow_run_id,event_kind,entity_kind,entity_id,
           recovery_hold_revision,next_state,reason_code,occurred_at,recorded_at,schema_version,runtime_instance_id,runtime_generation)
           VALUES (lower(hex(randomblob(16))),?,'RECOVERY_HOLD_CREATED','WORKFLOW',?,1,'HELD',?,?,?,1,?,?)`, id, id, reason, now, now, lease!.runtimeInstanceId, lease!.generation);
+      }
+      if(reason && control?.hold_state==='RELEASED') {
+        this.#recoveryIntent={workflowRunId:id,kind:'HOLD',id};
+        tx.run("INSERT INTO recovery_hold_lifecycle SELECT NULL,workflow_run_id,hold_epoch+1,control_revision+1,'HELD',NULL,planning_review_pending,'GATE_REHOLD',?,? FROM recovery_workflow_control WHERE workflow_run_id=?",lease!.generation,recoveryTime(tx),id);
       }
       return reason;
     });
@@ -563,7 +574,8 @@ export class DurableDatabase {
     requireIntegrity(scope.phase === 'PLAN' && sessions.length === 1 && tasks.length === 1 && actions.length === 1);
     const action = actions[0], session = sessions[0], task = tasks[0];
     const sessionPayload = session.payload as { sessionId: string; contextRef: string }, taskPayload = task.payload as { taskId: string; sessionId: string };
-    requireIntegrity(action.round_key === `map.runner.v1:${scope.roundKey}` && sessionPayload.contextRef === action.round_key
+    const businessRoundKey = scope.tx.get("SELECT business_round_key FROM recovery_invocation_steps WHERE workflow_run_id=? AND kind='MODEL' AND target_id=?",scope.identity.workflowRunId,scope.identity.modelCallId)?.business_round_key ?? scope.roundKey;
+    requireIntegrity(action.round_key === `map.runner.v1:${businessRoundKey}` && sessionPayload.contextRef === action.round_key
       && session.sessionId === action.session_id && sessionPayload.sessionId === action.session_id
       && task.sessionId === action.session_id && taskPayload.sessionId === action.session_id && taskPayload.taskId === action.task_id);
     requireIntegrity(scope.tx.get(`SELECT action_id FROM execution_ledger WHERE workflow_run_id=? AND action_id=?
@@ -648,7 +660,7 @@ export class DurableDatabase {
   }
   #registerFencingFunctions(): void {
     this.#db.function('map_bounded_write', (workflow, table, op, target, detail) =>
-      (table === 'recovery_invocations' && op === 'UPDATE' && this.#context?.kind === 'management' && this.#context.workflowRunId === workflow) || this.#bounded.allows(workflow,table,op,target,detail) ? 1 : 0);
+      ((table === 'recovery_invocations' && op === 'UPDATE' || table === 'bounded_audit' && op === 'INSERT') && this.#context?.kind === 'management' && this.#context.workflowRunId === workflow) || this.#bounded.allows(workflow,table,op,target,detail) ? 1 : 0);
     this.#db.function('map_bounded_event', (workflow,type,payload)=>this.#bounded.eventAllowed(workflow,type,payload)?1:0);
     this.#db.function('map_bounded_legacy_binding', (workflow, table, plan) => {
       if (this.#context?.kind !== 'lease' || this.#context.record.handle.workflowRunId !== workflow) return 0;

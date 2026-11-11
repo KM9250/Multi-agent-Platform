@@ -29,10 +29,11 @@ export interface ArtifactRef { artifactId: string; version: number; contentDiges
 export type ContinuationPlanInput = BoundedOperation & {
   workflowRunId: string; requestId: string; limits: InvocationLimits;
   start?: 'NEW_ROUND' | 'RESUME_PREPARED' | 'VERIFY_FINALIZED_RESULT'; taskId?: string; actionId?: string;
-  providerId?: string; modelId?: string; reasoning?: Record<string, string | number | boolean>;
+  providerId?: string; modelId?: string; requestSummary?: boolean; reasoning?: Record<string, string | number | boolean>;
   input?: { text: string; snapshots: InputSnapshot[]; dataClass: string; destination: string };
+  actions?: Array<{executorId:string;operation:string;actionClass:string;payloadDigest:string}>;
   resources?: string[]; artifact?: ArtifactRef; previousArtifact?: ArtifactRef;
-  resume?: { reason: string; approvalRef?: string; securityReviewRef?: string; evidenceReviewRef?: string };
+  resume?: import('../types').WorkflowResumePayload;
 };
 export type ContinuationPlan = ContinuationPlanInput & {
   planId: string; contract: typeof BOUNDED_CONTRACT; planDigest: string; createdBy: string;
@@ -45,6 +46,8 @@ export interface ContinuationPolicy {
   releaseApprovals: { minimumApprovers: number; forbidSelfApproval: boolean };
   canAccess(identity: VerifiedRecoveryIdentity, workflowRunId: string, operation: 'VIEW' | 'PLAN' | 'EXECUTE'): boolean;
   canSend(identity: VerifiedRecoveryIdentity, snapshot: InputSnapshot, destination: string, dataClass: string): boolean;
+  /** Required to adopt a non-local immutable snapshot for execution. Absent means unsupported. */
+  isSnapshotCurrent?(snapshot:InputSnapshot):boolean;
   storeReasoningSummary: boolean;
   /** Additional host-specific secret/data classification filter. */
   inspectContent(text: string, dataClass: string): boolean;
@@ -52,7 +55,7 @@ export interface ContinuationPolicy {
 }
 export interface ProviderCapabilities {
   providerId: string; modelId: string; adapterVersion: string; implementationDigest: string;
-  purposes: Array<'DRAFT_PLAN' | 'PLAN' | 'VERIFY'>; reasoningKeys: string[];
+  purposes: Array<'DRAFT_PLAN' | 'PLAN' | 'VERIFY'>; reasoningKeys: string[]; reasoningValues?:Record<string,Array<string|number|boolean>>;
   summary: boolean; completeUsage: boolean; outputIncludesReasoning: boolean;
   retry: 'disabled'; tools: 'disabled'; dataClasses: string[]; destinations: string[];
   quote: Omit<ModelBudgetQuote, 'requestDigest' | 'maxAttempts'>;
@@ -88,7 +91,7 @@ export interface PlanArtifact extends ArtifactRef {
   modelCallId: string; mode: PlanningMode; previousArtifact?: ArtifactRef; content: PlanContent;
   providerId: string; modelId: string; adapterVersion: string; reasoning: Record<string, string | number | boolean>;
   snapshots: InputSnapshot[]; summary: { state: SummaryState; text?: string; source: 'PROVIDER_SUMMARY' };
-  completeness: 'COMPLETE'; dataClass: string; createdAt: number;
+  completeness: 'COMPLETE'; dataClass: string; createdAt: number; basisDigest: string;
 }
 export type InvocationStatus = 'ACTIVE' | 'DRAINING' | 'COMPLETED' | 'STOPPED' | 'REVIEW_REQUIRED';
 export interface ContinuationInspection {
@@ -96,6 +99,9 @@ export interface ContinuationInspection {
   artifact?: PlanArtifact; control: { holdState: string; holdEpoch: number; revision: number; planningReviewPending: boolean };
   counts: { rounds: number; modelCalls: number; actionDispatches: number; readCalls: number };
   usage: { committed: { inputTokens: number; outputTokens: number; costMicros: number }; outstanding: { inputTokens: number; outputTokens: number; costMicros: number } };
+  remaining: { rounds:number;modelCalls:number;actionDispatches:number;readCalls:number };
+  performed: { businessActionDispatches:number;localReadCalls:number;modelCalls:number;internalPersistence:true };
+  review: { state:'UNREVIEWED'|'ACCEPTED_FOR_SCOPE'|'REJECTED'|'SUPERSEDED'|'STALE';executionAuthorizationRequired:true };
   executionAllowed: false;
 }
 export type ContinuationCommand =

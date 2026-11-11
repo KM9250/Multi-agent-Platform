@@ -1,3 +1,4 @@
+import { assertControlledBudget } from './controlledRecoveryPlanner';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import type { DurableDatabase, DurableTransaction, Row } from './db';
@@ -7,13 +8,13 @@ import type { ContinuationCommand, ContinuationPlan, ContinuationPlanInput, Cont
   BoundedProviderRegistry, BoundedProvider, InvocationTiming, PlanArtifact, ArtifactRef, PlanningProviderResponse } from './continuationTypes';
 import { BOUNDED_CONTRACT } from './continuationTypes';
 import { verifyRecoveryIdentity } from './recoveryAuthorization';
-import { boundedTiming, validateContinuationInput, planBinding, readContinuationPlan, executionState, validateProvider } from './recoveryContinuationPlanner';
+import { boundedTiming, validateContinuationInput, planBinding, readContinuationPlan, executionState, artifactBasis, validateProvider, assertArtifactReferences, continuationPolicyBinding } from './recoveryContinuationPlanner';
 import { canonicalJson, digest, DurableStoreError, jsonCopy, requireIntegrity } from './integrity';
 import { recoveryTime } from './recoveryPlanner';
 import { readWorkflowControl } from './recoveryHoldLifecycle';
 import { readJournal } from './restore';
 import { SqliteCoordinationRunnerStore } from './durableCoordinationStore';
-import { readArtifact, validateDraft } from './planningArtifactStore';
+import { readArtifact, validateDraft, assertPlanningTextSafe } from './planningArtifactStore';
 import type { PlanningReadRegistry } from './planningReadRegistry';
 import { ModelCallLedger, modelBudgetPosition } from './modelCallLedger';
 import type { ModelCallIdentity } from './modelCallLedger';
@@ -32,11 +33,12 @@ export interface BoundedRuntimeOptions {
 }
 interface Context {
   plan: ContinuationPlan; invocationId: string; lease: WorkflowLease; actor: VerifiedRecoveryIdentity;
-  phase: 'RUNNER'|'MODEL'|'APPLICATION'|'READ'|'FINISH'; callId?: string; roundKey?: string;
+  phase: 'RUNNER'|'MODEL'|'APPLICATION'|'READ'|'FINISH'|'EVIDENCE'; callId?: string; roundKey?: string; roundStepId?:string;
   valid: boolean; abort: AbortController;
 }
 interface Host {
   db: DurableDatabase; verifier?: RecoveryIdentityVerifier;
+  executorBinding(input:ContinuationPlanInput):unknown;
   write<T>(lease:WorkflowLease,fn:(tx:DurableTransaction)=>T):T;
 }
 /** Constructed only inside DurableDatabase. No authority-bearing method accepts caller SQL/callbacks. */
@@ -44,8 +46,9 @@ export class BoundedRuntime {
   readonly #host:Host; readonly #options:BoundedRuntimeOptions; readonly #timing:InvocationTiming;
   readonly #contexts=new AsyncLocalStorage<Context|undefined>();
   #management=false; #tx?:DurableTransaction; #inTransaction?:Context; #resume=false;
-  readonly #observed=new Map<string,{provider:BoundedProvider;draft:unknown;runner:unknown}>();
+  readonly #observed=new Map<string,{provider:BoundedProvider;draft:unknown;runner:unknown;plan:unknown;verify:unknown}>();
   readonly #active=new Map<string,Context>();
+  readonly #evidence=new AsyncLocalStorage<{context:Context;owner:import('./evidenceStore').EvidenceOwner;deadline:number;valid:boolean}>();
   constructor(host:Host,options:BoundedRuntimeOptions={}) {
     this.#host=host;this.#options=options;this.#timing=boundedTiming(options.timing);
     const p=options.policy;
@@ -66,8 +69,8 @@ export class BoundedRuntime {
     if(p.operation==='RELEASE_RECOVERY_HOLD')return;
     const b=this.withoutAuthority(()=>this.#options.providers?.get(p.providerId!,p.modelId!));validateProvider(b,p);
     const key=digest(b!.capabilities),old=this.#observed.get(key);
-    requireIntegrity(!old||old.provider===b&&old.draft===b!.draftPlan&&old.runner===b!.runner);
-    this.#observed.set(key,{provider:b!,draft:b!.draftPlan,runner:b!.runner});return b;
+    requireIntegrity(!old||old.provider===b&&old.draft===b!.draftPlan&&old.runner===b!.runner&&old.plan===b!.runner?.plan&&old.verify===b!.runner?.verify);
+    this.#observed.set(key,{provider:b!,draft:b!.draftPlan,runner:b!.runner,plan:b!.runner?.plan,verify:b!.runner?.verify});return b;
   }
   #write<T>(lease:WorkflowLease,fn:(tx:DurableTransaction)=>T):T {
     requireIntegrity(!this.#management);this.#management=true;
@@ -80,7 +83,7 @@ export class BoundedRuntime {
     const row=tx.get('SELECT * FROM recovery_invocations WHERE invocation_id=?',c.invocationId);
     requireIntegrity(row&&row.generation===c.lease.generation&&row.runtime_instance_id===c.lease.runtimeInstanceId);
     if(!['ACTIVE','DRAINING'].includes(String(row.status)))throw new DurableStoreError('CONTINUATION_STATE_CHANGED');
-    if(recoveryTime(tx)>=Number(row.collection_deadline))throw new DurableStoreError('CONTINUATION_EXPIRED');
+    if(c.phase!=='FINISH'&&recoveryTime(tx)>=Number(row.collection_deadline))throw new DurableStoreError('CONTINUATION_EXPIRED');
     if(row.expected_state!==executionState(tx,id))throw new DurableStoreError('CONTINUATION_STATE_CHANGED');
     requireIntegrity(readWorkflowControl(tx,id).active_invocation_id===c.invocationId);
   }
@@ -100,11 +103,13 @@ export class BoundedRuntime {
     const c=this.#inTransaction;
     if(!c?.valid||c.plan.workflowRunId!==workflow)return false;
     if(table==='resume')return false;
-    if(['recovery_invocations','recovery_invocation_steps','recovery_invocation_debits','bounded_audit','recovery_continuation_receipts','recovery_hold_lifecycle'].includes(table))return true;
+    if(c.phase==='FINISH')return ['recovery_invocations','recovery_continuation_receipts','recovery_hold_lifecycle','bounded_audit'].includes(table);
+    if(c.phase==='EVIDENCE')return ['runner_evidence','recovery_invocations','bounded_audit'].includes(table);
+    if(['recovery_invocations','recovery_invocation_steps','recovery_invocation_debits','recovery_model_lineage','bounded_audit','recovery_continuation_receipts','recovery_hold_lifecycle'].includes(table))return true;
     if(['model_call_ledger','model_call_attempts','workflow_seeds'].includes(table))return true;
     if(table==='journal_events')return true; // Exact event and target validation is in the additional event guard.
     if(table==='planning_application')return c.plan.operation==='PLANNING_ONLY'&&c.phase==='APPLICATION';
-    if(table==='planning_artifacts')return c.plan.operation==='PLANNING_ONLY'&&c.phase==='APPLICATION';
+    if(table==='planning_artifacts'||table==='planning_reviews')return c.plan.operation==='PLANNING_ONLY'&&c.phase==='APPLICATION';
     if(table==='planning_read_calls')return c.plan.mode==='PLAN_READ_ONLY'&&c.phase==='READ';
     return c.plan.operation==='BOUNDED_CONTINUATION'&&c.phase==='RUNNER'
       &&['pending_actions','execution_ledger','execution_results','runner_evidence'].includes(table);
@@ -114,6 +119,7 @@ export class BoundedRuntime {
     if(this.#management)return this.#resume&&eventType==='WorkflowResumed';
     if(!c?.valid||c.plan.workflowRunId!==workflow)return false;
     if(eventType==='UsageRecorded')return true;
+    if(!this.#policy().canAccess(c.actor,c.plan.workflowRunId,'EXECUTE')||digest(continuationPolicyBinding(this.#policy()))!==digest(c.plan.binding.policy))return false;
     if(c.plan.operation==='PLANNING_ONLY')return c.phase==='APPLICATION'&&['PlanArtifactPublished','PlanningReadRequested','PlanningInputRequested'].includes(String(eventType));
     return c.phase==='RUNNER'&&!['WorkflowRunCreated','WorkflowResumed','PlanArtifactPublished','PlanningReadRequested','PlanningInputRequested'].includes(String(eventType));
   }
@@ -127,14 +133,62 @@ export class BoundedRuntime {
   }
   businessApplicationAllowed(tx:DurableTransaction,id:string,callId:string):boolean {
     const c=this.#contexts.getStore();
-    return !!c?.valid && c.plan.operation==='BOUNDED_CONTINUATION' && c.plan.workflowRunId===id && c.callId===callId;
+    return !!c?.valid && c.plan.operation==='BOUNDED_CONTINUATION' && c.plan.workflowRunId===id && c.callId===callId&&this.#policy().canAccess(c.actor,id,'EXECUTE')&&digest(continuationPolicyBinding(this.#policy()))===digest(c.plan.binding.policy);
+  }
+  validateAction(action:import('../runner/types').PreparedRunnerAction):void {
+    const c=this.#contexts.getStore();if(!c)return;
+    requireIntegrity(c.valid&&c.plan.operation==='BOUNDED_CONTINUATION'&&c.plan.actions?.some(r=>r.executorId===action.executorId&&r.operation===action.operation&&r.actionClass===action.actionClass&&r.payloadDigest===digest(action.payload)));
+    requireIntegrity(digest(this.withoutAuthority(()=>this.#host.executorBinding(c.plan)))===digest(c.plan.binding.executors));
+    const check=(tx:DurableTransaction)=>{requireIntegrity(this.#policy().canAccess(c.actor,c.plan.workflowRunId,'EXECUTE'));assertArtifactReferences(tx,c.plan,this.#policy(),this.#options.reads);const owned=tx.get("SELECT step_id FROM recovery_invocation_steps WHERE invocation_id=? AND kind='ACTION' AND target_id=?",c.invocationId,action.actionId);
+      if(!owned&&Number(tx.get("SELECT count(*) n FROM recovery_invocation_debits WHERE invocation_id=? AND kind='ACTION'",c.invocationId)!.n)>=c.plan.limits.maxActionDispatches)throw new DurableStoreError('CONTINUATION_LIMIT');};
+    if(this.#tx)check(this.#tx);else this.#host.db.read(check);
   }
   async executeAction(execute:import('../runner/types').RunnerActionExecutor['execute'],action:import('../runner/types').PreparedRunnerAction,context:import('../runner/types').RunnerExecutionContext) {
     const c=this.#contexts.getStore();requireIntegrity(c?.valid&&c.plan.operation==='BOUNDED_CONTINUATION');
+    this.validateAction(action);this.dispatchDeadline('ACTION',action.actionId);
     const row=this.#host.db.read(tx=>tx.get("SELECT * FROM recovery_invocation_steps WHERE invocation_id=? AND kind='ACTION' AND target_id=?",c.invocationId,action.actionId));requireIntegrity(row);
-    const value=await collectBoundedResponse(signal=>this.withoutAuthority(()=>execute(action,{...context,signal})),c.plan.timing.actionTimeoutMs,c.plan.timing.collectionGraceMs,context.signal);
+    const remaining=Math.max(1,Number(row.execution_deadline)-this.#host.db.read(recoveryTime));
+    const sink={context:c,owner:{workflowRunId:context.workflowRunId,sessionId:context.sessionId,taskId:context.taskId,actionId:action.actionId},deadline:performance.now()+remaining,valid:true};
+    let value;
+    try {value=await collectBoundedResponse(signal=>this.#evidence.run(sink,()=>this.withoutAuthority(async()=>jsonCopy(await execute(action,{...context,signal})))),remaining,c.plan.timing.collectionGraceMs,context.signal);}
+    finally {sink.valid=false;}
     if(value.timedOut||value.aborted||!value.value)return {status:'uncertain' as const,summary:'Bounded action outcome is unknown.',errorCode:'RUNNER_EXECUTOR_OUTCOME_UNKNOWN'};
     return value.value;
+  }
+  collectModel<T>(invoke:()=>Promise<T>,signal?:AbortSignal) {
+    const c=this.#contexts.getStore();requireIntegrity(c?.valid);
+    const remaining=this.dispatchDeadline('MODEL',c.callId!);
+    return collectBoundedResponse(()=>this.withoutAuthority(async()=>{try{return jsonCopy(await invoke());}catch(error){throw jsonCopy(error??{});}}),remaining,c.plan.timing.collectionGraceMs,signal);
+  }
+  dispatchDeadline(kind:'MODEL'|'ACTION'|'READ',target:string):number {
+    const c=this.#contexts.getStore();requireIntegrity(c?.valid&&!c.abort.signal.aborted);
+    requireIntegrity(this.#policy().canAccess(c.actor,c.plan.workflowRunId,'EXECUTE'));
+    this.#checkData(c.actor,c.plan);requireIntegrity(digest(continuationPolicyBinding(this.#policy()))===digest(c.plan.binding.policy));
+    if(c.plan.operation!=='RELEASE_RECOVERY_HOLD')requireIntegrity(digest(validateProvider(this.#provider(c.plan),c.plan))===digest(c.plan.binding.provider));
+    return this.#host.db.read(tx=>{
+      const i=tx.get('SELECT * FROM recovery_invocations WHERE invocation_id=?',c.invocationId);
+      const step=tx.get('SELECT * FROM recovery_invocation_steps WHERE invocation_id=? AND kind=? AND target_id=?',c.invocationId,kind,target);
+      const now=recoveryTime(tx);requireIntegrity(i&&step&&i.status==='ACTIVE'&&i.expected_state===executionState(tx,c.plan.workflowRunId));
+      if(now>=Number(i.admission_deadline)||now>=Number(step.execution_deadline))throw new DurableStoreError('CONTINUATION_EXPIRED');
+      assertArtifactReferences(tx,c.plan,this.#policy(),this.#options.reads);
+      return Number(step.execution_deadline)-now;
+    });
+  }
+  putEvidence(owner:import('./evidenceStore').EvidenceOwner,evidence:import('../runner/types').RunnerEvidence):string|undefined {
+    const sink=this.#evidence.getStore();if(!sink)return;
+    requireIntegrity(sink.valid&&sink.context.valid&&canonicalJson(owner)===canonicalJson(sink.owner)&&performance.now()<sink.deadline);
+    const json=executionJson(evidence,1024*1024);rejectEmbeddedCredentials(evidence);
+    requireIntegrity(typeof evidence.kind==='string'&&!!evidence.kind.trim()&&Number.isFinite(evidence.createdAt)&&evidence.createdAt>=0);
+    const ref=`map.runner.evidence.v1:${randomUUID()}`;
+    return this.#contexts.run({...sink.context,phase:'EVIDENCE'},()=>this.#host.write(sink.context.lease,tx=>{
+      requireIntegrity(performance.now()<sink.deadline);
+      const r=tx.get('SELECT * FROM execution_ledger WHERE workflow_run_id=? AND action_id=?',owner.workflowRunId,owner.actionId);
+      requireIntegrity(r&&r.state==='DISPATCH_RESERVED'&&r.session_id===owner.sessionId&&r.task_id===owner.taskId);
+      const previous=tx.all('SELECT length(CAST(content_json AS BLOB)) AS n FROM runner_evidence WHERE workflow_run_id=? AND action_id=?',owner.workflowRunId,owner.actionId);
+      requireIntegrity(previous.length<15&&previous.reduce((n,r)=>n+Number(r.n),0)+Buffer.byteLength(json)<=768*1024);
+      tx.run('INSERT INTO runner_evidence VALUES(?,?,?,?,?,?,?,?,?,1)',ref,owner.workflowRunId,owner.sessionId,owner.taskId,owner.actionId,evidence.kind,json,digest(evidence),evidence.createdAt);
+      requireIntegrity(performance.now()<sink.deadline);return ref;
+    }));
   }
   #lifecycle(tx:DurableTransaction,id:string,change:{hold?:string;active?:string|null;review?:boolean},reason:string,generation:number):void {
     const c=readWorkflowControl(tx,id);
@@ -146,7 +200,14 @@ export class BoundedRuntime {
   }
   #checkData(who:VerifiedRecoveryIdentity,p:ContinuationPlanInput):void {
     const policy=this.#policy();
-    if(p.input){requireIntegrity(policy.inspectContent(p.input.text,p.input.dataClass));for(const s of p.input.snapshots)requireIntegrity(policy.canSend(who,s,p.input.destination,p.input.dataClass));}
+    if(p.input){assertPlanningTextSafe(p.input.text);requireIntegrity(policy.inspectContent(p.input.text,p.input.dataClass));for(const s of p.input.snapshots)requireIntegrity(policy.canSend(who,s,p.input.destination,p.input.dataClass)&&(!s.sourceWorkflowId||s.sourceWorkflowId!==p.workflowRunId&&policy.canAccess(who,s.sourceWorkflowId,'VIEW')));}
+  }
+  preview(input:ContinuationPlanInput,credential:unknown) {
+    return this.#host.db.read(tx=>{
+      const x=validateContinuationInput(input),who=this.#identity(tx,credential,x.workflowRunId);this.#checkData(who,x);
+      try {planBinding(this.#host.db,tx,x,this.#policy(),this.#provider(x),this.#options.reads,this.#timing);return {eligible:true,reason:null,executionAllowed:false as const};}
+      catch(error){if(!(error instanceof DurableStoreError))throw error;return {eligible:false,reason:error.code,executionAllowed:false as const};}
+    });
   }
   command(lease:WorkflowLease|undefined,credential:unknown,input:ContinuationCommand):unknown {
     const command=jsonCopy(input);
@@ -161,8 +222,9 @@ export class BoundedRuntime {
         const prior=tx.get('SELECT plan_id FROM recovery_continuation_plans WHERE workflow_run_id=? AND request_id=?',x.workflowRunId,x.requestId);
         if(prior){const saved=readContinuationPlan(tx,String(prior.plan_id));const {planId,contract,planDigest,createdBy,createdAt,expiresAt,timing,binding,...original}=saved;
           requireIntegrity(createdBy===who.actorId&&canonicalJson(original)===canonicalJson(x));return saved;}
+        if(x.artifact)requireIntegrity(readArtifact(tx,x.artifact).ownerId===who.actorId);
         if(x.previousArtifact){const a=readArtifact(tx,x.previousArtifact);requireIntegrity(a.ownerId===who.actorId&&a.workflowRunId===x.workflowRunId);}
-        const binding=planBinding(this.#host.db,tx,x,this.#policy(),this.#provider(x),this.#options.reads,this.#timing);
+        const binding={...planBinding(this.#host.db,tx,x,this.#policy(),this.#provider(x),this.#options.reads,this.#timing),executors:this.withoutAuthority(()=>this.#host.executorBinding(x))};
         const createdAt=recoveryTime(tx),body={...x,planId:randomUUID(),contract:BOUNDED_CONTRACT,createdBy:who.actorId,createdAt,
           expiresAt:Math.min(createdAt+this.#timing.startTtlMs,who.expiresAt),timing:this.#timing,binding};
         const p={...body,planDigest:digest(body)} as ContinuationPlan;
@@ -171,12 +233,12 @@ export class BoundedRuntime {
         return p;
       }
       if(command.kind==='REVOKE') {
-        const g=tx.get('SELECT * FROM recovery_continuation_grants WHERE grant_id=?',command.grantId);requireIntegrity(g&&g.workflow_run_id===lease.workflowRunId&&g.status==='AUTHORIZED');
+        const g=tx.get('SELECT * FROM recovery_continuation_grants WHERE grant_id=?',command.grantId);requireIntegrity(g&&g.workflow_run_id===lease.workflowRunId&&g.status==='AUTHORIZED'&&(g.actor_id===who.actorId||who.roles.includes('RECOVERY_ADMIN')));
         tx.run("UPDATE recovery_continuation_grants SET status='REVOKED' WHERE grant_id=?",command.grantId);return;
       }
       if(command.kind==='REVIEW') {
         const a=readArtifact(tx,command.artifact);requireIntegrity(a.workflowRunId===lease.workflowRunId&&a.ownerId===who.actorId&&!readWorkflowControl(tx,a.workflowRunId).active_invocation_id);
-        requireIntegrity(['ACCEPTED_FOR_SCOPE','REJECTED','SUPERSEDED'].includes(command.decision));
+        requireIntegrity(readWorkflowControl(tx,a.workflowRunId).planning_review_pending&&!tx.get("SELECT artifact_id FROM planning_artifacts WHERE json_extract(artifact_json,'$.previousArtifact.artifactId')=?",a.artifactId)&&['ACCEPTED_FOR_SCOPE','REJECTED','SUPERSEDED'].includes(command.decision));
         tx.run('INSERT INTO planning_reviews VALUES(?,?,?,?,?,?)',randomUUID(),a.workflowRunId,a.artifactId,who.actorId,command.decision,recoveryTime(tx));
         // Accepting content keeps the execution gate. Rejecting/superseding explicitly discards that review.
         if(command.decision!=='ACCEPTED_FOR_SCOPE')this.#lifecycle(tx,a.workflowRunId,{review:false},'PLAN_DISCARDED',lease.generation);
@@ -193,11 +255,13 @@ export class BoundedRuntime {
   #grant(tx:DurableTransaction,p:ContinuationPlan,who:VerifiedRecoveryIdentity):string {
     const rule=p.operation==='RELEASE_RECOVERY_HOLD'?this.#policy().releaseApprovals:this.#policy().recoveryApprovals;
     if(!(p.origin==='USER_REQUEST'&&p.operation==='PLANNING_ONLY'))requireIntegrity(!rule.forbidSelfApproval||who.actorId!==p.createdBy);
+    const prior=tx.get('SELECT * FROM recovery_continuation_grants WHERE plan_id=? AND actor_id=?',p.planId,who.actorId);
+    if(prior){requireIntegrity(prior.status==='AUTHORIZED'&&Number(prior.expires_at)>recoveryTime(tx));return String(prior.grant_id);}
     const id=randomUUID();tx.run("INSERT INTO recovery_continuation_grants VALUES(?,?,?,?,?,?,?,'AUTHORIZED')",id,p.workflowRunId,p.planId,who.actorId,who.source,p.planDigest,Math.min(p.expiresAt,who.expiresAt));return id;
   }
   #current(tx:DurableTransaction,p:ContinuationPlan):void {
     if(recoveryTime(tx)>=p.expiresAt)throw new DurableStoreError('RECOVERY_INVALID_PLAN');
-    const b=planBinding(this.#host.db,tx,p,this.#policy(),this.#provider(p),this.#options.reads,this.#timing);
+    const b={...planBinding(this.#host.db,tx,p,this.#policy(),this.#provider(p),this.#options.reads,this.#timing),executors:this.withoutAuthority(()=>this.#host.executorBinding(p))};
     if(canonicalJson(b)!==canonicalJson(p.binding))throw new DurableStoreError('RECOVERY_INVALID_PLAN');
   }
   async start(lease:WorkflowLease|undefined,planId:string,credential:unknown,signal?:AbortSignal):Promise<ContinuationInspection> {
@@ -208,7 +272,9 @@ export class BoundedRuntime {
     let committed:{p:ContinuationPlan;who:VerifiedRecoveryIdentity;invocationId?:string};
     try {committed=this.#write(lease,tx=>{
       const p=readContinuationPlan(tx,planId),who=this.#identity(tx,credential,p.workflowRunId,'EXECUTE');
-      requireIntegrity(p.workflowRunId===lease.workflowRunId&&!signal?.aborted);this.#checkData(who,p);this.#current(tx,p);
+      requireIntegrity(p.workflowRunId===lease.workflowRunId&&!signal?.aborted);
+      if(p.origin==='USER_REQUEST'&&p.operation==='PLANNING_ONLY')requireIntegrity(p.createdBy===who.actorId&&who.roles.some(r=>this.#policy().planningRoles.includes(r)));
+      else requireIntegrity(who.roles.some(r=>['RECOVERY_OPERATOR','RECOVERY_ADMIN'].includes(r)));this.#checkData(who,p);this.#current(tx,p);
       const grants=tx.all("SELECT * FROM recovery_continuation_grants WHERE plan_id=? AND status='AUTHORIZED' AND expires_at>?",p.planId,recoveryTime(tx));
       const rule=p.operation==='RELEASE_RECOVERY_HOLD'?this.#policy().releaseApprovals:this.#policy().recoveryApprovals;
       requireIntegrity(grants.length>=(p.origin==='USER_REQUEST'&&p.operation==='PLANNING_ONLY'?1:rule.minimumApprovers)&&grants.every(g=>g.plan_digest===p.planDigest));
@@ -217,7 +283,7 @@ export class BoundedRuntime {
       if(p.operation==='RELEASE_RECOVERY_HOLD') {
         this.#lifecycle(tx,p.workflowRunId,{hold:'RELEASED'},'HOLD_RELEASED',lease.generation);this.#receipt(tx,p,'RELEASE',{planId:p.planId,at:recoveryTime(tx),actor:who.actorId});return {p,who};
       }
-      const invocationId=randomUUID(),now=recoveryTime(tx),admission=now+p.timing.admissionMs,
+      const invocationId=randomUUID(),now=recoveryTime(tx),admission=Math.min(now+p.timing.admissionMs,p.expiresAt,who.expiresAt,...grants.map(g=>Number(g.expires_at))),
         collection=admission+Math.max(p.timing.modelTimeoutMs,p.timing.actionTimeoutMs,p.timing.readTimeoutMs)+p.timing.collectionGraceMs+p.timing.finalizationMs;
       tx.run("INSERT INTO recovery_invocations VALUES(?,?,?,?,?,?,'ACTIVE',NULL,0,?,?,?,?)",invocationId,p.workflowRunId,p.planId,who.actorId,lease.runtimeInstanceId,lease.generation,executionState(tx,p.workflowRunId),now,admission,collection);
       this.#lifecycle(tx,p.workflowRunId,{active:invocationId,review:false},'INVOCATION_STARTED',lease.generation);
@@ -236,7 +302,7 @@ export class BoundedRuntime {
           this.#finish(ctx,'COMPLETED','BOUNDED_SCOPE_COMPLETED');
         }
       }catch(error){
-        try {const unknown=this.#host.db.read(tx=>effectiveModelRows(tx,ctx.plan.workflowRunId).some(r=>r.unresolved)||!!tx.get("SELECT action_id FROM execution_ledger WHERE workflow_run_id=? AND state IN ('DISPATCH_RESERVED','REVIEW_REQUIRED')",ctx.plan.workflowRunId));
+        try {const unknown=this.#host.db.read(tx=>effectiveModelRows(tx,ctx.plan.workflowRunId).some(r=>r.unresolved)||!!tx.get("SELECT action_id FROM execution_ledger WHERE workflow_run_id=? AND state IN ('DISPATCH_RESERVED','RESULT_RECORDED','REVIEW_REQUIRED')",ctx.plan.workflowRunId)||!!tx.get("SELECT read_id FROM planning_read_calls WHERE workflow_run_id=? AND state='INTENT'",ctx.plan.workflowRunId));
           this.#finish(ctx,unknown?'REVIEW_REQUIRED':'STOPPED',error instanceof DurableStoreError?error.code:'CONTINUATION_FAILED');}catch{/* Retain the persisted unresolved Invocation for diagnosis. */}
       }
     });}finally{stopHeartbeat();ctx.valid=false;this.#active.delete(ctx.invocationId);signal?.removeEventListener('abort',abort);}
@@ -248,8 +314,10 @@ export class BoundedRuntime {
     const next=appendEvent(s,event);requireIntegrity(!runnerSecurityReviewReason(next)&&!runnerEvidenceReviewReason(next));
     this.#resume=true;try{new SqliteCoordinationRunnerStore(this.#host.db,lease).appendInTransaction(tx,event);}finally{this.#resume=false;}
   }
-  #round(ctx:Context):void {this.#host.write(ctx.lease,tx=>this.#step(tx,ctx,'ROUND',randomUUID(),'ROUND',zeroAmounts()));}
+  #round(ctx:Context):void {ctx.roundStepId=this.#host.write(ctx.lease,tx=>this.#step(tx,ctx,'ROUND',randomUUID(),'ROUND',zeroAmounts()));}
   #step(tx:DurableTransaction,ctx:Context,kind:'ROUND'|'MODEL'|'ACTION'|'READ',target:string,purpose:string,amounts:{inputTokens:number;outputTokens:number;costMicros:number},roundKey?:string):string {
+    requireIntegrity(this.#policy().canAccess(ctx.actor,ctx.plan.workflowRunId,'EXECUTE')&&digest(continuationPolicyBinding(this.#policy()))===digest(ctx.plan.binding.policy));
+    assertControlledBudget(tx,ctx.plan.workflowRunId);
     const i=tx.get('SELECT * FROM recovery_invocations WHERE invocation_id=?',ctx.invocationId)!;
     if(i.status!=='ACTIVE'||ctx.abort.signal.aborted||recoveryTime(tx)>=Number(i.admission_deadline))throw new DurableStoreError('CONTINUATION_EXPIRED');
     const prior=tx.get('SELECT step_id FROM recovery_invocation_steps WHERE invocation_id=? AND kind=? AND target_id=?',ctx.invocationId,kind,target);if(prior)return String(prior.step_id);
@@ -259,20 +327,34 @@ export class BoundedRuntime {
     const usage=this.#usage(tx,ctx.invocationId),limits=ctx.plan.limits;
     for(const [key,limit] of [['inputTokens',limits.maxInputTokens],['outputTokens',limits.maxOutputTokens],['costMicros',limits.maxCostMicros]] as const)
       requireIntegrity(Number.isSafeInteger(amounts[key])&&amounts[key]>=0&&BigInt(usage.committed[key])+BigInt(usage.outstanding[key])+BigInt(amounts[key])<=BigInt(limit));
-    const step=randomUUID();tx.run('INSERT INTO recovery_invocation_steps VALUES(?,?,?,?,?,?,?,?,?)',step,ctx.plan.workflowRunId,ctx.invocationId,kind,target,purpose,roundKey??null,null,recoveryTime(tx));
+    const step=randomUUID(),now=recoveryTime(tx),execution=now+({ROUND:ctx.plan.timing.admissionMs,MODEL:ctx.plan.timing.modelTimeoutMs,ACTION:ctx.plan.timing.actionTimeoutMs,READ:ctx.plan.timing.readTimeoutMs}[kind]);
+    tx.run('INSERT INTO recovery_invocation_steps VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',step,ctx.plan.workflowRunId,ctx.invocationId,kind,target,purpose,roundKey??null,kind==='ROUND'?null:ctx.roundStepId??null,now,execution,execution+ctx.plan.timing.collectionGraceMs,execution+ctx.plan.timing.collectionGraceMs+ctx.plan.timing.finalizationMs);
     tx.run('INSERT INTO recovery_invocation_debits VALUES(?,?,?,?,?,?,?,?)',step,ctx.plan.workflowRunId,ctx.invocationId,kind,target,amounts.inputTokens,amounts.outputTokens,amounts.costMicros);return step;
   }
   participate(tx:DurableTransaction,kind:'MODEL'|'ACTION',target:string,amounts:{inputTokens:number;outputTokens:number;costMicros:number},roundKey?:string):void {
     const c=this.#inTransaction;if(!c)return;
     requireIntegrity(this.#tx===tx&&c.valid);
     if(kind==='MODEL')c.callId=target;
-    this.#step(tx,c,kind,target,kind==='MODEL'&&c.plan.operation==='PLANNING_ONLY'?'DRAFT_PLAN':kind,amounts,roundKey);
+    const model=kind==='MODEL'?tx.get('SELECT * FROM model_call_ledger WHERE model_call_id=?',target):undefined;
+    if(model){const {requestDigest,maxAttempts,...quote}=JSON.parse(String(model.quote_json));requireIntegrity(model.provider_id===c.plan.providerId&&model.model_id===c.plan.modelId&&maxAttempts===1&&canonicalJson(quote)===canonicalJson((c.plan.binding.provider as BoundedProvider['capabilities']).quote));}
+    const step=this.#step(tx,c,kind,target,model?(c.plan.operation==='PLANNING_ONLY'?'DRAFT_PLAN':String(model.phase)):kind,amounts,roundKey);
+    if(model&&c.plan.operation==='BOUNDED_CONTINUATION') {
+      const predecessors=effectiveModelRows(tx,c.plan.workflowRunId).filter(r=>r.historical.model_call_id!==target&&r.historical.phase===model.phase&&
+        (r.historical.round_key===roundKey||tx.get('SELECT step_id FROM recovery_invocation_steps WHERE workflow_run_id=? AND target_id=? AND business_round_key=?',c.plan.workflowRunId,r.historical.model_call_id,roundKey!)));
+      for(const r of predecessors)requireIntegrity(!r.unresolved&&(r.resolution||r.historical.state==='CANCELLED_PRE_DISPATCH'||r.historical.application_status==='DISCARDED'));
+      const prior=predecessors.sort((a,b)=>Number(b.historical.created_at)-Number(a.historical.created_at))[0];
+      if(prior) {
+        const resolution=prior.resolution??tx.get("SELECT * FROM runtime_audit_events WHERE model_call_id=? AND event_kind IN ('MODEL_CALL_CANCELLED_PRE_DISPATCH','MODEL_RESPONSE_DISCARDED') ORDER BY audit_sequence DESC LIMIT 1",prior.historical.model_call_id);
+        requireIntegrity(resolution);
+        tx.run('INSERT INTO recovery_model_lineage VALUES(?,?,?,?,?,?)',step,c.plan.workflowRunId,target,prior.historical.model_call_id,String(resolution.operation_id??resolution.audit_event_id),digest(resolution));
+      }
+    }
   }
   #usage(tx:DurableTransaction,invocationId:string):ContinuationInspection['usage'] {
     let committed=zeroAmounts(),outstanding=zeroAmounts();
     for(const r of tx.all("SELECT m.* FROM model_call_ledger m JOIN recovery_invocation_debits d ON d.target_id=m.model_call_id AND d.workflow_run_id=m.workflow_run_id WHERE d.invocation_id=? AND d.kind='MODEL'",invocationId)) {
       if(r.state==='SETTLED')committed=addAmounts(committed,usageAmounts(JSON.parse(String(r.usage_json))));
-      else if(!['CANCELLED_PRE_DISPATCH'].includes(String(r.state)))outstanding=addAmounts(outstanding,{llmCalls:1,inputTokens:Number(r.reserved_input),outputTokens:Number(r.reserved_output),costMicros:Number(r.reserved_cost)});
+      else if(effectiveModelRows(tx,String(r.workflow_run_id)).find(x=>x.historical.model_call_id===r.model_call_id)?.outstandingReservation)outstanding=addAmounts(outstanding,{llmCalls:1,inputTokens:Number(r.reserved_input),outputTokens:Number(r.reserved_output),costMicros:Number(r.reserved_cost)});
     }
     const {llmCalls:_,...a}=committed,{llmCalls:__,...b}=outstanding;return {committed:a,outstanding:b};
   }
@@ -283,7 +365,7 @@ export class BoundedRuntime {
       t.run('UPDATE recovery_invocations SET status=?,outcome=?,revision=revision+1 WHERE invocation_id=?',status,outcome,ctx.invocationId);
       this.#lifecycle(t,ctx.plan.workflowRunId,{active:null,review},review?'PLAN_REVIEW_PENDING':'INVOCATION_FINISHED',ctx.lease.generation);
       this.#receipt(t,ctx.plan,'FINISH',{invocationId:ctx.invocationId,status,outcome,at:recoveryTime(t)});};
-    if(tx)finish(tx);else this.#host.write(ctx.lease,finish);
+    if(tx)finish(tx);else {const prior=ctx.phase;ctx.phase='FINISH';try{this.#host.write(ctx.lease,finish);}finally{ctx.phase=prior;}}
   }
   #inspect(tx:DurableTransaction,planId:string,credential:unknown):ContinuationInspection {
     const p=readContinuationPlan(tx,planId),who=this.#identity(tx,credential,p.workflowRunId,'VIEW');
@@ -293,7 +375,10 @@ export class BoundedRuntime {
     const counts={rounds:0,modelCalls:0,actionDispatches:0,readCalls:0};
     if(i)for(const r of tx.all('SELECT kind,count(*) AS n FROM recovery_invocation_debits WHERE invocation_id=? GROUP BY kind',i.invocation_id))
       counts[({ROUND:'rounds',MODEL:'modelCalls',ACTION:'actionDispatches',READ:'readCalls'} as const)[r.kind as 'ROUND']]=Number(r.n);
-    return {plan:p,invocation:i?{invocationId:String(i.invocation_id),status:i.status as 'ACTIVE',outcome:i.outcome as string|null}:undefined,
+    const review=a?tx.get('SELECT decision FROM planning_reviews WHERE artifact_id=? ORDER BY rowid DESC LIMIT 1',a.artifact_id):undefined;
+    return {remaining:{rounds:p.limits.maxRounds-counts.rounds,modelCalls:p.limits.maxModelCalls-counts.modelCalls,actionDispatches:p.limits.maxActionDispatches-counts.actionDispatches,readCalls:p.limits.maxReadCalls-counts.readCalls},
+      performed:{businessActionDispatches:counts.actionDispatches,localReadCalls:counts.readCalls,modelCalls:counts.modelCalls,internalPersistence:true},
+      review:{state:(review?.decision??'UNREVIEWED') as 'UNREVIEWED',executionAuthorizationRequired:true},plan:p,invocation:i?{invocationId:String(i.invocation_id),status:i.status as 'ACTIVE',outcome:i.outcome as string|null}:undefined,
       artifact:a?readArtifact(tx,{artifactId:String(a.artifact_id),version:Number(a.version),contentDigest:String(a.content_digest)}):undefined,
       control:{holdState:String(c.hold_state),holdEpoch:Number(c.hold_epoch),revision:Number(c.control_revision),planningReviewPending:!!c.planning_review_pending},
       counts,usage:i?this.#usage(tx,String(i.invocation_id)):{committed:{inputTokens:0,outputTokens:0,costMicros:0},outstanding:{inputTokens:0,outputTokens:0,costMicros:0}},executionAllowed:false};
@@ -303,6 +388,7 @@ export class BoundedRuntime {
     const provider=this.#provider(p)!,caps=validateProvider(provider,p),store=new SqliteCoordinationRunnerStore(this.#host.db,ctx.lease),ledger=new ModelCallLedger(store);
     const reads:Array<{resourceId:string;digest:string;text:string}>=[];
     for(let n=0;n<p.limits.maxModelCalls;n++) {
+      requireIntegrity(digest(validateProvider(this.#provider(p),p))===digest(p.binding.provider));
       ctx.phase='MODEL';const s=store.getSnapshot(p.workflowRunId),callId=randomUUID();
       const x:ModelCallIdentity={workflowRunId:p.workflowRunId,modelCallId:callId,attemptId:randomUUID(),providerId:p.providerId!,modelId:p.modelId!};
       const request={mode:p.mode,input:p.input!.text,reasoning:p.reasoning??{},references:p.input!.snapshots,reads,
@@ -311,7 +397,8 @@ export class BoundedRuntime {
       ledger.reserve({...x,roundKey:`bounded:${ctx.invocationId}:${n}`,phase:'PLAN',requestCursor:s.events.length,requestEventId:s.events.at(-1)!.eventId,
         quote:{...caps.quote,maxAttempts:1,requestDigest:digest(request)}});
       ledger.markDispatchIntent(x);store.assertLease(p.workflowRunId);
-      const collected=await collectBoundedResponse(signal=>this.withoutAuthority(()=>provider.draftPlan!({...jsonCopy(request),signal})),p.timing.modelTimeoutMs,p.timing.collectionGraceMs,ctx.abort.signal);
+      const remaining=this.dispatchDeadline('MODEL',callId);
+      const collected=await collectBoundedResponse(signal=>this.withoutAuthority(async()=>jsonCopy(await provider.draftPlan!({...jsonCopy(request),signal}))),remaining,p.timing.collectionGraceMs,ctx.abort.signal);
       store.assertLease(p.workflowRunId);
       const result=collected.value;
       if(!result||result.completeness!=='COMPLETE'||!result.usage) {
@@ -329,16 +416,17 @@ export class BoundedRuntime {
       ctx.phase='APPLICATION';
       if(draft.kind==='plan') {
         const content=jsonCopy(draft.artifact),text=executionJson(content,96*1024);requireIntegrity(this.#policy().inspectContent(text,p.input!.dataClass));
-        const summary:PlanArtifact['summary']={state:!caps.summary?'NOT_SUPPORTED':!result.summary?'NOT_RETURNED':!this.#policy().storeReasoningSummary?'NOT_STORED':'AVAILABLE',source:'PROVIDER_SUMMARY'};
-        if(summary.state==='AVAILABLE'){requireIntegrity(result.summary!.length<=16*1024&&this.#policy().inspectContent(result.summary!,p.input!.dataClass));summary.text=result.summary;}
+        const summary:PlanArtifact['summary']={state:!p.requestSummary?'NOT_REQUESTED':!caps.summary?'NOT_SUPPORTED':!result.summary?'NOT_RETURNED':!this.#policy().storeReasoningSummary?'NOT_STORED':'AVAILABLE',source:'PROVIDER_SUMMARY'};
+        if(summary.state==='AVAILABLE'){assertPlanningTextSafe(result.summary!);requireIntegrity(result.summary!.length<=16*1024&&this.#policy().inspectContent(result.summary!,p.input!.dataClass));summary.text=result.summary;}
         const artifact:PlanArtifact={artifactId:randomUUID(),version:p.previousArtifact?p.previousArtifact.version+1:1,schemaVersion:1,
           contentDigest:digest(content),workflowRunId:p.workflowRunId,ownerId:ctx.actor.actorId,requestId:p.requestId,invocationId:ctx.invocationId,
           modelCallId:x.modelCallId,mode:p.mode,previousArtifact:p.previousArtifact,content,providerId:caps.providerId,modelId:caps.modelId,adapterVersion:caps.adapterVersion,
           reasoning:p.reasoning??{},snapshots:[...p.input!.snapshots,...reads.map(r=>({id:r.resourceId,digest:r.digest,revision:this.#options.reads!.describe(r.resourceId)!.revision,observedAt:Date.now()}))],
-          summary,completeness:'COMPLETE',dataClass:p.input!.dataClass,createdAt:Date.now()};
+          summary,completeness:'COMPLETE',dataClass:p.input!.dataClass,createdAt:Date.now(),basisDigest:this.#host.db.read(tx=>artifactBasis(tx,p.workflowRunId))};
         const json=executionJson(artifact,128*1024);rejectEmbeddedCredentials(artifact);
         this.#host.write(ctx.lease,tx=>{
-          tx.run('INSERT INTO planning_artifacts VALUES(?,?,?,?,?,?,?,?)',artifact.artifactId,p.workflowRunId,ctx.invocationId,x.modelCallId,artifact.ownerId,artifact.version,artifact.contentDigest,json);
+          tx.run('INSERT INTO planning_artifacts (artifact_id,workflow_run_id,invocation_id,model_call_id,owner_id,version,content_digest,artifact_json) VALUES(?,?,?,?,?,?,?,?)',artifact.artifactId,p.workflowRunId,ctx.invocationId,x.modelCallId,artifact.ownerId,artifact.version,artifact.contentDigest,json);
+          if(p.previousArtifact)tx.run("INSERT INTO planning_reviews VALUES(?,?,?,?,?,?)",randomUUID(),p.workflowRunId,p.previousArtifact.artifactId,ctx.actor.actorId,'SUPERSEDED',recoveryTime(tx));
           this.#applyPlanning(tx,ctx,x,'PlanArtifactPublished',artifact.artifactId,artifact.contentDigest);
           this.#finish(ctx,'COMPLETED','AWAITING_PLAN_REVIEW',true,tx);
         });return;
@@ -353,11 +441,14 @@ export class BoundedRuntime {
         ctx.phase='READ';const id=randomUUID();
         this.#host.write(ctx.lease,tx=>{const step=this.#step(tx,ctx,'READ',id,'READ',zeroAmounts());
           tx.run("INSERT INTO planning_read_calls VALUES(?,?,?,?,?,?,?,'INTENT',NULL,NULL,0,?,?)",id,p.workflowRunId,ctx.invocationId,step,r.resourceId,digest(r),r.digest,recoveryTime(tx),recoveryTime(tx)+p.timing.readTimeoutMs);});
-        const value=await collectBoundedResponse(async()=>this.withoutAuthority(()=>this.#options.reads!.read(r.resourceId,r.digest)),p.timing.readTimeoutMs,p.timing.collectionGraceMs,ctx.abort.signal);
+        const remainingRead=this.dispatchDeadline('READ',id);
+        const value=await collectBoundedResponse(async()=>this.withoutAuthority(()=>this.#options.reads!.read(r.resourceId,r.digest)),remainingRead,p.timing.collectionGraceMs,ctx.abort.signal);
         store.assertLease(p.workflowRunId);
         this.#host.write(ctx.lease,tx=>tx.run('UPDATE planning_read_calls SET state=?,result_digest=?,size_bytes=? WHERE read_id=?',value.timedOut?'TIMED_OUT':value.value?'SUCCEEDED':'FAILED',value.value?.digest??null,value.value?.sizeBytes??null,id));
         if(!value.value||value.timedOut||value.aborted)throw new DurableStoreError('PLANNING_READ_DENIED');
-        requireIntegrity(this.#policy().inspectContent(value.value.text,p.input!.dataClass));
+        assertPlanningTextSafe(value.value.text);requireIntegrity(this.#policy().inspectContent(value.value.text,p.input!.dataClass));
+        const metadata=this.#options.reads!.describe(r.resourceId)!;
+        requireIntegrity(this.#policy().canSend(ctx.actor,{id:r.resourceId,digest:metadata.digest,revision:metadata.revision,observedAt:this.#host.db.read(recoveryTime)},p.input!.destination,p.input!.dataClass));
         reads.push({resourceId:r.resourceId,digest:value.value.digest,text:value.value.text});
       }
     }
@@ -376,6 +467,8 @@ export class BoundedRuntime {
 
 export class RecoveryContinuationCoordinator {
   constructor(readonly database:DurableDatabase,readonly lease?:WorkflowLease){}
+  preview(input:ContinuationPlanInput,credential:unknown) {return this.database.previewContinuation(input,credential);}
+  requestRevision(artifact:ArtifactRef,input:ContinuationPlanInput,credential:unknown):ContinuationPlan {requireIntegrity(input.operation==='PLANNING_ONLY');return this.createPlan({...input,previousArtifact:artifact},credential);}
   createPlan(input:ContinuationPlanInput,credential:unknown):ContinuationPlan {return this.database.continuationDecision(this.lease,credential,{kind:'CREATE_PLAN',input}) as ContinuationPlan;}
   authorize(plan:ContinuationPlan,credential:unknown):string {return this.database.continuationDecision(this.lease,credential,{kind:'AUTHORIZE',planId:plan.planId,planDigest:plan.planDigest}) as string;}
   revoke(grantId:string,credential:unknown):void {this.database.continuationDecision(this.lease,credential,{kind:'REVOKE',grantId});}

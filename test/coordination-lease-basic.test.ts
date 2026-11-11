@@ -103,7 +103,7 @@ test('Explicit heartbeat lifecycle is quiet on success and stops permanently aft
 test('Generation overflow fails closed without replacing the retained row or audit', t => {
   const f = fixture(t); f.release(); const raw = f.raw();
   // Explicit hostile/corruption setup, never a supported generation reset API.
-  raw.exec('DROP TRIGGER leases_update; DROP TRIGGER lease_audit_update; DROP TRIGGER recovery_takeover; DROP TRIGGER recovery_risky_acquire');
+  raw.exec('DROP TRIGGER leases_update; DROP TRIGGER lease_audit_update; DROP TRIGGER bounded_generation_hold');
   raw.exec('UPDATE runtime_leases SET generation=9007199254740991');
   const before = contents(f);
   assert.throws(() => f.manager.acquire('run'), { code: 'LEASE_GENERATION_EXHAUSTED' });
