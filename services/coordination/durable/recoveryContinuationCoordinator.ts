@@ -411,8 +411,17 @@ export class BoundedRuntime {
         quote:{...caps.quote,maxAttempts:1,requestDigest:digest(request)}});
       ledger.markDispatchIntent(x);store.assertLease(p.workflowRunId);
       const remaining=this.dispatchDeadline('MODEL',callId);
+      const sendDeadline=performance.now()+remaining;
       const collected=await collectBoundedResponse(signal=>this.withoutAuthority(async()=>{
         this.#checkData(ctx.actor,p,request); // Last check of this exact payload, after Intent and before external entry.
+        store.assertLease(p.workflowRunId);
+        this.#host.db.read(tx=>{
+          const i=tx.get('SELECT status,admission_deadline FROM recovery_invocations WHERE invocation_id=?',ctx.invocationId);
+          const step=tx.get("SELECT execution_deadline FROM recovery_invocation_steps WHERE invocation_id=? AND kind='MODEL' AND target_id=?",ctx.invocationId,callId);
+          requireIntegrity(i&&step);
+          if(i.status!=='ACTIVE'||signal.aborted||ctx.abort.signal.aborted||performance.now()>=sendDeadline
+            ||recoveryTime(tx)>=Math.min(Number(i.admission_deadline),Number(step.execution_deadline)))throw new DurableStoreError('CONTINUATION_EXPIRED');
+        });
         return jsonCopy(await provider.draftPlan!({...jsonCopy(request),signal}));
       }),remaining,p.timing.collectionGraceMs,ctx.abort.signal);
       store.assertLease(p.workflowRunId);

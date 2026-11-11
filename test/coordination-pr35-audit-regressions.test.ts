@@ -181,6 +181,24 @@ test('PR35 F-01: the final permission check uses the actual payload outside the 
   assert.equal(r.invocation?.status,'REVIEW_REQUIRED');assert.equal(r.usage.outstanding.inputTokens,20);
 });
 
+for(const boundary of ['deadline','stop'] as const)test(`PR35 F-01: ${boundary} during the final permission check prevents external entry`,async t=>{
+  const f=continuationFixture(t,{modelTimeoutMs:boundary==='deadline'?50:1000});let planId='',checked=false;
+  f.policy.canSend=((_actor,snapshot)=>{
+    if(snapshot.id==='source'&&f.counts.draft===1&&!f.db.boundedInvocationActive){
+      checked=true;
+      if(boundary==='deadline'){const until=performance.now()+200;while(performance.now()<until){}}
+      else f.api().requestStop(planId,f.credential);
+    }
+    return true;
+  }) as ContinuationPolicy['canSend'] as typeof f.policy.canSend;
+  f.hook(async()=>({value:{kind:'read_requests',requests:[{resourceId:'source',digest:f.reads.describe('source')!.digest}]},usage,completeness:'COMPLETE'}));
+  const p=f.api().createPlan(f.input('PLAN_READ_ONLY'),f.credential);planId=p.planId;
+  const r=await f.api().startAuthorized(planId,f.credential);
+  assert.equal(checked,true);assert.equal(f.counts.draft,1,'No Provider entry after the permission check outlives the send window.');
+  assert.equal(r.counts.modelCalls,2);assert.equal(r.usage.committed.inputTokens,1);assert.equal(r.usage.outstanding.inputTokens,20);
+  assert.equal(r.invocation?.status,'REVIEW_REQUIRED');assert.equal(f.counts.action,0);
+});
+
 async function expiredResult(t:import('node:test').TestContext) {
   const f=continuationFixture(t,{actionTimeoutMs:1000,collectionGraceMs:50,finalizationMs:50});hold(f);
   const p=f.api().createPlan(executeInput(f),f.credential);f.api().authorize(p,f.approver);
