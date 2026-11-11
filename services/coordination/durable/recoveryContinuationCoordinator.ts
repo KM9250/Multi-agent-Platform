@@ -168,9 +168,10 @@ export class BoundedRuntime {
     return this.#host.db.read(tx=>{
       const i=tx.get('SELECT * FROM recovery_invocations WHERE invocation_id=?',c.invocationId);
       const step=tx.get('SELECT * FROM recovery_invocation_steps WHERE invocation_id=? AND kind=? AND target_id=?',c.invocationId,kind,target);
-      const now=recoveryTime(tx);requireIntegrity(i&&step&&i.status==='ACTIVE'&&i.expected_state===executionState(tx,c.plan.workflowRunId));
-      if(now>=Number(i.admission_deadline)||now>=Number(step.execution_deadline))throw new DurableStoreError('CONTINUATION_EXPIRED');
+      requireIntegrity(i&&step&&i.status==='ACTIVE'&&i.expected_state===executionState(tx,c.plan.workflowRunId));
       assertArtifactReferences(tx,c.plan,this.#policy(),this.#options.reads);
+      const now=recoveryTime(tx);
+      if(now>=Number(i.admission_deadline)||now>=Number(step.execution_deadline))throw new DurableStoreError('CONTINUATION_EXPIRED');
       return Number(step.execution_deadline)-now;
     });
   }

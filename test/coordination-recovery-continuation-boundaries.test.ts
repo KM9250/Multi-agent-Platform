@@ -13,11 +13,16 @@ import { RecoveryContinuationCoordinator } from '../services/coordination/durabl
 import { createRunnerEvent } from '../services/coordination/runner/eventFactory.ts';
 import { runnerPendingApproval } from '../services/coordination/runner/policyGuard.ts';
 const usage={llmCalls:1,inputTokens:1,outputTokens:1,estimatedCost:0};
-for(const resolution of ['CANCELLED_PRE_DISPATCH','DISCARDED','UNKNOWN'] as const)test(`I13: prior VERIFY ${resolution} requires a durable resolution lineage before a new call`,async t=>{
+for(const resolution of ['CANCELLED_PRE_DISPATCH','DISCARDED','RECOVERY_DISCARDED','UNKNOWN'] as const)test(`I13: prior VERIFY ${resolution} requires a durable resolution lineage before a new call`,async t=>{
  const f=continuationFixture(t),coordinator=new DurableExecutionCoordinator(f.store,{get:id=>f.options.controlledExecutors.get(id)?.executor});const reg=registration(f.store);coordinator.registerAction(record,reg.expected,reg.sessionEvent,reg.taskEvent);const task=f.store.getSnapshot('run').tasks.task;await coordinator.dispatch('run',task);coordinator.finalizeResult('run',task);
  const s=f.store.getSnapshot('run'),x={workflowRunId:'run',modelCallId:'old-verify',attemptId:'old-attempt',providerId:'synthetic',modelId:'test',roundKey:'round',phase:'VERIFY' as const,requestCursor:s.events.length,requestEventId:s.events.at(-1)!.eventId,quote:{...f.provider.capabilities.quote,maxAttempts:1 as const,requestDigest:'c'.repeat(64)}};
- const ledger=new ModelCallLedger(f.store);ledger.reserve(x);if(resolution==='CANCELLED_PRE_DISPATCH')ledger.cancelBeforeDispatch(x);else {ledger.markDispatchIntent(x);if(resolution==='UNKNOWN')ledger.markReviewRequired(x,'UNKNOWN');else {ledger.settle(x,usage,true);ledger.markDiscarded(x,'ABORTED');}}
- hold(f);const input=executeInput(f);input.start='VERIFY_FINALIZED_RESULT';input.taskId='task';input.limits.maxActionDispatches=0;input.limits.maxModelCalls=1;
+ const ledger=new ModelCallLedger(f.store);ledger.reserve(x);if(resolution==='CANCELLED_PRE_DISPATCH')ledger.cancelBeforeDispatch(x);else {ledger.markDispatchIntent(x);if(resolution==='UNKNOWN')ledger.markReviewRequired(x,'UNKNOWN');else {ledger.settle(x,usage,true);if(resolution==='DISCARDED')ledger.markDiscarded(x,'ABORTED');}}
+ if(resolution==='RECOVERY_DISCARDED'){
+  const {SafeRecoveryPlanner,SafeRecoveryAuthorizer,SafeRecoveryExecutor}=await import('../services/coordination/durable/safeRecoveryExecutor.ts');const {executionScopeOf}=await import('../services/coordination/durable/safeRecoveryStore.ts');
+  assert.throws(()=>f.store.assertRecoveryExecution('run'));const oldPlan=new SafeRecoveryPlanner(f.db,f.lease).createPlan({workflowRunId:'run',operationKind:'DISCARD_SETTLED_RESPONSE',targetId:x.modelCallId},f.credential);
+  new SafeRecoveryAuthorizer(f.db,f.lease).authorize(oldPlan.executionPlanId,executionScopeOf(oldPlan),f.approver);new SafeRecoveryExecutor(f.db,f.lease).executeAuthorized(oldPlan.executionPlanId,f.credential);
+ } else hold(f);
+ const input=executeInput(f);if(resolution==='RECOVERY_DISCARDED')delete input.resume;input.start='VERIFY_FINALIZED_RESULT';input.taskId='task';input.limits.maxActionDispatches=0;input.limits.maxModelCalls=1;
  if(resolution==='UNKNOWN'){assert.throws(()=>f.api().createPlan(input,f.credential));assert.equal(f.counts.verify,0);return;}
  const p=f.api().createPlan(input,f.credential);f.api().authorize(p,f.approver);const r=await f.api().startAuthorized(p.planId,f.credential);assert.equal(r.invocation?.status,'COMPLETED',JSON.stringify(r));
  const link=f.raw.prepare('SELECT * FROM recovery_model_lineage').get()!;assert.equal(link.supersedes_model_call_id,'old-verify');assert.notEqual(link.model_call_id,'old-verify');assert.ok(link.resolution_id);assert.equal(r.usage.committed.inputTokens,1);assert.equal(f.counts.verify,1);

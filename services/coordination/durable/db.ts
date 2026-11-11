@@ -1,3 +1,5 @@
+import { readWorkflowControl } from './recoveryHoldLifecycle';
+import { effectiveModelRows } from './safeRecoveryModelState';
 import { BoundedRuntime } from './recoveryContinuationCoordinator';
 import type { BoundedRuntimeOptions } from './recoveryContinuationCoordinator';
 import type { ContinuationCommand, ContinuationPlan, ContinuationPlanInput } from './continuationTypes';
@@ -291,15 +293,20 @@ export class DurableDatabase {
         ? tx.get('SELECT workflow_run_id FROM recovery_controlled_grants WHERE authorization_id=?',command.authorizationId)?.workflow_run_id
         : tx.get('SELECT workflow_run_id FROM recovery_controlled_plans WHERE plan_id=?',command.planId)?.workflow_run_id;
       if (workflow !== lease.workflowRunId) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
-      if (command.kind === 'CREATE_PLAN' && !tx.get('SELECT workflow_run_id FROM recovery_holds WHERE workflow_run_id=?',workflow)) {
+      if (command.kind === 'CREATE_PLAN' && !tx.get('SELECT workflow_run_id FROM recovery_effective_holds WHERE workflow_run_id=?',workflow)) {
         // Identity and eligibility precede the first management write. Same transaction as the plan.
         preparedEligibility(this,tx,command.input);
         this.#recoveryIntent = {workflowRunId:workflow,kind:'HOLD',id:workflow};
         const now = recoveryTime(tx);
+        const control=readWorkflowControl(tx,workflow);requireIntegrity(!control.active_invocation_id&&!control.planning_review_pending);
+        if(tx.get('SELECT workflow_run_id FROM recovery_holds WHERE workflow_run_id=?',workflow)) {
+          tx.run("INSERT INTO recovery_hold_lifecycle SELECT NULL,workflow_run_id,hold_epoch+1,control_revision+1,'HELD',NULL,planning_review_pending,'GATE_REHOLD',?,? FROM recovery_workflow_control WHERE workflow_run_id=?",lease.generation,now,workflow);
+        } else {
         tx.run("INSERT INTO recovery_holds VALUES (?,1,'STATE_CHANGED',?,?,'GATE',1)",workflow,lease.generation,now);
         tx.run(`INSERT INTO runtime_audit_events (audit_event_id,workflow_run_id,event_kind,entity_kind,entity_id,
           recovery_hold_revision,next_state,reason_code,occurred_at,recorded_at,schema_version,runtime_instance_id,runtime_generation)
           VALUES (lower(hex(randomblob(16))),?,'RECOVERY_HOLD_CREATED','WORKFLOW',?,1,'HELD','STATE_CHANGED',?,?,1,?,?)`,workflow,workflow,now,now,lease.runtimeInstanceId,lease.generation);
+        }
         this.#recoveryIntent = undefined;
       }
       return persistControlledDecision(this,tx,command,identity,lease,this.#controlledExecutors,this.#controlledTiming,
@@ -523,8 +530,7 @@ export class DurableDatabase {
         && before.events[Number(r.request_cursor) - 1]?.eventId === r.request_event_id);
       if (!this.#bounded.businessApplicationAllowed(tx,id,identity.modelCallId) && (recoveryGateReason(tx, id) !== 'PENDING_RESPONSE' || tx.get('SELECT workflow_run_id FROM recovery_effective_holds WHERE workflow_run_id=?', id)))
         throw new DurableStoreError('RECOVERY_HELD');
-      requireIntegrity(!tx.get(`SELECT model_call_id FROM model_call_ledger WHERE workflow_run_id=? AND model_call_id<>?
-        AND (application_status='PENDING_APPLICATION' OR state IN ('DISPATCH_INTENT','REVIEW_REQUIRED') OR budget_violation=1)`, id, identity.modelCallId));
+      requireIntegrity(!effectiveModelRows(tx,id).some(row=>row.historical.model_call_id!==identity.modelCallId&&(row.pendingApplication||['DISPATCH_INTENT','REVIEW_REQUIRED'].includes(String(row.historical.state))||row.historical.budget_violation===1)));
       const priorActions = new Set(tx.all('SELECT action_id FROM pending_actions WHERE workflow_run_id=?', id).map(a => a.action_id));
       const scope: ModelApplicationScope = { tx, identity, phase: String(r.phase), roundKey: String(r.round_key),
         requestCursor: Number(r.request_cursor), requestEventId: String(r.request_event_id), startCursor: expectedCursor,

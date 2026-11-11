@@ -1,4 +1,4 @@
-import { assertLegacyControl } from './recoveryHoldLifecycle';
+import { assertLegacyControl, readWorkflowControl } from './recoveryHoldLifecycle';
 import { randomUUID } from 'node:crypto';
 import type { DurableDatabase, DurableTransaction } from './db';
 import { canonicalJson, digest, DurableStoreError, parseJson, requireIntegrity } from './integrity';
@@ -55,6 +55,7 @@ export function safeRecoveryBinding(db: DurableDatabase, tx: DurableTransaction,
   if (!SAFE_RECOVERY_OPERATIONS.includes(input.operationKind)) throw new DurableStoreError('RECOVERY_INVALID_PLAN');
   requireIntegrity(typeof input.targetId === 'string' && !!input.targetId && Object.keys(input).every(k => ['workflowRunId','operationKind','targetId','ttlMs'].includes(k)));
   const id = input.workflowRunId, snapshot = readJournal(tx, id).snapshot;
+  requireIntegrity(readWorkflowControl(tx,id).hold_state==='HELD');
   const inspection = new RecoveryReader(db).inspectInTransaction(tx, id, recoveryTime(tx), false);
   if (inspection.disposition === 'RECOVERY_FAILED' || ['RESOLVED','CANCELLED','FAILED'].includes(snapshot.run.status)) throw new DurableStoreError('RECOVERY_INVALID_PLAN');
   const lease = tx.get('SELECT * FROM runtime_leases WHERE workflow_run_id=?', id);

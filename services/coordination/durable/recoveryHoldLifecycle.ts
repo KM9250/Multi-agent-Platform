@@ -10,6 +10,6 @@ export function readWorkflowControl(tx: DurableTransaction, id: string): Row {
 export function assertLegacyControl(tx: DurableTransaction, id: string, table: string, planId: string): void {
   const c = readWorkflowControl(tx,id);
   const b = tx.get('SELECT * FROM recovery_legacy_control_bindings WHERE plan_table=? AND plan_id=? AND workflow_run_id=?',table,planId,id);
-  if (!b || b.hold_epoch!==c.hold_epoch || b.control_revision!==c.control_revision || c.active_invocation_id || c.planning_review_pending)
+  if (c.hold_state!=='HELD' || !b || b.hold_epoch!==c.hold_epoch || b.control_revision!==c.control_revision || c.active_invocation_id || c.planning_review_pending)
     throw new DurableStoreError('RECOVERY_INVALID_PLAN');
 }
