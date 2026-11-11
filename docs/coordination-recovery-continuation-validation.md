@@ -1,5 +1,7 @@
 # COORD-5C-4B-2B 検証報告
 
+この文書は初回PR #35提出時（`995c186e123e0b96d2a072db09b6d5acf1f0c078`）の結果を保持する。F-01〜F-03修正後の最新結果は [監査修正報告](coordination-pr35-audit-corrections.md) を参照。
+
 基準main: `e4de47b6f5290ec566e26c6a7ffd22ae1e82ab5a`。ブランチ: `codex/coord-5c-4b-2b`。検証日: 2026-11-11。最終HEADは、この報告を含むコミット自身のSHAを埋め込む循環を避け、Draft PR本文に完全な値を記載する。
 
 設計・API・制約: [coordination-recovery-continuation.md](coordination-recovery-continuation.md)。Schema9 / 009_bounded_continuation_hold_lifecycle / COORD-5C-4B2B:BOUNDED_EXECUTION:1。

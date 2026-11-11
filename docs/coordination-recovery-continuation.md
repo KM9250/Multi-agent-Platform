@@ -80,6 +80,8 @@ await execution.startAuthorized(approvedExecution.planId, operatorCredential);
 
 `ContinuationInspection` はMode、Artifact、参照、要約状態、確定／未確定Usage、回数、残枠、実施したModel・Read・Action、終了理由、内容レビュー状態を返す。`internalPersistence: true` はModel課金やMAP内部保存と「業務変更なし」を区別する。`executionAllowed` は常にfalseで、DTOを実行権限に転用できない。既存RecoveryReaderも現在のControlと計画レビュー待ちを表示し、過去Receiptの検証には変更されていないHold原本を使う。
 
+`needs_input` は `inputRequest` に検証済み質問・Digest・出所を返す。`inputRequest.state` は `AWAITING_INPUT`、Invocationは `STOPPED / PLAN_INCOMPLETE` で、完成したPlanの `AWAITING_PLAN_REVIEW` とは区別する。初回 `startAuthorized()` と認証付きReader／再接続は同じ保存済み質問を返す。質問の所有者本人かつ現在のWorkflow閲覧ACLを満たす必要があり、別Actorの管理者Roleだけでは取得できない。回答は新しいrequestId・明示入力・予算のPlanとして作成し、表示や再照会からModelを再生成しない。
+
 ## 原子的な開始・Step・保存
 
 開始TransactionはIdentity・Role・Lease、全Plan Binding、二重Budget、Review、排他を再検証し、Grant消費・必要な単一Resume・Invocation・Control Lifecycle・Receipt・Auditを同時確定する。SQLiteの部分一意Indexにより、WorkflowごとのACTIVE/DRAININGは最大1件。Plan・Grant自身の保存やHeartbeatはBindingを失効させず、Generation、Policy、対象、Budget、Resource、Adapter版・実装変更は失効させる。
@@ -118,11 +120,15 @@ Invocationの状態は ACTIVE → DRAINING → COMPLETED / STOPPED / REVIEW_REQU
 
 DRAFT_PLANは業務 `RunnerPlanProposal` と別の `plan / read_requests / needs_input` 型。execute・Tool CallはTaskへ変換しない。最終出力の専用Artifact保存、PlanArtifactPublished Journal、APPLIED Receipt、COMPLETED/AWAITING_PLAN_REVIEW、ControlとAuditは同一COMMIT。ArtifactにはAPPLIED状態への遅延複合FKもある。途中の要求はPlanningReadRequested / PlanningInputRequested。これらのイベントはTask・Acceptance等の業務状態を変更しない。
 
+質問は専用の `planning_input_requests` に保存する。20問以内・各4,096文字以内、保存JSONは128 KiB以内とし、Credential・秘密パターンとHostのData Class検査を適用する。質問保存、`PlanningInputRequested` の参照とDigest、Model APPLIED、Invocation終了、Receipt・Auditは同じCOMMIT。STRICT、追記専用Scope、Workflow/Invocation/ModelのFKとAPPLIEDへの遅延複合FKを持つ。Journal/Auditには質問本文やRaw Responseを入れない。保存失敗では確定済みUsageと未適用応答を保持し、質問・APPLIED・入力待ち終了だけの部分COMMITをしない。
+
 本文は固定Schema、サイズ、Credential・秘密パターン、Host機密区分で検証し、専用表へ保存する。Model Ledger/Auditには生Prompt・Raw Response・隠されたReasoning・署名を保存しない。Summaryは別フィールドで AVAILABLE / NOT_REQUESTED / NOT_SUPPORTED / NOT_RETURNED / NOT_STORED と出所を示す。保存はHostの明示設定がある場合だけ。Artifact保存失敗時は既に確定したUsageを残し、PENDING_APPLICATIONを自動再Callしない。
 
 LinuxのRead Registryは明示したRootと相対ファイルのallowlistだけを受け付ける。初期Digest・inode・device・mtime/ctime/sizeを固定し、descriptor相対open、O_NOFOLLOW、通常ファイル・hardlink数・UTF-8・サイズ検査を使う。traversal、別Root、symlink、UNC/ADS、Shell、自由SQL、URLを拒否する。読取り前後の同一性を検査し、内容は有限量の一時的なモデル入力にのみ渡す。Read LedgerはIntent、Resource、期待／結果Digest、状態、サイズ、deadline、費用0を保存する。本文をLedgerへコピーしない。
 
 Artifact採用のSnapshot再検証は固定descriptorのメタデータ検査であり、追加の本文取得・Model送信ではない。非ローカルSnapshotはHostの `isSnapshotCurrent` がなければ採用を拒否する。ネットワークReadやWindows用の安全なReaderは未接続でFail Closed。
+
+取得済みReadはResource ID・Digest・Revision・観測時刻とともに保持する。毎回の実Payloadを複製して固定し、入力本文・初回参照・累積Readについて現在のHost検査を予約前、Intent後の送信期限検査、親Scopeを外した外部呼出し直前に行う。`canSend` には現在の操作者・送信先・Data Classを渡し、取得時の許可を再利用しない。同じ入力集合をArtifactと質問の出所へ保存する。予約前の撤回では追加Model Debitを作らず、Intent後の撤回では送信を止めて既存の不確定予約を保持する。推測ゼロ精算や別IDへの再送は行わない。
 
 ## Hold・互換性・責務
 
@@ -131,6 +137,8 @@ Artifact採用のSnapshot再検証は固定descriptorのメタデータ検査で
 解除には、Active/Draining・未知結果・予約・未適用応答・未反映Result・Budget違反・未解決Review・開いたSession・PREPARED・計画レビュー待ちがないことを要求する。正規Resumeが必要なら、元Referenceと仮適用後Snapshotの既存Guardを検証して一つだけ同時確定する。親GrantはAction/Security/Evidence Reviewの代わりにならない。Terminalを復活させない。
 
 解除後は期限切れTakeoverだけでなく、正常Release→AcquireでもGeneration変更と同じCOMMITで新Epochへ再Holdする。HeartbeatはEpochを変えない。解除後に新たな安全停止を検出した場合も原本を保って再Holdする。旧4B-1/2A Receiptは当時の証跡で検証し、新PlanはEpoch/Revision sidecarへ固定する。Migration前の未消費権限はsidecar欠落により実行時に失効する。
+
+元Action StepのApplication期限後は、旧Invocation・通常Store・無認可SQLのApplyを拒否する。別途認証・承認した4B-1 `REFLECT_RECORDED_RESULT` だけは、既存の非公開Safe Recovery Scopeに含まれる現在Lease、Plan/Grant、対象Workflow/Action、Attempt・Result参照/Digest、更新前後のLedgerとTaskイベントを照合して保存済みResultを反映できる。Triggerは既存の `map_safe_recovery_write` による正確な更新許可を検査する。期限を書き換えず、Grantを元Invocation権限へ転用せず、Executorを再実行しない。Grant消費・Task反映・FINALIZED・Receipt・Auditは元の4B-1 Transactionのまま。
 
 Schema9は既存v8のHold・未解決状態を安全側へ投影する。OpenでInvocationを作らず、初回SeedとControlを同時確定する。既存SQLを生成する配列・定数は変更しない。実行前の旧RuntimeはSchema9を `SCHEMA_UNSUPPORTED` として拒否する。
 
@@ -151,3 +159,5 @@ Provider能力はProvider/Model/Adapter版・実装Digest、Purpose、許可さ�
 このPRは合成Provider/Executorだけで検証する。GPT/Gemini/Claudeの本番Adapter、価格・課金・ストリーミング・opaque continuation blockの実装、Production Identity UIは未接続。既存テストAdapterを本番用として再Exportしていない。既定で利用可能なProviderはなく、必要な安全能力が不足すれば予約前に拒否する。Host Registry/ACL/Verifierは信頼境界であり、変更時は安定した版・Digest・Policy versionを更新する。
 
 Unknown Action/Usage、Crash後の未送信か送信済みかを判定できないIntent、失われた本文は4C向けに保全する。自動再送・推測精算・無制限解除は提供しない。検証の件数、初回失敗、Linux環境、Windows未検証事項は [検証報告](coordination-recovery-continuation-validation.md) を参照。
+
+PR #35のF-01〜F-03修正と最新の検証結果は [監査修正報告](coordination-pr35-audit-corrections.md) を参照。
