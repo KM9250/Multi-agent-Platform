@@ -49,7 +49,7 @@ for(const [operation,boundary] of [['cancel','grant'],['cancel','resolution'],['
 function historical(path:string,version:number){const raw=new DatabaseSync(path);if(version){raw.exec('CREATE TABLE schema_migrations (schema_version INTEGER PRIMARY KEY,migration_id TEXT NOT NULL UNIQUE,applied_at INTEGER NOT NULL) STRICT');for(const m of MIGRATIONS.slice(0,version)){raw.exec(m.sql);raw.prepare('INSERT INTO schema_migrations VALUES (?,?,1)').run(m.version,m.id);}raw.exec(`PRAGMA user_version=${version}`);}return raw;}
 for(const version of [0,1,2,3,4,5,6])test(`migration ${version}→8 creates every strict recovery table without execution authority`,t=>{
   const {path}=location(t),raw=historical(path,version);t.after(()=>raw.close());const db=new DurableDatabase({path});t.after(()=>db.close());
-  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,8);assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n,8);
+  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,9);assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n,9);
   assert.equal(raw.prepare('SELECT migration_id FROM schema_migrations WHERE schema_version=7').get()!.migration_id,'007_safe_recovery_execution');
   for(const table of ['recovery_execution_plans','recovery_execution_grants','recovery_execution_operations','recovery_operation_grants','recovery_hold_transitions','recovery_model_resolutions']){
     assert.equal(raw.prepare('SELECT strict FROM pragma_table_list WHERE name=?').get(table)!.strict,1);assert.equal(raw.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n,0);
@@ -64,9 +64,9 @@ test('migration 007 thrown DDL failure rolls back schema, triggers and migration
 });
 for(const boundary of ['before-ddl','after-ddl','before-commit','after-commit'])test(`${terminationName} migration 007/${boundary} exposes only a complete old or new schema`,async t=>{
   const {path}=location(t),raw=historical(path,6);t.after(()=>raw.close());await childCrash(t,path,'migration',boundary);const committed=boundary==='after-commit';
-  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,committed?8:6);assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n,committed?8:6);
+  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,committed?9:6);assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n,committed?9:6);
   assert.equal(raw.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name='recovery_execution_operations'").get()!.n,committed?1:0);
-  const db=new DurableDatabase({path});db.close();assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,8);
+  const db=new DurableDatabase({path});db.close();assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,9);
 });
 
 test('populated schema 6 migration preserves hold, old model reservation and record-only authorization without granting execution',t=>{
@@ -82,7 +82,7 @@ test('populated schema 6 migration preserves hold, old model reservation and rec
     raw.exec(`DELETE FROM ${table}`);for(const record of records)raw.prepare(`INSERT INTO ${table} (${names}) VALUES (${columns.map(()=>'?').join(',')})`).run(...columns.map(c=>record[c] as string|number|null));
   }
   for(const trigger of triggers)raw.exec(String(trigger.sql));raw.exec('PRAGMA foreign_keys=ON');
-  const db=new DurableDatabase({path});t.after(()=>db.close());assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,8);
+  const db=new DurableDatabase({path});t.after(()=>db.close());assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,9);
   for(const [table,records] of Object.entries(before)){
     const columns=records.length?Object.keys(records[0]):raw.prepare(`PRAGMA table_info(${table})`).all().map(c=>String(c.name));
     assert.deepEqual(raw.prepare(`SELECT ${columns.join(',')} FROM ${table} ORDER BY rowid`).all(),records);

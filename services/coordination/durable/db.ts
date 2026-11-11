@@ -1,3 +1,9 @@
+import { readWorkflowControl } from './recoveryHoldLifecycle';
+import { effectiveModelRows } from './safeRecoveryModelState';
+import { BoundedRuntime } from './recoveryContinuationCoordinator';
+import type { BoundedRuntimeOptions } from './recoveryContinuationCoordinator';
+import type { ContinuationCommand, ContinuationPlan, ContinuationPlanInput } from './continuationTypes';
+import type { RunnerExecutorRegistry } from '../runner/types';
 import { DatabaseSync } from 'node:sqlite';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomBytes } from 'node:crypto';
@@ -40,6 +46,7 @@ export interface DurableTransaction {
 }
 export interface DurableDatabaseOptions {
   path: string; busyTimeoutMs?: number;
+  bounded?: BoundedRuntimeOptions;
   /** Trusted host startup dependency. Never populate from an HTTP request or saved DTO. */
   recoveryIdentityVerifier?: RecoveryIdentityVerifier;
   recoveryAuthorizationPolicy?: RecoveryAuthorizationPolicy;
@@ -82,6 +89,7 @@ interface DispatchSink { intent: DispatchIntent; lease: WorkflowLease; valid: bo
 /** One synchronous transaction owner. SQLite serializes writers across connections. */
 export class DurableDatabase {
   #db: DatabaseSync;
+  readonly #bounded: BoundedRuntime;
   readonly #databaseIdentity: string;
   #context?: WriteContext;
   #fencingRejected = false;
@@ -104,7 +112,7 @@ export class DurableDatabase {
   readonly #dispatchEvidence = new AsyncLocalStorage<DispatchSink>();
   #timeAnchor = { wall: Date.now(), monotonic: performance.now() };
   constructor(options: DurableDatabaseOptions) {
-    const observedBindings = new Map<string,{executor:object;execute:unknown}>();
+    const observedBindings = new Map<string,{executor:object;execute:unknown;prepare:unknown}>();
     const registryGet = options.controlledExecutors?.get.bind(options.controlledExecutors);
     this.#controlledExecutors = registryGet
       ? Object.freeze({get: (id:string) => {
@@ -112,11 +120,15 @@ export class DurableDatabase {
         if (binding) {
           const key = canonicalJson([id,binding.contractVersion,binding.implementationDigest]);
           const prior = observedBindings.get(key);
-          requireIntegrity(!prior || prior.executor === binding.executor && prior.execute === binding.executor.execute);
-          observedBindings.set(key,{executor:binding.executor,execute:binding.executor.execute});
+          requireIntegrity(!prior || prior.executor === binding.executor && prior.execute === binding.executor.execute && prior.prepare === binding.executor.prepare);
+          observedBindings.set(key,{executor:binding.executor,execute:binding.executor.execute,prepare:binding.executor.prepare});
         }
         return binding;
       }}) : undefined;
+    this.#bounded = new BoundedRuntime({db:this,verifier:options.recoveryIdentityVerifier,executorBinding:input=>(input.actions??[]).map(a=>{
+      const b=this.#controlledExecutors?.get(a.executorId);requireIntegrity(b&&b.sideEffectRetries==='disabled');
+      return {executorId:a.executorId,contractVersion:b.contractVersion,implementationDigest:b.implementationDigest};
+    }),write:(lease,fn)=>this.#writeFenced(lease,lease.workflowRunId,fn)},options.bounded);
     this.#controlledTiming = controlledTiming(options.controlledTiming);
     this.#recoveryVerifier = options.recoveryIdentityVerifier
       ? Object.freeze({ verify: options.recoveryIdentityVerifier.verify.bind(options.recoveryIdentityVerifier) }) : undefined;
@@ -164,22 +176,22 @@ export class DurableDatabase {
       this.assertTransaction(tx, mutation);
       // No transaction/DDL/PRAGMA control escapes to participants.
       if (!(mutation ? /^(INSERT|UPDATE|DELETE)\s/i : /^SELECT\s/i).test(sql.trim())) {
-        if (this.#safeRecoveryCommand || this.#controlledCommand) this.#recoveryRejected = true;
+        if (this.#safeRecoveryCommand || this.#controlledCommand || this.#bounded.protecting) this.#recoveryRejected = true;
         throw new DurableStoreError('INVALID_TRANSACTION');
       }
     };
     const tx: DurableTransaction = {
       get: (sql, ...params) => { try { check(sql, false); return this.#db.prepare(sql).get(...params); }
-        catch (error) { if (this.#safeRecoveryCommand || this.#controlledCommand) this.#recoveryRejected = true; throw error; } },
+        catch (error) { if (this.#safeRecoveryCommand || this.#controlledCommand || this.#bounded.protecting) this.#recoveryRejected = true; throw error; } },
       all: (sql, ...params) => { try { check(sql, false); return this.#db.prepare(sql).all(...params); }
-        catch (error) { if (this.#safeRecoveryCommand || this.#controlledCommand) this.#recoveryRejected = true; throw error; } },
+        catch (error) { if (this.#safeRecoveryCommand || this.#controlledCommand || this.#bounded.protecting) this.#recoveryRejected = true; throw error; } },
       run: (sql, ...params) => {
         check(sql, true);
         try { this.#db.prepare(sql).run(...params); }
         catch (error) {
           const safe = this.safeError(error);
           if (safe.code === 'LEASE_FENCED') this.#fencingRejected = true;
-          if (safe.code.startsWith('RECOVERY_') || this.#modelApplication || this.#safeRecoveryCommand || this.#controlledCommand) this.#recoveryRejected = true;
+          if (safe.code.startsWith('RECOVERY_') || this.#modelApplication || this.#safeRecoveryCommand || this.#controlledCommand || this.#bounded.protecting) this.#recoveryRejected = true;
           throw safe;
         }
       },
@@ -188,8 +200,9 @@ export class DurableDatabase {
     try {
       this.#db.exec(write ? 'BEGIN IMMEDIATE' : 'BEGIN'); begun = true;
       this.#active = tx; this.#writable = write; this.#context = context; this.#fencingRejected = false;
-      if (context?.kind === 'lease') this.#assertLease(context.record);
+      if (context?.kind === 'lease') { this.#assertLease(context.record); this.#bounded.before(tx,context.record.handle.workflowRunId); }
       const result = fn(tx);
+      if (context?.kind === 'lease') this.#bounded.after(tx);
       if (result && typeof (result as { then?: unknown }).then === 'function') throw new DurableStoreError('INVALID_TRANSACTION');
       if (this.#fencingRejected) throw new DurableStoreError('LEASE_FENCED');
       if (this.#recoveryRejected) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
@@ -201,17 +214,41 @@ export class DurableDatabase {
       // A successful COMMIT can lose its acknowledgement. Keep a usable connection
       // only when SQLite confirms the transaction ended; the receipt reader decides
       // the outcome. Older runtimes without this observation keep the closed fallback.
-      const endedAfterCommit = (this.#safeRecoveryCommand || this.#controlledCommand) && commitAttempted
+      const endedAfterCommit = (this.#safeRecoveryCommand || this.#controlledCommand || this.#bounded.protecting) && commitAttempted
         && (this.#db as DatabaseSync & { isTransaction?: boolean }).isTransaction === false;
       if (begun && !endedAfterCommit) {
         try { this.#db.exec('ROLLBACK'); }
         catch { this.#db.close(); this.#closed = true; }
       }
       throw this.safeError(error);
-    } finally { this.#active = undefined; this.#writable = false; this.#context = undefined; this.#fencingRejected = false;
+    } finally { this.#bounded.clear(); this.#active = undefined; this.#writable = false; this.#context = undefined; this.#fencingRejected = false;
       this.#recoveryIntent = undefined; this.#recoveryRejected = false; this.#modelApplication = undefined;
       this.#safeRecovery = undefined; this.#safeRecoveryCommand = false;
       this.#controlledScope = undefined; this.#controlledCommand = false; }
+  }
+  previewContinuation(input:ContinuationPlanInput,credential:unknown) {return this.#bounded.preview(input,credential);}
+  continuationDecision(lease: WorkflowLease | undefined, credential: unknown, command: ContinuationCommand): unknown {
+    return this.#bounded.command(lease,credential,command);
+  }
+  startContinuation(lease:WorkflowLease|undefined,planId:string,credential:unknown,signal?:AbortSignal) {
+    return this.#bounded.start(lease,planId,credential,signal);
+  }
+  validateInvocationAction(action:import('../runner/types').PreparedRunnerAction):void {this.#bounded.validateAction(action);}
+  putBoundedEvidence(owner:EvidenceOwner,evidence:RunnerEvidence):string|undefined {return this.#bounded.putEvidence(owner,evidence);}
+  collectInvocationModel<T>(invoke:()=>Promise<T>,signal?:AbortSignal) {return this.#bounded.collectModel(invoke,signal);}
+  get boundedInvocationActive(): boolean { return this.#bounded.active; }
+  outsideInvocation<T>(fn:()=>T):T { return this.#bounded.withoutAuthority(fn); }
+  participateInvocation(tx:DurableTransaction,kind:'MODEL'|'ACTION',target:string,amounts:{inputTokens:number;outputTokens:number;costMicros:number},roundKey?:string):void {
+    this.assertTransaction(tx,true);this.#bounded.participate(tx,kind,target,amounts,roundKey);
+  }
+  boundedExecutorRegistry(plan:ContinuationPlan):RunnerExecutorRegistry {
+    requireIntegrity(this.#bounded.active && plan.operation==='BOUNDED_CONTINUATION');
+    return {get:(id:string)=>{
+      const binding=this.#controlledExecutors?.get(id); if(!binding)return;
+      requireIntegrity(binding.sideEffectRetries==='disabled');
+      return {id,prepare:proposal=>this.outsideInvocation(async()=>jsonCopy(await binding.executor.prepare(proposal))),
+        execute:(action,context)=>this.#bounded.executeAction(binding.executor.execute.bind(binding.executor),action,context)};
+    }};
   }
   read<T>(fn: (tx: DurableTransaction) => T): T { return this.#transaction(false, fn); }
   get recoveryPolicy(): RecoveryAuthorizationPolicy { return jsonCopy(this.#recoveryPolicy); }
@@ -230,7 +267,7 @@ export class DurableDatabase {
   previewControlledDispatch(workflowRunId: string) {
     return this.read(tx => {
       readJournal(tx,workflowRunId);
-      const held = !!tx.get('SELECT workflow_run_id FROM recovery_holds WHERE workflow_run_id=?',workflowRunId);
+      const held = !!tx.get('SELECT workflow_run_id FROM recovery_effective_holds WHERE workflow_run_id=?',workflowRunId);
       const candidates = tx.all("SELECT action_id FROM execution_ledger WHERE workflow_run_id=? AND state='PREPARED'",workflowRunId).map(row => {
         let reason: string | null = held ? null : 'HOLD_NOT_ESTABLISHED';
         if (held) try { controlledBinding(this,tx,{workflowRunId,actionId:String(row.action_id)},this.#controlledExecutors,this.#controlledTiming); }
@@ -256,15 +293,20 @@ export class DurableDatabase {
         ? tx.get('SELECT workflow_run_id FROM recovery_controlled_grants WHERE authorization_id=?',command.authorizationId)?.workflow_run_id
         : tx.get('SELECT workflow_run_id FROM recovery_controlled_plans WHERE plan_id=?',command.planId)?.workflow_run_id;
       if (workflow !== lease.workflowRunId) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
-      if (command.kind === 'CREATE_PLAN' && !tx.get('SELECT workflow_run_id FROM recovery_holds WHERE workflow_run_id=?',workflow)) {
+      if (command.kind === 'CREATE_PLAN' && !tx.get('SELECT workflow_run_id FROM recovery_effective_holds WHERE workflow_run_id=?',workflow)) {
         // Identity and eligibility precede the first management write. Same transaction as the plan.
         preparedEligibility(this,tx,command.input);
         this.#recoveryIntent = {workflowRunId:workflow,kind:'HOLD',id:workflow};
         const now = recoveryTime(tx);
+        const control=readWorkflowControl(tx,workflow);requireIntegrity(!control.active_invocation_id&&!control.planning_review_pending);
+        if(tx.get('SELECT workflow_run_id FROM recovery_holds WHERE workflow_run_id=?',workflow)) {
+          tx.run("INSERT INTO recovery_hold_lifecycle SELECT NULL,workflow_run_id,hold_epoch+1,control_revision+1,'HELD',NULL,planning_review_pending,'GATE_REHOLD',?,? FROM recovery_workflow_control WHERE workflow_run_id=?",lease.generation,now,workflow);
+        } else {
         tx.run("INSERT INTO recovery_holds VALUES (?,1,'STATE_CHANGED',?,?,'GATE',1)",workflow,lease.generation,now);
         tx.run(`INSERT INTO runtime_audit_events (audit_event_id,workflow_run_id,event_kind,entity_kind,entity_id,
           recovery_hold_revision,next_state,reason_code,occurred_at,recorded_at,schema_version,runtime_instance_id,runtime_generation)
           VALUES (lower(hex(randomblob(16))),?,'RECOVERY_HOLD_CREATED','WORKFLOW',?,1,'HELD','STATE_CHANGED',?,?,1,?,?)`,workflow,workflow,now,now,lease.runtimeInstanceId,lease.generation);
+        }
         this.#recoveryIntent = undefined;
       }
       return persistControlledDecision(this,tx,command,identity,lease,this.#controlledExecutors,this.#controlledTiming,
@@ -426,12 +468,15 @@ export class DurableDatabase {
   }
   assertRecoveryExecution(lease: WorkflowLease | undefined, id: string, reservedModelId?: string): void {
     const reason = this.writeWithLease(lease, id, tx => {
+      if (this.#bounded.startAllowed(tx,id,'RUNNER')) return undefined;
       let reason;
       try { reason = recoveryGateReason(tx, id, reservedModelId); }
       catch (error) {
         if (!(error instanceof DurableStoreError) || ['DATABASE_ERROR','DATABASE_BUSY'].includes(error.code)) throw error;
         reason = 'INTEGRITY_UNVERIFIED' as const;
       }
+      const control = tx.get('SELECT hold_state,active_invocation_id,planning_review_pending FROM recovery_workflow_control WHERE workflow_run_id=?',id);
+      if (control?.active_invocation_id || control?.planning_review_pending) return reason;
       if (reason && !tx.get('SELECT workflow_run_id FROM recovery_holds WHERE workflow_run_id=?', id)) {
         this.#recoveryIntent = { workflowRunId: id, kind: 'HOLD', id };
         const now = recoveryTime(tx);
@@ -439,6 +484,10 @@ export class DurableDatabase {
         tx.run(`INSERT INTO runtime_audit_events (audit_event_id,workflow_run_id,event_kind,entity_kind,entity_id,
           recovery_hold_revision,next_state,reason_code,occurred_at,recorded_at,schema_version,runtime_instance_id,runtime_generation)
           VALUES (lower(hex(randomblob(16))),?,'RECOVERY_HOLD_CREATED','WORKFLOW',?,1,'HELD',?,?,?,1,?,?)`, id, id, reason, now, now, lease!.runtimeInstanceId, lease!.generation);
+      }
+      if(reason && control?.hold_state==='RELEASED') {
+        this.#recoveryIntent={workflowRunId:id,kind:'HOLD',id};
+        tx.run("INSERT INTO recovery_hold_lifecycle SELECT NULL,workflow_run_id,hold_epoch+1,control_revision+1,'HELD',NULL,planning_review_pending,'GATE_REHOLD',?,? FROM recovery_workflow_control WHERE workflow_run_id=?",lease!.generation,recoveryTime(tx),id);
       }
       return reason;
     });
@@ -448,6 +497,7 @@ export class DurableDatabase {
   /** An existing writer gets no blanket exception. Only registration may use the private PLAN scope. */
   assertRecoveryStartInTransaction(tx: DurableTransaction, id: string, registration: boolean): void {
     this.assertWorkflowWrite(tx, id);
+    if (this.#bounded.startAllowed(tx,id,registration?'REGISTER':'RUNNER')) return;
     const reason = recoveryGateReason(tx, id);
     if (reason && !(reason === 'PENDING_RESPONSE' && registration && this.#planApplicationCurrent(tx, id))) {
       this.#recoveryRejected = true;
@@ -478,10 +528,9 @@ export class DurableDatabase {
       requireIntegrity(Number.isSafeInteger(expectedCursor) && expectedCursor === Number(r.request_cursor) + 1
         && before.events.length === expectedCursor && before.events.at(-1)!.eventId === r.usage_event_id
         && before.events[Number(r.request_cursor) - 1]?.eventId === r.request_event_id);
-      if (recoveryGateReason(tx, id) !== 'PENDING_RESPONSE' || tx.get('SELECT workflow_run_id FROM recovery_holds WHERE workflow_run_id=?', id))
+      if (!this.#bounded.businessApplicationAllowed(tx,id,identity.modelCallId) && (recoveryGateReason(tx, id) !== 'PENDING_RESPONSE' || tx.get('SELECT workflow_run_id FROM recovery_effective_holds WHERE workflow_run_id=?', id)))
         throw new DurableStoreError('RECOVERY_HELD');
-      requireIntegrity(!tx.get(`SELECT model_call_id FROM model_call_ledger WHERE workflow_run_id=? AND model_call_id<>?
-        AND (application_status='PENDING_APPLICATION' OR state IN ('DISPATCH_INTENT','REVIEW_REQUIRED') OR budget_violation=1)`, id, identity.modelCallId));
+      requireIntegrity(!effectiveModelRows(tx,id).some(row=>row.historical.model_call_id!==identity.modelCallId&&(row.pendingApplication||['DISPATCH_INTENT','REVIEW_REQUIRED'].includes(String(row.historical.state))||row.historical.budget_violation===1)));
       const priorActions = new Set(tx.all('SELECT action_id FROM pending_actions WHERE workflow_run_id=?', id).map(a => a.action_id));
       const scope: ModelApplicationScope = { tx, identity, phase: String(r.phase), roundKey: String(r.round_key),
         requestCursor: Number(r.request_cursor), requestEventId: String(r.request_event_id), startCursor: expectedCursor,
@@ -508,7 +557,7 @@ export class DurableDatabase {
     this.assertWorkflowWrite(tx, id);
     requireIntegrity(this.#modelApplication === scope && this.#context?.kind === 'lease'
       && this.#context.record.handle.runtimeInstanceId === scope.runtimeInstanceId && this.#context.record.handle.generation === scope.generation);
-    if (tx.get('SELECT workflow_run_id FROM recovery_holds WHERE workflow_run_id=?', id)) throw new DurableStoreError('RECOVERY_HELD');
+    if (!this.#bounded.businessApplicationAllowed(tx,id,identity.modelCallId) && tx.get('SELECT workflow_run_id FROM recovery_effective_holds WHERE workflow_run_id=?', id)) throw new DurableStoreError('RECOVERY_HELD');
     const r = tx.get('SELECT * FROM model_call_ledger WHERE workflow_run_id=? AND model_call_id=?', id, identity.modelCallId);
     requireIntegrity(r && r.state === 'SETTLED' && r.application_status === 'PENDING_APPLICATION' && !r.budget_violation
       && r.phase === scope.phase && r.round_key === scope.roundKey && r.request_cursor === scope.requestCursor && r.request_event_id === scope.requestEventId
@@ -531,7 +580,8 @@ export class DurableDatabase {
     requireIntegrity(scope.phase === 'PLAN' && sessions.length === 1 && tasks.length === 1 && actions.length === 1);
     const action = actions[0], session = sessions[0], task = tasks[0];
     const sessionPayload = session.payload as { sessionId: string; contextRef: string }, taskPayload = task.payload as { taskId: string; sessionId: string };
-    requireIntegrity(action.round_key === `map.runner.v1:${scope.roundKey}` && sessionPayload.contextRef === action.round_key
+    const businessRoundKey = scope.tx.get("SELECT business_round_key FROM recovery_invocation_steps WHERE workflow_run_id=? AND kind='MODEL' AND target_id=?",scope.identity.workflowRunId,scope.identity.modelCallId)?.business_round_key ?? scope.roundKey;
+    requireIntegrity(action.round_key === `map.runner.v1:${businessRoundKey}` && sessionPayload.contextRef === action.round_key
       && session.sessionId === action.session_id && sessionPayload.sessionId === action.session_id
       && task.sessionId === action.session_id && taskPayload.sessionId === action.session_id && taskPayload.taskId === action.task_id);
     requireIntegrity(scope.tx.get(`SELECT action_id FROM execution_ledger WHERE workflow_run_id=? AND action_id=?
@@ -615,6 +665,14 @@ export class DurableDatabase {
     }
   }
   #registerFencingFunctions(): void {
+    this.#db.function('map_bounded_write', (workflow, table, op, target, detail) =>
+      ((table === 'recovery_invocations' && op === 'UPDATE' || table === 'bounded_audit' && op === 'INSERT') && this.#context?.kind === 'management' && this.#context.workflowRunId === workflow) || this.#bounded.allows(workflow,table,op,target,detail) ? 1 : 0);
+    this.#db.function('map_bounded_event', (workflow,type,payload)=>this.#bounded.eventAllowed(workflow,type,payload)?1:0);
+    this.#db.function('map_bounded_legacy_binding', (workflow, table, plan) => {
+      if (this.#context?.kind !== 'lease' || this.#context.record.handle.workflowRunId !== workflow) return 0;
+      if (table === 'recovery_execution_plans') return this.#safeRecovery?.intent.kind === 'CREATE_PLAN' && this.#safeRecovery.intent.executionPlanId === plan ? 1 : 0;
+      return table === 'recovery_controlled_plans' && this.#controlledScope?.table === table && this.#controlledScope.row.plan_id === plan ? 1 : 0;
+    });
     this.#db.function('map_controlled_actor', () => this.#controlledScope?.actorId ?? null);
     this.#db.function('map_controlled_write', (table, before, after) => {
       const s = this.#controlledScope;
@@ -712,7 +770,8 @@ export class DurableDatabase {
     });
     this.#db.function('map_recovery_start', (workflow, route, target) => {
       if (this.#context?.kind !== 'lease' || !this.#active || this.#context.record.handle.workflowRunId !== workflow) return -1;
-      try { return recoveryStartAllowed(this.#active, String(workflow), String(route), String(target),
+      try { if(this.#bounded.startAllowed(this.#active,String(workflow),String(route))) return 1;
+        return recoveryStartAllowed(this.#active, String(workflow), String(route), String(target),
         route === 'REGISTER' && this.#planApplicationCurrent(this.#active, String(workflow))) ? 1 : 0; }
       catch { return 0; }
     });

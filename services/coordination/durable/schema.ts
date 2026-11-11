@@ -7,7 +7,9 @@ import { RECOVERY_DECISION_SQL } from './recoveryDecisionSchema';
 import { SAFE_RECOVERY_SQL } from './safeRecoverySchema';
 import { CONTROLLED_RECOVERY_SQL } from './controlledRecoverySchema';
 
-export const SCHEMA_VERSION = 8;
+import { CONTINUATION_SQL } from './continuationSchema';
+
+export const SCHEMA_VERSION = 9;
 // Persisted seed/checkpoint format is unchanged by the additive execution migration.
 export const JOURNAL_SCHEMA_VERSION = 1;
 export const MIGRATIONS = [{ version: 1, id: '001_durable_coordination', sql: `
@@ -167,4 +169,6 @@ BEGIN SELECT RAISE(ABORT, 'INVALID_EXECUTION_TRANSITION'); END;
 { version: 5, id: '005_durable_model_call_budget', sql: MODEL_CALL_SQL },
 { version: 6, id: '006_recovery_decision_authorization', sql: RECOVERY_DECISION_SQL },
 { version: 7, id: '007_safe_recovery_execution', sql: SAFE_RECOVERY_SQL },
-{ version: 8, id: '008_bounded_recovery_execution', sql: CONTROLLED_RECOVERY_SQL }] as const;
+{ version: 8, id: '008_bounded_recovery_execution', sql: CONTROLLED_RECOVERY_SQL },
+{ version: 9, id: '009_bounded_continuation_hold_lifecycle', sql: CONTINUATION_SQL },
+] as const;

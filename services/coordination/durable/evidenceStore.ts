@@ -28,6 +28,8 @@ export class SqliteRunnerEvidenceStore implements RunnerEvidenceStore {
   async put(evidence: RunnerEvidence): Promise<string> {
     const scope = this.owners.getStore(); requireIntegrity(scope);
     const { owner, lease } = scope;
+    const bounded = this.database.putBoundedEvidence(owner,evidence);
+    if(bounded!==undefined)return bounded;
     const controlled = this.database.putControlledEvidence(owner,evidence);
     if (controlled !== undefined) return controlled;
     const json = executionJson(evidence, EXECUTION_LIMITS.evidence);

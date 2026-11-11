@@ -6,13 +6,16 @@ import { runnerActionApproved, runnerEvidenceReviewReason, runnerSecurityReviewR
 import { parseJson } from './integrity';
 import { evaluateRunnerActionRisk } from '../runner/policyGuard';
 import type { PreparedRunnerAction } from '../runner/types';
+import { readWorkflowControl } from './recoveryHoldLifecycle';
 import { effectiveModelRows } from './safeRecoveryModelState';
 
 /** Persisted risk only. A normal dispatch may finish under its still-current lease;
  * a new invocation cannot treat that dispatch as permission to start more work. */
 export function recoveryGateReason(tx: DurableTransaction, id: string, ignoreReservedModel?: string): RecoveryReason | undefined {
   const s = readJournal(tx, id).snapshot;
-  const existing = tx.get('SELECT reason_code FROM recovery_holds WHERE workflow_run_id=?', id);
+  const control = readWorkflowControl(tx, id);
+  if (control.active_invocation_id || control.planning_review_pending) return 'STATE_CHANGED';
+  const existing = tx.get('SELECT reason_code FROM recovery_effective_holds WHERE workflow_run_id=?', id);
   if (existing) return existing.reason_code as RecoveryReason;
   if (tx.get('SELECT coverage FROM model_call_coverage WHERE workflow_run_id=?', id)?.coverage !== 'TRACKED_FROM_CREATION') return 'LEGACY_COVERAGE';
   if (['BLOCKED','SUSPENDED'].includes(s.run.status)) return 'EXPLICIT_STOP';

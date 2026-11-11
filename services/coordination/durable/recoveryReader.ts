@@ -1,3 +1,4 @@
+import { readWorkflowControl } from './recoveryHoldLifecycle';
 import { inspectModelCalls } from './modelCallRecovery';
 import type { CoordinationSnapshot } from '../types';
 import { parseRunnerActionRef, runnerPendingApproval } from '../runner/policyGuard';
@@ -128,6 +129,8 @@ export class RecoveryReader {
           });
           reason = 'RECOVERY_DECISION_INTEGRITY_INVALID';
           inspection.recoveryDecisions = recoveryDecisionSummary(tx, workflowRunId);
+          const control=readWorkflowControl(tx,workflowRunId);
+          inspection.workflowControl={holdState:control.hold_state as 'HELD',holdEpoch:Number(control.hold_epoch),revision:Number(control.control_revision),activeInvocationId:control.active_invocation_id as string|null,planningReviewPending:!!control.planning_review_pending};
           const hold = tx.get('SELECT * FROM recovery_holds WHERE workflow_run_id=?', workflowRunId);
           const transitions = tx.all('SELECT * FROM recovery_hold_transitions WHERE workflow_run_id=? ORDER BY revision', workflowRunId);
           const operations = tx.all('SELECT * FROM recovery_execution_operations WHERE workflow_run_id=? ORDER BY committed_at,operation_id', workflowRunId);
@@ -143,15 +146,20 @@ export class RecoveryReader {
             revision++;
           }
           if (hold) inspection.safeRecovery = { holdRevision: revision,
-            holdState: transitions.at(-1)?.state as 'RECOVERY_STEP_APPLIED' | 'READY_FOR_CONTINUATION_REVIEW' ?? 'HELD',
+            holdState: control.hold_state==='RELEASED'?'RELEASED':transitions.at(-1)?.state as 'RECOVERY_STEP_APPLIED' | 'READY_FOR_CONTINUATION_REVIEW' ?? 'HELD',
             operations: operations.map(operation => ({ operationId: String(operation.operation_id), executionPlanId: String(operation.execution_plan_id),
               operationKind: String(operation.operation_kind), targetId: String(operation.target_id), receiptDigest: String(operation.receipt_digest), committedAt: Number(operation.committed_at) })),
             executionAllowed: false };
-          if (transitions.at(-1)?.state === 'READY_FOR_CONTINUATION_REVIEW' && inspection.disposition === 'READY_TO_RESUME') {
+          if (control.hold_state==='HELD' && transitions.at(-1)?.state === 'READY_FOR_CONTINUATION_REVIEW' && inspection.disposition === 'READY_TO_RESUME') {
             inspection.disposition = 'READY_FOR_CONTINUATION_REVIEW';
             inspection.nextStep = 'REQUIRE_OPERATOR_REVIEW';
             inspection.reasonCodes = [...new Set([...inspection.reasonCodes, 'RECOVERY_HOLD_REQUIRES_CONTINUATION_REVIEW'])];
           }
+        }
+        if(inspection.workflowControl?.activeInvocationId||inspection.workflowControl?.planningReviewPending){
+          inspection.disposition=inspection.workflowControl.activeInvocationId?'INVOCATION_ACTIVE':'AWAITING_PLAN_REVIEW';
+          inspection.nextStep=inspection.workflowControl.activeInvocationId?'WAIT_FOR_INVOCATION':'REVIEW_PLAN';
+          inspection.requiresExplicitAuthorization=true;inspection.reasonCodes=[...inspection.reasonCodes,inspection.disposition];
         }
         return inspection;
     } catch (error) {

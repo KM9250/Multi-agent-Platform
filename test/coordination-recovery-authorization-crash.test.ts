@@ -42,7 +42,7 @@ for(const version of [0,1,2,3,4,5])test(`Migration ${version} → 8 preserves or
   for(let v=3;v<=version;v++){raw.exec(MIGRATIONS[v-1].sql);raw.prepare('INSERT INTO schema_migrations VALUES (?,?,?)').run(v,MIGRATIONS[v-1].id,1);raw.exec(`PRAGMA user_version=${v}`);}
   const tables=raw.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('schema_migrations','sqlite_sequence')").all().map(r=>String(r.name));
   const before=Object.fromEntries(tables.map(name=>[name,raw.prepare(`SELECT * FROM ${name}`).all()]));
-  const db=new DurableDatabase({path});t.after(()=>db.close());assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,8);
+  const db=new DurableDatabase({path});t.after(()=>db.close());assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,9);
   for(const [table,rows] of Object.entries(before)) {
     const after=raw.prepare(`SELECT * FROM ${table}`).all();
     assert.equal(after.length,rows.length);rows.forEach((row,i)=>{for(const key of Object.keys(row))assert.deepEqual(after[i][key],row[key]);});
@@ -54,7 +54,7 @@ for(const boundary of ['before','after'])test(`Linux SIGKILL migration006 ${boun
   const f=executionFixture(t);f.register();const path=join(f.dir,'migration.sqlite');historicalDatabase(f,path,2);
   const raw=new DatabaseSync(path);t.after(()=>raw.close());
   for(let v=3;v<=5;v++){raw.exec(MIGRATIONS[v-1].sql);raw.prepare('INSERT INTO schema_migrations VALUES (?,?,1)').run(v,MIGRATIONS[v-1].id);raw.exec(`PRAGMA user_version=${v}`);}
-  await crash(path,'migration',boundary);assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,boundary==='after'?8:5);
+  await crash(path,'migration',boundary);assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,boundary==='after'?9:5);
   assert.equal(raw.prepare("SELECT count(*) n FROM sqlite_master WHERE name='recovery_holds'").get()!.n,boundary==='after'?1:0);
   const db=new DurableDatabase({path});db.close();assert.equal(raw.prepare('SELECT count(*) n FROM recovery_holds').get()!.n,1);
 });

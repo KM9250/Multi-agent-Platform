@@ -60,6 +60,8 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
   registerAction(input: RunnerPendingActionRecord, expected: CoordinationSnapshot, sessionEvent: CoordinationEvent, taskEvent: CoordinationEvent): RunnerPendingActionRecord {
     this.store.assertRecoveryRegistration(input.workflowRunId);
     const record = validateAction(input), action = record.action;
+    this.store.database.validateInvocationAction(action);
+    if(this.store.database.boundedInvocationActive)requireIntegrity(evaluateRunnerActionRisk(expected,action)!=='DENY');
     // Identity is stable across a lost response. No replacement Action or Round is generated here.
     const registrationDigest = digest([record, expected.events.at(-1), expected.policy, sessionEvent, taskEvent]);
     return this.store.writeWorkflow(record.workflowRunId, tx => {
@@ -111,10 +113,12 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
       const risk = evaluateRunnerActionRisk(s, r.action);
       requireIntegrity(risk !== 'DENY' && (risk !== 'NEEDS_USER' || runnerActionApproved(s, r.action)));
       requireIntegrity(this.executors.get(r.action.executorId)?.id === r.action.executorId);
+      this.store.database.validateInvocationAction(r.action);
       const row = readExecution(tx, r);
       if (row.state !== 'PREPARED') throw new DurableStoreError('EXECUTION_REVIEW_REQUIRED');
       const attemptId = randomUUID(), now = this.now();
       reserveExecutionInTransaction(tx,r,attemptId,now);
+      this.store.database.participateInvocation(tx,'ACTION',r.action.actionId,{inputTokens:0,outputTokens:0,costMicros:0});
       return { record: r, attemptId };
     });
   }

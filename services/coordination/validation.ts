@@ -1,3 +1,4 @@
+import { validatePlanningEvent, PLANNING_EVENTS } from './planningEvents';
 import type { AcceptanceCriterionEvaluatedPayload, CommitmentAcceptedPayload, CommitmentGateResult, CommitmentPolicyEvaluationPayload, CommitmentRejectedPayload, CommitmentRequestedPayload, CoordinationSnapshot, ProgressRecordedPayload, UsageRecordedPayload, WorkflowBlockedPayload, WorkflowCommitmentState, WorkflowResumePayload, WorkflowStatus } from './types';
 import { ALLOWED_WHILE_STOPPED, COORDINATION_EVENT_TYPES, STOPPED_WORKFLOW_STATUSES, TERMINAL_WORKFLOW_STATUSES } from './types';
 import { evaluateQuorumOutcome, requiredQuorumApprovals } from './quorum';
@@ -125,6 +126,7 @@ export const validateCoordinationSnapshot = (snapshot: CoordinationSnapshot): vo
       for (const id of evidenceIds) { const evidenceIndex = snapshot.events.findIndex(candidate => candidate.eventId === id); if (evidenceIndex < 0 || evidenceIndex >= index) throw new Error('Acceptance evidence must reference a prior event.'); if (!ACCEPTANCE_EVIDENCE_TYPES.has(snapshot.events[evidenceIndex].type)) throw new Error('Acceptance evidence type is not allowed.'); }
       if (payload.outcome === 'SATISFIED') satisfied.add(criterion); else satisfied.delete(criterion);
     }
+    validatePlanningEvent(event,run.supervisorAgentId);
     if (event.type === 'UsageRecorded') {
       if (TERMINAL_WORKFLOW_STATUSES.has(replayedWorkflowStatus)) throw new Error('Usage cannot be recorded after workflow termination.');
       if (event.sessionId !== undefined || event.actorAgentId !== run.supervisorAgentId) throw new Error('Usage must be workflow-scoped and supervisor-owned.');

@@ -61,7 +61,7 @@ test('policy copy or seed tampering is detected without substitution', t => {
 test('future database/seed schemas and inconsistent migration ledgers are refused', t => {
   const f = fixture(t), raw = f.raw(); f.db.close();
   raw.exec('PRAGMA user_version=999'); assert.throws(() => f.open(), { code: 'SCHEMA_UNSUPPORTED' });
-  raw.exec('PRAGMA user_version=8'); raw.prepare('UPDATE schema_migrations SET migration_id=? WHERE schema_version=1').run('future');
+  raw.exec('PRAGMA user_version=9'); raw.prepare('UPDATE schema_migrations SET migration_id=? WHERE schema_version=1').run('future');
   assert.throws(() => f.open(), { code: 'INTEGRITY_ERROR' });
   raw.prepare('UPDATE schema_migrations SET migration_id=? WHERE schema_version=1').run('001_durable_coordination');
   bypassFencingForCorruption(raw); raw.exec('DROP TRIGGER seed_immutable; UPDATE workflow_seeds SET schema_version=999');
