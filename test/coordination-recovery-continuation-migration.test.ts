@@ -30,7 +30,7 @@ for(let version=0;version<=8;version++)test(`M01: ${version}→9 creates strict 
  const dir=mkdtempSync(join(tmpdir(),'map-v9-migrate-')),path=join(dir,'db.sqlite');t.after(()=>rmSync(dir,{recursive:true,force:true}));const raw=historical(path,version);t.after(()=>raw.close());
  const db=new DurableDatabase({path});t.after(()=>db.close());assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,9);
  assert.equal(raw.prepare('SELECT migration_id FROM schema_migrations WHERE schema_version=9').get()!.migration_id,'009_bounded_continuation_hold_lifecycle');
- for(const name of ['recovery_invocations','recovery_invocation_steps','recovery_invocation_debits','recovery_workflow_control','recovery_hold_lifecycle','planning_artifacts','planning_read_calls']){assert.equal(raw.prepare('SELECT strict FROM pragma_table_list WHERE name=?').get(name)!.strict,1);assert.equal(raw.prepare(`SELECT count(*) n FROM ${name}`).get()!.n,0);}
+ for(const name of ['recovery_invocations','recovery_invocation_steps','recovery_invocation_debits','recovery_workflow_control','recovery_hold_lifecycle','planning_artifacts','planning_input_requests','planning_read_calls']){assert.equal(raw.prepare('SELECT strict FROM pragma_table_list WHERE name=?').get(name)!.strict,1);assert.equal(raw.prepare(`SELECT count(*) n FROM ${name}`).get()!.n,0);}
  assert.deepEqual(raw.prepare('PRAGMA foreign_key_check').all(),[]);
 });
 for(const executed of [false,true])test(`M01/H07: populated v8 ${executed?'Receipt':'unused Grant'} keeps every original row and invalidates unbound execution`,async t=>{
