@@ -1,5 +1,6 @@
 import type { CoordinationEvent } from './types';
 export const PLANNING_EVENTS = new Set(['PlanArtifactPublished','PlanningReadRequested','PlanningInputRequested']);
+// PlanningInputRequested references the private saved question artifact. Journal/Audit contain no question body.
 export function validatePlanningEvent(event:CoordinationEvent, supervisor:string):void {
   if(!PLANNING_EVENTS.has(event.type))return;
   const p=event.payload as Record<string,unknown>;

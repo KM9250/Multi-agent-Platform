@@ -9,7 +9,7 @@ export class RecoveryContinuationReader {
   timeline(planId:string,credential:unknown):Array<{source:'BOUNDED'|'RUNTIME';sequence:number;kind:string;referenceId:string;recordedAt:number}> {
     const saved=this.inspect(planId,credential),id=saved.plan.workflowRunId,invocation=saved.invocation?.invocationId;
     return this.database.read(tx=>{
-      const refs=new Set([planId,...(invocation?[invocation]:[]),...(saved.artifact?[saved.artifact.artifactId]:[])]);
+      const refs=new Set([planId,...(invocation?[invocation]:[]),...(saved.artifact?[saved.artifact.artifactId]:[]),...(saved.inputRequest?[saved.inputRequest.inputRequestId]:[])]);
       for(const r of tx.all('SELECT grant_id FROM recovery_continuation_grants WHERE plan_id=?',planId))refs.add(String(r.grant_id));
       for(const r of tx.all('SELECT receipt_id FROM recovery_continuation_receipts WHERE plan_id=?',planId))refs.add(String(r.receipt_id));
       for(const r of tx.all('SELECT step_id,target_id FROM recovery_invocation_steps WHERE invocation_id=?',invocation??'')){refs.add(String(r.step_id));refs.add(String(r.target_id));}

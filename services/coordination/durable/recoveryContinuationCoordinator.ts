@@ -5,7 +5,7 @@ import type { DurableDatabase, DurableTransaction, Row } from './db';
 import type { WorkflowLease } from './runtimeLease';
 import type { RecoveryIdentityVerifier, VerifiedRecoveryIdentity } from './recoveryDecisionTypes';
 import type { ContinuationCommand, ContinuationPlan, ContinuationPlanInput, ContinuationPolicy, ContinuationInspection,
-  BoundedProviderRegistry, BoundedProvider, InvocationTiming, PlanArtifact, ArtifactRef, PlanningProviderResponse } from './continuationTypes';
+  BoundedProviderRegistry, BoundedProvider, InvocationTiming, PlanArtifact, ArtifactRef, PlanningProviderRequest, PlanningProviderResponse, InputSnapshot, PlanningInputRequest } from './continuationTypes';
 import { BOUNDED_CONTRACT } from './continuationTypes';
 import { verifyRecoveryIdentity } from './recoveryAuthorization';
 import { boundedTiming, validateContinuationInput, planBinding, readContinuationPlan, executionState, artifactBasis, validateProvider, assertArtifactReferences, continuationPolicyBinding } from './recoveryContinuationPlanner';
@@ -14,7 +14,7 @@ import { recoveryTime } from './recoveryPlanner';
 import { readWorkflowControl } from './recoveryHoldLifecycle';
 import { readJournal } from './restore';
 import { SqliteCoordinationRunnerStore } from './durableCoordinationStore';
-import { readArtifact, validateDraft, assertPlanningTextSafe } from './planningArtifactStore';
+import { readArtifact, readPlanningInputRequest, validateDraft, assertPlanningTextSafe } from './planningArtifactStore';
 import type { PlanningReadRegistry } from './planningReadRegistry';
 import { ModelCallLedger, modelBudgetPosition } from './modelCallLedger';
 import type { ModelCallIdentity } from './modelCallLedger';
@@ -35,6 +35,11 @@ interface Context {
   plan: ContinuationPlan; invocationId: string; lease: WorkflowLease; actor: VerifiedRecoveryIdentity;
   phase: 'RUNNER'|'MODEL'|'APPLICATION'|'READ'|'FINISH'|'EVIDENCE'; callId?: string; roundKey?: string; roundStepId?:string;
   valid: boolean; abort: AbortController;
+  planningRequest?: Omit<PlanningProviderRequest,'signal'>;
+}
+/** The payload's references are also the provenance displayed with its output. */
+function planningSnapshots(request:Omit<PlanningProviderRequest,'signal'>):InputSnapshot[] {
+  return [...request.references,...request.reads.map(r=>({id:r.resourceId,digest:r.digest,revision:r.revision,observedAt:r.observedAt}))];
 }
 interface Host {
   db: DurableDatabase; verifier?: RecoveryIdentityVerifier;
@@ -109,7 +114,7 @@ export class BoundedRuntime {
     if(['model_call_ledger','model_call_attempts','workflow_seeds'].includes(table))return true;
     if(table==='journal_events')return true; // Exact event and target validation is in the additional event guard.
     if(table==='planning_application')return c.plan.operation==='PLANNING_ONLY'&&c.phase==='APPLICATION';
-    if(table==='planning_artifacts'||table==='planning_reviews')return c.plan.operation==='PLANNING_ONLY'&&c.phase==='APPLICATION';
+    if(['planning_artifacts','planning_input_requests','planning_reviews'].includes(table))return c.plan.operation==='PLANNING_ONLY'&&c.phase==='APPLICATION';
     if(table==='planning_read_calls')return c.plan.mode==='PLAN_READ_ONLY'&&c.phase==='READ';
     return c.plan.operation==='BOUNDED_CONTINUATION'&&c.phase==='RUNNER'
       &&['pending_actions','execution_ledger','execution_results','runner_evidence'].includes(table);
@@ -163,7 +168,7 @@ export class BoundedRuntime {
   dispatchDeadline(kind:'MODEL'|'ACTION'|'READ',target:string):number {
     const c=this.#contexts.getStore();requireIntegrity(c?.valid&&!c.abort.signal.aborted);
     requireIntegrity(this.#policy().canAccess(c.actor,c.plan.workflowRunId,'EXECUTE'));
-    this.#checkData(c.actor,c.plan);requireIntegrity(digest(continuationPolicyBinding(this.#policy()))===digest(c.plan.binding.policy));
+    this.#checkData(c.actor,c.plan,kind==='MODEL'?c.planningRequest:undefined);requireIntegrity(digest(continuationPolicyBinding(this.#policy()))===digest(c.plan.binding.policy));
     if(c.plan.operation!=='RELEASE_RECOVERY_HOLD')requireIntegrity(digest(validateProvider(this.#provider(c.plan),c.plan))===digest(c.plan.binding.provider));
     return this.#host.db.read(tx=>{
       const i=tx.get('SELECT * FROM recovery_invocations WHERE invocation_id=?',c.invocationId);
@@ -199,9 +204,12 @@ export class BoundedRuntime {
   #receipt(tx:DurableTransaction,p:ContinuationPlan,kind:'START'|'FINISH'|'RELEASE'|'STOP',body:unknown):void {
     tx.run('INSERT INTO recovery_continuation_receipts VALUES(?,?,?,?,?,?)',randomUUID(),p.workflowRunId,p.planId,kind,canonicalJson(body),digest(body));
   }
-  #checkData(who:VerifiedRecoveryIdentity,p:ContinuationPlanInput):void {
+  #checkData(who:VerifiedRecoveryIdentity,p:ContinuationPlanInput,request?:Omit<PlanningProviderRequest,'signal'>):void {
     const policy=this.#policy();
-    if(p.input){assertPlanningTextSafe(p.input.text);requireIntegrity(policy.inspectContent(p.input.text,p.input.dataClass));for(const s of p.input.snapshots)requireIntegrity(policy.canSend(who,s,p.input.destination,p.input.dataClass)&&(!s.sourceWorkflowId||s.sourceWorkflowId!==p.workflowRunId&&policy.canAccess(who,s.sourceWorkflowId,'VIEW')));}
+    if(p.input){
+      for(const text of request?[request.input,...request.reads.map(r=>r.text)]:[p.input.text]){assertPlanningTextSafe(text);requireIntegrity(policy.inspectContent(text,p.input.dataClass));}
+      for(const s of request?planningSnapshots(request):p.input.snapshots)requireIntegrity(policy.canSend(who,s,p.input.destination,p.input.dataClass)&&(!s.sourceWorkflowId||s.sourceWorkflowId!==p.workflowRunId&&policy.canAccess(who,s.sourceWorkflowId,'VIEW')));
+    }
   }
   preview(input:ContinuationPlanInput,credential:unknown) {
     return this.#host.db.read(tx=>{
@@ -373,6 +381,8 @@ export class BoundedRuntime {
     requireIntegrity(p.createdBy===who.actorId||who.roles.includes('RECOVERY_ADMIN'));
     const i=tx.get('SELECT * FROM recovery_invocations WHERE plan_id=?',planId),c=readWorkflowControl(tx,p.workflowRunId);
     const a=i&&tx.get('SELECT * FROM planning_artifacts WHERE invocation_id=?',i.invocation_id);
+    const q=i&&tx.get('SELECT input_request_id,owner_id FROM planning_input_requests WHERE invocation_id=?',i.invocation_id);
+    if(q)requireIntegrity(q.owner_id===who.actorId);
     const counts={rounds:0,modelCalls:0,actionDispatches:0,readCalls:0};
     if(i)for(const r of tx.all('SELECT kind,count(*) AS n FROM recovery_invocation_debits WHERE invocation_id=? GROUP BY kind',i.invocation_id))
       counts[({ROUND:'rounds',MODEL:'modelCalls',ACTION:'actionDispatches',READ:'readCalls'} as const)[r.kind as 'ROUND']]=Number(r.n);
@@ -381,25 +391,30 @@ export class BoundedRuntime {
       performed:{businessActionDispatches:counts.actionDispatches,localReadCalls:counts.readCalls,modelCalls:counts.modelCalls,internalPersistence:true},
       review:{state:(review?.decision??'UNREVIEWED') as 'UNREVIEWED',executionAuthorizationRequired:true},plan:p,invocation:i?{invocationId:String(i.invocation_id),status:i.status as 'ACTIVE',outcome:i.outcome as string|null}:undefined,
       artifact:a?readArtifact(tx,{artifactId:String(a.artifact_id),version:Number(a.version),contentDigest:String(a.content_digest)}):undefined,
+      inputRequest:q?readPlanningInputRequest(tx,String(q.input_request_id)):undefined,
       control:{holdState:String(c.hold_state),holdEpoch:Number(c.hold_epoch),revision:Number(c.control_revision),planningReviewPending:!!c.planning_review_pending},
       counts,usage:i?this.#usage(tx,String(i.invocation_id)):{committed:{inputTokens:0,outputTokens:0,costMicros:0},outstanding:{inputTokens:0,outputTokens:0,costMicros:0}},executionAllowed:false};
   }
   async #planning(ctx:Context):Promise<void> {
     const p=ctx.plan;requireIntegrity(p.operation==='PLANNING_ONLY');
     const provider=this.#provider(p)!,caps=validateProvider(provider,p),store=new SqliteCoordinationRunnerStore(this.#host.db,ctx.lease),ledger=new ModelCallLedger(store);
-    const reads:Array<{resourceId:string;digest:string;text:string}>=[];
+    const reads:PlanningProviderRequest['reads']=[];
     for(let n=0;n<p.limits.maxModelCalls;n++) {
       requireIntegrity(digest(validateProvider(this.#provider(p),p))===digest(p.binding.provider));
       ctx.phase='MODEL';const s=store.getSnapshot(p.workflowRunId),callId=randomUUID();
       const x:ModelCallIdentity={workflowRunId:p.workflowRunId,modelCallId:callId,attemptId:randomUUID(),providerId:p.providerId!,modelId:p.modelId!};
-      const request={mode:p.mode,input:p.input!.text,reasoning:p.reasoning??{},references:p.input!.snapshots,reads,
-        remainingModelCalls:p.limits.maxModelCalls-n,remainingReadCalls:p.limits.maxReadCalls-reads.length};
-      this.#checkData(ctx.actor,p);
+      const request=jsonCopy({mode:p.mode,input:p.input!.text,reasoning:p.reasoning??{},references:p.input!.snapshots,reads,
+        remainingModelCalls:p.limits.maxModelCalls-n,remainingReadCalls:p.limits.maxReadCalls-reads.length});
+      ctx.planningRequest=request;
+      this.#checkData(ctx.actor,p,request);
       ledger.reserve({...x,roundKey:`bounded:${ctx.invocationId}:${n}`,phase:'PLAN',requestCursor:s.events.length,requestEventId:s.events.at(-1)!.eventId,
         quote:{...caps.quote,maxAttempts:1,requestDigest:digest(request)}});
       ledger.markDispatchIntent(x);store.assertLease(p.workflowRunId);
       const remaining=this.dispatchDeadline('MODEL',callId);
-      const collected=await collectBoundedResponse(signal=>this.withoutAuthority(async()=>jsonCopy(await provider.draftPlan!({...jsonCopy(request),signal}))),remaining,p.timing.collectionGraceMs,ctx.abort.signal);
+      const collected=await collectBoundedResponse(signal=>this.withoutAuthority(async()=>{
+        this.#checkData(ctx.actor,p,request); // Last check of this exact payload, after Intent and before external entry.
+        return jsonCopy(await provider.draftPlan!({...jsonCopy(request),signal}));
+      }),remaining,p.timing.collectionGraceMs,ctx.abort.signal);
       store.assertLease(p.workflowRunId);
       const result=collected.value;
       if(!result||result.completeness!=='COMPLETE'||!result.usage) {
@@ -422,7 +437,7 @@ export class BoundedRuntime {
         const artifact:PlanArtifact={artifactId:randomUUID(),version:p.previousArtifact?p.previousArtifact.version+1:1,schemaVersion:1,
           contentDigest:digest(content),workflowRunId:p.workflowRunId,ownerId:ctx.actor.actorId,requestId:p.requestId,invocationId:ctx.invocationId,
           modelCallId:x.modelCallId,mode:p.mode,previousArtifact:p.previousArtifact,content,providerId:caps.providerId,modelId:caps.modelId,adapterVersion:caps.adapterVersion,
-          reasoning:p.reasoning??{},snapshots:[...p.input!.snapshots,...reads.map(r=>({id:r.resourceId,digest:r.digest,revision:this.#options.reads!.describe(r.resourceId)!.revision,observedAt:Date.now()}))],
+          reasoning:p.reasoning??{},snapshots:planningSnapshots(request),
           summary,completeness:'COMPLETE',dataClass:p.input!.dataClass,createdAt:Date.now(),basisDigest:this.#host.db.read(tx=>artifactBasis(tx,p.workflowRunId))};
         const json=executionJson(artifact,128*1024);rejectEmbeddedCredentials(artifact);
         this.#host.write(ctx.lease,tx=>{
@@ -433,7 +448,19 @@ export class BoundedRuntime {
         });return;
       }
       if(draft.kind==='needs_input') {
-        this.#host.write(ctx.lease,tx=>{this.#applyPlanning(tx,ctx,x,'PlanningInputRequested',p.requestId,digest(draft));this.#finish(ctx,'STOPPED','PLAN_INCOMPLETE',false,tx);});return;
+        const questions=jsonCopy(draft.questions);
+        requireIntegrity(this.#policy().inspectContent(executionJson(questions,96*1024),p.input!.dataClass));
+        const inputRequest:PlanningInputRequest={inputRequestId:randomUUID(),schemaVersion:1,state:'AWAITING_INPUT',
+          workflowRunId:p.workflowRunId,ownerId:ctx.actor.actorId,requestId:p.requestId,invocationId:ctx.invocationId,
+          modelCallId:x.modelCallId,mode:p.mode,questions,contentDigest:digest(questions),snapshots:planningSnapshots(request),
+          dataClass:p.input!.dataClass,createdAt:this.#host.db.read(recoveryTime)};
+        const json=executionJson(inputRequest,128*1024);assertPlanningTextSafe(json);rejectEmbeddedCredentials(inputRequest);
+        this.#host.write(ctx.lease,tx=>{
+          tx.run('INSERT INTO planning_input_requests (input_request_id,workflow_run_id,invocation_id,model_call_id,owner_id,content_digest,request_json) VALUES(?,?,?,?,?,?,?)',
+            inputRequest.inputRequestId,p.workflowRunId,ctx.invocationId,x.modelCallId,inputRequest.ownerId,inputRequest.contentDigest,json);
+          this.#applyPlanning(tx,ctx,x,'PlanningInputRequested',inputRequest.inputRequestId,inputRequest.contentDigest);
+          this.#finish(ctx,'STOPPED','PLAN_INCOMPLETE',false,tx);
+        });return;
       }
       const requests=draft.requests;
       for(const r of requests){requireIntegrity(p.resources?.includes(r.resourceId)&&this.#options.reads?.describe(r.resourceId)?.digest===r.digest);}
@@ -449,8 +476,9 @@ export class BoundedRuntime {
         if(!value.value||value.timedOut||value.aborted)throw new DurableStoreError('PLANNING_READ_DENIED');
         assertPlanningTextSafe(value.value.text);requireIntegrity(this.#policy().inspectContent(value.value.text,p.input!.dataClass));
         const metadata=this.#options.reads!.describe(r.resourceId)!;
-        requireIntegrity(this.#policy().canSend(ctx.actor,{id:r.resourceId,digest:metadata.digest,revision:metadata.revision,observedAt:this.#host.db.read(recoveryTime)},p.input!.destination,p.input!.dataClass));
-        reads.push({resourceId:r.resourceId,digest:value.value.digest,text:value.value.text});
+        const snapshot={id:r.resourceId,digest:metadata.digest,revision:metadata.revision,observedAt:this.#host.db.read(recoveryTime)};
+        requireIntegrity(snapshot.digest===value.value.digest&&this.#policy().canSend(ctx.actor,snapshot,p.input!.destination,p.input!.dataClass));
+        reads.push({resourceId:r.resourceId,digest:snapshot.digest,revision:snapshot.revision,observedAt:snapshot.observedAt,text:value.value.text});
       }
     }
     this.#finish(ctx,'STOPPED','PLAN_INCOMPLETE');

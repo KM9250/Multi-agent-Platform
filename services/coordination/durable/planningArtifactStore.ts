@@ -1,5 +1,5 @@
 import type { DurableTransaction } from './db';
-import type { PlanArtifact, PlanContent, PlanDraftResponse, ArtifactRef } from './continuationTypes';
+import type { PlanArtifact, PlanContent, PlanDraftResponse, ArtifactRef, PlanningInputRequest } from './continuationTypes';
 import { digest, jsonCopy, parseJson, requireIntegrity } from './integrity';
 import { executionJson, rejectEmbeddedCredentials } from './executionIntegrity';
 
@@ -36,4 +36,24 @@ export function readArtifact(tx:DurableTransaction, ref:ArtifactRef):PlanArtifac
   requireIntegrity(published.payload.referenceId===a.artifactId&&published.payload.contentDigest===a.contentDigest);
   assertPlanningTextSafe(executionJson(a,128*1024));rejectEmbeddedCredentials(a);
   validateDraft({kind:'plan',artifact:a.content});return a;
+}
+
+export function readPlanningInputRequest(tx:DurableTransaction, id:string):PlanningInputRequest {
+  const r=tx.get('SELECT * FROM planning_input_requests WHERE input_request_id=?',id);requireIntegrity(r);
+  const q=parseJson<PlanningInputRequest>(r.request_json);
+  requireIntegrity(q.inputRequestId===id&&q.schemaVersion===1&&q.state==='AWAITING_INPUT'
+    &&q.workflowRunId===r.workflow_run_id&&q.invocationId===r.invocation_id&&q.modelCallId===r.model_call_id
+    &&q.ownerId===r.owner_id&&q.contentDigest===r.content_digest&&digest(q.questions)===q.contentDigest);
+  assertPlanningTextSafe(executionJson(q,128*1024));rejectEmbeddedCredentials(q);
+  validateDraft({kind:'needs_input',questions:q.questions});
+  const i=tx.get('SELECT * FROM recovery_invocations WHERE workflow_run_id=? AND invocation_id=?',q.workflowRunId,q.invocationId);
+  const p=i&&tx.get('SELECT * FROM recovery_continuation_plans WHERE workflow_run_id=? AND plan_id=?',q.workflowRunId,i.plan_id);
+  requireIntegrity(i?.status==='STOPPED'&&i.outcome==='PLAN_INCOMPLETE'&&p?.operation==='PLANNING_ONLY'
+    &&p.mode===q.mode&&p.created_by===q.ownerId&&p.request_id===q.requestId);
+  const call=tx.get('SELECT * FROM model_call_ledger WHERE workflow_run_id=? AND model_call_id=?',q.workflowRunId,q.modelCallId);
+  const event=call&&tx.get('SELECT payload,event_type FROM journal_events WHERE workflow_run_id=? AND event_id=?',q.workflowRunId,call.application_event_id);
+  requireIntegrity(call?.application_status==='APPLIED'&&event?.event_type==='PlanningInputRequested');
+  const published=parseJson<{payload:{referenceId:string;contentDigest:string;invocationId:string;modelCallId:string}}>(event.payload).payload;
+  requireIntegrity(published.referenceId===id&&published.contentDigest===q.contentDigest&&published.invocationId===q.invocationId&&published.modelCallId===q.modelCallId);
+  return q;
 }

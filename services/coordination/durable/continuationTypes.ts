@@ -77,7 +77,7 @@ export interface PlanningProviderResponse {
 }
 export interface PlanningProviderRequest {
   mode: PlanningMode; input: string; reasoning: Record<string, string | number | boolean>;
-  references: InputSnapshot[]; reads: Array<{ resourceId: string; digest: string; text: string }>;
+  references: InputSnapshot[]; reads: Array<{ resourceId: string; digest: string; revision: string; observedAt: number; text: string }>;
   remainingModelCalls: number; remainingReadCalls: number; signal: AbortSignal;
 }
 export interface BoundedProvider {
@@ -93,10 +93,17 @@ export interface PlanArtifact extends ArtifactRef {
   snapshots: InputSnapshot[]; summary: { state: SummaryState; text?: string; source: 'PROVIDER_SUMMARY' };
   completeness: 'COMPLETE'; dataClass: string; createdAt: number; basisDigest: string;
 }
+/** Saved, bounded questions; never a final plan or execution authorization. */
+export interface PlanningInputRequest {
+  inputRequestId: string; schemaVersion: 1; state: 'AWAITING_INPUT'; workflowRunId: string; ownerId: string;
+  requestId: string; invocationId: string; modelCallId: string; mode: PlanningMode;
+  questions: string[]; contentDigest: string; snapshots: InputSnapshot[]; dataClass: string; createdAt: number;
+}
 export type InvocationStatus = 'ACTIVE' | 'DRAINING' | 'COMPLETED' | 'STOPPED' | 'REVIEW_REQUIRED';
 export interface ContinuationInspection {
   plan: ContinuationPlan; invocation?: { invocationId: string; status: InvocationStatus; outcome: string | null };
-  artifact?: PlanArtifact; control: { holdState: string; holdEpoch: number; revision: number; planningReviewPending: boolean };
+  artifact?: PlanArtifact; inputRequest?: PlanningInputRequest;
+  control: { holdState: string; holdEpoch: number; revision: number; planningReviewPending: boolean };
   counts: { rounds: number; modelCalls: number; actionDispatches: number; readCalls: number };
   usage: { committed: { inputTokens: number; outputTokens: number; costMicros: number }; outstanding: { inputTokens: number; outputTokens: number; costMicros: number } };
   remaining: { rounds:number;modelCalls:number;actionDispatches:number;readCalls:number };

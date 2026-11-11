@@ -23,7 +23,7 @@ for (const sql of [RECOVERY_DECISION_SQL, SAFE_RECOVERY_SQL, CONTROLLED_RECOVERY
 }
 const managed = ['recovery_continuation_plans','recovery_continuation_grants','recovery_invocations',
   'recovery_invocation_steps','recovery_invocation_debits','recovery_continuation_receipts',
-  'planning_artifacts','planning_reviews','planning_read_calls','recovery_model_lineage'];
+  'planning_artifacts','planning_input_requests','planning_reviews','planning_read_calls','recovery_model_lineage'];
 const mutable = new Set(['recovery_continuation_grants','recovery_invocations','planning_read_calls']);
 const originalHoldGuard=RECOVERY_DECISION_SQL.match(/CREATE TRIGGER recovery_holds_guard[\s\S]*?END;/)![0];
 export const CONTINUATION_SQL = `
@@ -177,6 +177,16 @@ CREATE TABLE planning_artifacts (
  UNIQUE(workflow_run_id,artifact_id)
 ) STRICT;
 CREATE UNIQUE INDEX bounded_artifact_successor ON planning_artifacts(json_extract(artifact_json,'$.previousArtifact.artifactId')) WHERE json_extract(artifact_json,'$.previousArtifact.artifactId') IS NOT NULL;
+CREATE TABLE planning_input_requests (
+ input_request_id TEXT PRIMARY KEY NOT NULL, workflow_run_id TEXT NOT NULL, invocation_id TEXT NOT NULL UNIQUE,
+ model_call_id TEXT NOT NULL UNIQUE, owner_id TEXT NOT NULL,
+ applied_status TEXT NOT NULL DEFAULT 'APPLIED' CHECK(applied_status='APPLIED'),
+ content_digest TEXT NOT NULL CHECK(length(content_digest)=64), request_json TEXT NOT NULL CHECK(json_valid(request_json) AND length(CAST(request_json AS BLOB))<=131072),
+ FOREIGN KEY(workflow_run_id,invocation_id) REFERENCES recovery_invocations(workflow_run_id,invocation_id),
+ FOREIGN KEY(workflow_run_id,model_call_id) REFERENCES model_call_ledger(workflow_run_id,model_call_id),
+ FOREIGN KEY(workflow_run_id,model_call_id,applied_status) REFERENCES model_call_ledger(workflow_run_id,model_call_id,application_status) DEFERRABLE INITIALLY DEFERRED,
+ UNIQUE(workflow_run_id,input_request_id)
+) STRICT;
 CREATE TABLE planning_reviews (
  review_id TEXT PRIMARY KEY NOT NULL, workflow_run_id TEXT NOT NULL, artifact_id TEXT NOT NULL, actor_id TEXT NOT NULL,
  decision TEXT NOT NULL CHECK(decision IN ('ACCEPTED_FOR_SCOPE','REJECTED','SUPERSEDED','STALE')), recorded_at INTEGER NOT NULL,
@@ -202,7 +212,7 @@ ${immutable('bounded_audit')}${guard('bounded_audit')}
 ${managed.map(t => ['INSERT',...(mutable.has(t)?['UPDATE']:[])].map(op=>`
 CREATE TRIGGER ${t}_bounded_audit_${op} AFTER ${op} ON ${t} BEGIN
  INSERT INTO bounded_audit VALUES(NULL,NEW.workflow_run_id,'${t}','${op}',
- ${t==='recovery_continuation_grants'?'NEW.grant_id':t==='recovery_invocations'?'NEW.invocation_id':t.includes('steps')||t.includes('debits')||t==='recovery_model_lineage'?'NEW.step_id':t.includes('receipts')?'NEW.receipt_id':t==='planning_artifacts'?'NEW.artifact_id':t==='planning_reviews'?'NEW.review_id':t==='planning_read_calls'?'NEW.read_id':'NEW.plan_id'},${now}); END;`).join('')).join('\n')}
+ ${t==='recovery_continuation_grants'?'NEW.grant_id':t==='recovery_invocations'?'NEW.invocation_id':t.includes('steps')||t.includes('debits')||t==='recovery_model_lineage'?'NEW.step_id':t.includes('receipts')?'NEW.receipt_id':t==='planning_artifacts'?'NEW.artifact_id':t==='planning_input_requests'?'NEW.input_request_id':t==='planning_reviews'?'NEW.review_id':t==='planning_read_calls'?'NEW.read_id':'NEW.plan_id'},${now}); END;`).join('')).join('\n')}
 ${[...guards.values()].join('\n')}
 DROP TRIGGER recovery_resume_disabled;
 CREATE TRIGGER recovery_resume_disabled BEFORE INSERT ON journal_events WHEN NEW.event_type='WorkflowResumed'
@@ -265,6 +275,9 @@ CREATE TRIGGER bounded_action_result_deadline BEFORE INSERT ON execution_results
 BEGIN SELECT RAISE(ABORT,'CONTINUATION_EXPIRED'); END;
 CREATE TRIGGER bounded_action_application_deadline BEFORE UPDATE ON execution_ledger WHEN NEW.state='FINALIZED' AND
  EXISTS(SELECT 1 FROM recovery_invocation_steps WHERE kind='ACTION' AND target_id=NEW.action_id AND workflow_run_id=NEW.workflow_run_id AND application_deadline<=${now})
+ AND map_safe_recovery_write(NEW.workflow_run_id,'execution_ledger','UPDATE',NEW.action_id,
+ json_object('old',json_array(OLD.state,OLD.review_reason,OLD.finalized_event_id,OLD.result_ref,OLD.result_digest,OLD.attempt_id,OLD.reserved_at,OLD.updated_at),
+ 'next',json_array(NEW.state,NEW.review_reason,NEW.finalized_event_id,NEW.result_ref,NEW.result_digest,NEW.attempt_id,NEW.reserved_at,NEW.updated_at)))<>1
 BEGIN SELECT RAISE(ABORT,'CONTINUATION_EXPIRED'); END;
 CREATE TRIGGER bounded_read_result_deadline BEFORE UPDATE ON planning_read_calls WHEN
  EXISTS(SELECT 1 FROM recovery_invocation_steps WHERE step_id=NEW.step_id AND collection_deadline<=${now})
