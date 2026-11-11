@@ -310,7 +310,8 @@ export class BoundedRuntime {
     if(canonicalJson(b)!==canonicalJson(p.binding))throw new DurableStoreError('RECOVERY_INVALID_PLAN');
   }
   async start(lease:WorkflowLease|undefined,planId:string,credential:unknown,signal?:AbortSignal):Promise<ContinuationInspection> {
-    const prior=this.#host.db.read(tx=>{const p=readContinuationPlan(tx,planId);this.#identity(tx,credential,p.workflowRunId,'EXECUTE');
+    const prior=this.#host.db.read(tx=>{const p=readContinuationPlan(tx,planId),who=this.#identity(tx,credential,p.workflowRunId,'EXECUTE');
+      if(p.operation==='PLANNING_ONLY')requireIntegrity(p.createdBy===who.actorId);
       return tx.get('SELECT receipt_id FROM recovery_continuation_receipts WHERE plan_id=?',planId)?this.#inspect(tx,planId,credential):undefined;});
     if(prior)return prior;
     if(!lease)throw new DurableStoreError('LEASE_FENCED');
@@ -318,7 +319,8 @@ export class BoundedRuntime {
     try {committed=this.#write(lease,tx=>{
       const p=readContinuationPlan(tx,planId),who=this.#identity(tx,credential,p.workflowRunId,'EXECUTE');
       requireIntegrity(p.workflowRunId===lease.workflowRunId&&!signal?.aborted);
-      if(p.origin==='USER_REQUEST'&&p.operation==='PLANNING_ONLY')requireIntegrity(p.createdBy===who.actorId&&who.roles.some(r=>this.#policy().planningRoles.includes(r)));
+      if(p.operation==='PLANNING_ONLY')requireIntegrity(p.createdBy===who.actorId);
+      if(p.origin==='USER_REQUEST'&&p.operation==='PLANNING_ONLY')requireIntegrity(who.roles.some(r=>this.#policy().planningRoles.includes(r)));
       else requireIntegrity(who.roles.some(r=>['RECOVERY_OPERATOR','RECOVERY_ADMIN'].includes(r)));this.#checkData(who,p);this.#current(tx,p);
       const grants=tx.all("SELECT * FROM recovery_continuation_grants WHERE plan_id=? AND status='AUTHORIZED' AND expires_at>?",p.planId,recoveryTime(tx));
       const rule=p.operation==='RELEASE_RECOVERY_HOLD'?this.#policy().releaseApprovals:this.#policy().recoveryApprovals;
