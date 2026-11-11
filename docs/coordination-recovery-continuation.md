@@ -66,7 +66,7 @@ const plan = planning.createPlan(request, credential);
 const result = await planning.startAuthorized(plan.planId, credential, { signal });
 reader.inspect(plan.planId, credential); // 同じArtifact・Usage・終了状態を読むだけ
 reader.timeline(plan.planId, credential); // 最小Audit参照。生Prompt・本文を含まない
-planning.recordReview(result.artifact!, 'ACCEPTED_FOR_SCOPE', credential);
+planning.recordReview(result.artifact!, 'ACCEPTED_FOR_SCOPE', credential, result.review.target!.controlRevision);
 // 別に、具体的ActionのExecutor/Operation/分類/payloadDigestを固定する。
 const approvedExecution = execution.createPlan(executionRequest, operatorCredential);
 execution.authorize(approvedExecution, approverCredential);
@@ -74,13 +74,17 @@ execution.authorize(approvedExecution, approverCredential);
 await execution.startAuthorized(approvedExecution.planId, operatorCredential);
 ```
 
-`requestRevision(artifactRef, newRequest, credential)` は原本を変更せず、前版参照を持つ新しい版を生成する。同一版の分岐した後継は一意制約で防ぐ。旧版の拒否で現行版のReview Gateを消すことはできない。拒否・置換はReview Gateの明示解除、受諾はGateを維持する。採用時とAction登録・送信直前に参照資料を再検証する。
+`requestRevision(artifactRef, newRequest, credential)` は原本を変更せず、前版参照を持つ新しい版を生成する。同一版の分岐した後継は一意制約で防ぐ。修正の開始や入力待ち・失敗・取消・Timeoutでは旧計画の未解決Review Gateを保持し、完成した新版の保存時だけ原子的に対象を置き換える。採用時とAction登録・送信直前に参照資料を再検証する。
+
+レビュー対象は追記専用のArtifact公開・Review履歴と有効Controlから導出し、現在のArtifact ID・Version・Digest・Owner・Control Revisionを結び付ける。`review.target` は照会したArtifactが現在対象で、操作者がOwnerの場合だけ返す。`recordReview(ref, decision, credential, expectedControlRevision)` の第4引数は必須。同じTransactionで現在対象と期待Revisionを検査し、ReviewとControlを更新する。古い対象やRevisionの再送は書込みなしで拒否する。現在対象の拒否・置換はGateを解除し、受諾はGateを保持してRevisionを進める。受諾は実行Grantを作らない。別の計画が待っているときに旧Artifactを修正・実行計画の参照として使うことも拒否する。
 
 実行可能な合成シナリオは `test/coordination-planning-only-adoption.test.ts`、`test/coordination-recovery-continuation.test.ts`、`test/coordination-hold-lifecycle.test.ts` にある。APIキー不要で、Plan提示→内容確認→別承認→1 Round、独立Snapshot計画、VERIFYのみ、解除を自動検証する。既存UIへの本番Identity接続は含めない。
 
 `ContinuationInspection` はMode、Artifact、参照、要約状態、確定／未確定Usage、回数、残枠、実施したModel・Read・Action、終了理由、内容レビュー状態を返す。`internalPersistence: true` はModel課金やMAP内部保存と「業務変更なし」を区別する。`executionAllowed` は常にfalseで、DTOを実行権限に転用できない。既存RecoveryReaderも現在のControlと計画レビュー待ちを表示し、過去Receiptの検証には変更されていないHold原本を使う。
 
 `needs_input` は `inputRequest` に検証済み質問・Digest・出所を返す。`inputRequest.state` は `AWAITING_INPUT`、Invocationは `STOPPED / PLAN_INCOMPLETE` で、完成したPlanの `AWAITING_PLAN_REVIEW` とは区別する。初回 `startAuthorized()` と認証付きReader／再接続は同じ保存済み質問を返す。質問の所有者本人かつ現在のWorkflow閲覧ACLを満たす必要があり、別Actorの管理者Roleだけでは取得できない。回答は新しいrequestId・明示入力・予算のPlanとして作成し、表示や再照会からModelを再生成しない。
+
+既存Artifactの修正中に質問待ちになった場合は、そのArtifactのレビュー待ちを保持する。回答を渡す次の要求も現在対象への `requestRevision` とし、元のArtifactを参照する。元の計画をレビューする場合は認証付き再照会で最新のControl Revisionを取得する。
 
 ## 原子的な開始・Step・保存
 
@@ -97,6 +101,8 @@ Workflow committed + outstanding + requested と、Invocation committed + outsta
 外部Provider、Executor、prepare、Thenableの解決を含む非同期処理は、親Contextを外して呼ぶ。返却データもその範囲でJSONへ検証・分離する。Accessorや非JSONオブジェクトは拒否する。Executorに渡るEvidence Sinkは対象Action/Task/Session、現在Generation、件数・サイズ・実行deadlineを検査し、別のStepやWorkflowを操作できない。
 
 Invocationの状態は ACTIVE → DRAINING → COMPLETED / STOPPED / REVIEW_REQUIRED。停止後の新しいVERIFYも禁止する。一方、開始済み対象のUsage・Result、対象限定Application、安全停止は回収窓内で保存できる。失われたLeaseからの保存は拒否する。実行中のみCoordinatorがHeartbeatを管理し、Open/ReaderはHeartbeatを開始しない。
+
+`requestStop(planId, credential)` は有効Lease、現在の認証・Workflow閲覧ACLに加え、保存されたInvocationのOwner本人、または検証済み `RECOVERY_ADMIN` を要求する。PLAN/EXECUTEの可否から他者停止権限を推定しない。本人はPLAN/EXECUTEを撤回されても、認証と閲覧権限が有効なら停止できる。認可とDRAINING・STOP Receipt・Auditは同一Transaction。拒否やRollbackではDBもProvider Signalも変えない。ローカルAbortはCOMMIT後、親Scopeを外して通知する。COMMIT ACK喪失時は、その要求で観測した同じ不変Receiptを認証付きで再読取りできた場合だけ通知する。別接続のSTOPも応答回収・計画反映時に検査し、開始済みUsageを保存して新しいRead/ModelやArtifact公開を止める。
 
 ## 時間の上限
 
@@ -160,6 +166,6 @@ Provider能力はProvider/Model/Adapter版・実装Digest、Purpose、許可さ�
 
 このPRは合成Provider/Executorだけで検証する。GPT/Gemini/Claudeの本番Adapter、価格・課金・ストリーミング・opaque continuation blockの実装、Production Identity UIは未接続。既存テストAdapterを本番用として再Exportしていない。既定で利用可能なProviderはなく、必要な安全能力が不足すれば予約前に拒否する。Host Registry/ACL/Verifierは信頼境界であり、変更時は安定した版・Digest・Policy versionを更新する。
 
-Unknown Action/Usage、Crash後の未送信か送信済みかを判定できないIntent、失われた本文は4C向けに保全する。自動再送・推測精算・無制限解除は提供しない。検証の件数、初回失敗、Linux環境、Windows未検証事項は [検証報告](coordination-recovery-continuation-validation.md) を参照。
+Unknown Action/Usage、Crash後の未送信か送信済みかを判定できないIntent、失われた本文は4C向けに保全する。自動再送・推測精算・無制限解除は提供しない。最新の検証件数・追加認可境界は [RT-01/RT-02修正報告](coordination-pr35-redteam-corrections.md)、初回実装時の対応表は [検証報告](coordination-recovery-continuation-validation.md) を参照。
 
 PR #35のF-01〜F-03修正と最新の検証結果は [監査修正報告](coordination-pr35-audit-corrections.md) を参照。

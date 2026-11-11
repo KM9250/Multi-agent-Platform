@@ -1,5 +1,7 @@
 # PR #35 F-01〜F-03 監査修正報告
 
+本書はF-01〜F-03修正時点の検証記録。後続のRT-01／RT-02修正と全Suite再実行は [追加監査修正報告](coordination-pr35-redteam-corrections.md) を参照する。F-01〜F-03の契約・回帰は維持している。
+
 監査基準HEAD: `995c186e123e0b96d2a072db09b6d5acf1f0c078`。基準main: `e4de47b6f5290ec566e26c6a7ffd22ae1e82ab5a`。同じ `codex/coord-5c-4b-2b` ブランチに追加する。検証日: 2026-11-11（Asia/Tokyo）。最終HEADは文書自身のSHAの循環を避け、PR本文に完全な値を記載する。
 
 ## 修正内容
