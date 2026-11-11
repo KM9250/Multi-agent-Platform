@@ -18,7 +18,7 @@ test('A02: two verified approvers are required; a viewer cannot start an approve
 test('A04/I15: acknowledged start wins revocation race, STOP drains the existing step, and grants never return',async t=>{
  const f=continuationFixture(t);let entered!:()=>void,done!:()=>void;const ready=new Promise<void>(r=>entered=r),pending=new Promise<void>(r=>done=r);f.hook(async()=>{entered();await pending;return {value:{kind:'plan',artifact:content},usage,completeness:'COMPLETE'};});
  const p=f.api().createPlan(f.input(),f.credential),grant=String(f.raw.prepare('SELECT grant_id FROM recovery_continuation_grants').get()!.grant_id),run=f.api().startAuthorized(p.planId,f.credential);await ready;
- assert.throws(()=>f.api().revoke(grant,f.credential));f.api().requestStop(p.planId,f.credential);assert.equal(f.raw.prepare('SELECT status FROM recovery_invocations').get()!.status,'DRAINING');assert.throws(()=>f.api().createPlan(f.input(),f.credential));done();const r=await run;
+ assert.throws(()=>f.api().revoke(grant,f.credential));f.api().requestStop(p.planId,f.credential);assert.equal(f.raw.prepare('SELECT status FROM recovery_invocations').get()!.status,'DRAINING');assert.equal(JSON.parse(String(f.raw.prepare("SELECT receipt_json FROM recovery_continuation_receipts WHERE kind='STOP'").get()!.receipt_json)).actor,'operator');assert.throws(()=>f.api().createPlan(f.input(),f.credential));done();const r=await run;
  assert.equal(r.invocation?.status,'STOPPED');assert.equal(f.raw.prepare('SELECT status FROM recovery_continuation_grants').get()!.status,'CONSUMED');
 });
 test('I16/R02/R03: NEEDS_USER requires the original concrete Action reference in the first authorized Resume',async t=>{

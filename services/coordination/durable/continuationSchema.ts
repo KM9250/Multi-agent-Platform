@@ -128,6 +128,8 @@ CREATE UNIQUE INDEX bounded_active_workflow ON recovery_invocations(workflow_run
 CREATE TRIGGER bounded_invocation_transition BEFORE UPDATE ON recovery_invocations WHEN
  NEW.revision<>OLD.revision+1 OR OLD.status NOT IN ('ACTIVE','DRAINING') OR
  (OLD.status='DRAINING' AND NEW.status='ACTIVE') OR
+ (OLD.status='ACTIVE' AND NEW.status IN ('COMPLETED','STOPPED')) OR
+ (OLD.status='ACTIVE' AND NEW.status='REVIEW_REQUIRED' AND map_lease_change(NEW.workflow_run_id)<>1) OR
  ${['invocation_id','workflow_run_id','plan_id','owner_id','runtime_instance_id','generation','started_at','admission_deadline','collection_deadline'].map(k=>`NEW.${k} IS NOT OLD.${k}`).join(' OR ')}
 BEGIN SELECT RAISE(ABORT,'RECOVERY_UNAUTHORIZED'); END;
 CREATE TABLE recovery_invocation_steps (
@@ -151,7 +153,7 @@ CREATE TABLE recovery_invocation_debits (
 ) STRICT;
 CREATE TABLE recovery_continuation_receipts (
  receipt_id TEXT PRIMARY KEY NOT NULL, workflow_run_id TEXT NOT NULL, plan_id TEXT NOT NULL,
- kind TEXT NOT NULL CHECK(kind IN ('START','FINISH','RELEASE')), receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
+ kind TEXT NOT NULL CHECK(kind IN ('START','FINISH','RELEASE','STOP')), receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
  receipt_digest TEXT NOT NULL CHECK(length(receipt_digest)=64), UNIQUE(plan_id,kind),
  FOREIGN KEY(workflow_run_id,plan_id) REFERENCES recovery_continuation_plans(workflow_run_id,plan_id)
 ) STRICT;

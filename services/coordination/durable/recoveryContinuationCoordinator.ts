@@ -196,7 +196,7 @@ export class BoundedRuntime {
     tx.run('INSERT INTO recovery_hold_lifecycle VALUES(NULL,?,?,?,?,?,?,?,?,?)',id,c.hold_epoch,Number(c.control_revision)+1,
       change.hold??c.hold_state,change.active===undefined?c.active_invocation_id:change.active,change.review===undefined?c.planning_review_pending:change.review?1:0,reason,generation,recoveryTime(tx));
   }
-  #receipt(tx:DurableTransaction,p:ContinuationPlan,kind:'START'|'FINISH'|'RELEASE',body:unknown):void {
+  #receipt(tx:DurableTransaction,p:ContinuationPlan,kind:'START'|'FINISH'|'RELEASE'|'STOP',body:unknown):void {
     tx.run('INSERT INTO recovery_continuation_receipts VALUES(?,?,?,?,?,?)',randomUUID(),p.workflowRunId,p.planId,kind,canonicalJson(body),digest(body));
   }
   #checkData(who:VerifiedRecoveryIdentity,p:ContinuationPlanInput):void {
@@ -249,7 +249,7 @@ export class BoundedRuntime {
       if(command.kind==='AUTHORIZE') {requireIntegrity(command.planDigest===p.planDigest);this.#current(tx,p);return this.#grant(tx,p,who);}
       requireIntegrity(command.kind==='STOP');
       const i=tx.get('SELECT * FROM recovery_invocations WHERE plan_id=?',p.planId);requireIntegrity(i);
-      if(i.status==='ACTIVE')tx.run("UPDATE recovery_invocations SET status='DRAINING',outcome='USER_STOP',revision=revision+1 WHERE invocation_id=?",i.invocation_id);
+      if(i.status==='ACTIVE'){tx.run("UPDATE recovery_invocations SET status='DRAINING',outcome='USER_STOP',revision=revision+1 WHERE invocation_id=?",i.invocation_id);this.#receipt(tx,p,'STOP',{invocationId:String(i.invocation_id),actor:who.actorId,outcome:'USER_STOP',at:recoveryTime(tx)});}
       this.#active.get(String(i.invocation_id))?.abort.abort();return;
     });
   }
