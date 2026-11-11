@@ -6,7 +6,7 @@ import { DurableDatabase } from '../services/coordination/durable/db.ts';
 import { RecoveryContinuationCoordinator } from '../services/coordination/durable/recoveryContinuationCoordinator.ts';
 import { executeInput } from './continuation-runner-fixture.ts';
 import { executionSeed } from './durable-execution-fixture.ts';
-import type { ContinuationInspection, ContinuationPlan, ContinuationPolicy } from '../services/coordination/durable/continuationTypes.ts';
+import type { ContinuationInspection, ContinuationPlan, ContinuationPolicy, PlanDraftResponse, PlanContent } from '../services/coordination/durable/continuationTypes.ts';
 
 const usage={llmCalls:1,inputTokens:1,outputTokens:1,estimatedCost:0};
 function actors(t:TestContext) {
@@ -26,7 +26,7 @@ async function plan(f:Fixture,credential:unknown) {
 function review(f:Fixture,r:ContinuationInspection,credential:unknown,decision:'REJECTED'|'ACCEPTED_FOR_SCOPE'|'SUPERSEDED'='REJECTED',revision=r.control.revision) {
   f.api().recordReview(r.artifact!,decision,credential,revision);
 }
-async function pending(f:Fixture,credential:unknown,p?:ContinuationPlan,reply:unknown={kind:'plan',artifact:content}) {
+async function pending(f:Fixture,credential:unknown,p?:ContinuationPlan,reply:PlanDraftResponse={kind:'plan',artifact:content}) {
   let entered!:()=>void,complete!:()=>void,signal!:AbortSignal;
   const ready=new Promise<void>(r=>entered=r),waiting=new Promise<void>(r=>complete=r);
   f.hook(async request=>{signal=request.signal;entered();await waiting;return {value:reply,usage,completeness:'COMPLETE'};});
@@ -119,7 +119,8 @@ test('RT-01: successful revision atomically supersedes A and binds the pending g
 
 for(const failure of ['invalid-response','unknown'] as const)test(`RT-01: ${failure} during revision retains A's unresolved gate`,async t=>{
   const {f,alice}=actors(t),a=await plan(f,alice);
-  f.hook(async()=>{if(failure==='unknown')throw Error('synthetic failure');return {value:{kind:'plan',artifact:{}},usage,completeness:'COMPLETE'};});
+  // Deliberately malformed external response; runtime validation must reject it.
+  f.hook(async()=>{if(failure==='unknown')throw Error('synthetic failure');return {value:{kind:'plan',artifact:{} as PlanContent},usage,completeness:'COMPLETE'};});
   const p=f.api().requestRevision(a.artifact!,f.input(),alice),r=await f.api().startAuthorized(p.planId,alice);
   assert.equal(r.control.planningReviewPending,true);assert.equal(r.artifact,undefined);
   assert.equal(f.api().inspect(a.plan.planId,alice).review.target?.artifactId,a.artifact!.artifactId);
