@@ -28,3 +28,12 @@ test('H01/H03: a new safety stop after release reholds with a new epoch and pres
  const control=f.api().inspect(p.planId,f.credential).control;assert.equal(control.holdState,'HELD');assert.equal(control.holdEpoch,2);assert.deepEqual(f.raw.prepare('SELECT * FROM recovery_holds').all(),original);
  assert.throws(()=>f.db.writeWithLease(f.lease,'run',tx=>tx.run("UPDATE recovery_workflow_control SET hold_state='RELEASED',control_revision=control_revision+1 WHERE workflow_run_id='run'")));
 });
+test('H01/H07/M04: old RecoveryReader preserves resolution receipts after release and reports the current planning gate',async t=>{
+ const {RecoveryReader}=await import('../services/coordination/durable/recoveryReader.ts');const {ModelCallLedger}=await import('../services/coordination/durable/modelCallLedger.ts');
+ const {SafeRecoveryPlanner,SafeRecoveryAuthorizer,SafeRecoveryExecutor}=await import('../services/coordination/durable/safeRecoveryExecutor.ts');const {executionScopeOf}=await import('../services/coordination/durable/safeRecoveryStore.ts');
+ const f=continuationFixture(t),s=f.store.getSnapshot('run'),ledger=new ModelCallLedger(f.store);ledger.reserve({workflowRunId:'run',modelCallId:'old',attemptId:'attempt',providerId:'synthetic',modelId:'test',roundKey:'old',phase:'PLAN',requestCursor:s.events.length,requestEventId:s.events.at(-1)!.eventId,quote:{...f.provider.capabilities.quote,maxAttempts:1,requestDigest:'c'.repeat(64)}});f.reacquire();
+ const recovery=new SafeRecoveryPlanner(f.db,f.lease).createPlan({workflowRunId:'run',operationKind:'CANCEL_UNSENT_MODEL',targetId:'old'},f.credential);new SafeRecoveryAuthorizer(f.db,f.lease).authorize(recovery.executionPlanId,executionScopeOf(recovery),f.approver);new SafeRecoveryExecutor(f.db,f.lease).executeAuthorized(recovery.executionPlanId,f.credential);
+ const x=releaseInput();delete x.resume;const p=f.api().createPlan(x,f.credential);f.api().authorize(p,f.approver);await f.api().startAuthorized(p.planId,f.credential);
+ const reader=new RecoveryReader(f.db),released=reader.inspect('run');assert.notEqual(released.disposition,'RECOVERY_FAILED',JSON.stringify(released));assert.equal(released.workflowControl?.holdState,'RELEASED');assert.equal(released.safeRecovery?.operations.length,1);assert.equal(released.safeRecovery?.holdState,'RELEASED');
+ const q=f.api().createPlan(f.input(),f.credential);await f.api().startAuthorized(q.planId,f.credential);assert.equal(reader.inspect('run').disposition,'AWAITING_PLAN_REVIEW');assert.equal(reader.inspect('run').nextStep,'REVIEW_PLAN');
+});

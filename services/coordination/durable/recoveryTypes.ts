@@ -1,8 +1,8 @@
 import type { WorkflowUsage } from '../types';
 import type { DurableExecutionState } from './executionLedger';
 
-export type RecoveryDisposition = 'INACTIVE' | 'READY_TO_RESUME' | 'REVIEW_REQUIRED' | 'RECOVERY_FAILED' | 'READY_FOR_CONTINUATION_REVIEW';
-export type RecoveryNextStep = 'NONE' | 'REVALIDATE_PREPARED_ACTION' | 'REFLECT_RECORDED_RESULT'
+export type RecoveryDisposition = 'INVOCATION_ACTIVE' | 'AWAITING_PLAN_REVIEW' | 'INACTIVE' | 'READY_TO_RESUME' | 'REVIEW_REQUIRED' | 'RECOVERY_FAILED' | 'READY_FOR_CONTINUATION_REVIEW';
+export type RecoveryNextStep = 'WAIT_FOR_INVOCATION' | 'REVIEW_PLAN' | 'NONE' | 'REVALIDATE_PREPARED_ACTION' | 'REFLECT_RECORDED_RESULT'
   | 'CONTINUE_VERIFICATION' | 'COMPLETE_SAFETY_STOP' | 'CONSIDER_NEW_PLAN' | 'REQUIRE_OPERATOR_REVIEW';
 export interface RecoveryAuthorizationRequirement {
   kind: 'ACTION_APPROVAL' | 'SECURITY_REVIEW' | 'EVIDENCE_REVIEW' | 'EXPLICIT_RESUME';
@@ -14,10 +14,11 @@ export interface ExecutionStateSummary {
   finalizedEventId?: string; safetyStopIncomplete?: boolean;
 }
 export interface RecoveryInspection {
+  workflowControl?: {holdState:'NONE'|'HELD'|'RELEASED';holdEpoch:number;revision:number;activeInvocationId:string|null;planningReviewPending:boolean};
   controlledDispatches?: Array<{planId:string;operationId:string;actionId:string;attemptId:string;status:string;outcome:string;resultRef?:string;taskStatus:string;finalizedEventId:string|null}>;
   recoveryDecisions?: ReturnType<typeof import('./recoveryDecisionStore').recoveryDecisionSummary>;
   safeRecovery?: {
-    holdRevision: number; holdState: 'HELD' | 'RECOVERY_STEP_APPLIED' | 'READY_FOR_CONTINUATION_REVIEW';
+    holdRevision: number; holdState: 'RELEASED' | 'HELD' | 'RECOVERY_STEP_APPLIED' | 'READY_FOR_CONTINUATION_REVIEW';
     operations: Array<{operationId:string;executionPlanId:string;operationKind:string;targetId:string;receiptDigest:string;committedAt:number}>;
     executionAllowed: false;
   };
