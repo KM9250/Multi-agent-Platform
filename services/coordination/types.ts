@@ -179,6 +179,7 @@ export type CoordinationEventType =
   | 'QuorumOpened' | 'QuorumVoteCast' | 'QuorumResolved' | 'QuorumCancelled'
   | 'EvaluationAdded' | 'PolicyEvaluated' | 'WorkflowSuspended' | 'WorkflowBlocked' | 'WorkflowResumed'
   | 'AcceptanceCriterionEvaluated' | 'CommitmentRequested' | 'CommitmentAccepted' | 'CommitmentRejected'
+  | 'PlanArtifactPublished' | 'PlanningReadRequested' | 'PlanningInputRequested'
   | 'UsageRecorded' | 'ProgressRecorded'
   | 'WorkflowCancelled' | 'ErrorRecorded';
 
@@ -188,6 +189,7 @@ export const COORDINATION_EVENT_TYPES: ReadonlySet<CoordinationEventType> = new 
   'SessionCancelled', 'SessionExpired', 'TaskAssigned', 'TaskCompleted', 'TaskFailed', 'TaskCancelled',
   'DecisionOpened', 'DecisionResolved', 'DecisionCancelled', 'QuorumOpened', 'QuorumVoteCast',
   'QuorumResolved', 'QuorumCancelled', 'EvaluationAdded', 'AcceptanceCriterionEvaluated',
+  'PlanArtifactPublished', 'PlanningReadRequested', 'PlanningInputRequested',
   'UsageRecorded', 'ProgressRecorded', 'PolicyEvaluated', 'CommitmentRequested', 'CommitmentAccepted',
   'CommitmentRejected', 'WorkflowSuspended', 'WorkflowBlocked', 'WorkflowResumed',
   'WorkflowCancelled', 'ErrorRecorded',

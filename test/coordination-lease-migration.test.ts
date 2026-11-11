@@ -43,7 +43,7 @@ for (const version of [0,1,2,3] as const) test(`Migration ${version}→4 preserv
   const before = Object.fromEntries(tables.map(table => [table, legacyRows(raw.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all())]));
   const db = new DurableDatabase({ path });
   try {
-    assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 8);
+    assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 9);
     assert.deepEqual(raw.prepare('SELECT migration_id FROM schema_migrations ORDER BY schema_version').all().map(row => row.migration_id), MIGRATIONS.map(m => m.id));
     for (const [table, rows] of Object.entries(before)) assert.deepEqual(legacyRows(raw.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()), rows);
     assert.equal(raw.prepare('SELECT count(*) AS n FROM runtime_leases').get()!.n, 0);
@@ -99,10 +99,10 @@ for (const boundary of ['before-ddl','after-ddl','after-commit']) test(`${termin
   const stage = new Promise<any>((resolve, reject) => { timer = setTimeout(() => reject(Error('Migration child timeout')), 10_000); child.once('message', resolve); child.once('error', reject); child.once('exit', () => reject(Error('Migration child exited'))); });
   t.after(async () => { clearTimeout(timer); if (child.exitCode === null && child.signalCode === null) terminateChild(child); await closed; });
   assert.deepEqual(await stage, { stage: boundary }); clearTimeout(timer); terminateChild(child); await closed;
-  const version = boundary === 'after-commit' ? 8 : 3;
+  const version = boundary === 'after-commit' ? 9 : 3;
   assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, version);
   assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n, version);
-  assert.equal(raw.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name='runtime_fencing_boundary'").get()!.n, version === 8 ? 1 : 0);
+  assert.equal(raw.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name='runtime_fencing_boundary'").get()!.n, version === 9 ? 1 : 0);
   assert.deepEqual(all(raw), before);
   const db = new DurableDatabase({ path }); try { assert.notEqual(new RecoveryReader(db, clock).inspect('run').disposition, 'RECOVERY_FAILED'); } finally { db.close(); }
 });

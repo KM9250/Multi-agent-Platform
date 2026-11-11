@@ -1,3 +1,4 @@
+import { validatePlanningEvent, PLANNING_EVENTS } from './planningEvents';
 import type {
   CoordinationEvent, CoordinationEventType, CoordinationPolicy, CoordinationSession,
   CoordinationSnapshot, CoordinationTask, CoordinationDecision, CoordinationQuorum, CoordinationEvaluation,
@@ -361,6 +362,8 @@ export const appendEvent = (snapshot: CoordinationSnapshot, event: CoordinationE
     const note = payload.note?.trim(); if (payload.note !== undefined && !note) throw new Error('Acceptance note cannot be empty.');
     const satisfied = new Set(run.satisfiedCriteria); if (payload.outcome === 'SATISFIED') satisfied.add(criterion); else satisfied.delete(criterion);
     run.satisfiedCriteria = run.acceptanceCriteria.filter(value => satisfied.has(value));
+  } else if (PLANNING_EVENTS.has(event.type)) {
+    requireWorkflowScopedEvent(event); requireSupervisor(run, event); validatePlanningEvent(event,run.supervisorAgentId);
   } else if (event.type === 'UsageRecorded') {
     requireWorkflowScopedEvent(event); requireSupervisor(run, event);
     validateUsagePayload(event.payload as UsageRecordedPayload);

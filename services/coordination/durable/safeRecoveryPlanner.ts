@@ -1,3 +1,4 @@
+import { assertLegacyControl } from './recoveryHoldLifecycle';
 import { randomUUID } from 'node:crypto';
 import type { DurableDatabase, DurableTransaction } from './db';
 import { canonicalJson, digest, DurableStoreError, parseJson, requireIntegrity } from './integrity';
@@ -91,6 +92,7 @@ export function verifyExecutionPlanDigest(plan: RecoveryExecutionPlan): void {
     && plan.expiresAt === recoveryExpiry(plan.createdAt, plan.expiresAt - plan.createdAt));
 }
 export function assertExecutionPlanCurrent(db: DurableDatabase, tx: DurableTransaction, plan: RecoveryExecutionPlan): void {
+  assertLegacyControl(tx,plan.workflowRunId,'recovery_execution_plans',plan.executionPlanId);
   verifyExecutionPlanDigest(plan);
   if (recoveryTime(tx) >= plan.expiresAt) throw new DurableStoreError('RECOVERY_INVALID_PLAN');
   const binding = safeRecoveryBinding(db, tx, { workflowRunId: plan.workflowRunId, operationKind: plan.operationKind, targetId: plan.targetId });

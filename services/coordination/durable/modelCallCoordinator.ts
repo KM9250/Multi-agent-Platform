@@ -51,13 +51,13 @@ export class DurableModelCallCoordinator implements RunnerDurableModelCalls {
   const prepared=prepare(input.phase,input.request),q=prepared.quote;
   if(this.provider.scheduling) requireIntegrity(this.provider.scheduling.provider===q.providerId && this.provider.scheduling.model===q.modelId);
   const x={workflowRunId:input.workflowRunId,modelCallId:randomUUID(),attemptId:randomUUID(),providerId:q.providerId,modelId:q.modelId};
-  this.ledger.reserve({...x,roundKey:input.roundKey,phase:input.phase,requestCursor:input.requestCursor,requestEventId:input.requestEventId,quote:q});
+  this.ledger.reserve({...x,roundKey:this.store.database.boundedInvocationActive ? `bounded:${x.modelCallId}:${input.roundKey}` : input.roundKey,phase:input.phase,requestCursor:input.requestCursor,requestEventId:input.requestEventId,quote:q});
   if(input.request.signal?.aborted){this.ledger.cancelBeforeDispatch(x);throw new DurableStoreError('MODEL_REVIEW_REQUIRED');}
   this.ledger.markDispatchIntent(x);
   this.store.assertLease(x.workflowRunId);
   if(input.request.signal?.aborted){this.ledger.markReviewRequired(x,'UNKNOWN');throw new DurableStoreError('MODEL_REVIEW_REQUIRED');}
   let response: Awaited<ReturnType<Prepared['invoke']>>;
-  try { response=await prepared.invoke(x.attemptId); }
+  try { response=await this.store.database.outsideInvocation(()=>prepared.invoke(x.attemptId)); }
   catch(error) {
    this.store.assertLease(x.workflowRunId);
    const e=error as {receipt?:DurableUsageReceipt;usage?:RunnerModelResult<unknown>['usage']};

@@ -1,3 +1,4 @@
+import { assertLegacyControl } from './recoveryHoldLifecycle';
 import type { DurableDatabase, DurableTransaction } from './db';
 import type { ControlledBinding, ControlledExecutorRegistry, ControlledPlan, ControlledPlanInput, ControlledTiming } from './controlledRecoveryTypes';
 import { CONTROLLED_LIMITS, CONTROLLED_OPERATION, CONTROLLED_RECOVERY_CONTRACT } from './controlledRecoveryTypes';
@@ -111,6 +112,7 @@ export function controlledBinding(db: DurableDatabase, tx: DurableTransaction, i
 }
 export function assertControlledPlanCurrent(db: DurableDatabase, tx: DurableTransaction, plan: ControlledPlan,
   registry: ControlledExecutorRegistry | undefined, timing: ControlledTiming) {
+  assertLegacyControl(tx,plan.workflowRunId,'recovery_controlled_plans',plan.planId);
   const { planId, planDigest, createdByActorId, createdAt, sendDeadline, ...saved } = plan;
   const current = controlledBinding(db,tx,{workflowRunId:plan.workflowRunId,actionId:plan.actionId},registry,timing);
   if (sendDeadline <= recoveryTime(tx) || canonicalJson(saved) !== canonicalJson(current.binding)) throw new DurableStoreError('RECOVERY_INVALID_PLAN');

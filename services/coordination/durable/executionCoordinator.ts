@@ -115,6 +115,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
       if (row.state !== 'PREPARED') throw new DurableStoreError('EXECUTION_REVIEW_REQUIRED');
       const attemptId = randomUUID(), now = this.now();
       reserveExecutionInTransaction(tx,r,attemptId,now);
+      this.store.database.participateInvocation(tx,'ACTION',r.action.actionId,{inputTokens:0,outputTokens:0,costMicros:0});
       return { record: r, attemptId };
     });
   }
