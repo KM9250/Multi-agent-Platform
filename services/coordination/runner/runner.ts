@@ -166,7 +166,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
   }
   private budget(ctx: RoundContext) {
     const s = this.snapshot(ctx);
-    return findExhaustedBudget(s.run.budget, s.run.usage, Math.max(0, this.clock.now() - s.run.createdAt));
+    return findExhaustedBudget(s.run.budget, this.deps.store.getEffectiveUsage?.(ctx.id) ?? s.run.usage, Math.max(0, this.clock.now() - s.run.createdAt));
   }
   private block(ctx: RoundContext, reason: string, approval?: RunnerPendingApproval): RunnerRunResult {
     this.append(ctx, 'WorkflowBlocked', { reason });
@@ -380,6 +380,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       if (this.deps.durableExecution) this.durable(() => this.deps.durableExecution!.assertCanPlan(ctx.id));
       const s = this.snapshot(ctx);
       const request=runnerPlanRequest(s,this.now(s),ctx.signal);
+      request.effectiveUsage = this.deps.store.getEffectiveUsage?.(ctx.id) ?? s.run.usage;
       const response = await this.model(ctx, 'plan', () => this.deps.supervisorProvider.plan(request),request);
       const stopped = this.safePoint(ctx); if (stopped) {this.discardStoppedModel(ctx);return stopped;}
       if (response.stale || cursor(this.snapshot(ctx)) !== response.cursor) {this.discardModel(ctx,'STALE_RESPONSE');return this.decide(ctx);}
@@ -550,7 +551,9 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
         let item;
         // Classify only the storage boundary and minimum structure, never provider failures.
         try {
-          item = this.deps.durableExecution
+          item = ref.startsWith('map.reconciliation.result.v1:') && this.deps.durableModelCalls?.getReconciledEvidence
+            ? this.deps.durableModelCalls.getReconciledEvidence(ctx.id,task,ref)
+            : this.deps.durableExecution
             ? await this.deps.durableExecution.getOwnedEvidence(ctx.id, task, ref)
             : await this.deps.evidenceStore.get(ref);
           if (!item || typeof item !== 'object' || Array.isArray(item)
@@ -568,6 +571,7 @@ export class BoundedCoordinationRunner implements CoordinationRunner {
       const request: RunnerVerifyRequest = {
         workflowRunId: ctx.id, goal: s.run.goal, acceptanceCriteria: [...s.run.acceptanceCriteria],
         task: structuredClone(task), evidence, audit: runnerAudit(s, this.now(s)), systemContract: RUNNER_PROVIDER_SYSTEM_CONTRACT, signal: ctx.signal,
+        effectiveUsage: this.deps.store.getEffectiveUsage?.(ctx.id) ?? s.run.usage,
       };
       const response=await this.model(ctx,'verify',()=>this.deps.supervisorProvider.verify(request),request);
       const after = this.safePoint(ctx); if (after) {this.discardStoppedModel(ctx);return after;}

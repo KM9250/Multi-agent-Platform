@@ -100,3 +100,14 @@ The existing tests retain all assertions and crash boundaries. Their expected la
 Windows native execution is not validated by the Linux results. Existing browser/normal dispatch, non-durable Runner, 4A PLAN application, 5C-2 fencing and 4B-1 recovery retain their contracts. No actual external executor or model/provider call is needed to validate this feature. The host must explicitly connect a trusted identity verifier and opted-in executor before production use.
 
 For 4B-2B, add Invocation bounds, PLAN/VERIFY and Hold/Resume rules under a new approval scope; never expand these Grants. For 4C, inspect missing external results/Usage with independent evidence. Missing results in this phase never justify resending the same Action or declaring success.
+
+## COORD-5C-4C integration (Schema 10)
+
+[Reconciliation](coordination-reconciliation-design.md) feeds the shared current
+obligations, effective accounting and state digest used by controlled planning.
+Reconciled attempts are sealed against late normal writes or sends. The old
+controlled-dispatch receipt remains an immutable account of the original
+dispatch, even after later reconciliation and Task application. Original sends
+are never retried by reconciliation, and a new operation does not restore a
+consumed send permit. Unconnected production verification capabilities fail
+closed without disabling candidate preservation or synthetic validation.

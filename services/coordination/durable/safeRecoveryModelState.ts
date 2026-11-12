@@ -2,6 +2,7 @@ import type { DurableTransaction, Row } from './db';
 import { canonicalJson, digest, parseJson, requireIntegrity } from './integrity';
 import type { RecoveryOperationReceipt, RecoveryExecutionPlan } from './safeRecoveryTypes';
 import { readSafeRecoveryReceipt } from './safeRecoveryStore';
+import { readReconciledModelUsage } from './reconciliationAccounting';
 
 const CONTRACT = 'COORD-5C-4B:EXECUTE:1';
 
@@ -75,7 +76,9 @@ export function readModelRecoveryResolution(tx: DurableTransaction, workflowRunI
 }
 
 export interface EffectiveModelRow {
-  historical: Row; resolution?: Row;
+  historical: Row; resolution?: Row; reconciliation?: Row;
+  accountingState: 'UNSETTLED' | 'NORMAL_SETTLED' | 'RECONCILED_SETTLED' | 'DISPUTED';
+  responseState: string; budgetViolation: boolean; disputed: boolean;
   outstandingReservation: boolean; pendingApplication: boolean; unresolved: boolean;
 }
 
@@ -83,10 +86,17 @@ export interface EffectiveModelRow {
 export function effectiveModelRows(tx: DurableTransaction, workflowRunId: string): EffectiveModelRow[] {
   return tx.all('SELECT * FROM model_call_ledger WHERE workflow_run_id=? ORDER BY model_call_id', workflowRunId).map(historical => {
     const resolution = readModelRecoveryResolution(tx, workflowRunId, String(historical.model_call_id));
+    const reconciliation = readReconciledModelUsage(tx, workflowRunId, String(historical.model_call_id));
+    const disputed = !!tx.get("SELECT dispute_id FROM reconciliation_disputes WHERE workflow_run_id=? AND target_kind='MODEL' AND target_id=?", workflowRunId, historical.model_call_id);
     const outstandingReservation = ['RESERVED', 'DISPATCH_INTENT', 'REVIEW_REQUIRED'].includes(String(historical.state))
-      && resolution?.resolution_kind !== 'CANCELLED_UNSENT';
-    const pendingApplication = historical.application_status === 'PENDING_APPLICATION' && resolution?.resolution_kind !== 'DISCARDED_BY_RECOVERY';
-    return { historical, resolution, outstandingReservation, pendingApplication,
-      unresolved: outstandingReservation || pendingApplication || historical.budget_violation === 1 };
+      && resolution?.resolution_kind !== 'CANCELLED_UNSENT' && !reconciliation;
+    const responseState = resolution?.resolution_kind === 'DISCARDED_BY_RECOVERY' ? 'DISCARDED'
+      : reconciliation ? String(reconciliation.response_status) : String(historical.application_status);
+    const pendingApplication = responseState === 'PENDING_APPLICATION' || responseState === 'UNAVAILABLE_REVIEW_REQUIRED';
+    const budgetViolation = historical.budget_violation === 1 || reconciliation?.budget_violation === 1;
+    return { historical, resolution, reconciliation, outstandingReservation, pendingApplication,
+      responseState, budgetViolation, disputed,
+      accountingState: disputed ? 'DISPUTED' : reconciliation ? 'RECONCILED_SETTLED' : historical.state === 'SETTLED' ? 'NORMAL_SETTLED' : 'UNSETTLED',
+      unresolved: outstandingReservation || pendingApplication || budgetViolation || disputed };
   });
 }

@@ -26,6 +26,8 @@ import { runBoundedRunner } from './boundedRunner';
 import { appendEvent } from '../kernel';
 import { runnerActionApproved, runnerEvidenceReviewReason, runnerSecurityReviewReason } from '../runner/dispatchGuard';
 import { effectiveModelRows } from './safeRecoveryModelState';
+import { effectiveActionRows } from './reconciliationEffectiveState';
+import { readReconciledModelUsage } from './reconciliationAccounting';
 
 export interface BoundedRuntimeOptions {
   policy?: ContinuationPolicy; providers?: BoundedProviderRegistry; reads?: PlanningReadRegistry;
@@ -33,6 +35,7 @@ export interface BoundedRuntimeOptions {
 }
 interface Context {
   plan: ContinuationPlan; invocationId: string; lease: WorkflowLease; actor: VerifiedRecoveryIdentity;
+  credential: unknown;
   phase: 'RUNNER'|'MODEL'|'APPLICATION'|'READ'|'FINISH'|'EVIDENCE'; callId?: string; roundKey?: string; roundStepId?:string;
   valid: boolean; abort: AbortController;
   planningRequest?: Omit<PlanningProviderRequest,'signal'>;
@@ -61,6 +64,11 @@ export class BoundedRuntime {
       requireIntegrity(p.version&&Array.isArray(p.planningRoles)&&typeof p.canAccess==='function'&&typeof p.canSend==='function'&&typeof p.inspectContent==='function');
       for(const q of [p.recoveryApprovals,p.releaseApprovals])requireIntegrity(Number.isSafeInteger(q.minimumApprovers)&&q.minimumApprovers>=1&&q.minimumApprovers<=100&&typeof q.forbidSelfApproval==='boolean');
     }
+  }
+  /** Called only by the DB-owned reconciliation host after the drain transaction committed. */
+  notifyReconciliationDrain(ids:readonly string[]):void {
+    const confirmed=this.#host.db.read(tx=>ids.filter(id=>tx.get("SELECT invocation_id FROM recovery_invocations WHERE invocation_id=? AND status='DRAINING'",id)));
+    this.withoutAuthority(()=>{for(const id of confirmed)this.#active.get(id)?.abort.abort();});
   }
   get protecting():boolean {return this.#management||this.active;}
   get active():boolean {return !!this.#contexts.getStore()?.valid;}
@@ -314,6 +322,8 @@ export class BoundedRuntime {
       if(p.operation==='PLANNING_ONLY')requireIntegrity(p.createdBy===who.actorId);
       return tx.get('SELECT receipt_id FROM recovery_continuation_receipts WHERE plan_id=?',planId)?this.#inspect(tx,planId,credential):undefined;});
     if(prior)return prior;
+    const candidate=this.#host.db.read(tx=>readContinuationPlan(tx,planId));
+    if(candidate.operation!=='RELEASE_RECOVERY_HOLD')this.#host.db.reconciliationDecision(undefined,credential,{kind:'RUNNER_CONTEXT',workflowRunId:candidate.workflowRunId,destination:candidate.input?.destination??`${candidate.providerId}/${candidate.modelId}`});
     if(!lease)throw new DurableStoreError('LEASE_FENCED');
     let committed:{p:ContinuationPlan;who:VerifiedRecoveryIdentity;invocationId?:string};
     try {committed=this.#write(lease,tx=>{
@@ -338,18 +348,18 @@ export class BoundedRuntime {
     });}catch(error){const saved=this.#host.db.read(tx=>tx.get('SELECT receipt_id FROM recovery_continuation_receipts WHERE plan_id=?',planId));if(saved)return this.#host.db.read(tx=>this.#inspect(tx,planId,credential));throw error;}
     if(!committed.invocationId)return this.#host.db.read(tx=>this.#inspect(tx,planId,credential));
     // Created only on the direct acknowledged return above. No ID/inspection can enter this branch.
-    const ctx:Context={plan:committed.p,invocationId:committed.invocationId,lease,actor:committed.who,phase:'RUNNER',valid:true,abort:new AbortController()};
+    const ctx:Context={plan:committed.p,invocationId:committed.invocationId,lease,actor:committed.who,credential,phase:'RUNNER',valid:true,abort:new AbortController()};
     const abort=()=>ctx.abort.abort();signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();this.#active.set(ctx.invocationId,ctx);
     const stopHeartbeat=this.#host.db.createLeaseManager().startHeartbeat(lease,abort);
     try {await this.#contexts.run(ctx,async()=>{
       try {
         if(ctx.plan.operation==='PLANNING_ONLY')await this.#planning(ctx);
         else {
-          await runBoundedRunner(this.#host.db,ctx.lease,ctx.plan,this.#provider(ctx.plan)!,ctx.abort.signal,()=>this.#round(ctx));
+          await runBoundedRunner(this.#host.db,ctx.lease,ctx.plan,this.#provider(ctx.plan)!,ctx.abort.signal,()=>this.#round(ctx),{credential:ctx.credential,destination:`${ctx.plan.providerId}/${ctx.plan.modelId}`});
           this.#finish(ctx,'COMPLETED','BOUNDED_SCOPE_COMPLETED');
         }
       }catch(error){
-        try {const unknown=this.#host.db.read(tx=>effectiveModelRows(tx,ctx.plan.workflowRunId).some(r=>r.unresolved)||!!tx.get("SELECT action_id FROM execution_ledger WHERE workflow_run_id=? AND state IN ('DISPATCH_RESERVED','RESULT_RECORDED','REVIEW_REQUIRED')",ctx.plan.workflowRunId)||!!tx.get("SELECT read_id FROM planning_read_calls WHERE workflow_run_id=? AND state='INTENT'",ctx.plan.workflowRunId));
+        try {const unknown=this.#host.db.read(tx=>effectiveModelRows(tx,ctx.plan.workflowRunId).some(r=>r.unresolved)||effectiveActionRows(tx,ctx.plan.workflowRunId).some(r=>r.unresolved)||!!tx.get("SELECT read_id FROM planning_read_calls WHERE workflow_run_id=? AND state='INTENT'",ctx.plan.workflowRunId));
           this.#finish(ctx,unknown?'REVIEW_REQUIRED':'STOPPED',error instanceof DurableStoreError?error.code:'CONTINUATION_FAILED');}catch{/* Retain the persisted unresolved Invocation for diagnosis. */}
       }
     });}finally{stopHeartbeat();ctx.valid=false;this.#active.delete(ctx.invocationId);signal?.removeEventListener('abort',abort);}
@@ -400,7 +410,9 @@ export class BoundedRuntime {
   #usage(tx:DurableTransaction,invocationId:string):ContinuationInspection['usage'] {
     let committed=zeroAmounts(),outstanding=zeroAmounts();
     for(const r of tx.all("SELECT m.* FROM model_call_ledger m JOIN recovery_invocation_debits d ON d.target_id=m.model_call_id AND d.workflow_run_id=m.workflow_run_id WHERE d.invocation_id=? AND d.kind='MODEL'",invocationId)) {
-      if(r.state==='SETTLED')committed=addAmounts(committed,usageAmounts(JSON.parse(String(r.usage_json))));
+      const reconciled=readReconciledModelUsage(tx,String(r.workflow_run_id),String(r.model_call_id));
+      if(reconciled)committed=addAmounts(committed,usageAmounts(JSON.parse(String(reconciled.usage_json))));
+      else if(r.state==='SETTLED')committed=addAmounts(committed,usageAmounts(JSON.parse(String(r.usage_json))));
       else if(effectiveModelRows(tx,String(r.workflow_run_id)).find(x=>x.historical.model_call_id===r.model_call_id)?.outstandingReservation)outstanding=addAmounts(outstanding,{llmCalls:1,inputTokens:Number(r.reserved_input),outputTokens:Number(r.reserved_output),costMicros:Number(r.reserved_cost)});
     }
     const {llmCalls:_,...a}=committed,{llmCalls:__,...b}=outstanding;return {committed:a,outstanding:b};
@@ -442,8 +454,10 @@ export class BoundedRuntime {
       requireIntegrity(digest(validateProvider(this.#provider(p),p))===digest(p.binding.provider));
       ctx.phase='MODEL';const s=store.getSnapshot(p.workflowRunId),callId=randomUUID();
       const x:ModelCallIdentity={workflowRunId:p.workflowRunId,modelCallId:callId,attemptId:randomUUID(),providerId:p.providerId!,modelId:p.modelId!};
+      const readFacts=()=>this.#host.db.reconciliationDecision(undefined,ctx.credential,{kind:'RUNNER_CONTEXT',workflowRunId:p.workflowRunId,destination:p.input!.destination}) as import('../runner/types').RunnerReconciledFact[];
+      const facts=readFacts();
       const request=jsonCopy({mode:p.mode,input:p.input!.text,reasoning:p.reasoning??{},references:p.input!.snapshots,reads,
-        remainingModelCalls:p.limits.maxModelCalls-n,remainingReadCalls:p.limits.maxReadCalls-reads.length});
+        remainingModelCalls:p.limits.maxModelCalls-n,remainingReadCalls:p.limits.maxReadCalls-reads.length,reconciledFacts:facts,effectiveUsage:store.getEffectiveUsage(p.workflowRunId)});
       ctx.planningRequest=request;
       this.#checkData(ctx.actor,p,request);
       ledger.reserve({...x,roundKey:`bounded:${ctx.invocationId}:${n}`,phase:'PLAN',requestCursor:s.events.length,requestEventId:s.events.at(-1)!.eventId,
@@ -453,6 +467,7 @@ export class BoundedRuntime {
       const sendDeadline=performance.now()+remaining;
       const collected=await collectBoundedResponse(signal=>this.withoutAuthority(async()=>{
         this.#checkData(ctx.actor,p,request); // Last check of this exact payload, after Intent and before external entry.
+        requireIntegrity(canonicalJson(readFacts())===canonicalJson(facts));
         store.assertLease(p.workflowRunId);
         this.#host.db.read(tx=>{
           const i=tx.get('SELECT status,admission_deadline FROM recovery_invocations WHERE invocation_id=?',ctx.invocationId);

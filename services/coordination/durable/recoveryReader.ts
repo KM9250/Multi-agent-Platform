@@ -19,6 +19,8 @@ import { RecoveryAuditReader } from './recoveryTimeline';
 import { readSafeRecoveryReceipt } from './safeRecoveryStore';
 import { inspectDispatchInTransaction } from './recoveryDispatchReader';
 import type { ExecutionStateSummary, RecoveryAuthorizationRequirement, RecoveryInspection, TimelineQueryOptions } from './recoveryTypes';
+import { effectiveWorkflowUsage } from './reconciliationAccounting';
+import { effectiveActionRows, readReconciledActionApplication } from './reconciliationEffectiveState';
 
 /** No Runner, Coordinator, registry, model provider, or execution capability is accepted. */
 export class RecoveryReader {
@@ -50,6 +52,7 @@ export class RecoveryReader {
         const ledgers = tx.all('SELECT action_id FROM execution_ledger WHERE workflow_run_id = ?', workflowRunId);
         requireIntegrity(actions.length === ledgers.length);
         const ownedTasks = new Set<string>();
+        const effectiveActions = effectiveActionRows(tx,workflowRunId);
         for (const item of actions) {
           const r = this.actions.getInTransaction(tx, workflowRunId, String(item.action_id)); requireIntegrity(r);
           validateActionOwner(s, r);
@@ -57,6 +60,8 @@ export class RecoveryReader {
           const savedAction = tx.get('SELECT round_key FROM pending_actions WHERE workflow_run_id = ? AND action_id = ?', workflowRunId, r.action.actionId);
           requireIntegrity(savedAction?.round_key === session.contextRef);
           const result = readExecutionResult(tx, r, this.evidence);
+          const reconciliation = effectiveActions.find(item=>item.historical.action_id===r.action.actionId);
+          const appliedReconciliation = readReconciledActionApplication(tx,workflowRunId,r.action.actionId);
           if (result?.safetyHold) authorizationRequirements.push({ kind: 'SECURITY_REVIEW', reference: result.safetyHold.reviewRef,
             effectState: result.safetyHold.effectState, satisfied: !runnerSecurityReviewReason(s) && row.finalized_event_id !== null });
           const approval = runnerPendingApproval(workflowRunId, r.action);
@@ -78,16 +83,17 @@ export class RecoveryReader {
               && canonicalJson(event.payload) === canonicalJson(expected.payload)
               && task.status === (event.type === 'TaskCompleted' ? 'COMPLETED' : 'FAILED'));
           } else if (['RESULT_RECORDED','DISPATCH_RESERVED'].includes(String(row.state))) {
-            requireIntegrity(task.status === 'ASSIGNED' || s.run.status === 'CANCELLED' && task.status === 'CANCELLED');
+            requireIntegrity(appliedReconciliation || task.status === 'ASSIGNED' || s.run.status === 'CANCELLED' && task.status === 'CANCELLED');
           }
           let safetyStopIncomplete = false;
-          if (row.review_reason === 'EXECUTION_UNCERTAIN' && result) {
+          if (row.review_reason === 'EXECUTION_UNCERTAIN' && result && !appliedReconciliation) {
             requireIntegrity(result.status === 'uncertain' && !result.safetyHold);
             const stop = inspectUncertainStop(tx, s, r, row, result, { now: () => inspectedAt });
             safetyStopIncomplete = !stop?.block;
           }
           executions.push({ actionId: r.action.actionId, sessionId: r.sessionId, taskId: r.taskId,
             state: row.state as DurableExecutionState, taskStatus: task.status, sessionState: session.state,
+            ...(reconciliation?.outcome ? {reconciledOutcome:reconciliation.outcomeState,reconciledApplication:reconciliation.applicationState,reconciliationUnresolved:reconciliation.unresolved} : {}),
             reviewReason: row.review_reason as string ?? undefined, finalizedEventId: row.finalized_event_id as string ?? undefined, safetyStopIncomplete });
           ownedTasks.add(r.taskId);
         }
@@ -116,7 +122,7 @@ export class RecoveryReader {
         if (['BLOCKED','SUSPENDED'].includes(s.run.status)) authorizationRequirements.push({ kind: 'EXPLICIT_RESUME', satisfied: false });
         reason='MODEL_CALL_INTEGRITY_INVALID';
         const models=inspectModelCalls(tx,this.store,workflowRunId);
-        const inspection = classifyRecovery({ modelCalls:models.summary,modelCallCoverage:models.coverage, workflowRunId, inspectedAt, snapshot: s, executions, authorizationRequirements,
+        const inspection = classifyRecovery({ effectiveUsage:effectiveWorkflowUsage(tx,workflowRunId,s),modelCalls:models.summary,modelCallCoverage:models.coverage, workflowRunId, inspectedAt, snapshot: s, executions, authorizationRequirements,
           missingHistoricalLedger: Object.values(s.tasks).some(task => !ownedTasks.has(task.taskId)),
           unresolvedSecurityReview: !!runnerSecurityReviewReason(s)
             || executions.some(e => e.reviewReason === 'SECURITY_REVIEW_REQUIRED' && !e.finalizedEventId),

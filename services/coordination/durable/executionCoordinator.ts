@@ -18,6 +18,9 @@ import { canonicalJson, digest, DurableStoreError, guarded, requireIntegrity } f
 import { EXECUTION_LIMITS, executionJson, rejectEmbeddedCredentials } from './executionIntegrity';
 import { readJournal } from './restore';
 import { readExecutionResult, validateExecutionEvidence, inspectUncertainStop, finalizeRecordedResultInTransaction } from './executionReader';
+import { effectiveWorkflowUsage } from './reconciliationAccounting';
+import { effectiveActionRows, hasReconciledActionRepeat, readReconciledActionApplication } from './reconciliationEffectiveState';
+import { parseJson } from './integrity';
 
 export class DurableExecutionCoordinator implements RunnerDurableExecution {
   readonly pendingActions: SqliteRunnerPendingActionStore;
@@ -32,7 +35,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
     this.clock = options.clock ?? { now: Date.now };
   }
   private assertNoUnknownExecution(tx: DurableTransaction, id: string): void {
-    const unknown = tx.get("SELECT action_id FROM execution_ledger WHERE workflow_run_id = ? AND (state = 'DISPATCH_RESERVED' OR (state = 'REVIEW_REQUIRED' AND review_reason <> 'SECURITY_REVIEW_REQUIRED'))", id);
+    const unknown = effectiveActionRows(tx,id).find(row=>row.unresolved && (row.historical.state==='DISPATCH_RESERVED' || row.historical.state==='REVIEW_REQUIRED' && row.historical.review_reason!=='SECURITY_REVIEW_REQUIRED'));
     if (unknown) throw new DurableStoreError('EXECUTION_REVIEW_REQUIRED');
   }
   assertLease(id: string): void { this.store.assertLease(id); }
@@ -58,13 +61,15 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
     return record;
   }
   registerAction(input: RunnerPendingActionRecord, expected: CoordinationSnapshot, sessionEvent: CoordinationEvent, taskEvent: CoordinationEvent): RunnerPendingActionRecord {
-    this.store.assertRecoveryRegistration(input.workflowRunId);
     const record = validateAction(input), action = record.action;
+    this.store.database.read(tx=>{if(hasReconciledActionRepeat(tx,record.workflowRunId,action))throw new DurableStoreError('EXECUTION_REVIEW_REQUIRED');});
+    this.store.assertRecoveryRegistration(input.workflowRunId);
     this.store.database.validateInvocationAction(action);
     if(this.store.database.boundedInvocationActive)requireIntegrity(evaluateRunnerActionRisk(expected,action)!=='DENY');
     // Identity is stable across a lost response. No replacement Action or Round is generated here.
     const registrationDigest = digest([record, expected.events.at(-1), expected.policy, sessionEvent, taskEvent]);
     return this.store.writeWorkflow(record.workflowRunId, tx => {
+      if(hasReconciledActionRepeat(tx,record.workflowRunId,action))throw new DurableStoreError('EXECUTION_REVIEW_REQUIRED');
       let s = readJournal(tx, record.workflowRunId).snapshot;
       const prior = tx.get('SELECT * FROM pending_actions WHERE workflow_run_id = ? AND (action_id = ? OR task_id = ? OR session_id = ? OR round_key = ?)',
         record.workflowRunId, action.actionId, record.taskId, record.sessionId, String((sessionEvent.payload as { contextRef?: string }).contextRef ?? ''));
@@ -100,6 +105,12 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
   }
   /** Only this successful, acknowledged COMMIT permits the immediately following dispatch. */
   reserveDispatch(id: string, task: CoordinationTask): { record: RunnerPendingActionRecord; attemptId: string } {
+    // A sealed attempt is not a request to start a recovery Gate transition.
+    // Reject this retry before the gate can append a Hold or control revision.
+    this.store.database.read(tx=>{
+      const record=this.record(tx,id,task);
+      if(tx.get("SELECT operation_id FROM reconciliation_target_seals WHERE workflow_run_id=? AND target_kind='ACTION' AND target_id=?",id,record.action.actionId))throw new DurableStoreError('EXECUTION_REVIEW_REQUIRED');
+    });
     this.assertRecoveryExecution(id);
     return this.store.writeWorkflow(id, tx => {
       const s = readJournal(tx, id).snapshot, r = this.record(tx, id, task);
@@ -107,7 +118,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
       requireIntegrity(s.run.status === 'RUNNING' && s.run.executionMode === 'supervised_autonomous'
         && s.sessions[r.sessionId].state === 'OPEN' && s.tasks[r.taskId].status === 'ASSIGNED'
         && Object.values(s.sessions).filter(session => ['OPEN','SUSPENDED'].includes(session.state)).length === 1);
-      requireIntegrity(!findExhaustedBudget(s.run.budget, s.run.usage, Math.max(0, this.now() - s.run.createdAt)));
+      requireIntegrity(!findExhaustedBudget(s.run.budget, effectiveWorkflowUsage(tx,id,s), Math.max(0, this.now() - s.run.createdAt)));
       requireIntegrity(!runnerSecurityReviewReason(s) && !runnerEvidenceReviewReason(s));
       this.assertNoUnknownExecution(tx, id);
       const risk = evaluateRunnerActionRisk(s, r.action);
@@ -199,6 +210,8 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
   getResult(id: string, task: CoordinationTask): RunnerExecutionResult | undefined {
     return this.store.database.read(tx => {
       const r = this.record(tx, id, task); validateActionOwner(readJournal(tx, id).snapshot, r);
+      const application = readReconciledActionApplication(tx,id,r.action.actionId);
+      if(application) return parseJson<RunnerExecutionResult>(application.result_json);
       const row = readExecution(tx, r), result = readExecutionResult(tx, r, this.evidenceStore);
       if (!result && row.state !== 'PREPARED') throw new DurableStoreError('EXECUTION_REVIEW_REQUIRED');
       return result;

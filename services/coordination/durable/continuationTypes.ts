@@ -79,6 +79,8 @@ export interface PlanningProviderRequest {
   mode: PlanningMode; input: string; reasoning: Record<string, string | number | boolean>;
   references: InputSnapshot[]; reads: Array<{ resourceId: string; digest: string; revision: string; observedAt: number; text: string }>;
   remainingModelCalls: number; remainingReadCalls: number; signal: AbortSignal;
+  reconciledFacts?: import('../runner/types').RunnerReconciledFact[];
+  effectiveUsage?: import('../types').WorkflowUsage;
 }
 export interface BoundedProvider {
   capabilities: ProviderCapabilities;

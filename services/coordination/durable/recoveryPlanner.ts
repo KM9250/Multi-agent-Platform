@@ -8,6 +8,9 @@ import { canonicalJson, digest, DurableStoreError, requireIntegrity } from './in
 import { readJournal } from './restore';
 import { DEFAULT_RECOVERY_TTL_MS, MAX_RECOVERY_TTL_MS, RECOVERY_CONTRACT, RECOVERY_OPERATIONS } from './recoveryDecisionTypes';
 import type { CreateRecoveryPlan, RecoveryAuthorizationPolicy, RecoveryCandidate, RecoveryPlan, RecoveryPlanBinding, RecoveryPreview } from './recoveryDecisionTypes';
+import { effectiveWorkflowUsage, reconciliationStateDigest } from './reconciliationAccounting';
+import { effectiveModelRows } from './safeRecoveryModelState';
+import { effectiveActionRows } from './reconciliationEffectiveState';
 
 export function recoveryTime(tx: DurableTransaction): number {
   const now = tx.get('SELECT map_recovery_now() AS now')?.now;
@@ -31,9 +34,9 @@ export function recoverySnapshot(db: DurableDatabase, tx: DurableTransaction, id
   const common = {
     workflowRunId: id, journalCursor: snapshot.events.at(-1)!.sequence, journalEventId: snapshot.events.at(-1)!.eventId,
     runtimeInstanceId: String(lease?.owner_instance_id ?? ''), runtimeGeneration: Number(lease?.generation ?? 0),
-    actionStateDigest: digest({ actions, artifacts }),
-    modelStateDigest: digest({ models, attempts: tx.all('SELECT * FROM model_call_attempts WHERE workflow_run_id=? ORDER BY attempt_id', id), coverage: inspection.modelCallCoverage }),
-    policyDigest: digest({ workflow: snapshot.policy, recovery: policy }), budgetPositionDigest: digest({ budget, usage: snapshot.run.usage }),
+    actionStateDigest: digest({ actions, artifacts, reconciliation:reconciliationStateDigest(tx,id) }),
+    modelStateDigest: digest({ models, attempts: tx.all('SELECT * FROM model_call_attempts WHERE workflow_run_id=? ORDER BY attempt_id', id), coverage: inspection.modelCallCoverage, reconciliation:reconciliationStateDigest(tx,id) }),
+    policyDigest: digest({ workflow: snapshot.policy, recovery: policy }), budgetPositionDigest: digest({ budget, usage: effectiveWorkflowUsage(tx,id,snapshot) }),
     recoveryHoldRevision: Number(hold?.revision ?? 0), operationContractVersion: RECOVERY_CONTRACT,
   };
   const candidates: RecoveryCandidate[] = [];
@@ -53,8 +56,8 @@ export function recoverySnapshot(db: DurableDatabase, tx: DurableTransaction, id
       if (model.state === 'RESERVED') add('CANCEL_UNSENT_MODEL', String(model.model_call_id), 'NO_DISPATCH_INTENT');
       if (model.state === 'SETTLED' && model.application_status === 'PENDING_APPLICATION') add('DISCARD_SETTLED_RESPONSE', String(model.model_call_id), 'SETTLED_RESPONSE');
     }
-    if (!actions.some(a => ['DISPATCH_RESERVED','RESULT_RECORDED','REVIEW_REQUIRED'].includes(String(a.state)))
-      && !models.some(m => ['RESERVED','DISPATCH_INTENT','REVIEW_REQUIRED'].includes(String(m.state)) || m.application_status === 'PENDING_APPLICATION' || m.budget_violation)
+    if (!effectiveActionRows(tx,id).some(a => a.unresolved)
+      && !effectiveModelRows(tx,id).some(m => m.unresolved)
       && inspection.modelCallCoverage === 'TRACKED_FROM_CREATION') add('BOUNDED_CONTINUATION', id, 'REVALIDATION_REQUIRED');
   }
   return { common, candidates, snapshot, inspection, lease };

@@ -15,6 +15,8 @@ import { recoveryTime } from './recoveryPlanner';
 import { findExhaustedBudget } from '../policy';
 import { runnerActionApproved, runnerEvidenceReviewReason, runnerSecurityReviewReason } from '../runner/dispatchGuard';
 import { evaluateRunnerActionRisk } from '../runner/policyGuard';
+import { effectiveWorkflowUsage, reconciliationStateDigest } from './reconciliationAccounting';
+import { effectiveActionRows } from './reconciliationEffectiveState';
 
 export function controlledTiming(input: Partial<ControlledTiming> = {}): ControlledTiming {
   requireIntegrity(Object.keys(input).every(k => ['sendTtlMs','executionTimeoutMs','resultGraceMs'].includes(k)));
@@ -38,8 +40,8 @@ export function resolveControlledExecutor(registry: ControlledExecutorRegistry |
 export function controlledState(tx: DurableTransaction, id: string) {
   const rows = (table: string) => tx.all(`SELECT * FROM ${table} WHERE workflow_run_id=? ORDER BY rowid`, id);
   return {
-    actionStateDigest: digest({ ledger: rows('execution_ledger'), actions: rows('pending_actions'), results: rows('execution_results'), evidence: rows('runner_evidence') }),
-    modelStateDigest: digest({ ledger: rows('model_call_ledger'), attempts: rows('model_call_attempts'), resolutions: rows('recovery_model_resolutions'), coverage: rows('model_call_coverage') }),
+    actionStateDigest: digest({ ledger: rows('execution_ledger'), actions: rows('pending_actions'), results: rows('execution_results'), evidence: rows('runner_evidence'), reconciliation: reconciliationStateDigest(tx,id) }),
+    modelStateDigest: digest({ ledger: rows('model_call_ledger'), attempts: rows('model_call_attempts'), resolutions: rows('recovery_model_resolutions'), coverage: rows('model_call_coverage'), reconciliation: reconciliationStateDigest(tx,id) }),
     controlledStateDigest: digest({ intents: rows('recovery_dispatch_intents'), receipts: rows('recovery_dispatch_receipts'), evidence: rows('recovery_dispatch_evidence') }),
   };
 }
@@ -48,7 +50,7 @@ export function dispatchPostState(tx: DurableTransaction, id: string): string {
   const s = readJournal(tx,id).snapshot;
   const { actionStateDigest, modelStateDigest } = controlledState(tx,id);
   return digest({ actionStateDigest, modelStateDigest, cursor: s.events.length, head: s.events.at(-1),
-    policy: s.policy, usage: s.run.usage, hold: effectiveHoldRevision(tx,id) });
+    policy: s.policy, usage: effectiveWorkflowUsage(tx,id,s), hold: effectiveHoldRevision(tx,id) });
 }
 export function preparedEligibility(db: DurableDatabase, tx: DurableTransaction, input: ControlledPlanInput) {
   requireIntegrity(Object.keys(input).every(k => ['workflowRunId','actionId'].includes(k))
@@ -66,7 +68,7 @@ export function preparedEligibility(db: DurableDatabase, tx: DurableTransaction,
     && !tx.get('SELECT result_ref FROM execution_results WHERE workflow_run_id=? AND action_id=?',id,input.actionId)
     && !tx.get('SELECT evidence_ref FROM runner_evidence WHERE workflow_run_id=? AND action_id=?',id,input.actionId)
     && !tx.get("SELECT audit_sequence FROM runtime_audit_events WHERE workflow_run_id=? AND action_id=? AND event_kind='EXECUTION_CHANGED' AND (attempt_id IS NOT NULL OR next_state<>'PREPARED')",id,input.actionId));
-  requireIntegrity(!tx.get("SELECT action_id FROM execution_ledger WHERE workflow_run_id=? AND action_id<>? AND state<>'FINALIZED'",id,input.actionId)
+  requireIntegrity(!effectiveActionRows(tx,id).some(r=>r.historical.action_id!==input.actionId && (r.unresolved || r.historical.state==='PREPARED'))
     && !runnerSecurityReviewReason(s) && !runnerEvidenceReviewReason(s)
     && tx.get('SELECT coverage FROM model_call_coverage WHERE workflow_run_id=?',id)?.coverage === 'TRACKED_FROM_CREATION'
     && !effectiveModelRows(tx,id).some(m => m.unresolved));
@@ -88,7 +90,7 @@ export function preparedEligibility(db: DurableDatabase, tx: DurableTransaction,
 }
 export function assertControlledBudget(tx: DurableTransaction, id: string): void {
   const s = readJournal(tx,id).snapshot;
-  requireIntegrity(!findExhaustedBudget(s.run.budget,s.run.usage,Math.max(0,recoveryTime(tx)-s.run.createdAt)));
+  requireIntegrity(!findExhaustedBudget(s.run.budget,effectiveWorkflowUsage(tx,id,s),Math.max(0,recoveryTime(tx)-s.run.createdAt)));
 }
 export function controlledBinding(db: DurableDatabase, tx: DurableTransaction, input: ControlledPlanInput,
   registry: ControlledExecutorRegistry | undefined, timing: ControlledTiming): { binding: ControlledBinding; executor: ReturnType<typeof resolveControlledExecutor> } {
@@ -105,7 +107,7 @@ export function controlledBinding(db: DurableDatabase, tx: DurableTransaction, i
     executorId: executor.executorId, executorContractVersion: executor.contractVersion, executorBindingDigest: executor.bindingDigest,
     journalCursor: s.events.length, journalEventId: s.events.at(-1)!.eventId, ...controlledState(tx,id),
     policyDigest: digest({ workflow: s.policy, recovery: db.recoveryPolicy }),
-    budgetPositionDigest: digest({ budget, usage: s.run.usage }),
+    budgetPositionDigest: digest({ budget, usage: effectiveWorkflowUsage(tx,id,s) }),
     recoveryHoldRevision: effectiveHoldRevision(tx,id), runtimeInstanceId: String(lease.owner_instance_id), runtimeGeneration: Number(lease.generation),
     approvalPolicy: db.recoveryPolicy.ALLOW_PREPARED_DISPATCH ?? { minimumApprovers: 1, forbidSelfApproval: true },
     reviewDigest: digest(inspection.authorizationRequirements), maxActionDispatches: 1, maxModelCalls: 0, maxRounds: 0, timing } };

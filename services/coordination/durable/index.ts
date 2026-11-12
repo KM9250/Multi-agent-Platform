@@ -1,5 +1,15 @@
 // Node-only entry point. Do not re-export from services/coordination/index.ts.
 export { DurableDatabase } from './db';
+export { ReconciliationEvidenceService } from './reconciliationEvidenceStore';
+export { ReconciliationPlanner } from './reconciliationPlanner';
+export { ReconciliationAuthorizer, reconciliationScopeOf } from './reconciliationAuthorizer';
+export { ReconciliationExecutor } from './reconciliationExecutor';
+export { ReconciliationReader } from './reconciliationReader';
+export { RECONCILIATION_CONTRACT, RECONCILIATION_OPERATIONS } from './reconciliationTypes';
+export type { ReconciliationOptions, ReconciliationPolicy, ReconciliationTarget, ReconciliationPermission,
+  ReconciliationVerifierBinding, ReconciliationVerifierRegistry, ReconciliationVerifierRequest,
+  ReconciliationVerifierResult, ReconciliationEvidence, ReconciliationVerification,
+  ReconciliationPlan, ReconciliationGrant, ReconciliationOperationReceipt } from './reconciliationTypes';
 export type { DurableDatabaseOptions, DurableTransaction } from './db';
 export { SqliteCoordinationRunnerStore } from './durableCoordinationStore';
 export type { DurableCoordinationAdministration } from './durableCoordinationStore';

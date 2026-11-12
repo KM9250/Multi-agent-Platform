@@ -1,7 +1,7 @@
 import { validateRunnerUsage } from '../runner/model';
 import { randomUUID } from 'node:crypto';
 import type { RunnerSupervisorProvider, RunnerPlanRequest, RunnerVerifyRequest, RunnerModelResult, RunnerDurableModelCalls, RunnerModelApplicationResult, RunnerModelDiscardReason } from '../runner/types';
-import { digest, DurableStoreError, requireIntegrity } from './integrity';
+import { canonicalJson, digest, DurableStoreError, requireIntegrity } from './integrity';
 import { ModelCallLedger, validateQuote } from './modelCallLedger';
 import type { ModelBudgetQuote, ModelCallIdentity } from './modelCallLedger';
 import type { SqliteCoordinationRunnerStore } from './durableCoordinationStore';
@@ -37,22 +37,40 @@ export function createTestDurableModelAdapter(provider: RunnerSupervisorProvider
 }
 export class DurableModelCallCoordinator implements RunnerDurableModelCalls {
  readonly ledger: ModelCallLedger;
- constructor(readonly store: SqliteCoordinationRunnerStore,readonly provider:RunnerSupervisorProvider,clock={now:Date.now}) {this.ledger=new ModelCallLedger(store,clock);}
+ constructor(readonly store: SqliteCoordinationRunnerStore,readonly provider:RunnerSupervisorProvider,clock={now:Date.now},readonly reconciliationContext?:{credential:unknown;destination:string}) {this.ledger=new ModelCallLedger(store,clock);}
  assertCanRun(id:string):void {
   this.store.assertRecoveryExecution(id);
   this.store.assertLease(id);
   const coverage=this.store.database.read(tx=>tx.get('SELECT coverage FROM model_call_coverage WHERE workflow_run_id=?',id)?.coverage);
   if(coverage!=='TRACKED_FROM_CREATION' || this.ledger.inspectEffective(id).some(r=>r.unresolved)) throw new DurableStoreError('MODEL_REVIEW_REQUIRED');
  }
+ getReconciledEvidence(id:string,task:import('../types').CoordinationTask,ref:string):import('../runner/types').RunnerEvidence|undefined {
+  const facts=this.store.database.reconciliationDecision(undefined,this.reconciliationContext?.credential,
+    {kind:'RUNNER_CONTEXT',workflowRunId:id,destination:this.reconciliationContext?.destination??'unconfigured'}) as import('../runner/types').RunnerReconciledFact[];
+  const fact=facts.find(item=>item.resultRef===ref);if(!fact)return;
+  return this.store.database.read(tx=>{
+    const application=tx.get('SELECT * FROM reconciled_action_applications WHERE workflow_run_id=? AND action_id=? AND task_id=? AND result_ref=?',id,fact.targetId,task.taskId,ref);
+    requireIntegrity(application&&application.attempt_id===fact.attemptId);
+    return {kind:'reconciled-action-fact',content:fact,createdAt:Number(application.created_at)};
+  });
+ }
  async call(input: Parameters<RunnerDurableModelCalls['call']>[0]) {
   this.assertCanRun(input.workflowRunId);
   if(input.request.signal?.aborted) throw new DurableStoreError('MODEL_REVIEW_REQUIRED');
+  // All reconciled facts in the actual request are authenticated here. Callers
+  // cannot inject a verified-looking DTO, and the final send rechecks the ACL.
+  const readFacts=()=>this.store.database.reconciliationDecision(undefined,this.reconciliationContext?.credential,
+    {kind:'RUNNER_CONTEXT',workflowRunId:input.workflowRunId,destination:this.reconciliationContext?.destination??'unconfigured'}) as import('../runner/types').RunnerReconciledFact[];
+  const facts=readFacts();
+  const request={...input.request,reconciledFacts:facts,effectiveUsage:this.store.getEffectiveUsage(input.workflowRunId)};
   const prepare=adapters.get(this.provider);if(!prepare)throw new DurableStoreError('MODEL_ADAPTER_UNSUPPORTED');
-  const prepared=prepare(input.phase,input.request),q=prepared.quote;
+  const prepared=prepare(input.phase,request),q=prepared.quote;
   if(this.provider.scheduling) requireIntegrity(this.provider.scheduling.provider===q.providerId && this.provider.scheduling.model===q.modelId);
   const x={workflowRunId:input.workflowRunId,modelCallId:randomUUID(),attemptId:randomUUID(),providerId:q.providerId,modelId:q.modelId};
   this.ledger.reserve({...x,businessRoundKey:input.roundKey,roundKey:this.store.database.boundedInvocationActive ? `bounded:${x.modelCallId}:${input.roundKey}` : input.roundKey,phase:input.phase,requestCursor:input.requestCursor,requestEventId:input.requestEventId,quote:q});
   if(input.request.signal?.aborted){this.ledger.cancelBeforeDispatch(x);throw new DurableStoreError('MODEL_REVIEW_REQUIRED');}
+  try { requireIntegrity(canonicalJson(readFacts())===canonicalJson(facts)); }
+  catch(error) {this.ledger.cancelBeforeDispatch(x);throw error;}
   this.ledger.markDispatchIntent(x);
   this.store.assertLease(x.workflowRunId);
   if(input.request.signal?.aborted){this.ledger.markReviewRequired(x,'UNKNOWN');throw new DurableStoreError('MODEL_REVIEW_REQUIRED');}

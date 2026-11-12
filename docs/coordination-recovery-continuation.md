@@ -171,3 +171,17 @@ Provider能力はProvider/Model/Adapter版・実装Digest、Purpose、許可さ�
 Unknown Action/Usage、Crash後の未送信か送信済みかを判定できないIntent、失われた本文は4C向けに保全する。自動再送・推測精算・無制限解除は提供しない。最新の検証結果は [F-04修正報告](coordination-pr35-owner-binding-correction.md)、レビュー・停止の認可境界は [RT-01/RT-02修正報告](coordination-pr35-redteam-corrections.md)、初回実装時の対応表は [検証報告](coordination-recovery-continuation-validation.md) を参照。
 
 PR #35のF-01〜F-03修正と最新の検証結果は [監査修正報告](coordination-pr35-audit-corrections.md) を参照。
+
+## COORD-5C-4C integration (Schema 10)
+
+[照合設計](coordination-reconciliation-design.md)の有効会計・未解決義務・
+Control Revisionを継続Plan、Invocation予算、Hold解除判定へ接続する。
+元Invocationの期限・Debit・残回数・終了状態を返却／延長しない。
+照合Usageが判明しても、応答本文が失われた場合は新しい計画の権限を
+自動発行しない。旧Generationからの通常応答は引き続き拒否する。
+
+PLANNING_ONLYとBounded Runnerへ渡す照合事実は、現在Identity、対象ACL、
+証拠使用権、モデル送信権を確認した正規化メタデータだけとする。
+実Payloadの送信直前にも再検査する。本文の指示は権限にならず、
+照合処理自体から生成、VERIFY、WorkflowResume、Hold解除を呼ばない。
+本番Provider／照合Verifier／Identityサービスの接続は今回含まない。

@@ -12,6 +12,7 @@ export interface ExecutionStateSummary {
   actionId: string; sessionId: string; taskId: string; state: DurableExecutionState;
   taskStatus: string; sessionState: string; reviewReason?: string;
   finalizedEventId?: string; safetyStopIncomplete?: boolean;
+  reconciledOutcome?: string; reconciledApplication?: string; reconciliationUnresolved?: boolean;
 }
 export interface RecoveryInspection {
   workflowControl?: {holdState:'NONE'|'HELD'|'RELEASED';holdEpoch:number;revision:number;activeInvocationId:string|null;planningReviewPending:boolean};
@@ -26,6 +27,7 @@ export interface RecoveryInspection {
   journalCursor: number; journalTimestamp?: number; inspectedAt: number;
   pendingActionIds: string[]; executionStates: ExecutionStateSummary[];
   recordedUsage: WorkflowUsage;
+  effectiveWorkflowUsage?: WorkflowUsage;
   budgetStatus: 'WITHIN_RECORDED_LIMITS' | 'RECORDED_LIMIT_EXHAUSTED' | 'UNVERIFIED';
   modelCallCoverage: 'TRACKED_FROM_CREATION' | 'LEGACY_UNTRACKED' | 'UNVERIFIED';
   modelCalls?: import('./modelCallRecovery').ModelCallSummary; requiresExplicitAuthorization: boolean;

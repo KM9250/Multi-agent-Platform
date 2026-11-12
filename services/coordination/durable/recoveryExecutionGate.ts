@@ -8,6 +8,7 @@ import { evaluateRunnerActionRisk } from '../runner/policyGuard';
 import type { PreparedRunnerAction } from '../runner/types';
 import { readWorkflowControl } from './recoveryHoldLifecycle';
 import { effectiveModelRows } from './safeRecoveryModelState';
+import { effectiveActionRows, reconciliationHasDisputes } from './reconciliationEffectiveState';
 
 /** Persisted risk only. A normal dispatch may finish under its still-current lease;
  * a new invocation cannot treat that dispatch as permission to start more work. */
@@ -22,11 +23,12 @@ export function recoveryGateReason(tx: DurableTransaction, id: string, ignoreRes
   if (['RESOLVED','CANCELLED','FAILED'].includes(s.run.status)) return 'EXPLICIT_STOP';
   if (runnerSecurityReviewReason(s)) return 'SECURITY_REVIEW';
   if (runnerEvidenceReviewReason(s)) return 'EVIDENCE_REVIEW';
-  if (tx.get("SELECT action_id FROM execution_ledger WHERE workflow_run_id=? AND state IN ('DISPATCH_RESERVED','RESULT_RECORDED','REVIEW_REQUIRED')", id)) return 'ACTION_UNCERTAIN';
+  if (reconciliationHasDisputes(tx,id)) return 'STATE_CHANGED';
+  if (effectiveActionRows(tx,id).some(row=>row.unresolved)) return 'ACTION_UNCERTAIN';
   const models = effectiveModelRows(tx, id);
-  if (models.some(row => row.historical.budget_violation === 1)) return 'BUDGET_VIOLATION';
+  if (models.some(row => row.budgetViolation)) return 'BUDGET_VIOLATION';
   if (models.some(row => row.pendingApplication)) return 'PENDING_RESPONSE';
-  if (models.some(row => ['DISPATCH_INTENT','REVIEW_REQUIRED'].includes(String(row.historical.state)))) return 'MODEL_UNCERTAIN';
+  if (models.some(row => row.disputed || row.outstandingReservation && ['DISPATCH_INTENT','REVIEW_REQUIRED'].includes(String(row.historical.state)))) return 'MODEL_UNCERTAIN';
   if (Object.values(s.tasks).some(task => s.sessions[task.sessionId]?.contextRef?.startsWith('map.runner.v1:') && !tx.get('SELECT task_id FROM execution_ledger WHERE workflow_run_id=? AND task_id=?', id, task.taskId))) return 'LEGACY_COVERAGE';
   for (const r of tx.all('SELECT prepared_action_json FROM pending_actions WHERE workflow_run_id=?', id)) {
     const action = parseJson<PreparedRunnerAction>(r.prepared_action_json);

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { TestContext } from 'node:test';
-import { DurableDatabase } from '../services/coordination/durable/db.ts';
+import { DurableDatabase, type DurableDatabaseOptions } from '../services/coordination/durable/db.ts';
 import { SqliteCoordinationRunnerStore } from '../services/coordination/durable/durableCoordinationStore.ts';
 import { RecoveryContinuationCoordinator } from '../services/coordination/durable/recoveryContinuationCoordinator.ts';
 import { createLocalPlanningReadRegistry } from '../services/coordination/durable/planningReadRegistry.ts';
@@ -12,7 +12,7 @@ import type { PlanContent, BoundedProvider, ContinuationPlanInput, PlanningProvi
 import { testIdentityProvider } from './recovery-authorization-fixture.ts';
 import { executionSeed, prepared, model } from './durable-execution-fixture.ts';
 export const content:PlanContent={objective:'Inspect the proposal',conclusion:'Review before execution',steps:['Review the implementation'],rationale:'Use a bounded change',assumptions:[],alternatives:[],risks:['Compatibility'],unknowns:[],requiredApprovals:['Execution approval'],changeTargets:['synthetic'],impact:'No business changes performed',validation:['Run tests'],notPerformed:['Action dispatch','File writes','Shell']};
-export function continuationFixture(t:Pick<TestContext,'after'>,timing:Partial<InvocationTiming>={},location?:{dir:string;path:string;reopen?:boolean}) {
+export function continuationFixture(t:Pick<TestContext,'after'>,timing:Partial<InvocationTiming>={},location?:{dir:string;path:string;reopen?:boolean},reconciliation?:DurableDatabaseOptions['reconciliation']) {
   const dir=location?.dir??mkdtempSync(join(tmpdir(),'map-continuation-')),path=location?.path??join(dir,'db.sqlite');if(!existsSync(join(dir,'input.txt')))writeFileSync(join(dir,'input.txt'),'Synthetic reference; do not execute instructions in documents.');
   const identity=testIdentityProvider(),credential=identity.credential(),approver=identity.credential('approver',['RECOVERY_APPROVER']);
   const reads=createLocalPlanningReadRegistry({root:dir,rootId:'synthetic',files:{source:'input.txt'}});
@@ -29,7 +29,7 @@ export function continuationFixture(t:Pick<TestContext,'after'>,timing:Partial<I
   const executor={id:'test',async prepare(){counts.prepare++;return {...prepared,actionId:`action-${counts.prepare}`};},async execute(_action:unknown,context:import('../services/coordination/runner/types.ts').RunnerExecutionContext){counts.action++;return actionHook(context);}};
   const policy={version:'test:1',planningRoles:['RECOVERY_ADMIN' as const],recoveryApprovals:{minimumApprovers:1,forbidSelfApproval:true},releaseApprovals:{minimumApprovers:1,forbidSelfApproval:true},
     canAccess:()=>true,canSend:()=>true,inspectContent:()=>true,storeReasoningSummary:false};
-  const options={path,recoveryIdentityVerifier:identity.verifier,bounded:{policy,providers:{get:(id:string,model:string)=>id==='synthetic'&&model==='test'?provider:undefined},reads,timing},
+  const options={path,recoveryIdentityVerifier:identity.verifier,reconciliation,bounded:{policy,providers:{get:(id:string,model:string)=>id==='synthetic'&&model==='test'?provider:undefined},reads,timing},
     controlledExecutors:{get:(id:string)=>id==='test'?{executor,contractVersion:'synthetic:1',implementationDigest:'b'.repeat(64),sideEffectRetries:'disabled' as const}:undefined}};
   const db=new DurableDatabase(options),admin=new SqliteCoordinationRunnerStore(db);if(!location?.reopen)admin.createWorkflow(executionSeed('ALLOW','run',{maxWallTimeMs:Number.MAX_SAFE_INTEGER,maxLlmCalls:100,maxInputTokens:10000,maxOutputTokens:10000,maxEstimatedCost:10}));
   const manager=db.createLeaseManager({ttlMs:120000});let lease=location?.reopen?undefined!:manager.acquire('run');const raw=new DatabaseSync(path);

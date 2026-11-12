@@ -1,3 +1,7 @@
+import { effectiveActionRows, hasReconciledActionRepeat } from './reconciliationEffectiveState';
+import { ReconciliationRuntime } from './reconciliationEvidenceStore';
+import type { ReconciliationOptions, ReconciliationCommand, VerifyReconciliationEvidence } from './reconciliationTypes';
+import { RECONCILIATION_COLUMNS } from './reconciliationSchema';
 import { readWorkflowControl } from './recoveryHoldLifecycle';
 import { effectiveModelRows } from './safeRecoveryModelState';
 import { BoundedRuntime } from './recoveryContinuationCoordinator';
@@ -47,6 +51,7 @@ export interface DurableTransaction {
 export interface DurableDatabaseOptions {
   path: string; busyTimeoutMs?: number;
   bounded?: BoundedRuntimeOptions;
+  reconciliation?: ReconciliationOptions;
   /** Trusted host startup dependency. Never populate from an HTTP request or saved DTO. */
   recoveryIdentityVerifier?: RecoveryIdentityVerifier;
   recoveryAuthorizationPolicy?: RecoveryAuthorizationPolicy;
@@ -90,6 +95,9 @@ interface DispatchSink { intent: DispatchIntent; lease: WorkflowLease; valid: bo
 export class DurableDatabase {
   #db: DatabaseSync;
   readonly #bounded: BoundedRuntime;
+  readonly #reconciliation: ReconciliationRuntime;
+  #reconciliationScope?: { tx:DurableTransaction; lease:WorkflowLease; actorId:string; table:string; row:Row; old?:Row };
+  readonly #externalReconciliation = new AsyncLocalStorage<boolean>();
   readonly #databaseIdentity: string;
   #context?: WriteContext;
   #fencingRejected = false;
@@ -129,6 +137,11 @@ export class DurableDatabase {
       const b=this.#controlledExecutors?.get(a.executorId);requireIntegrity(b&&b.sideEffectRetries==='disabled');
       return {executorId:a.executorId,contractVersion:b.contractVersion,implementationDigest:b.implementationDigest};
     }),write:(lease,fn)=>this.#writeFenced(lease,lease.workflowRunId,fn)},options.bounded);
+    this.#reconciliation = new ReconciliationRuntime({db:this,identityVerifier:options.recoveryIdentityVerifier,
+      write:(lease,fn)=>this.#bounded.withoutAuthority(()=>this.#writeFenced(lease,lease.workflowRunId,fn)),
+      scopedWrite:(tx,lease,actorId,table,row,old)=>this.#setReconciliationScope(tx,lease,actorId,table,row,old),
+      outside:fn=>this.#outsideReconciliation(fn),
+      notifyDrained:ids=>this.#outsideReconciliation(()=>this.#bounded.notifyReconciliationDrain(ids))},options.reconciliation);
     this.#controlledTiming = controlledTiming(options.controlledTiming);
     this.#recoveryVerifier = options.recoveryIdentityVerifier
       ? Object.freeze({ verify: options.recoveryIdentityVerifier.verify.bind(options.recoveryIdentityVerifier) }) : undefined;
@@ -168,30 +181,32 @@ export class DurableDatabase {
     return new DurableStoreError(errno !== undefined && [5, 6].includes(errno & 255) ? 'DATABASE_BUSY' : 'DATABASE_ERROR');
   }
   assertTransaction(tx: DurableTransaction, write = false): void {
+    if (write && this.#externalReconciliation.getStore()) { if(this.#active)this.#recoveryRejected=true; throw new DurableStoreError('RECOVERY_UNAUTHORIZED'); }
     if (this.#closed || this.#active !== tx || (write && !this.#writable)) throw new DurableStoreError('INVALID_TRANSACTION');
   }
   #transaction<T>(write: boolean, fn: (tx: DurableTransaction) => T, context?: WriteContext): T {
+    if (this.#externalReconciliation.getStore() && write) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
     if (this.#closed || this.#active) throw new DurableStoreError('INVALID_TRANSACTION');
     const check = (sql: string, mutation: boolean) => {
       this.assertTransaction(tx, mutation);
       // No transaction/DDL/PRAGMA control escapes to participants.
       if (!(mutation ? /^(INSERT|UPDATE|DELETE)\s/i : /^SELECT\s/i).test(sql.trim())) {
-        if (this.#safeRecoveryCommand || this.#controlledCommand || this.#bounded.protecting) this.#recoveryRejected = true;
+        if (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting)) this.#recoveryRejected = true;
         throw new DurableStoreError('INVALID_TRANSACTION');
       }
     };
     const tx: DurableTransaction = {
       get: (sql, ...params) => { try { check(sql, false); return this.#db.prepare(sql).get(...params); }
-        catch (error) { if (this.#safeRecoveryCommand || this.#controlledCommand || this.#bounded.protecting) this.#recoveryRejected = true; throw error; } },
+        catch (error) { if (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting)) this.#recoveryRejected = true; throw error; } },
       all: (sql, ...params) => { try { check(sql, false); return this.#db.prepare(sql).all(...params); }
-        catch (error) { if (this.#safeRecoveryCommand || this.#controlledCommand || this.#bounded.protecting) this.#recoveryRejected = true; throw error; } },
+        catch (error) { if (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting)) this.#recoveryRejected = true; throw error; } },
       run: (sql, ...params) => {
         check(sql, true);
         try { this.#db.prepare(sql).run(...params); }
         catch (error) {
           const safe = this.safeError(error);
           if (safe.code === 'LEASE_FENCED') this.#fencingRejected = true;
-          if (safe.code.startsWith('RECOVERY_') || this.#modelApplication || this.#safeRecoveryCommand || this.#controlledCommand || this.#bounded.protecting) this.#recoveryRejected = true;
+          if (safe.code.startsWith('RECOVERY_') || this.#modelApplication || this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting)) this.#recoveryRejected = true;
           throw safe;
         }
       },
@@ -214,7 +229,7 @@ export class DurableDatabase {
       // A successful COMMIT can lose its acknowledgement. Keep a usable connection
       // only when SQLite confirms the transaction ended; the receipt reader decides
       // the outcome. Older runtimes without this observation keep the closed fallback.
-      const endedAfterCommit = (this.#safeRecoveryCommand || this.#controlledCommand || this.#bounded.protecting) && commitAttempted
+      const endedAfterCommit = (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting)) && commitAttempted
         && (this.#db as DatabaseSync & { isTransaction?: boolean }).isTransaction === false;
       if (begun && !endedAfterCommit) {
         try { this.#db.exec('ROLLBACK'); }
@@ -224,7 +239,43 @@ export class DurableDatabase {
     } finally { this.#bounded.clear(); this.#active = undefined; this.#writable = false; this.#context = undefined; this.#fencingRejected = false;
       this.#recoveryIntent = undefined; this.#recoveryRejected = false; this.#modelApplication = undefined;
       this.#safeRecovery = undefined; this.#safeRecoveryCommand = false;
-      this.#controlledScope = undefined; this.#controlledCommand = false; }
+      this.#controlledScope = undefined; this.#controlledCommand = false; this.#reconciliationScope = undefined; }
+  }
+  reconciliationDecision(lease:WorkflowLease|undefined,credential:unknown,command:ReconciliationCommand):unknown {
+    return this.#reconciliation.command(lease,credential,command);
+  }
+  verifyReconciliationEvidence(lease:WorkflowLease|undefined,credential:unknown,input:VerifyReconciliationEvidence,signal?:AbortSignal) {
+    return this.#reconciliation.verify(lease,credential,input,signal);
+  }
+  #outsideReconciliation<T>(fn:()=>T):T {
+    return this.#externalReconciliation.run(true,()=>this.#bounded.withoutAuthority(fn));
+  }
+  #setReconciliationScope(tx:DurableTransaction,lease:WorkflowLease,actorId:string,table:string,row:Row,old?:Row):void {
+    this.assertWorkflowWrite(tx,lease.workflowRunId);
+    const legacy=['journal_events','workflow_seeds','recovery_hold_lifecycle','recovery_invocations','bounded_audit'];
+    requireIntegrity(!this.#externalReconciliation.getStore() && (RECONCILIATION_COLUMNS[table] || legacy.includes(table))
+      && row.workflow_run_id===lease.workflowRunId && (!old || old.workflow_run_id===lease.workflowRunId)
+      && !this.#safeRecovery && !this.#modelApplication && !this.#controlledScope);
+    const columns=RECONCILIATION_COLUMNS[table] ?? Object.keys(row);
+    requireIntegrity(Object.keys(row).every(k=>columns.includes(k)&&/^[a-z_]+$/.test(k))
+      && (!old || canonicalJson(Object.keys(old).sort())===canonicalJson(Object.keys(row).sort())));
+    this.#reconciliationScope={tx,lease,actorId,table,row:jsonCopy(row),old:old&&jsonCopy(old)};
+    try {
+      const keys=Object.keys(row);
+      if(old) {
+        const predicate=keys.map(k=>`${k} IS ?`).join(' AND ');
+        requireIntegrity(tx.get(`SELECT 1 AS found FROM ${table} WHERE ${predicate}`,...keys.map(k=>old[k])));
+        const changed=keys.filter(k=>row[k]!==old[k]);requireIntegrity(changed.length>0);
+        tx.run(`UPDATE ${table} SET ${changed.map(k=>`${k}=?`).join(',')} WHERE ${predicate}`,...changed.map(k=>row[k]),...keys.map(k=>old[k]));
+      } else tx.run(`INSERT INTO ${table} (${keys.join(',')}) VALUES (${keys.map(()=>'?').join(',')})`,...keys.map(k=>row[k]));
+    } finally {this.#reconciliationScope=undefined;}
+  }
+  #reconciliationLegacy(workflow:unknown,table:unknown,op:unknown):boolean {
+    const s=this.#reconciliationScope;
+    if(!s || this.#externalReconciliation.getStore() || s.tx!==this.#active || this.#context?.kind!=='lease'
+      || s.lease!==this.#context.record.handle || s.row.workflow_run_id!==workflow) return false;
+    if(table==='bounded_audit' && op==='INSERT' && s.table==='recovery_invocations') return true;
+    return s.table===table && op===(s.old?'UPDATE':'INSERT');
   }
   previewContinuation(input:ContinuationPlanInput,credential:unknown) {return this.#bounded.preview(input,credential);}
   continuationDecision(lease: WorkflowLease | undefined, credential: unknown, command: ContinuationCommand): unknown {
@@ -530,7 +581,7 @@ export class DurableDatabase {
         && before.events[Number(r.request_cursor) - 1]?.eventId === r.request_event_id);
       if (!this.#bounded.businessApplicationAllowed(tx,id,identity.modelCallId) && (recoveryGateReason(tx, id) !== 'PENDING_RESPONSE' || tx.get('SELECT workflow_run_id FROM recovery_effective_holds WHERE workflow_run_id=?', id)))
         throw new DurableStoreError('RECOVERY_HELD');
-      requireIntegrity(!effectiveModelRows(tx,id).some(row=>row.historical.model_call_id!==identity.modelCallId&&(row.pendingApplication||['DISPATCH_INTENT','REVIEW_REQUIRED'].includes(String(row.historical.state))||row.historical.budget_violation===1)));
+      requireIntegrity(!effectiveModelRows(tx,id).some(row=>row.historical.model_call_id!==identity.modelCallId&&(row.pendingApplication||row.unresolved||row.historical.budget_violation===1)));
       const priorActions = new Set(tx.all('SELECT action_id FROM pending_actions WHERE workflow_run_id=?', id).map(a => a.action_id));
       const scope: ModelApplicationScope = { tx, identity, phase: String(r.phase), roundKey: String(r.round_key),
         requestCursor: Number(r.request_cursor), requestEventId: String(r.request_event_id), startCursor: expectedCursor,
@@ -665,8 +716,33 @@ export class DurableDatabase {
     }
   }
   #registerFencingFunctions(): void {
+    this.#db.function('map_reconciliation_duplicate_action',(workflow,actionJson)=>{
+      if(!this.#active)return 1;
+      try {return hasReconciledActionRepeat(this.#active,String(workflow),parseJson(actionJson))?1:0;}catch{return 1;}
+    });
+    this.#db.function('map_reconciliation_unresolved',(workflow,kind)=>{
+      if(!this.#active)return 1;
+      try {return (kind==='MODEL'?effectiveModelRows(this.#active,String(workflow)):effectiveActionRows(this.#active,String(workflow))).some(r=>r.unresolved)?1:0;}
+      catch{return 1;}
+    });
+    this.#db.function('map_reconciliation_digest', value=>digest(parseJson(value)));
+    this.#db.function('map_reconciliation_write',(table,before,after)=>{
+      const s=this.#reconciliationScope, columns=RECONCILIATION_COLUMNS[String(table)];
+      if(!s || !columns || this.#externalReconciliation.getStore() || s.tx!==this.#active || this.#context?.kind!=='lease'
+        || s.table!==table || s.lease!==this.#context.record.handle) return 0;
+      try { return canonicalJson(parseJson(after))===canonicalJson(columns.map(c=>s.row[c]??null))
+        && canonicalJson(before===null?null:parseJson(before))===canonicalJson(s.old?columns.map(c=>s.old![c]??null):null) ? 1 : 0;
+      } catch { return 0; }
+    });
+    this.#db.function('map_reconciliation_business',(workflow,table,op,key,detail)=>{
+      if(!this.#reconciliationLegacy(workflow,table,op))return 0;
+      const r=this.#reconciliationScope!.row;
+      if(table==='journal_events')return r.event_id===key && r.payload===detail && ['TaskCompleted','TaskFailed'].includes(String(r.event_type)) ? 1 : 0;
+      if(table==='workflow_seeds')return r.last_sequence===key && r.journal_anchor===detail ? 1 : 0;
+      return 0;
+    });
     this.#db.function('map_bounded_write', (workflow, table, op, target, detail) =>
-      ((table === 'recovery_invocations' && op === 'UPDATE' || table === 'bounded_audit' && op === 'INSERT') && this.#context?.kind === 'management' && this.#context.workflowRunId === workflow) || this.#bounded.allows(workflow,table,op,target,detail) ? 1 : 0);
+      ((table === 'recovery_invocations' && op === 'UPDATE' || table === 'bounded_audit' && op === 'INSERT') && this.#context?.kind === 'management' && this.#context.workflowRunId === workflow) || this.#bounded.allows(workflow,table,op,target,detail) || this.#reconciliationLegacy(workflow,table,op) ? 1 : 0);
     this.#db.function('map_bounded_event', (workflow,type,payload)=>this.#bounded.eventAllowed(workflow,type,payload)?1:0);
     this.#db.function('map_bounded_legacy_binding', (workflow, table, plan) => {
       if (this.#context?.kind !== 'lease' || this.#context.record.handle.workflowRunId !== workflow) return 0;
@@ -904,6 +980,7 @@ export class DurableDatabase {
   }
   /** Consistent SQLite backup (includes committed WAL data); trusted, new target only. */
   backup(path: string): void {
+    if (this.#externalReconciliation.getStore()) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
     if (this.#closed || this.#active) throw new DurableStoreError('INVALID_TRANSACTION');
     guarded('DATABASE_ERROR', () => {
       if (existsSync(path)) throw new DurableStoreError('INVALID_CONFIGURATION');
