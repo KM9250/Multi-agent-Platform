@@ -62,7 +62,7 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
   }
   registerAction(input: RunnerPendingActionRecord, expected: CoordinationSnapshot, sessionEvent: CoordinationEvent, taskEvent: CoordinationEvent): RunnerPendingActionRecord {
     const record = validateAction(input), action = record.action;
-    this.store.database.read(tx=>{if(hasReconciledActionRepeat(tx,record.workflowRunId,action))throw new DurableStoreError('EXECUTION_REVIEW_REQUIRED');});
+    this.store.readWorkflow(tx=>{if(hasReconciledActionRepeat(tx,record.workflowRunId,action))throw new DurableStoreError('EXECUTION_REVIEW_REQUIRED');});
     this.store.assertRecoveryRegistration(input.workflowRunId);
     this.store.database.validateInvocationAction(action);
     if(this.store.database.boundedInvocationActive)requireIntegrity(evaluateRunnerActionRisk(expected,action)!=='DENY');
@@ -107,9 +107,13 @@ export class DurableExecutionCoordinator implements RunnerDurableExecution {
   reserveDispatch(id: string, task: CoordinationTask): { record: RunnerPendingActionRecord; attemptId: string } {
     // A sealed attempt is not a request to start a recovery Gate transition.
     // Reject this retry before the gate can append a Hold or control revision.
-    this.store.database.read(tx=>{
-      const record=this.record(tx,id,task);
-      if(tx.get("SELECT operation_id FROM reconciliation_target_seals WHERE workflow_run_id=? AND target_kind='ACTION' AND target_id=?",id,record.action.actionId))throw new DurableStoreError('EXECUTION_REVIEW_REQUIRED');
+    this.store.readWorkflow(tx=>{
+      // This preflight only recognizes an existing sealed target. Full Task
+      // validation remains after the original recovery gate, including for
+      // invalid callers and PLAN application transactions.
+      if(typeof task.taskId==='string'&&tx.get(`SELECT seal.operation_id FROM reconciliation_target_seals seal
+        JOIN execution_ledger ledger ON ledger.workflow_run_id=seal.workflow_run_id AND ledger.action_id=seal.target_id
+        WHERE seal.workflow_run_id=? AND seal.target_kind='ACTION' AND ledger.task_id=?`,id,task.taskId))throw new DurableStoreError('EXECUTION_REVIEW_REQUIRED');
     });
     this.assertRecoveryExecution(id);
     return this.store.writeWorkflow(id, tx => {
