@@ -1,5 +1,9 @@
 # COORD-5C-4C: Crash, process competition, and migration validation
 
+This records the initial PR #36 validation. The subsequent F-01/RT-01/RT-02
+corrections, additional crash/race cases and latest command totals are in the
+[audit correction report](coordination-reconciliation-pr36-corrections.md).
+
 Baseline: `89d431e20cf1f6617d4095b9a8722d86fb711d1d`. The final tested source SHA and full-suite results are recorded in [coordination-reconciliation-validation.md](coordination-reconciliation-validation.md). These results concern synthetic local fixtures, independent Node processes, and temporary SQLite files; no production provider or paid API was used.
 
 Validation platform: Linux x64, Node `v24.19.0`, SQLite `3.53.3`. Windows was not executed and is not included in successful checks. The harness uses the repository's portable child termination helper; on this platform the actual terminating signal was `SIGKILL`. A timeout-triggered kill is explicitly distinguished from an intentional boundary kill and fails the test.

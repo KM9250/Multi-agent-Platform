@@ -1,5 +1,7 @@
 # COORD-5C-4C 実装・検証記録
 
+これはPR #36初回提出時の検証記録である。監査HEAD `2baf04d` に対するF-01／RT-01／RT-02の修正と最新の最終検証は[監査修正記録](coordination-reconciliation-pr36-corrections.md)を参照。
+
 基準main: `89d431e20cf1f6617d4095b9a8722d86fb711d1d`。
 最終実行ソースSHA: `dc74b063a14da8c2afd2807c7918050369bb12d3`。
 Branch: `codex/coord-5c-4c-evidence-reconciliation`。Schema **10**、Migration **010_evidence_reconciliation**、Contract **COORD-5C-4C:RECONCILIATION:1**。

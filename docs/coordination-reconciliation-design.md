@@ -106,6 +106,14 @@ application receipt. A failed/closed/terminal business history is not revived.
 Normal and reconciled completion share the deterministic Task result event
 identity; duplicate application is also blocked by unique Task/outcome keys.
 
+PR #36 F-01 distinguishes adoption expiry from later application. APPLY validates
+the original Outcome's committed receipt and proves it was adopted before the
+Verification expired. It still checks current trust/binding, Dispute, ACL, target,
+Lease and fresh Plan/Grant validity. Unadopted expired evidence remains ineligible.
+No deadline or old row is rewritten; a newer unverified candidate version alone
+does not invalidate the adopted fact. Application history validates its original
+Outcome receipt instead of requiring the old adoption deadline to remain current.
+
 `SETTLE_VERIFIED_MODEL_USAGE` uses complete, final USD usage with the original
 quote's fixed pricing ID. Tokens and micro-USD quantities must be safe,
 nonnegative integers at the accounting boundary; no unknown values become zero.
@@ -139,6 +147,22 @@ emits no Abort. An explicit trusted registry revocation is a separate negative
 transition; ordinary expiry or an unconnected registry does not rewrite settled
 history. Disputed usage remains counted and no automatic refund/correction is
 made.
+
+PR #36 RT-01 also compares newly persisted NORMAL usage and Action results at the
+DB-owned pre-COMMIT boundary, so contradictions are detected in either arrival
+order. The normal fact, Dispute, Case, Hold/Drain and Audit commit atomically.
+The negative participant uses `system:normal-fact`, consumes no Grant and keeps
+the actual normal Usage under the existing unique authority. Its post-COMMIT
+notification runs after transaction scopes are cleared. Readers and candidate
+submission do not repair historical missed conflicts by writing to the database.
+
+PR #36 RT-02 uses one output helper for first verification return, cache, lost-ACK
+recovery and explicit verification reads. Current Identity, VIEW_CASE,
+owner-specific USE_EVIDENCE and OUTPUT classification of the entire returned
+receipt are required. Output denial preserves a committed Verification and
+returns a fixed authorization error; authorized rereads do not run the verifier.
+See the [audit correction report](coordination-reconciliation-pr36-corrections.md)
+for regression and process coverage.
 
 Later PLAN/VERIFY receives normalized identifiers and outcomes through a fixed
 `RUNNER_CONTEXT` projection, using current view/use/send ACLs and an explicit
