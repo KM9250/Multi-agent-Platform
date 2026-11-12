@@ -175,6 +175,15 @@ Bodies, metadata, identity of submitter/owner, verifier source, approver and
 applier remain distinct. General audit stores fixed IDs/digests/codes and no
 candidate body or credential.
 
+The verifier receives nonsecret target identifiers and binding digests rather
+than raw Action payloads, model prompts or quote text. Content policy inspects
+the entire material actually released to it, including that target metadata.
+Candidate ACK retries with the same logical ID and content return the existing
+version. Verification ACK recovery uses its completed immutable job receipt.
+Neither path calls the original Action or model. Approval credentials stay only
+inside the private host runtime; after restart an approver must authenticate
+again before an unconsumed Grant can be applied.
+
 The registered test verifier uses Node's standard Ed25519 verification over the
 complete canonical signed payload (target and original digest, source/account/
 environment/external effect, claim/finality/completeness, expiry). Keys are
