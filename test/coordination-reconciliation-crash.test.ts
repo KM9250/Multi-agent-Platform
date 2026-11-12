@@ -17,7 +17,7 @@ const cases: Record<string,{id:string;table:string;audit:string}> = {
   dispute:{id:'CR-06',table:'reconciliation_disputes',audit:'RECONCILIATION_DISPUTE_RECORDED'},
 };
 for (const [mode,{id,table,audit}] of Object.entries(cases)) for (const boundary of ['before-commit','after-commit'])
-  test(`${id}/CR-07: real SIGKILL ${mode}/${boundary} retains atomic effects and restart only reads receipts`, async t => {
+  test(`${id}/CR-07: real SIGKILL ${mode}/${boundary} retains atomic effects and restart uses authenticated read APIs`, async t => {
     const dir=mkdtempSync(join(tmpdir(),'map-reconciliation-crash-')),path=join(dir,'db.sqlite'); t.after(()=>rmSync(dir,{recursive:true,force:true}));
     const result=await processResult(reconciliationChild([path,mode,boundary]));
     assert.equal(result.timedOut,false,result.stderr); assert.equal(result.signal,process.platform==='win32'?'SIGTERM':'SIGKILL',result.stderr);
@@ -49,6 +49,10 @@ for (const [mode,{id,table,audit}] of Object.entries(cases)) for (const boundary
     assert.deepEqual(raw.prepare('PRAGMA foreign_key_check').all(),[]);assert.equal(raw.prepare('PRAGMA integrity_check').get()!.integrity_check,'ok');
     const durableBefore=Object.fromEntries(raw.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(row=>[String(row.name),rows(String(row.name))]));
     const restarted=await processResult(reconciliationChild([path,'inspect']));assert.equal(restarted.timedOut,false,restarted.stderr);assert.equal(restarted.code,0,restarted.stderr);
+    const inspection=(restarted.messages.find((value:any)=>value.inspected) as {inspected:Record<string,number>}).inspected;
+    assert.deepEqual(inspection,{cases:1,evidence:rows('reconciliation_evidence').length,bodies:rows('reconciliation_evidence').length,
+      verifications:rows('reconciliation_verifications').length,planChecks:rows('reconciliation_plans').length,receipts:rows('reconciliation_operations').length,
+      authenticationRefusals:1+2*rows('reconciliation_evidence').length+rows('reconciliation_verifications').length+rows('reconciliation_plans').length});
     for(const [name,data] of Object.entries(durableBefore))assert.deepEqual(rows(name),data,name);
   });
 
@@ -65,6 +69,8 @@ for(const boundary of ['before-commit','after-commit'])test(`CR-06: real SIGKILL
   for(const table of ['journal_events','model_call_ledger','model_call_attempts','recovery_invocation_debits'])assert.deepEqual(JSON.parse(JSON.stringify(raw.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all())),before[table],table);
   assert.deepEqual(raw.prepare('PRAGMA foreign_key_check').all(),[]);
   const retry=await processResult(reconciliationChild([path,'inspect']));assert.equal(retry.code,0,retry.stderr);
+  const inspection=(retry.messages.find((value:any)=>value.inspected) as {inspected:Record<string,number>}).inspected;
+  assert.deepEqual(inspection,{cases:1,evidence:2,bodies:2,verifications:committed?2:1,planChecks:0,receipts:0,authenticationRefusals:committed?7:6});
 });
 
 test('CR-06/IN-07: dispute audit failure rolls back Drain and Hold with zero Abort; successful retry notifies after commit',async t=>{

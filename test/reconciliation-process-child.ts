@@ -75,10 +75,37 @@ if (mode === 'migration') {
   const close=()=>{fixture.raw.close();fixture.db.close();};
   if (mode === 'inspect') {
     const state=JSON.parse(readFileSync(join(dir,'state.json'),'utf8'));
-    const before=reconciliationContents(fixture.raw);
-    if(state.planId)fixture.api().executor.inspectReceipt(state.planId,fixture.credential);
+    const before=reconciliationContents(fixture.raw),target=state.target;
+    const {ReconciliationReader}=await import('../services/coordination/durable/reconciliationReader.ts');
+    const reader=new ReconciliationReader(fixture.db),api=fixture.api();
+    const inspected={cases:0,evidence:0,bodies:0,verifications:0,planChecks:0,receipts:0,authenticationRefusals:0};
+    const authenticatedRead=<T>(read:(credential:unknown)=>T):T=>{
+      assert.throws(()=>read({}),{code:'RECOVERY_UNAUTHENTICATED'});inspected.authenticationRefusals++;
+      return read(fixture.credential);
+    };
+    assert.equal(authenticatedRead(token=>reader.inspect(target,token)).executionAllowed,false);inspected.cases++;
+    // Direct fixture SQL discovers committed IDs only. Candidate/body/verification
+    // reads and Plan-based receipt lookups use authenticated public APIs.
+    const targetArgs=[target.workflowRunId,target.targetKind,target.targetId,target.attemptId];
+    const ownedIds=(table:string,column:string)=>fixture.raw.prepare(`SELECT ${column} FROM ${table} WHERE workflow_run_id=? AND target_kind=? AND target_id=? AND attempt_id=? ORDER BY rowid`).all(...targetArgs);
+    for(const row of ownedIds('reconciliation_evidence','evidence_id')) {
+      const evidenceId=String(row.evidence_id);
+      assert.equal(authenticatedRead(token=>api.evidence.readEvidence(evidenceId,token)).evidenceId,evidenceId);inspected.evidence++;
+      assert.ok(authenticatedRead(token=>api.evidence.readBody(evidenceId,token)));inspected.bodies++;
+    }
+    for(const row of ownedIds('reconciliation_verifications','verification_id')) {
+      const verificationId=String(row.verification_id);
+      assert.equal(authenticatedRead(token=>api.evidence.readVerification(verificationId,token)).verificationId,verificationId);inspected.verifications++;
+    }
+    for(const row of ownedIds('reconciliation_plans','plan_id')) {
+      const planId=String(row.plan_id),receipt=authenticatedRead(token=>api.executor.inspectReceipt(planId,token));inspected.planChecks++;
+      const committed=fixture.raw.prepare('SELECT operation_id FROM reconciliation_operations WHERE plan_id=?').get(planId);
+      if(committed){assert.equal(receipt?.operationId,committed.operation_id);inspected.receipts++;}
+      else assert.equal(receipt,undefined);
+    }
     assert.deepEqual(reconciliationContents(fixture.raw),before);
-    assert.equal(fixture.counts.action,0);assert.equal(fixture.counts.model,0);assert.equal(fixture.counts.verifier,0);close();process.exit(0);
+    assert.equal(fixture.counts.action,0);assert.equal(fixture.counts.model,0);assert.equal(fixture.counts.verifier,0);
+    await new Promise<void>((resolve,reject)=>process.send!({inspected},error=>error?reject(error):resolve()));close();process.exit(0);
   } else if(mode==='lease-race') {
     process.send!({ready:true});process.once('message',()=>{fixture.reacquire();process.send!({acquired:true});close();process.disconnect();});
   } else if(mode==='verify-owner') {
