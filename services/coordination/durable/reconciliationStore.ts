@@ -7,6 +7,7 @@ import type { ReconciliationOperationContext, ReconciliationOperationCommand, Re
 import { RECONCILIATION_CONTRACT, RECONCILIATION_OPERATIONS } from './reconciliationTypes';
 import { canonicalJson, digest, DurableStoreError, parseJson, requireIntegrity } from './integrity';
 import { readJournal } from './restore';
+import { readReconciliationVerification } from './reconciliationEvidenceStore';
 import { recoveryTime } from './recoveryPlanner';
 import { readWorkflowControl } from './recoveryHoldLifecycle';
 import { validateAuditRow } from './recoveryAudit';
@@ -19,12 +20,13 @@ import { validateQuote } from './modelCallLedger';
 import type { ModelBudgetQuote } from './modelCallLedger';
 import { applyReconciledAction, inspectReconciledActionApplication, normalizeReconciledResult, validateReconciledApplicationHistory } from './reconciliationActions';
 
+type ReconciliationWriteContext=Pick<ReconciliationOperationContext,'tx'|'lease'|'write'>&{actor:{actorId:string}};
 const same=(a:unknown,b:unknown)=>canonicalJson(a)===canonicalJson(b);
 export function reconciliationScopeOf(p:ReconciliationPlan):ReconciliationGrantScope {
  return {planId:p.planId,target:p.target,operationKind:p.operationKind,planDigest:p.planDigest,contract:RECONCILIATION_CONTRACT};
 }
 export const reconciliationOperationId=(p:ReconciliationPlan)=>`reconciliation-${digest([RECONCILIATION_CONTRACT,p.planId,p.planDigest])}`;
-export function reconciliationAudit(c:ReconciliationOperationContext,eventKind:string,id:string,hash:string):void {
+export function reconciliationAudit(c:ReconciliationWriteContext,eventKind:string,id:string,hash:string):void {
  c.write('reconciliation_audit',{audit_id:randomUUID(),workflow_run_id:c.lease.workflowRunId,event_kind:eventKind,record_id:id,actor_id:c.actor.actorId,
   record_digest:hash,runtime_instance_id:c.lease.runtimeInstanceId,generation:c.lease.generation,recorded_at:recoveryTime(c.tx)});
 }
@@ -51,11 +53,15 @@ function expiry(c:ReconciliationOperationContext,now:number,ttl?:number):number 
 function assertNoDispute(tx:DurableTransaction,t:ReconciliationTarget):void {
  if(tx.get('SELECT dispute_id FROM reconciliation_disputes WHERE workflow_run_id=? AND target_kind=? AND target_id=? AND attempt_id=?',...targetParams(t)))throw new DurableStoreError('RECOVERY_INVALID_PLAN');
 }
+function operationVerification(c:ReconciliationOperationContext,input:Pick<CreateReconciliationPlan,'operationKind'|'target'|'verificationId'>,actor=c.actor):ReconciliationVerification {
+ return input.operationKind==='APPLY_RECONCILED_ACTION_RESULT'
+  ?c.validateAdoptedActionVerification(input.verificationId,input.target,actor):c.validateVerification(input.verificationId,input.target,actor);
+}
 export function reconciliationBinding(c:ReconciliationOperationContext,input:CreateReconciliationPlan):ReconciliationPlanBinding {
  const {tx}=c,t=input.target,now=recoveryTime(tx);
  requireIntegrity(RECONCILIATION_OPERATIONS.includes(input.operationKind));
  c.checkAccess(c.actor,t,'CREATE_RECONCILIATION_PLAN');
- const v=c.validateVerification(input.verificationId,t,c.actor),{target,source}=sourceRows(tx,t);
+ const v=operationVerification(c,input),{target,source}=sourceRows(tx,t);
  requireIntegrity(v.status==='VERIFIED'&&v.targetDigest===target.targetDigest);
  assertNoDispute(tx,t);
  const control=readWorkflowControl(tx,t.workflowRunId),snapshot=readJournal(tx,t.workflowRunId).snapshot;
@@ -170,7 +176,12 @@ export function readReconciliationReceipt(tx:DurableTransaction,planId:string):R
   &&r.committedAt===row.created_at&&p.createdAt<=r.committedAt&&r.committedAt<p.expiresAt);
  const verification=tx.get('SELECT * FROM reconciliation_verifications WHERE verification_id=?',p.verificationId);requireIntegrity(verification&&verification.digest===p.verificationDigest&&verification.workflow_run_id===p.target.workflowRunId);
  const v=parseJson<ReconciliationVerification>(verification.receipt_json),{receiptDigest,...vb}=v;
- requireIntegrity(receiptDigest===digest(vb)&&receiptDigest===p.verificationDigest&&r.committedAt<v.expiresAt&&v.status==='VERIFIED'&&same(v.target,p.target)&&v.sourceEffectKey===p.sourceEffectKey&&v.claimDigest===p.claimDigest&&v.claimDigest===digest(v.claim));
+ requireIntegrity(receiptDigest===digest(vb)&&receiptDigest===p.verificationDigest&&v.verifiedAt<=r.committedAt&&v.status==='VERIFIED'&&same(v.target,p.target)&&v.sourceEffectKey===p.sourceEffectKey&&v.claimDigest===p.claimDigest&&v.claimDigest===digest(v.claim));
+ if(p.operationKind==='APPLY_RECONCILED_ACTION_RESULT') {
+  const adopted=tx.get("SELECT plan_id FROM reconciliation_operations WHERE operation_id=? AND operation_kind='RECORD_VERIFIED_ACTION_OUTCOME'",p.outcomeOperationId!);requireIntegrity(adopted);
+  const original=readReconciliationReceipt(tx,String(adopted.plan_id));
+  requireIntegrity(original&&same(original.target,p.target)&&original.verificationId===v.verificationId&&original.sourceEffectKey===v.sourceEffectKey&&original.committedAt<=r.committedAt);
+ } else requireIntegrity(r.committedAt<v.expiresAt);
  const links=tx.all('SELECT * FROM reconciliation_operation_grants WHERE operation_id=? ORDER BY grant_id',operationId);
  requireIntegrity(same(links.map(x=>x.grant_id),r.grantIds)&&links.length>=p.approvalPolicy.minimumApprovers);
  const actors=new Set<string>();
@@ -212,13 +223,13 @@ function settlementBudgetViolation(tx:DurableTransaction,t:ReconciliationTarget,
  }
  return violation;
 }
-function appendControl(c:ReconciliationOperationContext,t:ReconciliationTarget,reason:string,hold=false):number {
+function appendControl(c:ReconciliationWriteContext,t:ReconciliationTarget,reason:string,hold=false):number {
  const control=readWorkflowControl(c.tx,t.workflowRunId),revision=Number(control.control_revision)+1;
  c.write('recovery_hold_lifecycle',{lifecycle_id:null,workflow_run_id:t.workflowRunId,hold_epoch:Number(control.hold_epoch)+(hold&&control.hold_state!=='HELD'?1:0),control_revision:revision,
   hold_state:hold?'HELD':control.hold_state,active_invocation_id:control.active_invocation_id,planning_review_pending:control.planning_review_pending,reason,generation:c.lease.generation,recorded_at:recoveryTime(c.tx)});
  return revision;
 }
-function appendCase(c:ReconciliationOperationContext,t:ReconciliationTarget,body:unknown):number {
+function appendCase(c:ReconciliationWriteContext,t:ReconciliationTarget,body:unknown):number {
  const revision=caseRevision(c.tx,t)+1;c.write('reconciliation_cases',{workflow_run_id:t.workflowRunId,target_kind:t.targetKind,target_id:t.targetId,attempt_id:t.attemptId,
   revision,case_json:canonicalJson(body),created_at:recoveryTime(c.tx)});return revision;
 }
@@ -271,9 +282,9 @@ export function persistReconciliationDecision(c:ReconciliationOperationContext,r
  for(const grant of grants){
   requireIntegrity(!p.approvalPolicy.forbidSelfApproval||grant.approvedBy!==p.createdBy);
   const approver=c.revalidateApproval(grant.approvedBy,grant.authorizationSource,p.target);
-  c.validateVerification(p.verificationId,p.target,approver);approvalExpiries.push(approver.expiresAt);
+  operationVerification(c,p,approver);approvalExpiries.push(approver.expiresAt);
  }
- const v=c.validateVerification(p.verificationId,p.target,c.actor),operationId=reconciliationOperationId(p),{source,target}=sourceRows(tx,p.target);
+ const v=operationVerification(c,p),operationId=reconciliationOperationId(p),{source,target}=sourceRows(tx,p.target);
  let effect:Row;
  if(p.operationKind==='SETTLE_VERIFIED_MODEL_USAGE') {
   const usage=v.claim.usage as RunnerModelUsage,amounts=usageAmounts(usage),model=target.ledger;
@@ -295,7 +306,7 @@ export function persistReconciliationDecision(c:ReconciliationOperationContext,r
  }
  if(p.operationKind!=='APPLY_RECONCILED_ACTION_RESULT')c.write('reconciliation_target_seals',{workflow_run_id:p.target.workflowRunId,target_kind:p.target.targetKind,target_id:p.target.targetId,attempt_id:p.target.attemptId,operation_id:operationId,revision:1,created_at:now});
  // No callback occurs after applying rows. Expiry is rechecked before committing any part.
- requireIntegrity(recoveryTime(tx)<Math.min(p.expiresAt,c.actor.expiresAt,v.expiresAt,...grants.map(g=>g.expiresAt),...approvalExpiries));
+ requireIntegrity(recoveryTime(tx)<Math.min(p.expiresAt,c.actor.expiresAt,...(p.operationKind==='APPLY_RECONCILED_ACTION_RESULT'?[]:[v.expiresAt]),...grants.map(g=>g.expiresAt),...approvalExpiries));
  for(const g of grants){const old=tx.get('SELECT * FROM reconciliation_grants WHERE grant_id=?',g.grantId)!;c.write('reconciliation_grants',{...old,status:'CONSUMED',consumed_operation_id:operationId},old);reconciliationAudit(c,'RECONCILIATION_GRANT_CONSUMED',g.grantId,String(old.grant_digest));}
  const controlRevision=appendControl(c,p.target,'RECONCILIATION_COMMITTED'),nextCase=appendCase(c,p.target,{operationId,verificationId:v.verificationId,operationKind:p.operationKind});
  const after=readJournal(tx,p.target.workflowRunId).snapshot,events=after.events.slice(p.journalCursor);
@@ -312,7 +323,7 @@ export function persistReconciliationDecision(c:ReconciliationOperationContext,r
 
 /** Trusted conflicts only tighten safety. This participant never frees budgets,
  * applies results, consumes grants or dispatches business work. */
-export function recordVerifiedConflict(c:ReconciliationOperationContext,v:ReconciliationVerification):string[] {
+export function recordVerifiedConflict(c:ReconciliationWriteContext,v:ReconciliationVerification):string[] {
  if(v.status!=='VERIFIED'||v.claim.completeness!=='COMPLETE'||v.claim.finality!=='FINAL')return [];
  const {tx}=c,t=v.target;
  const previous=tx.all("SELECT * FROM reconciliation_verifications WHERE workflow_run_id=? AND target_kind=? AND target_id=? AND attempt_id=? AND status='VERIFIED' AND verification_id<>?",...targetParams(t),v.verificationId)
@@ -333,13 +344,14 @@ export function recordVerifiedConflict(c:ReconciliationOperationContext,v:Reconc
 }
 /** The runtime first proves an explicit registry trust loss; a clock expiry alone
  * cannot enter this path or remove previously booked usage. */
-export function recordVerificationRevocation(c:ReconciliationOperationContext,v:ReconciliationVerification):string[] {
+export function recordVerificationRevocation(c:ReconciliationWriteContext,v:ReconciliationVerification):string[] {
  requireIntegrity(v.status==='VERIFIED');
  if(c.tx.get("SELECT dispute_id FROM reconciliation_disputes WHERE verification_id=? AND reason_code='TRUST_REVOKED'",v.verificationId))return [];
  return appendVerifiedDispute(c,v,null,'TRUST_REVOKED');
 }
-function appendVerifiedDispute(c:ReconciliationOperationContext,v:ReconciliationVerification,priorVerificationId:string|null,reasonCode:string):string[] {
+function appendVerifiedDispute(c:ReconciliationWriteContext,v:ReconciliationVerification,priorVerificationId:string|null,reasonCode:string):string[] {
  const {tx}=c,t=v.target;
+ if(tx.get('SELECT dispute_id FROM reconciliation_disputes WHERE verification_id=? AND reason_code=? AND prior_verification_id IS ?',v.verificationId,reasonCode,priorVerificationId))return [];
  const dispute:Row={dispute_id:randomUUID(),workflow_run_id:t.workflowRunId,target_kind:t.targetKind,target_id:t.targetId,attempt_id:t.attemptId,
   verification_id:v.verificationId,prior_verification_id:priorVerificationId,reason_code:reasonCode,created_at:recoveryTime(tx)};
  c.write('reconciliation_disputes',dispute);
@@ -350,4 +362,29 @@ function appendVerifiedDispute(c:ReconciliationOperationContext,v:Reconciliation
  }
  appendControl(c,t,'RECONCILIATION_DISPUTE',true);
  reconciliationAudit(c,'RECONCILIATION_DISPUTE_RECORDED',String(dispute.dispute_id),digest(dispute));return draining;
+}
+
+/** DB-owned transaction participant: only newly persisted NORMAL facts can
+ * trigger this path. Candidate writes and readers cannot tighten safety. */
+export function normalReconciliationFacts(tx:DurableTransaction,id:string):Map<string,ReconciliationTarget> {
+ const facts=new Map<string,ReconciliationTarget>();
+ for(const row of tx.all("SELECT model_call_id,attempt_id,usage_digest FROM model_usage_authorities WHERE workflow_run_id=? AND authority='NORMAL'",id)) {
+  const target:ReconciliationTarget={workflowRunId:id,targetKind:'MODEL',targetId:String(row.model_call_id),attemptId:String(row.attempt_id)};
+  facts.set(canonicalJson([target,row.usage_digest]),target);
+ }
+ for(const row of tx.all('SELECT action_id,attempt_id,result_ref FROM execution_ledger WHERE workflow_run_id=? AND result_ref IS NOT NULL',id)) {
+  const target:ReconciliationTarget={workflowRunId:id,targetKind:'ACTION',targetId:String(row.action_id),attemptId:String(row.attempt_id)};
+  facts.set(canonicalJson([target,row.result_ref]),target);
+ }
+ return facts;
+}
+export function recordNormalFactConflicts(c:ReconciliationWriteContext,before:Map<string,ReconciliationTarget>):string[] {
+ const draining=new Set<string>();
+ for(const [key,target] of normalReconciliationFacts(c.tx,c.lease.workflowRunId))if(!before.has(key)) {
+  for(const row of c.tx.all("SELECT verification_id FROM reconciliation_verifications WHERE workflow_run_id=? AND target_kind=? AND target_id=? AND attempt_id=? AND status='VERIFIED'",...targetParams(target))) {
+   const verification=readReconciliationVerification(c.tx,String(row.verification_id));
+   for(const id of recordVerifiedConflict(c,verification))draining.add(id);
+  }
+ }
+ return [...draining];
 }

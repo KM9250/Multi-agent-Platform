@@ -15,9 +15,9 @@ function message(child:ChildProcess, field:string):Promise<Record<string,unknown
   });
 }
 function request(child:ChildProcess,command:string,field:string){const result=message(child,field);child.send(command);return result;}
-for(const first of ['NORMAL','RECONCILED'] as const)test(`CR-09/RT-C17: independent normal and recovery processes ${first} wins with one authority and no duplicate accounting`,async t=>{
+for(const different of [false,true])for(const first of ['NORMAL','RECONCILED'] as const)test(`CR-09/RT-C17: independent normal and recovery processes ${first} wins with one authority and no duplicate accounting${different?' (PR36 RT-01 different Usage)':''}`,async t=>{
   const dir=mkdtempSync(join(tmpdir(),'map-reconciliation-race-')),path=join(dir,'db.sqlite');t.after(()=>rmSync(dir,{recursive:true,force:true}));
-  const owner=reconciliationChild([path,'race-owner','','keep']);t.after(()=>{if(owner.connected)terminateChild(owner);});const ownerResult=processResult(owner,40_000);await ready(owner);
+  const owner=reconciliationChild([path,'race-owner',different?'different':'','keep']);t.after(()=>{if(owner.connected)terminateChild(owner);});const ownerResult=processResult(owner,40_000);await ready(owner);
   const challenger=reconciliationChild([path,'reconcile-race']);t.after(()=>{if(challenger.connected)terminateChild(challenger);});const challengerResult=processResult(challenger,40_000);await ready(challenger);
   if(first==='NORMAL') {
     const normal=await request(owner,'normal','done');assert.equal(normal.success,true,JSON.stringify(normal));
@@ -29,7 +29,9 @@ for(const first of ['NORMAL','RECONCILED'] as const)test(`CR-09/RT-C17: independ
   const outcome=result.messages.find((value:any)=>'success' in value) as {success:boolean};assert.equal(outcome.success,first==='RECONCILED',JSON.stringify(result.messages));
   owner.send('close');const ended=await ownerResult;assert.equal(ended.code,0,ended.stderr);
   const raw=new DatabaseSync(path);t.after(()=>raw.close());
-  const authorities=raw.prepare('SELECT * FROM model_usage_authorities').all();assert.equal(authorities.length,1);assert.equal(authorities[0].authority,first);assert.equal(authorities[0].cost_micros,400);
+  const authorities=raw.prepare('SELECT * FROM model_usage_authorities').all();assert.equal(authorities.length,1);assert.equal(authorities[0].authority,first);assert.equal(authorities[0].cost_micros,first==='NORMAL'&&different?500:400);
+  assert.equal(raw.prepare('SELECT count(*) n FROM reconciliation_disputes').get()!.n,first==='NORMAL'&&different?1:0);
+  if(first==='NORMAL'&&different)assert.equal(raw.prepare('SELECT hold_state FROM recovery_workflow_control').get()!.hold_state,'HELD');
   assert.equal(raw.prepare('SELECT count(*) n FROM reconciled_model_usages').get()!.n,first==='RECONCILED'?1:0);
   assert.equal(raw.prepare("SELECT count(*) n FROM journal_events WHERE event_type='UsageRecorded'").get()!.n,first==='NORMAL'?1:0);
   assert.equal(raw.prepare("SELECT count(*) n FROM reconciliation_grants WHERE status='CONSUMED'").get()!.n,first==='RECONCILED'?1:0);

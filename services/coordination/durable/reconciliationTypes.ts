@@ -82,6 +82,7 @@ export interface ReconciliationOperationContext {
   authorize(credential:unknown,target:ReconciliationTarget,permission:ReconciliationPermission,ownerId?:string):VerifiedRecoveryIdentity;
   checkAccess(actor:VerifiedRecoveryIdentity,target:ReconciliationTarget,permission:ReconciliationPermission,ownerId?:string):void;
   validateVerification(id:string,target:ReconciliationTarget,actor?:VerifiedRecoveryIdentity):ReconciliationVerification;
+  validateAdoptedActionVerification(id:string,target:ReconciliationTarget,actor?:VerifiedRecoveryIdentity):ReconciliationVerification;
   revalidateApproval(actorId:string,source:string,target:ReconciliationTarget):VerifiedRecoveryIdentity;
   write(table:string,row:Row,old?:Row):void;
 }

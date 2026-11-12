@@ -131,7 +131,7 @@ if (mode === 'migration') {
       if(command==='close'){close();process.disconnect();return;}
       if(command==='release'){fixture.manager.release(fixture.lease);process.send!({released:true});return;}
       try {
-        if(command==='normal')new ModelCallLedger(fixture.store,clock).settle(model.x,{...completeUsage},true);
+        if(command==='normal')new ModelCallLedger(fixture.store,clock).settle(model.x,{...completeUsage,estimatedCost:boundary==='different'?0.0005:0.0004},true);
         else if(command==='reconcile')fixture.execute(p);
         else throw Error('Unknown race command');
         process.send!({done:true,success:true});
@@ -140,22 +140,22 @@ if (mode === 'migration') {
     });
   } else {
     saveKeys();let planId:string|undefined,verificationId:string|undefined;
-    const target=mode==='usage'||mode==='candidate'||mode==='verification'||mode==='plan'||mode==='grant'?fixture.model().target:fixture.action().target;
+    const target=mode==='usage'||mode==='normal-conflict'||mode==='candidate'||mode==='verification'||mode==='plan'||mode==='grant'?fixture.model().target:fixture.action().target;
     let evidence:ReturnType<typeof fixture.submit>|undefined;
-    if(mode!=='candidate')evidence=fixture.submit(target);
+    if(mode!=='candidate')evidence=fixture.submit(target,undefined,mode==='expired-apply'?{expiresAt:Date.now()+1000}:undefined);
     if(!['candidate','verification'].includes(mode))verificationId=(await fixture.api().evidence.verify({evidenceId:evidence!.evidenceId,verifierId:fixture.synthetic.binding.verifierId},fixture.credential)).verificationId;
     if(!['candidate','verification','plan'].includes(mode)){
       const p=fixture.plan(target,verificationId!);planId=p.planId;
       if(mode!=='grant')fixture.authorize(p);
-      if(mode==='apply'||mode==='dispute') {
+      if(mode==='apply'||mode==='expired-apply'||mode==='dispute') {
         fixture.execute(p);
-        if(mode==='apply'){const apply=fixture.plan(target,verificationId!,'APPLY_RECONCILED_ACTION_RESULT');fixture.authorize(apply);planId=apply.planId;}
+        if(mode==='apply'||mode==='expired-apply'){if(mode==='expired-apply'){const expires=Number(fixture.raw.prepare('SELECT expires_at FROM reconciliation_verifications WHERE verification_id=?').get(verificationId)!.expires_at);await new Promise(resolve=>setTimeout(resolve,Math.max(0,expires-Date.now())+30));}const apply=fixture.plan(target,verificationId!,'APPLY_RECONCILED_ACTION_RESULT');fixture.authorize(apply);planId=apply.planId;}
         else evidence=fixture.submit(target,actionClaim('NOT_EXECUTED_FINAL'));
       }
     }
     persist({target,planId,verificationId,evidenceId:evidence?.evidenceId});
     writeFileSync(join(dir,'before.json'),JSON.stringify(reconciliationContents(fixture.raw)));
-    const tableByMode:Record<string,string>={candidate:'reconciliation_evidence',verification:'reconciliation_verifications',plan:'reconciliation_plans',grant:'reconciliation_grants',usage:'reconciled_model_usages',outcome:'reconciled_action_outcomes',apply:'reconciled_action_applications',dispute:'reconciliation_disputes'};
+    const tableByMode:Record<string,string>={candidate:'reconciliation_evidence',verification:'reconciliation_verifications',plan:'reconciliation_plans',grant:'reconciliation_grants',usage:'reconciled_model_usages',outcome:'reconciled_action_outcomes',apply:'reconciled_action_applications','expired-apply':'reconciled_action_applications','normal-conflict':'reconciliation_disputes',dispute:'reconciliation_disputes'};
     const selected=tableByMode[mode];assert.ok(selected,`Unknown mode ${mode}`);let armed=false;
     DatabaseSync.prototype.prepare=function(sql:string){const statement=nativePrepare.call(this,sql),run=statement.run.bind(statement);statement.run=(...args:Parameters<typeof statement.run>)=>{const result=run(...args);if(new RegExp(`^INSERT INTO ${selected}\\b`,'i').test(sql.trim()))armed=true;return result;};return statement;};
     DatabaseSync.prototype.exec=function(sql:string){if(armed&&sql==='COMMIT'&&boundary==='before-commit')kill();const result=nativeExec.call(this,sql);if(armed&&sql==='COMMIT'&&boundary==='after-commit')kill();return result;};
@@ -163,6 +163,7 @@ if (mode === 'migration') {
     else if(mode==='verification'||mode==='dispute')await fixture.api().evidence.verify({evidenceId:evidence!.evidenceId,verifierId:fixture.synthetic.binding.verifierId},fixture.credential);
     else if(mode==='plan'){const p=fixture.plan(target,verificationId!);planId=p.planId;}
     else if(mode==='grant'){const p=fixture.raw.prepare('SELECT plan_json FROM reconciliation_plans WHERE plan_id=?').get(planId);fixture.authorize(JSON.parse(String(p!.plan_json)));}
+    else if(mode==='normal-conflict')new ModelCallLedger(fixture.store,clock).settle({workflowRunId:target.workflowRunId,modelCallId:target.targetId,attemptId:target.attemptId,providerId:'test',modelId:'test'},{...completeUsage,estimatedCost:0.0005},false);
     else fixture.api().executor.executeAuthorized(planId!,fixture.credential);
     throw Error(`Missing reconciliation SIGKILL ${mode}/${boundary}`);
   }

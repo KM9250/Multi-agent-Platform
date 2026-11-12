@@ -13,6 +13,7 @@ const cases: Record<string,{id:string;table:string;audit:string}> = {
   grant:{id:'CR-02',table:'reconciliation_grants',audit:'RECONCILIATION_AUTHORIZED'},
   outcome:{id:'CR-03',table:'reconciled_action_outcomes',audit:'RECONCILIATION_ACTION_OUTCOME_RECORDED'},
   usage:{id:'CR-04',table:'reconciled_model_usages',audit:'RECONCILIATION_MODEL_USAGE_SETTLED'},
+  'expired-apply':{id:'PR36 F-01',table:'reconciled_action_applications',audit:'RECONCILIATION_ACTION_RESULT_APPLIED'},
   apply:{id:'CR-05',table:'reconciled_action_applications',audit:'RECONCILIATION_ACTION_RESULT_APPLIED'},
   dispute:{id:'CR-06',table:'reconciliation_disputes',audit:'RECONCILIATION_DISPUTE_RECORDED'},
 };
@@ -27,8 +28,8 @@ for (const [mode,{id,table,audit}] of Object.entries(cases)) for (const boundary
     assert.equal(rows(table).length,(before[table]?.length??0)+(committed?1:0),table);
     assert.equal(raw.prepare('SELECT count(*) n FROM reconciliation_audit WHERE event_kind=?').get(audit)!.n,(before.reconciliation_audit??[]).filter(row=>row.event_kind===audit).length+(committed?1:0));
     for(const name of ['execution_ledger','execution_results','model_call_ledger','model_call_attempts','recovery_invocation_debits'])assert.deepEqual(rows(name),before[name],name);
-    if(mode!=='apply')for(const name of ['workflow_seeds','journal_events'])assert.deepEqual(rows(name),before[name],name);
-    if(['outcome','usage','apply'].includes(mode)) {
+    if(mode!=='apply'&&mode!=='expired-apply')for(const name of ['workflow_seeds','journal_events'])assert.deepEqual(rows(name),before[name],name);
+    if(['outcome','usage','apply','expired-apply'].includes(mode)) {
       const operations=rows('reconciliation_operations');assert.equal(operations.length,before.reconciliation_operations.length+(committed?1:0));
       const consumed=rows('reconciliation_grants').filter(row=>row.status==='CONSUMED').length;
       assert.equal(consumed,before.reconciliation_grants.filter(row=>row.status==='CONSUMED').length+(committed?1:0));
@@ -41,7 +42,7 @@ for (const [mode,{id,table,audit}] of Object.entries(cases)) for (const boundary
       assert.equal(rows('reconciliation_target_seals').length,committed?1:0);
       if(committed){const authority=rows('model_usage_authorities')[0];assert.equal(authority.authority,'RECONCILED');assert.equal(authority.cost_micros,400);}
     }
-    if(mode==='apply')assert.equal(rows('journal_events').length,before.journal_events.length+(committed?1:0));
+    if(mode==='apply'||mode==='expired-apply')assert.equal(rows('journal_events').length,before.journal_events.length+(committed?1:0));
     if(mode==='dispute') {
       const control=rows('recovery_workflow_control')[0],prior=before.recovery_workflow_control[0];
       assert.equal(control.control_revision,Number(prior.control_revision)+(committed?1:0));assert.equal(control.hold_state,committed?'HELD':prior.hold_state);

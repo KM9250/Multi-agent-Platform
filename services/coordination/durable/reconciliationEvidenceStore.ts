@@ -8,7 +8,7 @@ import { canonicalJson, digest, DurableStoreError, parseJson, requireIntegrity }
 import { recoveryTime } from './recoveryPlanner';
 import { reconciliationData, validateReconciliationTarget, readReconciliationTarget, ReconciliationVerifiers, nativeVerifierPromise, validateVerifierResult } from './reconciliationVerifier';
 import type { ReconciliationHost, ReconciliationOptions, ReconciliationLimits, ReconciliationPolicy, ReconciliationPermission, ReconciliationTarget, ReconciliationEvidence, ReconciliationVerification, ReconciliationEvidenceCommand, ReconciliationOperationCommand, ReconciliationOperationContext, SubmitReconciliationEvidence, VerifyReconciliationEvidence } from './reconciliationTypes';
-import { persistReconciliationDecision, recordVerifiedConflict, recordVerificationRevocation } from './reconciliationStore';
+import { persistReconciliationDecision, recordVerifiedConflict, recordVerificationRevocation, readReconciliationReceipt } from './reconciliationStore';
 import { reconciliationRunnerFacts } from './reconciliationRunnerContext';
 import { inspectReconciliationInTransaction } from './reconciliationReader';
 
@@ -72,21 +72,36 @@ export class ReconciliationRuntime {
     const row=tx.get('SELECT body_json FROM reconciliation_evidence_bodies WHERE evidence_id=? AND workflow_run_id=?',e.evidenceId,e.target.workflowRunId);requireIntegrity(row);
     const body=reconciliationData(parseJson(row.body_json),this.#limits.maxCandidateBytes,this.#limits.maxDepth);requireIntegrity(digest(body)===e.candidateDigest&&Buffer.byteLength(canonicalJson(body))===e.sizeBytes);return body;
   }
-  #currentVerification(tx:DurableTransaction,id:string,target:ReconciliationTarget,actor:VerifiedRecoveryIdentity):ReconciliationVerification {
+  #viewVerification(tx:DurableTransaction,id:string,credential:unknown):ReconciliationVerification {
+    const v=readReconciliationVerification(tx,id),e=readReconciliationEvidence(tx,v.evidenceId);
+    const actor=this.#identity(tx,credential,v.target,'VIEW_CASE');this.#access(actor,v.target,'USE_EVIDENCE',e.evidenceOwnerId);
+    this.#content(v,e,'OUTPUT');return v;
+  }
+  #currentVerification(tx:DurableTransaction,id:string,target:ReconciliationTarget,actor:VerifiedRecoveryIdentity,adoptedAction=false):ReconciliationVerification {
     const v=readReconciliationVerification(tx,id),e=readReconciliationEvidence(tx,v.evidenceId);
     this.#access(actor,target,'VIEW_CASE');this.#access(actor,target,'USE_EVIDENCE',e.evidenceOwnerId);
-    requireIntegrity(canonicalJson(v.target)===canonicalJson(target)&&v.status==='VERIFIED'&&v.expiresAt>recoveryTime(tx));
-    const latest=tx.get('SELECT max(version) version FROM reconciliation_evidence WHERE workflow_run_id=? AND logical_id=?',target.workflowRunId,e.logicalId);
-    requireIntegrity(latest?.version===e.version);
+    requireIntegrity(canonicalJson(v.target)===canonicalJson(target)&&v.status==='VERIFIED');
+    if(adoptedAction) {
+      requireIntegrity(target.targetKind==='ACTION');
+      const outcome=tx.get('SELECT o.*,p.plan_id FROM reconciled_action_outcomes o JOIN reconciliation_operations p ON p.operation_id=o.operation_id WHERE o.workflow_run_id=? AND o.action_id=? AND o.attempt_id=?',target.workflowRunId,target.targetId,target.attemptId);
+      requireIntegrity(outcome&&outcome.verification_id===id&&outcome.source_effect_key===v.sourceEffectKey);
+      const receipt=readReconciliationReceipt(tx,String(outcome.plan_id));
+      requireIntegrity(receipt?.operationKind==='RECORD_VERIFIED_ACTION_OUTCOME'&&receipt.verificationId===id&&receipt.committedAt<v.expiresAt);
+    } else {
+      requireIntegrity(v.expiresAt>recoveryTime(tx));
+      const latest=tx.get('SELECT max(version) version FROM reconciliation_evidence WHERE workflow_run_id=? AND logical_id=?',target.workflowRunId,e.logicalId);
+      requireIntegrity(latest?.version===e.version);
+    }
     const current=this.#host.outside(()=>this.#registry.get(v.verifierId));requireIntegrity(current.bindingDigest===v.bindingDigest&&current.binding.authorityDomain===this.#policy().authorityDomain&&!this.#host.outside(()=>this.#registry.isRevoked(v.verifierId,v.bindingDigest)));
     requireIntegrity(readReconciliationTarget(tx,target).targetDigest===v.targetDigest);
-    this.#content(v.claim,e,'OUTPUT');return v;
+    this.#content(v,e,'OUTPUT');return v;
   }
   #context(tx:DurableTransaction,lease:WorkflowLease,actor:VerifiedRecoveryIdentity):ReconciliationOperationContext {
     return {db:this.#host.db,tx,lease,actor,policy:this.#policy(),policyRevision:this.#policyRevision,limits:this.#limits,
       authorize:(credential,target,permission,owner)=>this.#identity(tx,credential,target,permission,owner),
       checkAccess:(who,target,permission,owner)=>this.#access(who,target,permission,owner),
       validateVerification:(id,target,who=actor)=>this.#currentVerification(tx,id,target,who),
+      validateAdoptedActionVerification:(id,target,who=actor)=>this.#currentVerification(tx,id,target,who,true),
       revalidateApproval:(actorId,source,target)=>{const credential=this.#credentials.get(`${source}\u0000${actorId}`);if(credential===undefined)throw new DurableStoreError('RECOVERY_UNAUTHENTICATED');const who=this.#identity(tx,credential,target,'APPROVE_RECONCILIATION');requireIntegrity(who.actorId===actorId&&who.source===source);return who;},
       write:this.#writer(tx,lease,actor.actorId)};
   }
@@ -110,7 +125,7 @@ export class ReconciliationRuntime {
         const e=readReconciliationEvidence(tx,command.evidenceId);this.#identity(tx,credential,e.target,command.kind==='VIEW_EVIDENCE_BODY'?'VIEW_EVIDENCE_BODY':'VIEW_CASE',e.evidenceOwnerId);
         if(command.kind==='VIEW_EVIDENCE')return e;const body=this.#body(tx,e);this.#content(body,e,'OUTPUT');return body;
       }
-      if(command.kind==='VIEW_VERIFICATION') {const v=readReconciliationVerification(tx,command.verificationId),e=readReconciliationEvidence(tx,v.evidenceId);const who=this.#identity(tx,credential,v.target,'VIEW_CASE');this.#access(who,v.target,'USE_EVIDENCE',e.evidenceOwnerId);this.#content(v.claim,e,'OUTPUT');return v;}
+      if(command.kind==='VIEW_VERIFICATION')return this.#viewVerification(tx,command.verificationId,credential);
       if(command.kind==='SUBMIT_EVIDENCE') {
         requireIntegrity(lease);const x=command.input,target=validateReconciliationTarget(x.target);requireIntegrity(target.workflowRunId===lease.workflowRunId);
         const actor=this.#identity(tx,credential,target,'SUBMIT_EVIDENCE');readReconciliationTarget(tx,target);
@@ -157,7 +172,7 @@ export class ReconciliationRuntime {
       const actor=this.#identity(tx,credential,e.target,'VERIFY_EVIDENCE',e.evidenceOwnerId);this.#access(actor,e.target,'USE_EVIDENCE',e.evidenceOwnerId);
       const registered=this.#host.outside(()=>this.#registry.get(x.verifierId));requireIntegrity(registered.binding.authorityDomain===this.#policy().authorityDomain&&!this.#host.outside(()=>this.#registry.isRevoked(x.verifierId,registered.bindingDigest)));
       const existing=tx.get('SELECT verification_id FROM reconciliation_verifications WHERE evidence_id=? AND verifier_id=? AND binding_digest=?',e.evidenceId,x.verifierId,registered.bindingDigest);
-      if(existing){const saved=readReconciliationVerification(tx,String(existing.verification_id));this.#content(saved.claim,e,'OUTPUT');return {saved};}
+      if(existing)return {saved:String(existing.verification_id)};
       const current=readReconciliationTarget(tx,e.target),body=this.#body(tx,e);this.#content({body,targetSnapshot:current.targetSnapshot},e,'VERIFY');
       const now=recoveryTime(tx),jobs=tx.get("SELECT count(*) n FROM reconciliation_verification_jobs WHERE workflow_run_id=? AND status='PENDING' AND expires_at>?",e.target.workflowRunId,now)!;
       const total=tx.get('SELECT count(*) n FROM reconciliation_verification_jobs WHERE workflow_run_id=?',e.target.workflowRunId)!;
@@ -166,10 +181,10 @@ export class ReconciliationRuntime {
       this.#writer(tx,lease,actor.actorId)('reconciliation_verification_jobs',job);this.#audit(tx,lease,actor.actorId,'RECONCILIATION_VERIFICATION_STARTED',String(job.job_id),digest({evidenceId:e.evidenceId,bindingDigest:registered.bindingDigest,targetDigest:current.targetDigest}));
       return {e,actor,registered,current,body,job};
     });
-    if(prepared.saved){this.#host.notifyDrained(this.#host.db.read(tx=>this.#draining(tx,prepared.saved!.verificationId)));return prepared.saved;}
+    if(prepared.saved){this.#host.notifyDrained(this.#host.db.read(tx=>this.#draining(tx,prepared.saved!)));return this.#host.db.read(tx=>this.#viewVerification(tx,prepared.saved!,credential));}
     const {e,registered,current,body,job}=prepared;requireIntegrity(e&&registered&&current&&job);
     const start=performance.now(),wall=Date.now(),controller=new AbortController();let timer:ReturnType<typeof setTimeout>|undefined;let aborted=false;let rejectCancellation:((error:DurableStoreError)=>void)|undefined;
-    const cancelled=new Promise<never>((_,reject)=>{rejectCancellation=reject;});
+    const cancelled=new Promise<never>((_,reject)=>{rejectCancellation=reject;});let committed:ReconciliationVerification|undefined;
     const cancel=()=>this.#host.outside(()=>{aborted=true;controller.abort();rejectCancellation?.(new DurableStoreError('RECOVERY_UNAUTHORIZED'));});
     try {
       if(signal)this.#host.outside(()=>EventTarget.prototype.addEventListener.call(signal,'abort',cancel,{once:true}));
@@ -195,11 +210,15 @@ export class ReconciliationRuntime {
         write('reconciliation_verification_jobs',{...pending,status:'COMPLETE',receipt_id:verification.verificationId},pending);this.#audit(tx,lease,actor.actorId,'RECONCILIATION_VERIFICATION_RECORDED',verification.verificationId,verification.receiptDigest);
         draining=recordVerifiedConflict(this.#context(tx,lease,actor),verification);return verification;
       });
+      committed=saved;
       this.#host.notifyDrained(draining);
-      return saved;
+      return this.#host.db.read(tx=>this.#viewVerification(tx,saved.verificationId,credential));
     } catch(error) {
+      if(committed)throw error instanceof DurableStoreError?error:new DurableStoreError('RECOVERY_UNAUTHORIZED');
       // A completed job/immutable receipt is the only recovery after a lost COMMIT ACK.
-      try{const recovered=this.#host.db.read(tx=>{const pending=tx.get('SELECT * FROM reconciliation_verification_jobs WHERE job_id=?',job.job_id);requireIntegrity(pending?.status==='COMPLETE'&&pending.receipt_id);const v=readReconciliationVerification(tx,String(pending.receipt_id));requireIntegrity(v.evidenceId===e.evidenceId&&v.verifierId===x.verifierId&&v.bindingDigest===registered.bindingDigest);const actor=this.#identity(tx,credential,v.target,'VIEW_CASE');this.#access(actor,v.target,'USE_EVIDENCE',e.evidenceOwnerId);this.#content(v.claim,e,'OUTPUT');return {v,ids:this.#draining(tx,v.verificationId)};});this.#host.notifyDrained(recovered.ids);return recovered.v;}catch{}
+      let recovered:{v:ReconciliationVerification;ids:string[]}|undefined;
+      try{recovered=this.#host.db.read(tx=>{const pending=tx.get('SELECT * FROM reconciliation_verification_jobs WHERE job_id=?',job.job_id);requireIntegrity(pending?.status==='COMPLETE'&&pending.receipt_id);const v=readReconciliationVerification(tx,String(pending.receipt_id));requireIntegrity(v.evidenceId===e.evidenceId&&v.verifierId===x.verifierId&&v.bindingDigest===registered.bindingDigest);return {v,ids:this.#draining(tx,v.verificationId)};});}catch{}
+      if(recovered){this.#host.notifyDrained(recovered.ids);return this.#host.db.read(tx=>this.#viewVerification(tx,recovered!.v.verificationId,credential));}
       throw error instanceof DurableStoreError?error:new DurableStoreError('RECOVERY_UNAUTHORIZED');
     }
     finally {if(timer)clearTimeout(timer);if(signal)this.#host.outside(()=>EventTarget.prototype.removeEventListener.call(signal,'abort',cancel));this.#host.outside(()=>controller.abort());}

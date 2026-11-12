@@ -1,5 +1,6 @@
 import { effectiveActionRows, hasReconciledActionRepeat } from './reconciliationEffectiveState';
 import { ReconciliationRuntime } from './reconciliationEvidenceStore';
+import { normalReconciliationFacts, recordNormalFactConflicts } from './reconciliationStore';
 import type { ReconciliationOptions, ReconciliationCommand, VerifyReconciliationEvidence } from './reconciliationTypes';
 import { RECONCILIATION_COLUMNS } from './reconciliationSchema';
 import { readWorkflowControl } from './recoveryHoldLifecycle';
@@ -96,6 +97,7 @@ export class DurableDatabase {
   #db: DatabaseSync;
   readonly #bounded: BoundedRuntime;
   readonly #reconciliation: ReconciliationRuntime;
+  #normalFactParticipant=false;
   #reconciliationScope?: { tx:DurableTransaction; lease:WorkflowLease; actorId:string; table:string; row:Row; old?:Row };
   readonly #externalReconciliation = new AsyncLocalStorage<boolean>();
   readonly #databaseIdentity: string;
@@ -191,46 +193,55 @@ export class DurableDatabase {
       this.assertTransaction(tx, mutation);
       // No transaction/DDL/PRAGMA control escapes to participants.
       if (!(mutation ? /^(INSERT|UPDATE|DELETE)\s/i : /^SELECT\s/i).test(sql.trim())) {
-        if (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting)) this.#recoveryRejected = true;
+        if (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting || this.#normalFactParticipant)) this.#recoveryRejected = true;
         throw new DurableStoreError('INVALID_TRANSACTION');
       }
     };
     const tx: DurableTransaction = {
       get: (sql, ...params) => { try { check(sql, false); return this.#db.prepare(sql).get(...params); }
-        catch (error) { if (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting)) this.#recoveryRejected = true; throw error; } },
+        catch (error) { if (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting || this.#normalFactParticipant)) this.#recoveryRejected = true; throw error; } },
       all: (sql, ...params) => { try { check(sql, false); return this.#db.prepare(sql).all(...params); }
-        catch (error) { if (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting)) this.#recoveryRejected = true; throw error; } },
+        catch (error) { if (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting || this.#normalFactParticipant)) this.#recoveryRejected = true; throw error; } },
       run: (sql, ...params) => {
         check(sql, true);
         try { this.#db.prepare(sql).run(...params); }
         catch (error) {
           const safe = this.safeError(error);
           if (safe.code === 'LEASE_FENCED') this.#fencingRejected = true;
-          if (safe.code.startsWith('RECOVERY_') || this.#modelApplication || this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting)) this.#recoveryRejected = true;
+          if (safe.code.startsWith('RECOVERY_') || this.#modelApplication || this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting || this.#normalFactParticipant)) this.#recoveryRejected = true;
           throw safe;
         }
       },
     };
-    let begun = false, commitAttempted = false;
+    let begun = false, commitAttempted = false, committed = false;let draining:string[]=[];
     try {
       this.#db.exec(write ? 'BEGIN IMMEDIATE' : 'BEGIN'); begun = true;
       this.#active = tx; this.#writable = write; this.#context = context; this.#fencingRejected = false;
       if (context?.kind === 'lease') { this.#assertLease(context.record); this.#bounded.before(tx,context.record.handle.workflowRunId); }
+      const normalBefore=context?.kind==='lease'?normalReconciliationFacts(tx,context.record.handle.workflowRunId):undefined;
       const result = fn(tx);
+      if(context?.kind==='lease'&&normalBefore&&[...normalReconciliationFacts(tx,context.record.handle.workflowRunId).keys()].some(key=>!normalBefore.has(key))) {
+        const lease=context.record.handle;
+        // No caller-supplied DTO, credential, callback or human approval grants this capability.
+        this.#normalFactParticipant=true;
+        draining=recordNormalFactConflicts({tx,lease,actor:{actorId:'system:normal-fact'},
+          write:(table,row,old)=>this.#setReconciliationScope(tx,lease,'system:normal-fact',table,row,old)},normalBefore);
+      }
       if (context?.kind === 'lease') this.#bounded.after(tx);
       if (result && typeof (result as { then?: unknown }).then === 'function') throw new DurableStoreError('INVALID_TRANSACTION');
       if (this.#fencingRejected) throw new DurableStoreError('LEASE_FENCED');
       if (this.#recoveryRejected) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
       if (context?.kind === 'lease') this.#assertLease(context.record);
       if (context?.kind === 'bootstrap') this.#assertBootstrap(tx, context);
-      commitAttempted = true; this.#db.exec('COMMIT'); begun = false;
+      commitAttempted = true; this.#db.exec('COMMIT'); begun = false; committed = true;
       return result;
     } catch (error) {
       // A successful COMMIT can lose its acknowledgement. Keep a usable connection
       // only when SQLite confirms the transaction ended; the receipt reader decides
       // the outcome. Older runtimes without this observation keep the closed fallback.
-      const endedAfterCommit = (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting)) && commitAttempted
+      const endedAfterCommit = (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting || this.#normalFactParticipant)) && commitAttempted
         && (this.#db as DatabaseSync & { isTransaction?: boolean }).isTransaction === false;
+      committed=endedAfterCommit;
       if (begun && !endedAfterCommit) {
         try { this.#db.exec('ROLLBACK'); }
         catch { this.#db.close(); this.#closed = true; }
@@ -239,7 +250,8 @@ export class DurableDatabase {
     } finally { this.#bounded.clear(); this.#active = undefined; this.#writable = false; this.#context = undefined; this.#fencingRejected = false;
       this.#recoveryIntent = undefined; this.#recoveryRejected = false; this.#modelApplication = undefined;
       this.#safeRecovery = undefined; this.#safeRecoveryCommand = false;
-      this.#controlledScope = undefined; this.#controlledCommand = false; this.#reconciliationScope = undefined; }
+      this.#controlledScope = undefined; this.#controlledCommand = false; this.#reconciliationScope = undefined; this.#normalFactParticipant=false;
+      if(committed&&draining.length)this.#outsideReconciliation(()=>this.#bounded.notifyReconciliationDrain(draining)); }
   }
   reconciliationDecision(lease:WorkflowLease|undefined,credential:unknown,command:ReconciliationCommand):unknown {
     return this.#reconciliation.command(lease,credential,command);
