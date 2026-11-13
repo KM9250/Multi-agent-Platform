@@ -42,6 +42,10 @@ import type { ControlledWriter } from './recoveryDispatchStore';
 import { inspectDispatchInTransaction } from './recoveryDispatchReader';
 import { collectControlledResult, unknownDispatchResult } from './recoveryDispatchCoordinator';
 import type { ControlledExecutionWindow } from './recoveryDispatchCoordinator';
+import { NOTIFICATION_COLUMNS } from './notificationSchema';
+import { NotificationRuntime } from './notificationDeliveryCoordinator';
+import type { NotificationOptions } from './notificationTypes';
+import { snapshotNotificationOrigins, captureNotificationSources, initializeNotificationBaselines } from './notificationSourceCapture';
 
 export type Row = Record<string, SQLOutputValue>;
 export interface DurableTransaction {
@@ -51,6 +55,8 @@ export interface DurableTransaction {
 }
 export interface DurableDatabaseOptions {
   path: string; busyTimeoutMs?: number;
+  /** Trusted host dependencies. Omission disables notification delivery, never source capture. */
+  notifications?: NotificationOptions;
   bounded?: BoundedRuntimeOptions;
   reconciliation?: ReconciliationOptions;
   /** Trusted host startup dependency. Never populate from an HTTP request or saved DTO. */
@@ -79,6 +85,7 @@ interface LeaseRecord {
 const leaseHandles = new WeakMap<WorkflowLease, LeaseRecord>();
 type WriteContext = { kind: 'lease'; record: LeaseRecord }
   | { kind: 'management'; workflowRunId: string }
+  | { kind: 'notification'; workflowRunId: string; phase: 'DELIVERY'|'LEGACY_SYNC' }
   | { kind: 'bootstrap'; workflowRunId: string; seed: boolean; journal: boolean; audit: boolean };
 interface ModelApplicationScope {
   tx: DurableTransaction; identity: ModelCallIdentity; phase: string; roundKey: string;
@@ -95,6 +102,12 @@ interface DispatchSink { intent: DispatchIntent; lease: WorkflowLease; valid: bo
 /** One synchronous transaction owner. SQLite serializes writers across connections. */
 export class DurableDatabase {
   #db: DatabaseSync;
+  readonly #notifications: NotificationRuntime;
+  readonly #externalNotification = new AsyncLocalStorage<boolean>();
+  #notificationPhase?: 'CAPTURE'|'DELIVERY'|'LEGACY_SYNC'|'MIGRATION';
+  #notificationWorkflow?: string;
+  #notificationScope?: { tx:DurableTransaction; table:string; row:Row; old?:Row };
+  #notificationRejected = false;
   readonly #bounded: BoundedRuntime;
   readonly #reconciliation: ReconciliationRuntime;
   #normalFactParticipant=false;
@@ -167,57 +180,81 @@ export class DurableDatabase {
       requireIntegrity(this.#db.prepare('PRAGMA busy_timeout').get()!.timeout === timeout);
       this.#registerFencingFunctions();
       this.#db.exec('BEGIN IMMEDIATE');
-      try { migrate(this.#db); this.#db.exec('COMMIT'); }
+      try { migrate(this.#db,()=>this.#initializeNotificationBaselines()); this.#db.exec('COMMIT'); }
       catch (error) { this.#db.exec('ROLLBACK'); throw error; }
       requireIntegrity(this.#db.prepare('PRAGMA quick_check').all().every(row => row.quick_check === 'ok'));
       requireIntegrity(this.#db.prepare('PRAGMA foreign_key_check').all().every(row => row.table === 'workflow_checkpoints'));
     } catch (error) { this.#db.close(); throw this.safeError(error); }
+    try {
+      this.#notifications = new NotificationRuntime({
+        read: fn => this.read(fn),
+        write: (phase,workflowRunId,fn) => this.#transaction(true,fn,{kind:'notification',workflowRunId,phase}),
+        scopedWrite: (tx,table,row,old) => this.#setNotificationScope(tx,table,row,old),
+        outside: fn => this.#externalNotification.run(true,()=>this.#bounded.withoutAuthority(fn)),
+      }, options.notifications);
+    } catch(error) {this.#db.close();throw this.safeError(error);}
   }
   private safeError(error: unknown): DurableStoreError {
     if (error instanceof DurableStoreError) return error;
     if ((error as { message?: string })?.message === 'LEASE_FENCED') return new DurableStoreError('LEASE_FENCED');
     const code = (error as { message?: string })?.message;
+    if (['NOTIFICATION_UNAUTHORIZED','NOTIFICATION_IMMUTABLE','NOTIFICATION_FENCED'].includes(code ?? ''))
+      return new DurableStoreError(code as 'NOTIFICATION_UNAUTHORIZED');
     if (['RECOVERY_HELD','RECOVERY_UNAUTHORIZED','RECOVERY_IMMUTABLE','RECOVERY_EXECUTION_DISABLED'].includes(code ?? ''))
       return new DurableStoreError(code as 'RECOVERY_HELD');
     const errno = (error as { errcode?: number })?.errcode;
     return new DurableStoreError(errno !== undefined && [5, 6].includes(errno & 255) ? 'DATABASE_BUSY' : 'DATABASE_ERROR');
   }
   assertTransaction(tx: DurableTransaction, write = false): void {
+    if (write && this.#externalNotification.getStore()) { if(this.#active)this.#notificationRejected=true; throw new DurableStoreError('NOTIFICATION_UNAUTHORIZED'); }
     if (write && this.#externalReconciliation.getStore()) { if(this.#active)this.#recoveryRejected=true; throw new DurableStoreError('RECOVERY_UNAUTHORIZED'); }
     if (this.#closed || this.#active !== tx || (write && !this.#writable)) throw new DurableStoreError('INVALID_TRANSACTION');
   }
   #transaction<T>(write: boolean, fn: (tx: DurableTransaction) => T, context?: WriteContext): T {
+    if (this.#externalNotification.getStore() && write) { if(this.#active)this.#notificationRejected=true; throw new DurableStoreError('NOTIFICATION_UNAUTHORIZED'); }
     if (this.#externalReconciliation.getStore() && write) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
     if (this.#closed || this.#active) throw new DurableStoreError('INVALID_TRANSACTION');
     const check = (sql: string, mutation: boolean) => {
       this.assertTransaction(tx, mutation);
+      if (mutation && this.#notificationPhase && (!this.#notificationScope || this.#notificationScope.tx!==tx
+        || !new RegExp(`^(?:INSERT\\s+INTO|UPDATE)\\s+${this.#notificationScope.table}\\s`, 'i').test(sql.trim()))) {
+        this.#notificationRejected=true; throw new DurableStoreError('NOTIFICATION_UNAUTHORIZED');
+      }
       // No transaction/DDL/PRAGMA control escapes to participants.
       if (!(mutation ? /^(INSERT|UPDATE|DELETE)\s/i : /^SELECT\s/i).test(sql.trim())) {
         if (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting || this.#normalFactParticipant)) this.#recoveryRejected = true;
+        if (this.#notificationPhase) this.#notificationRejected=true;
         throw new DurableStoreError('INVALID_TRANSACTION');
       }
     };
     const tx: DurableTransaction = {
       get: (sql, ...params) => { try { check(sql, false); return this.#db.prepare(sql).get(...params); }
-        catch (error) { if (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting || this.#normalFactParticipant)) this.#recoveryRejected = true; throw error; } },
+        catch (error) { if(this.#notificationPhase)this.#notificationRejected=true; if (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting || this.#normalFactParticipant)) this.#recoveryRejected = true; throw error; } },
       all: (sql, ...params) => { try { check(sql, false); return this.#db.prepare(sql).all(...params); }
-        catch (error) { if (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting || this.#normalFactParticipant)) this.#recoveryRejected = true; throw error; } },
+        catch (error) { if(this.#notificationPhase)this.#notificationRejected=true; if (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting || this.#normalFactParticipant)) this.#recoveryRejected = true; throw error; } },
       run: (sql, ...params) => {
         check(sql, true);
         try { this.#db.prepare(sql).run(...params); }
         catch (error) {
           const safe = this.safeError(error);
+          if (this.#notificationPhase || safe.code.startsWith('NOTIFICATION_')) this.#notificationRejected=true;
           if (safe.code === 'LEASE_FENCED') this.#fencingRejected = true;
           if (safe.code.startsWith('RECOVERY_') || this.#modelApplication || this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting || this.#normalFactParticipant)) this.#recoveryRejected = true;
           throw safe;
         }
       },
     };
-    let begun = false, commitAttempted = false, committed = false;let draining:string[]=[];
+    let begun = false, commitAttempted = false, committed = false, notificationParticipated=false;let draining:string[]=[];
     try {
       this.#db.exec(write ? 'BEGIN IMMEDIATE' : 'BEGIN'); begun = true;
       this.#active = tx; this.#writable = write; this.#context = context; this.#fencingRejected = false;
-      if (context?.kind === 'lease') { this.#assertLease(context.record); this.#bounded.before(tx,context.record.handle.workflowRunId); }
+      this.#notificationRejected=false;
+      if(context?.kind==='notification') { this.#notificationPhase=context.phase; this.#notificationWorkflow=context.workflowRunId; notificationParticipated=true; }
+      if (context?.kind === 'lease') this.#assertLease(context.record);
+      const captureWorkflow=context?.kind==='lease'?context.record.handle.workflowRunId:
+        context?.kind==='bootstrap'||context?.kind==='management'?context.workflowRunId:undefined;
+      const notificationBefore=captureWorkflow?snapshotNotificationOrigins(tx,captureWorkflow):undefined;
+      if (context?.kind === 'lease') this.#bounded.before(tx,context.record.handle.workflowRunId);
       const normalBefore=context?.kind==='lease'?normalReconciliationFacts(tx,context.record.handle.workflowRunId):undefined;
       const result = fn(tx);
       if(context?.kind==='lease'&&normalBefore&&[...normalReconciliationFacts(tx,context.record.handle.workflowRunId).keys()].some(key=>!normalBefore.has(key))) {
@@ -233,13 +270,27 @@ export class DurableDatabase {
       if (this.#recoveryRejected) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
       if (context?.kind === 'lease') this.#assertLease(context.record);
       if (context?.kind === 'bootstrap') this.#assertBootstrap(tx, context);
+      if(captureWorkflow && notificationBefore) {
+        // Every business participant has validated its receipts and completed its
+        // final writes. Close their powers explicitly before the DB-only capture.
+        // Rejection flags deliberately survive this transition until COMMIT.
+        this.#bounded.clear(); this.#modelApplication=undefined; this.#safeRecovery=undefined;
+        this.#safeRecoveryCommand=false; this.#controlledScope=undefined; this.#controlledCommand=false;
+        this.#reconciliationScope=undefined; this.#normalFactParticipant=false; this.#recoveryIntent=undefined;
+        this.#notificationPhase='CAPTURE'; this.#notificationWorkflow=captureWorkflow; notificationParticipated=true;
+        captureNotificationSources(tx,captureWorkflow,notificationBefore,(table,row,old)=>this.#setNotificationScope(tx,table,row,old));
+      }
+      if(this.#notificationRejected)throw new DurableStoreError('NOTIFICATION_UNAUTHORIZED');
+      if (this.#fencingRejected) throw new DurableStoreError('LEASE_FENCED');
+      if (this.#recoveryRejected) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
+      if (context?.kind === 'lease') this.#assertLease(context.record);
       commitAttempted = true; this.#db.exec('COMMIT'); begun = false; committed = true;
       return result;
     } catch (error) {
       // A successful COMMIT can lose its acknowledgement. Keep a usable connection
       // only when SQLite confirms the transaction ended; the receipt reader decides
       // the outcome. Older runtimes without this observation keep the closed fallback.
-      const endedAfterCommit = (this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting || this.#normalFactParticipant)) && commitAttempted
+      const endedAfterCommit = (notificationParticipated || this.#safeRecoveryCommand || this.#controlledCommand || (this.#bounded.protecting || this.#reconciliation.protecting || this.#normalFactParticipant)) && commitAttempted
         && (this.#db as DatabaseSync & { isTransaction?: boolean }).isTransaction === false;
       committed=endedAfterCommit;
       if (begun && !endedAfterCommit) {
@@ -251,7 +302,54 @@ export class DurableDatabase {
       this.#recoveryIntent = undefined; this.#recoveryRejected = false; this.#modelApplication = undefined;
       this.#safeRecovery = undefined; this.#safeRecoveryCommand = false;
       this.#controlledScope = undefined; this.#controlledCommand = false; this.#reconciliationScope = undefined; this.#normalFactParticipant=false;
+      this.#notificationPhase=undefined;this.#notificationWorkflow=undefined;this.#notificationScope=undefined;this.#notificationRejected=false;
       if(committed&&draining.length)this.#outsideReconciliation(()=>this.#bounded.notifyReconciliationDrain(draining)); }
+  }
+  /** Closed notification API; no SQL writer, scope token, or send permit escapes. */
+  get notifications(): NotificationRuntime { return this.#notifications; }
+  #initializeNotificationBaselines():void {
+    const tx:DurableTransaction={
+      get:(sql,...args)=>this.#db.prepare(sql).get(...args),
+      all:(sql,...args)=>this.#db.prepare(sql).all(...args),
+      run:(sql,...args)=>{
+        requireIntegrity(this.#active===tx && this.#notificationScope?.tx===tx);
+        try{this.#db.prepare(sql).run(...args);}catch(error){this.#notificationRejected=true;throw error;}
+      },
+    };
+    this.#active=tx;this.#writable=true;this.#notificationPhase='MIGRATION';this.#notificationRejected=false;
+    try {
+      initializeNotificationBaselines(tx,(table,row,old)=>this.#setNotificationScope(tx,table,row,old));
+      if(this.#notificationRejected)throw new DurableStoreError('NOTIFICATION_UNAUTHORIZED');
+    } finally {
+      this.#active=undefined;this.#writable=false;this.#notificationPhase=undefined;
+      this.#notificationScope=undefined;this.#notificationWorkflow=undefined;this.#notificationRejected=false;
+    }
+  }
+  #setNotificationScope(tx:DurableTransaction,table:string,row:Row,old?:Row):void {
+    try {
+      this.assertTransaction(tx,true);
+      const phase=this.#notificationPhase,columns=NOTIFICATION_COLUMNS[table];
+      const permitted=phase==='MIGRATION'?['notification_migration_baselines']:
+        phase==='CAPTURE'?['notification_sources','notification_capture_cursors','notification_delivery_audit']:
+        phase==='LEGACY_SYNC'?['notification_sources','notification_delivery_audit','notification_management_receipts']:
+        phase==='DELIVERY'?Object.keys(NOTIFICATION_COLUMNS).filter(t=>!['notification_sources','notification_capture_cursors','notification_migration_baselines'].includes(t)):[];
+      requireIntegrity(phase && columns && permitted.includes(table) && !this.#notificationScope
+        && !this.#externalNotification.getStore() && !this.#externalReconciliation.getStore()
+        && !this.#modelApplication && !this.#safeRecovery && !this.#controlledScope && !this.#reconciliationScope
+        && typeof row.workflow_run_id==='string' && (phase==='MIGRATION'||row.workflow_run_id===this.#notificationWorkflow)
+        && (!old||old.workflow_run_id===row.workflow_run_id)
+        && canonicalJson(Object.keys(row).sort())===canonicalJson([...columns].sort())
+        && (!old||canonicalJson(Object.keys(old).sort())===canonicalJson([...columns].sort())));
+      this.#notificationScope={tx,table,row:jsonCopy(row),old:old&&jsonCopy(old)};
+      try {
+        if(old) {
+          const predicate=columns.map(c=>`${c} IS ?`).join(' AND ');
+          requireIntegrity(tx.get(`SELECT 1 AS found FROM ${table} WHERE ${predicate}`,...columns.map(c=>old[c])));
+          const changed=columns.filter(c=>row[c]!==old[c]);requireIntegrity(changed.length>0);
+          tx.run(`UPDATE ${table} SET ${changed.map(c=>`${c}=?`).join(',')} WHERE ${predicate}`,...changed.map(c=>row[c]),...columns.map(c=>old[c]));
+        } else tx.run(`INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(()=>'?').join(',')})`,...columns.map(c=>row[c]));
+      } finally {this.#notificationScope=undefined;}
+    } catch(error) {this.#notificationRejected=true;throw error;}
   }
   reconciliationDecision(lease:WorkflowLease|undefined,credential:unknown,command:ReconciliationCommand):unknown {
     return this.#reconciliation.command(lease,credential,command);
@@ -745,6 +843,18 @@ export class DurableDatabase {
     }
   }
   #registerFencingFunctions(): void {
+    this.#db.function('map_notification_write',(table,before,after)=>{
+      const s=this.#notificationScope,columns=NOTIFICATION_COLUMNS[String(table)];
+      let valid=false;
+      if(s && columns && s.table===table && s.tx===this.#active && this.#writable && this.#notificationPhase
+        && !this.#externalNotification.getStore() && !this.#externalReconciliation.getStore()) {
+        try {valid=canonicalJson(parseJson(after))===canonicalJson(columns.map(c=>s.row[c]??null))
+          && canonicalJson(before===null?null:parseJson(before))===canonicalJson(s.old?columns.map(c=>s.old![c]??null):null);}
+        catch { /* Fixed denial below. SQL predicates never mint authority. */ }
+      }
+      if(!valid && this.#active && this.#writable)this.#notificationRejected=true;
+      return valid?1:0;
+    });
     this.#db.function('map_reconciliation_duplicate_action',(workflow,actionJson)=>{
       if(!this.#active)return 1;
       try {return hasReconciledActionRepeat(this.#active,String(workflow),parseJson(actionJson))?1:0;}catch{return 1;}
@@ -1009,6 +1119,7 @@ export class DurableDatabase {
   }
   /** Consistent SQLite backup (includes committed WAL data); trusted, new target only. */
   backup(path: string): void {
+    if(this.#externalNotification.getStore())throw new DurableStoreError('NOTIFICATION_UNAUTHORIZED');
     if (this.#externalReconciliation.getStore()) throw new DurableStoreError('RECOVERY_UNAUTHORIZED');
     if (this.#closed || this.#active) throw new DurableStoreError('INVALID_TRANSACTION');
     guarded('DATABASE_ERROR', () => {

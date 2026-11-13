@@ -35,7 +35,9 @@ test('R04: a terminal Workflow cannot be revived by planning, continuation or re
 });
 test('T05: start expiry consumes nothing; admission expiry allows settlement but prevents a new Read intent',async t=>{
  const expired=continuationFixture(t,{startTtlMs:5}),p=expired.api().createPlan(expired.input(),expired.credential);await new Promise(r=>setTimeout(r,20));await assert.rejects(expired.api().startAuthorized(p.planId,expired.credential));assert.equal(expired.raw.prepare('SELECT count(*) n FROM recovery_invocations').get()!.n,0);
- const f=continuationFixture(t,{admissionMs:50});f.hook(async()=>{await new Promise(r=>setTimeout(r,80));return {value:{kind:'read_requests',requests:[{resourceId:'source',digest:f.reads.describe('source')!.digest}]},usage,completeness:'COMPLETE'};});const q=f.api().createPlan(f.input('PLAN_READ_ONLY'),f.credential),out=await f.api().startAuthorized(q.planId,f.credential);
+ // Reach the actual admitted Provider call before crossing its persisted deadline.
+ // A 50ms startup window could expire during DB validation under parallel suites.
+ const f=continuationFixture(t,{admissionMs:500});f.hook(async()=>{const deadline=Number(f.raw.prepare('SELECT admission_deadline FROM recovery_invocations').get()!.admission_deadline);assert.ok(Date.now()<deadline);await new Promise(r=>setTimeout(r,Math.max(0,deadline-Date.now())+20));return {value:{kind:'read_requests',requests:[{resourceId:'source',digest:f.reads.describe('source')!.digest}]},usage,completeness:'COMPLETE'};});const q=f.api().createPlan(f.input('PLAN_READ_ONLY'),f.credential),out=await f.api().startAuthorized(q.planId,f.credential);
  assert.equal(out.usage.committed.inputTokens,1);assert.equal(out.counts.readCalls,0);assert.equal(out.invocation?.status,'STOPPED');assert.equal(f.counts.draft,1);
 });
 test('A01/A02/P05: absent Identity and unvalidated network-style Read adapters fail closed before reservation',t=>{

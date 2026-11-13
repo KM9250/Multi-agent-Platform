@@ -64,6 +64,9 @@ for (const [operation, boundary, committed] of [
     const held = (await old.request('acquire')).value;
     if (operation === 'takeover') { actor = await leaseChild(t, f.path, 1000); await untilExpired(held.expiresAt); }
   }
+  // Start the contender before the short lease is acquired. Process startup can
+  // otherwise consume the entire TTL and race the LEASE_HELD observation.
+  const contender = committed ? await leaseChild(t, f.path, 1000) : undefined;
   const before = saved(f, workflow);
   const pending = actor.request(operation === 'renew' ? 'renew' : 'acquire', { workflow, crash: `${operation}-${boundary}` });
   assert.equal(await actor.stage, `${operation}-${boundary}`);
@@ -79,7 +82,6 @@ for (const [operation, boundary, committed] of [
   assert.notEqual(new RecoveryReader(f.db).inspect('run').disposition, 'RECOVERY_FAILED');
   // COMMIT-after/response-before death leaves a real lease; there is no implicit re-acquisition.
   if (committed) {
-    const contender = await leaseChild(t, f.path, 1000);
-    if (Number(after.lease!.expires_at) > Date.now()) assert.equal((await contender.request('acquire', { workflow })).code, 'LEASE_HELD');
+    if (Number(after.lease!.expires_at) > Date.now()) assert.equal((await contender!.request('acquire', { workflow })).code, 'LEASE_HELD');
   }
 });

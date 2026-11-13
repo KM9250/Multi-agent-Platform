@@ -8,7 +8,7 @@ import type { MacpHttpNotificationTransportOptions } from '../services/coordinat
 const endpoint = 'https://macp.example/api/notify';
 const packet = () => toMacpNotificationPacket(notification());
 const response = (status = 201, fields: object = {}) => Response.json({ ok: true, task_id: packet().task_id, event_id: 1, idempotent_replay: status === 200, ...fields }, { status });
-const adapter = (fetch: typeof globalThis.fetch, options: Partial<MacpHttpNotificationTransportOptions> = {}) => new MacpHttpNotificationTransport({ endpoint, fetch, ...options });
+const adapter = (fetch: typeof globalThis.fetch, options: Partial<MacpHttpNotificationTransportOptions> = {}) => new MacpHttpNotificationTransport({ endpoint, token: 'test-only-token', fetch, ...options });
 const errorIs = (code: string, retryable = false, status?: number) => (error: unknown) => {
   assert.ok(error instanceof DeliveryError); assert.equal(error.code, code); assert.equal(error.retryable, retryable);
   assert.equal(error.httpStatus, status); assert.equal(error.message, code); assert.equal(error.cause, undefined); return true;
@@ -135,4 +135,57 @@ test('abort during a live request is not retried and abort during backoff preven
     signal: backoffAbort.signal, sleep: async () => { backoffAbort.abort(); },
   }), 'failed');
   assert.equal(retries, 1); assert.equal(g.outbox.get(g.id)!.state, 'DELIVERY_FAILED');
+});
+
+test('COORD-5D: missing production identity is rejected before any HTTP', () => {
+  let calls = 0;
+  assert.throws(() => adapter(async () => { calls++; return response(); }, { token: undefined }), errorIs('INVALID_CONFIGURATION'));
+  assert.equal(calls, 0);
+});
+
+test('COORD-5D: packet accessors, proxies, toJSON, cycles and size are rejected before execution or HTTP', async () => {
+  let calls = 0, traps = 0;
+  const transport = adapter(async () => { calls++; return response(); });
+  const accessor = { ...packet() };
+  Object.defineProperty(accessor, 'summary', { enumerable: true, get() { traps++; return 'secret'; } });
+  const toJSON = { ...packet(), toJSON() { traps++; return packet(); } };
+  const proxy = new Proxy(packet(), { get() { traps++; throw new Error('secret'); }, ownKeys() { traps++; return []; } });
+  const cyclic: any = { ...packet() }; cyclic.metadata = cyclic;
+  for (const bad of [accessor, toJSON, proxy, cyclic, { ...packet(), summary: 'x'.repeat(4097) }]) {
+    await assert.rejects(transport.send(bad), errorIs('INVALID_CONFIGURATION'));
+  }
+  assert.equal(traps, 0); assert.equal(calls, 0);
+});
+
+test('COORD-5D: synchronous fetch stall cannot adopt a late response before timer notification', async () => {
+  let calls = 0;
+  const transport = adapter(async () => {
+    calls++; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);
+    return response();
+  }, { timeoutMs: 5 });
+  await assert.rejects(transport.send(packet()), errorIs('TIMEOUT', true));
+  assert.equal(calls, 1);
+});
+
+test('COORD-5D: synchronous body stall cannot adopt a late receipt', async () => {
+  let calls = 0;
+  const transport = adapter(async () => {
+    calls++;
+    return new Response(new ReadableStream({ pull(controller) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);
+      controller.enqueue(new TextEncoder().encode(JSON.stringify({ ok: true, task_id: packet().task_id, event_id: 1, idempotent_replay: false })));
+      controller.close();
+    } }), { status: 201 });
+  }, { timeoutMs: 5 });
+  await assert.rejects(transport.send(packet()), errorIs('TIMEOUT', true));
+  assert.equal(calls, 1);
+});
+
+test('COORD-5D: HTTP client thenables are not assimilated and a synchronous exception is not retried', async () => {
+  let reads = 0, calls = 0;
+  const thenable = Object.defineProperty({}, 'then', { get() { reads++; throw new Error('private'); } });
+  await assert.rejects(adapter((() => { calls++; return thenable; }) as unknown as typeof fetch).send(packet()), errorIs('INVALID_RESPONSE'));
+  assert.equal(reads, 0); assert.equal(calls, 1);
+  await assert.rejects(adapter(() => { calls++; throw new Error('private'); }).send(packet()), errorIs('NETWORK_ERROR', true));
+  assert.equal(calls, 2);
 });

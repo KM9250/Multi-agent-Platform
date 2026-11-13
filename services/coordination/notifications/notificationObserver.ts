@@ -16,6 +16,7 @@ export function createCoordinationNotificationObserver(outbox: { enqueue(notific
 /** Deliberate recovery entry point; rescans all history after a missed enqueue. */
 export async function reconcileCoordinationNotifications(store: CoordinationRunnerStore, workflowRunId: string,
   observer: CoordinationNotificationObserver, diagnostics?: NotificationDiagnosticSink): Promise<boolean> {
+  if (store.persistence === 'durable') throw new Error('DURABLE_NOTIFICATION_DOUBLE_WIRING');
   try { await observer.observe(structuredClone(store.getSnapshot(workflowRunId))); return true; }
   catch { reportFailure(diagnostics); return false; }
 }
@@ -23,6 +24,7 @@ export async function reconcileCoordinationNotifications(store: CoordinationRunn
 /** Install as dependencies.store when constructing a Runner; no Kernel edits. */
 export function createNotifyingCoordinationStore(baseStore: CoordinationRunnerStore,
   observer: CoordinationNotificationObserver, diagnostics?: NotificationDiagnosticSink): CoordinationRunnerStore {
+  if (baseStore.persistence === 'durable') throw new Error('DURABLE_NOTIFICATION_DOUBLE_WIRING');
   return {
     getSnapshot: workflowRunId => baseStore.getSnapshot(workflowRunId),
     append(event) {

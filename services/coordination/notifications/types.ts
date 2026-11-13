@@ -5,7 +5,12 @@ import type { DeliveryErrorCode, NotificationDeliveryReceipt } from './deliveryE
 export type CoordinationNotificationKind =
   | 'workflow_completed' | 'workflow_cancelled' | 'action_approval_required'
   | 'security_review_required' | 'evidence_review_required' | 'execution_review_required'
-  | 'budget_exhausted' | 'workflow_attention_required';
+  | 'budget_exhausted' | 'workflow_attention_required'
+  | 'planning_review_required' | 'planning_input_required'
+  | 'recovery_review_required' | 'reconciliation_review_required';
+
+/** Wire presentation has no Journal reference. Non-Journal sources must not invent one. */
+export type NotificationContent = Omit<CoordinationNotification, 'sourceEventId'>;
 
 export interface CoordinationNotification {
   schemaVersion: 1;

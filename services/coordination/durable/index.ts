@@ -60,3 +60,9 @@ export { BOUNDED_CONTRACT, DEFAULT_INVOCATION_TIMING } from './continuationTypes
 export type { ContinuationPlanInput, ContinuationPlan, ContinuationPolicy, ContinuationInspection, PlanArtifact, ArtifactRef, PlanningInputRequest, PlanningReviewTarget,
   BoundedOperation, PlanningMode, PlanContent, PlanDraftResponse, BoundedProvider, BoundedProviderRegistry, ProviderCapabilities } from './continuationTypes';
 export { RecoveryContinuationReader } from './recoveryContinuationReader';
+
+// COORD-5D: trusted Node host interfaces; no credential issuer or SQL scope is exported.
+export { DurableNotificationWorker } from './notificationDeliveryWorker';
+export type { NotificationWorkerOptions, NotificationWorkerCycle } from './notificationDeliveryWorker';
+export { DURABLE_NOTIFICATION_CONTRACT } from './notificationTypes';
+export type { NotificationOptions, NotificationPermission, NotificationActor, NotificationAccess, NotificationDestination, NotificationLimits, NotificationView, NotificationPage, NotificationReadInput, NotificationManagementCommand, NotificationSyncCommand } from './notificationTypes';

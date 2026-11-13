@@ -8,7 +8,7 @@ import { usageAmounts } from './modelBudgetGuard';
 import { MIGRATIONS, SCHEMA_VERSION } from './schema';
 
 /** Caller owns BEGIN IMMEDIATE and rollback, including the migration ledger. */
-export function migrate(db: DatabaseSync): void {
+export function migrate(db: DatabaseSync, notificationBaseline?: () => void): void {
   const version = Number(db.prepare('PRAGMA user_version').get()!.user_version);
   if (!Number.isSafeInteger(version) || version < 0 || version > SCHEMA_VERSION) throw new DurableStoreError('SCHEMA_UNSUPPORTED');
   const ledgerExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'").get();
@@ -23,6 +23,12 @@ export function migrate(db: DatabaseSync): void {
     if (migration.version <= version) continue;
     if (migration.version === 10) validateNormalUsageBackfill(db);
     db.exec(migration.sql);
+    if (migration.version === 11) {
+      // The transaction owner installs a private exact-row migration participant.
+      // No source, delivery, transport or identity callback runs during migration.
+      requireIntegrity(notificationBaseline || !db.prepare('SELECT workflow_run_id FROM workflow_seeds LIMIT 1').get());
+      notificationBaseline?.();
+    }
     db.prepare('INSERT INTO schema_migrations VALUES (?, ?, ?)').run(migration.version, migration.id, Date.now());
     db.exec(`PRAGMA user_version = ${migration.version}`);
   }
