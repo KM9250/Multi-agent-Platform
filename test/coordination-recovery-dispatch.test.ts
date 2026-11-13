@@ -9,6 +9,7 @@ import { RecoveryDispatchReader } from '../services/coordination/durable/recover
 import { SafeRecoveryPlanner, SafeRecoveryAuthorizer, SafeRecoveryExecutor } from '../services/coordination/durable/safeRecoveryExecutor.ts';
 import { executionScopeOf } from '../services/coordination/durable/safeRecoveryStore.ts';
 import { digest } from '../services/coordination/durable/integrity.ts';
+import { DATABASE_NOW_SQL } from '../services/coordination/durable/leaseSchema.ts';
 import { corruptTable } from './recovery-execution-fixture.ts';
 
 const count=(f:ReturnType<typeof fixture>,table:string)=>Number(f.raw.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n);
@@ -135,8 +136,21 @@ for(const addEvidence of [false,true])test(`F-01: 25ms execution deadline reject
   const saved=dispatchContents(f.raw);assert.deepEqual(await f.execute(p),inspection);assert.deepEqual(dispatchContents(f.raw),saved);assert.equal(f.calls.execute,1);
 });
 test('grant start expiry does not end a started result collection window',async t=>{
-  const f=fixture(t,{timing:{executionTimeoutMs:1000}}),p=f.plan();f.authorize(p,undefined,200);f.hook(async()=>{await delay(240);return {status:'succeeded',summary:'after start expiry'};});
-  assert.equal((await f.execute(p)).status,'RESULT_RECORDED');assert.equal(f.calls.execute,1);
+  const f=fixture(t,{timing:{executionTimeoutMs:3000}}),p=f.plan(),grant=f.authorize(p,undefined,1000);let returnedAfterExpiry=false;
+  f.hook(async()=>{
+    const saved=f.raw.prepare('SELECT expires_at,status FROM recovery_controlled_grants WHERE authorization_id=?').get(grant.authorizationId)!;
+    const intent=JSON.parse(String(f.raw.prepare('SELECT intent_json FROM recovery_dispatch_intents').get()!.intent_json));
+    const now=Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now),expiresAt=Number(saved.expires_at);
+    assert.equal(saved.status,'CONSUMED');assert.equal(expiresAt,grant.expiresAt);
+    assert.ok(now<expiresAt,'Executor must enter while its persisted start grant is valid');
+    const remaining=expiresAt-now+25;assert.ok(remaining>0&&remaining<=1025);await delay(remaining);
+    const late=Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now);
+    assert.ok(late>expiresAt&&late<intent.resultCollectionDeadline);returnedAfterExpiry=true;
+    return {status:'succeeded',summary:'after start expiry'};
+  });
+  const result=await f.execute(p);assert.equal(returnedAfterExpiry,true);assert.equal(result.status,'RESULT_RECORDED');assert.equal(f.calls.execute,1);
+  assert.ok(result.receipt!.recordedAt>grant.expiresAt&&result.receipt!.recordedAt<result.intent!.resultCollectionDeadline);
+  const saved=dispatchContents(f.raw);assert.deepEqual(await f.execute(p),result);assert.deepEqual(dispatchContents(f.raw),saved);assert.equal(f.calls.execute,1);
 });
 test('lease loss during execution rejects Evidence and Result with no retry',async t=>{
   const f=fixture(t),p=f.plan();f.authorize(p);f.hook(async()=>{f.reacquire();await assert.rejects(f.put({late:true}));return {status:'succeeded',summary:'late'};});
