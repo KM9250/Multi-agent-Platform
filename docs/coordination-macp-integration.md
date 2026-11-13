@@ -24,6 +24,12 @@ receipt confirms MACP acceptance only. A replay need not republish live SSE;
 the receiver database/history remains authoritative. OS Push, reading and
 business approval are separate and are not provided by this integration.
 
+After the PR37 correction, both the in-process synthetic Host and independent
+MAP worker grant the notification Service only MATERIALIZE, CLAIM, SEND and
+COLLECT. VIEW/AUDIT are denied to that Service; detailed inspection uses a
+separate human credential. The same actual MACP HTTP/restart/ACK-loss assertions
+remain in place.
+
 See [validation](coordination-notification-validation.md) for results and limits.
 
 ## Historical COORD-4C path

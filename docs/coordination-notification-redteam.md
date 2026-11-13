@@ -20,7 +20,14 @@ Run on 2026-11-13 with Node `v24.19.0`:
 npm run test:notification-redteam
 ```
 
-The complete dedicated run passed **82/82 tests**, exit 0, with fail/skip/cancelled/todo all 0; final fixed-SHA duration was 10.556 seconds. This is one suite/file, not the sum of earlier partial runs. Other suite results, final code SHA, public HEAD, and final execution environment are recorded in [the validation report](coordination-notification-validation.md). This count must not be added to a full `npm test` count, which already includes it.
+The complete dedicated run passed **82/82 tests**, exit 0, with fail/skip/cancelled/todo all 0. This is one suite/file, not the sum of earlier partial runs. Current duration, other suite results, final code SHA, public HEAD, and execution environment are recorded in [the validation report](coordination-notification-validation.md). This count must not be added to a full `npm test` count, which already includes it.
+
+The separate [PR37 audit suite](../test/coordination-notification-audit-pr37.test.ts)
+adds 22 regressions for migrated baseline non-disclosure, exact sync target/current
+authority, service-only delivery permissions, post-Claim revocation, safe minimal
+OUTPUT, no-send branches, restart, and the unchanged migration011 SQL hash.
+[Before/after evidence](coordination-notification-audit-correction.md) records the
+two failures reproduced at the audited HEAD and their corrected behavior.
 
 ## Findings corrected during implementation
 
@@ -57,7 +64,7 @@ The first dedicated run had 59 passes and one output-mutation failure. Four subs
 | RT-D16 | [Source suite](../test/coordination-notification-source.test.ts): `SO-11/SO-12/SO-13: PR36 Controlled contradictory result, receipt, verified dispute and source share COMMIT` includes eight unverified candidate submissions and eight renewals producing zero sources before the genuine boundary. `SO-10/SO-14: finite failed planning emits one Recovery confirmation; heartbeat and inspect emit none` repeats eight heartbeat/inspect cycles. These are bounded synthetic repetitions, not a production load/DoS certification. |
 | RT-D17 | R: `inbound ACK` / `READ` / `retry_requested` / `WorkflowResumed is not a delivery-management command or business approval`. All tables and transport count remain unchanged. Receipt first-return and lost-ACK tests demonstrate accepted delivery without executing business operations. |
 | RT-D18 | R: the same inbound-command rejections, authorized notification CLOSE/PAUSE and in-flight collection cases retain every business table. Notification management does not change Hold, Invocation, grants or accounting. |
-| RT-D19 | R: first/cached Reader VIEW/OUTPUT withdrawal; SEND/OUTPUT revoked immediately after Claim COMMIT; management first return and lost COMMIT ACK; receipt first return and lost ACK with current VIEW/OUTPUT; full receipt/audit output inspection and pristine-copy checks. |
+| RT-D19 | R: first/cached Reader VIEW/OUTPUT withdrawal; SEND/OUTPUT revoked immediately after Claim COMMIT; management first return and lost COMMIT ACK; receipt first return/lost ACK returns only the Service acknowledgement under current OUTPUT, while detailed Reader VIEW/OUTPUT remains mandatory; full receipt/audit output inspection and pristine-copy checks. PR37 adds delivery-only SEND/COLLECT/OUTPUT withdrawal immediately after Claim. |
 | RT-D20 | R: network failure then CLOSE; HTTP502/503/504 then CLOSE; in-flight PAUSE then CLOSE with either failure or a valid receipt. [Outbox suite](../test/coordination-notification-outbox.test.ts): `DL-15/DL-16: resolved never-sent source and unknown prior send have different terminal meanings`. |
 | RT-D21 | R: known persisted claim DTO/SQL predicates cannot grant scope; destination alias mutation cannot duplicate or redirect a fixed Source. [Independent-process suite](../test/coordination-notification-process.test.ts) tests a single persistent stream Claim and byte-identical recovery. |
 | RT-D22 | R: `copied DB opened without explicit host opt-in cannot send or recreate a source`. This verifies default-disabled copied stores. It does not claim to detect an operator deliberately enabling two independent copies with identical production bindings. |

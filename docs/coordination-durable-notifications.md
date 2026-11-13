@@ -40,7 +40,9 @@ current authority, claim, generation, packet and realm. Revoking SEND prevents a
 new request, while a still-authorized collector may record an already started
 request's receipt. The authenticated reader separately checks current VIEW and
 OUTPUT. Receipt commit acknowledgement loss can be recovered by reading that
-receipt; it does not require another HTTP request or business operation.
+receipt under current COLLECT authority; it does not require another HTTP request
+or business operation. The Service receives only a cycle acknowledgement. It
+does not receive the receipt or the human Reader's detailed projection.
 
 ## Meaning of delivery state
 
@@ -120,7 +122,9 @@ resets the lifetime counter. No history is automatically deleted or compacted.
 Within a Workflow's canonical destination stream, source sequence determines
 claim order. An earlier unrouted, paused or failed source blocks a later source;
 an explicit authorized close can advance the stream. Other workflows progress
-independently. SQLite transactions are short and never span HTTP waits.
+independently. SQLite transactions never span HTTP waits. Large single-Workflow
+histories can still make provenance-validation transactions long, as measured in
+the PR37 performance follow-up below.
 
 Current ACL and necessity are checked before claim and immediately before send.
 There is still an unavoidable interval between the last check and HTTP: another
@@ -172,11 +176,36 @@ await worker.stop();             // stops new claims and bounds collection time
 db.close();
 ```
 
-The authenticated page exposes an immutable legacy baseline when present. Pass
-its digest as `expectedBaseline` to `syncUnresolved`, together with an authorized
-human credential, owner, destination and unique request ID. Management PAUSE,
-RESUME, RETRY and CLOSE similarly require an exact delivery revision and request
-ID. Request replay rechecks current authorization and output before returning.
+An ordinary `NotificationPage` never includes a migration baseline, even when
+all rows are visible. A sync operator obtains the unchanged Workflow-wide
+baseline through `readSyncBaseline(credential, { workflowRunId, ownerSubject,
+destinationId })`. This separate API requires current
+`SYNC_UNRESOLVED_NOTIFICATIONS` on the Workflow and the exact Owner/recipient,
+destination, audience and Realm; it checks OUTPUT and rechecks authority and
+Registry binding before returning. It does not require VIEW or write any row.
+The Host must grant this permission as access to the complete migration baseline,
+not as an extension of a row-limited VIEW grant.
+
+Pass the returned `baseline.digest` as `expectedBaseline` to `syncUnresolved`,
+with the authorized human credential and a unique request ID. A null baseline
+means that no migrated legacy baseline exists. `syncUnresolved` and management
+PAUSE/RESUME/RETRY/CLOSE still return a `NotificationPage`, and therefore require
+current VIEW and OUTPUT in addition to their operation-specific permission.
+Management also requires an exact delivery revision. Replay rechecks current
+authorization and output before returning. Migration 001–011 and the original
+baseline digest/occurrence identity contract are unchanged by the PR37 correction.
+
+The delivery Service needs only `MATERIALIZE_NOTIFICATION`,
+`CLAIM_NOTIFICATION_DELIVERY`, `SEND_NOTIFICATION` and
+`COLLECT_NOTIFICATION_RECEIPT`, scoped to the relevant targets. It need not have
+`VIEW_NOTIFICATION` or `VIEW_DELIVERY_AUDIT`. Both `materialize` and `runOnce`
+return only `{ workflowRunId, operation, code:
+'NOTIFICATION_SERVICE_CYCLE_COMPLETE', executionAllowed: false }`. This fixed
+acknowledgement means the bounded cycle returned, including when no route, work
+or send is available; it is not proof of delivery. Its OUTPUT check uses current
+MATERIALIZE or CLAIM authority respectively. Packet OUTPUT, SEND and COLLECT
+checks remain independent and mandatory. A separately authorized human Reader
+can inspect status, receipt, attempt history and audit.
 
 Reader pages filter row-specific VIEW denials before parsing protected source or
 packet bodies. Public `position` and `nextCursor` count only authorized rows; they
@@ -186,6 +215,10 @@ implementation retrieves routing metadata for the requested workflow and scans
 permissions to the authorized page; metadata work can grow with that workflow's
 source count even though returned bodies are capped at 200. The page's backlog
 summary is explicitly `scope: 'PAGE'`; follow cursors for further authorized rows.
+Canonical provenance is currently replayed for each returned/materialized source.
+The [PR37 audit measurements](coordination-notification-audit-correction.md)
+describe the substantial cost within a long single Workflow. No provenance
+validation is disabled to reduce that cost.
 
 The host worker scans at most its configured batch per cycle, rotates an explicit
 workflow cursor, and returns `nextCursor`. It limits concurrent sends with both

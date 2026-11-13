@@ -10,6 +10,13 @@ Migration011 creates notification tables and guards, records each existing workf
 
 Fresh v11 business writes capture their minimal Source with the business commit regardless of delivery configuration. Their capture reason is `ATOMIC_COMMIT`. The immutable legacy baseline is never advanced by Reader, sync replay, or later business capture. Opening the DB and calling Reader do not write notification state or perform HTTP.
 
+The ordinary Reader no longer exposes that Workflow-wide baseline. The PR37
+regression migrates actual v10 histories with different Journal/occurrence counts,
+compares their empty row-filtered pages, and verifies explicit authorized sync
+through `readSyncBaseline`. Owner, recipient/destination, current SYNC and OUTPUT
+are checked without changing the baseline digest or original notification IDs.
+See [the audit correction](coordination-notification-audit-correction.md).
+
 The populated migration fixture compares **all original columns of every pre-existing table**, rather than comparing only counts. Schema0 is genuinely empty; schemas1–10 contain the supported historical business fixture, with Seed/Journal and, where available, settled model usage, authorization/grant, and operation receipt data. Empty tables are compared too. This does not assert that every possible historical record combination was generated.
 
 ## Fixed migration SQL
@@ -28,8 +35,12 @@ The populated migration fixture compares **all original columns of every pre-exi
 | 008 | `e5dce90128045fea17ac4a074fd75b28208312b96f788f88e38662a64f2fb724` |
 | 009 | `ce474da204af7f9b065f726847f20ab53ae8d2c5e42988a96e399df5fa5c39a4` |
 | 010 | `a5240937de47521e07a4c8ac716cf8db232f05a90ef9279b53b134076b42d3a2` |
+| 011 (pinned to audited PR37 HEAD) | `a7563451450fea30fcfdc783f3bb542977d08055fd4ef9e1607e9c611b8ee0c7` |
 
 The v10 compatibility test archives and imports the **actual fixed baseline runtime** and verifies `SCHEMA_UNSUPPORTED` against a v11 file, with every table unchanged. It does not simulate old behavior by editing a schema number in current code.
+
+The PR37 audit suite additionally pins migration011; the existing migration suite
+continues to pin 001–010. No generated migration SQL changes in the correction.
 
 ## Crash evidence and limits
 
@@ -38,6 +49,11 @@ The v10 compatibility test archives and imports the **actual fixed baseline runt
 Before-COMMIT tests compare complete snapshots. After-COMMIT tests require the exact relevant Source/Attempt/Receipt/management/audit transition and compare every business table. The business+Source test explicitly permits and validates the existing `JOURNAL_APPENDED` audit emitted by the original business append; that audit is not silently excluded. Notification-only operations preserve Runtime Lease, Grant, Hold/Control, model/action ledger, and accounting rows.
 
 HTTP tests count actual loopback requests and receiver deduplication keys. `before-http` kills after Claim commit and before the transport invokes HTTP. `after-http` kills after the receiver accepted the packet and returned its response but before MAP receipt persistence. The surviving Claim is not proof of nonreceipt. Reopening within its TTL does not restore its one-shot permit. After expiry, a different process creates a new attempt and generation; it never resumes the old attempt.
+
+The shared process Host now grants the Service only MATERIALIZE, CLAIM, SEND and
+COLLECT notification permissions. Inspection uses a separately authenticated
+human. Thus these independent-process and SIGKILL regressions also exercise the
+absence of Service VIEW/AUDIT permission.
 
 The stale-worker test uses actual `SIGSTOP`, waits for the SQLite clock to exceed the persisted Claim expiry, lets another process complete delivery, and resumes the old process using `SIGCONT`. The old return must leave **every table** identical to the new worker's committed snapshot. Receiver packet contents remain identical and its logical event count remains one.
 
