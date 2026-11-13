@@ -1,6 +1,6 @@
 # COORD-5C-4C 実装・検証記録
 
-これはPR #36初回提出時の検証記録である。監査HEAD `2baf04d` に対するF-01／RT-01／RT-02の修正と最新の最終検証は[監査修正記録](coordination-reconciliation-pr36-corrections.md)を参照。
+これはPR #36初回提出時の検証記録である。監査HEAD `2baf04d` に対するF-01／RT-01／RT-02は[監査修正記録](coordination-reconciliation-pr36-corrections.md)、再監査HEAD `87ef2b5` に対するF-02と最新の全検証は[F-02修正記録](coordination-reconciliation-pr36-f02.md)を参照。文書のみの変更という記載と以下の件数は初回提出時の範囲を指す。
 
 基準main: `89d431e20cf1f6617d4095b9a8722d86fb711d1d`。
 最終実行ソースSHA: `dc74b063a14da8c2afd2807c7918050369bb12d3`。

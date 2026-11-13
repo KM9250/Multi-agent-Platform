@@ -156,6 +156,20 @@ the actual normal Usage under the existing unique authority. Its post-COMMIT
 notification runs after transaction scopes are cleared. Readers and candidate
 submission do not repair historical missed conflicts by writing to the database.
 
+PR #36 F-02 connects Controlled Dispatch Transaction B to that participant. After
+`persistDispatchResult`, the private `#finishControlledResult` validates the same
+transaction, lease, runtime/generation, actor and RESULT-phase receipt scope. It
+compares the saved receipt row with the exact granted SQL vector and checks the
+captured Intent/Receipt through the existing reader, including Result, Evidence,
+Grant consumption and required audits, before the collection deadline. Only then
+does it end the Controlled scope. The DB-owned normal fact participant can acquire
+its disjoint scope and commit the Result/Receipt and conflict together. The
+`!#controlledScope` guard remains intact; no public handoff, force flag, callback
+or new grant is exposed. The command poison flag remains set through COMMIT, so a
+later swallowed SQL error still rolls back all of B. A's consumed Grant and Send
+Permit remain consumed after B rollback, ACK loss or restart. No external adapter
+is called during this handoff. See the [F-02 report](coordination-reconciliation-pr36-f02.md).
+
 PR #36 RT-02 uses one output helper for first verification return, cache, lost-ACK
 recovery and explicit verification reads. Current Identity, VIEW_CASE,
 owner-specific USE_EVIDENCE and OUTPUT classification of the entire returned

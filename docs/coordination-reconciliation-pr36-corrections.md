@@ -1,5 +1,7 @@
 # PR #36 監査修正記録
 
+これは `87ef2b50b9dc9d4548d5965039b70a2a82a96870` 提出時のF-01／RT-01／RT-02の記録である。これらを維持した追加F-02修正と最新の全検証は[F-02修正記録](coordination-reconciliation-pr36-f02.md)を参照。「この後の変更は文書のみ」は当時の提出範囲を指す。
+
 監査基準HEAD: `2baf04df3532f240a87178cf336f89bc42f05de3`。基準main: `89d431e20cf1f6617d4095b9a8722d86fb711d1d`。修正ソース: `d377dd312832209d8e5bf39b58326d1decc0a2cd`。この後の変更は文書のみ。公開時の最終HEADはPR本文に記録する。Branchは既存の `codex/coord-5c-4c-evidence-reconciliation`。記録日: 2026-11-12（Asia/Tokyo）。
 
 この文書のF-01／RT-01／RT-02はPR #36の監査IDで、PR #35の同名IDとは別である。Schema 10、Contract `COORD-5C-4C:RECONCILIATION:1`を維持し、Migration 001〜010・依存・lockfileを変更していない。

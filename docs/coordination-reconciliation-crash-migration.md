@@ -1,8 +1,10 @@
 # COORD-5C-4C: Crash, process competition, and migration validation
 
 This records the initial PR #36 validation. The subsequent F-01/RT-01/RT-02
-corrections, additional crash/race cases and latest command totals are in the
+corrections and additional crash/race cases are in the
 [audit correction report](coordination-reconciliation-pr36-corrections.md).
+The latest F-02 Controlled Dispatch conflict Crash/ACK tests and full command
+totals are in the [F-02 report](coordination-reconciliation-pr36-f02.md).
 
 Baseline: `89d431e20cf1f6617d4095b9a8722d86fb711d1d`. The final tested source SHA and full-suite results are recorded in [coordination-reconciliation-validation.md](coordination-reconciliation-validation.md). These results concern synthetic local fixtures, independent Node processes, and temporary SQLite files; no production provider or paid API was used.
 
