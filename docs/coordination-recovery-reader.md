@@ -227,3 +227,13 @@ flags remain false, including for AUTHORIZED grants and READY_TO_RESUME results.
 Expiration is derived without a write. Timeline entries include Plan, Authorization,
 Hold Revision and verified-actor references. Pre-v6 first-resume semantics remain
 diagnosable; persisting a new WorkflowResumed is disabled by the 4A gate.
+
+## COORD-5C-4C integration (Schema 10)
+
+[ReconciliationReader](coordination-reconciliation-design.md) adds authenticated,
+read-only historical/effective inspection. Evidence bodies require a separate
+ACL; workflow-wide accounting/obligation inspection checks all included targets.
+Historical execution/usage rows and old receipt validation remain intact. Late
+terminal usage is displayed separately from the terminal snapshot. Inspection
+never verifies candidates, repairs rows, consumes grants, releases Holds or
+starts a Runner; `executionAllowed` remains false.

@@ -86,3 +86,13 @@ Reader output preserves historical model counts and adds effective counts and re
 `npm run test:recovery-execution` covers contracts, authorization, stale bindings, four operations, effective budgets, scope separation, rollback, receipts, two connections, migration 0–6 to 7, and native child-process SIGKILL before/after COMMIT and individual writes. The existing durable, execution, reader, lease, model and 4A suites remain regression requirements. Existing assertions are retained; successful final schema expectations advance to 7.
 
 Linux tests do not establish native Windows locking, permissions or crash behavior. Those remain a separate validation item. Production identity-provider integration and administrative HTTP/UI are outside this phase. 4B-2 must separately authorize bounded continuation, new calls, budget checks and final hold release; 4C must not infer unknown external outcomes or usage from a completed safe stop.
+
+## COORD-5C-4C integration (Schema 10)
+
+[Reconciliation](coordination-reconciliation-design.md) has its own contract,
+ACL, Plan/Grant and private database scope. Existing safe-recovery grants cannot
+authorize it. Current obligations and budget bindings use verified overlays;
+historical 4B receipts retain their original immutable evidence. Settled usage
+does not discard or reconstruct a response. Recording an Action fact does not
+apply its Task result; application needs a separate fresh Plan/Grant and current
+ASSIGNED/OPEN/RUNNING eligibility. Neither operation releases the Hold.

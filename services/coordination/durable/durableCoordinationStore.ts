@@ -9,6 +9,7 @@ import type { WorkflowCheckpoint } from './checkpoint';
 import { canonicalJson, digest, DurableStoreError, guarded, jsonCopy, requireIntegrity } from './integrity';
 import { nextAnchor, readJournal, validateSeed } from './restore';
 import { JOURNAL_SCHEMA_VERSION } from './schema';
+import { effectiveWorkflowUsage } from './reconciliationAccounting';
 import type { WorkflowLease } from './runtimeLease';
 
 export interface DurableCoordinationAdministration {
@@ -72,6 +73,7 @@ export class SqliteCoordinationRunnerStore implements CoordinationRunnerStore, D
     return this.database.read(tx => tx.all('SELECT workflow_run_id FROM workflow_seeds ORDER BY workflow_run_id').map(row => String(row.workflow_run_id)));
   }
   getSnapshot(id: string): CoordinationSnapshot { return this.restoreWorkflow(id); }
+  getEffectiveUsage(id: string) { return this.readWorkflow(tx => effectiveWorkflowUsage(tx, id)); }
   restoreWorkflow(id: string): CoordinationSnapshot {
     if (this.#applicationTx) return this.restoreWorkflowInTransaction(this.#applicationTx, id);
     return this.database.read(tx => this.restoreWorkflowInTransaction(tx, id));

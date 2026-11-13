@@ -9,6 +9,7 @@ import { ControlledRecoveryPlanner, ControlledRecoveryAuthorizer, RecoveryDispat
 import { RecoveryDispatchReader } from '../services/coordination/durable/recoveryDispatchReader.ts';
 import type { ControlledTiming } from '../services/coordination/durable/controlledRecoveryTypes.ts';
 import type { RecoveryAuthorizationPolicy } from '../services/coordination/durable/recoveryDecisionTypes.ts';
+import type { ReconciliationOptions } from '../services/coordination/durable/reconciliationTypes.ts';
 import type { RunnerExecutionResult, RunnerExecutionContext } from '../services/coordination/runner/types.ts';
 import { testIdentityProvider } from './recovery-authorization-fixture.ts';
 import { executionSeed, registration, record, clock } from './durable-execution-fixture.ts';
@@ -16,7 +17,7 @@ import { recoveryContents } from './recovery-execution-fixture.ts';
 
 export const controlledTables=['recovery_controlled_plans','recovery_controlled_grants','recovery_dispatch_intents','recovery_dispatch_grants','recovery_dispatch_receipts','recovery_dispatch_evidence'];
 export const dispatchContents=(raw:DatabaseSync)=>({...recoveryContents(raw),...Object.fromEntries(controlledTables.map(table=>[table,raw.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]))});
-export function dispatchFixture(t:Pick<TestContext,'after'>,options:{policy?:RecoveryAuthorizationPolicy;timing?:Partial<ControlledTiming>;risk?:'ALLOW'|'DENY'|'NEEDS_USER';path?:string;dir?:string;maxWallTimeMs?:number}={}){
+export function dispatchFixture(t:Pick<TestContext,'after'>,options:{policy?:RecoveryAuthorizationPolicy;timing?:Partial<ControlledTiming>;risk?:'ALLOW'|'DENY'|'NEEDS_USER';path?:string;dir?:string;maxWallTimeMs?:number;reconciliation?:ReconciliationOptions}={}){
   const dir=options.dir??mkdtempSync(join(tmpdir(),'map-controlled-')),path=options.path??join(dir,'db.sqlite');
   const identity=testIdentityProvider(),credential=identity.credential(),approver=identity.credential('approver',['RECOVERY_APPROVER']);
   const calls={execute:0,plan:0,verify:0};
@@ -24,7 +25,7 @@ export function dispatchFixture(t:Pick<TestContext,'after'>,options:{policy?:Rec
   const executor={id:'test',prepare:async()=>record.action,execute:(_action:unknown,context:RunnerExecutionContext)=>{calls.execute++;return hook(context);}};
   const binding={executor,contractVersion:'test:1',implementationDigest:'a'.repeat(64),sideEffectRetries:'disabled' as const};
   const registry={get:(id:string)=>id==='test'?binding:undefined};
-  const db=new DurableDatabase({path,recoveryIdentityVerifier:identity.verifier,recoveryAuthorizationPolicy:options.policy,controlledExecutors:registry,controlledTiming:options.timing});
+  const db=new DurableDatabase({path,recoveryIdentityVerifier:identity.verifier,recoveryAuthorizationPolicy:options.policy,controlledExecutors:registry,controlledTiming:options.timing,reconciliation:options.reconciliation});
   const admin=new SqliteCoordinationRunnerStore(db);admin.createWorkflow(executionSeed(options.risk??'ALLOW','run',{maxWallTimeMs:options.maxWallTimeMs??Number.MAX_SAFE_INTEGER}));
   const manager=db.createLeaseManager({ttlMs:120_000});let lease=manager.acquire('run'),store=admin.withLease(lease);
   const coordinator=new DurableExecutionCoordinator(store,{get:()=>executor},{clock});

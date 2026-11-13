@@ -19,6 +19,8 @@ import { runnerSecurityReviewReason, runnerEvidenceReviewReason, runnerActionApp
 import { isValidatedPlanningReadRegistry } from './planningReadRegistry';
 import type { PlanningReadRegistry } from './planningReadRegistry';
 import { readArtifact, readPlanningReviewTarget } from './planningArtifactStore';
+import { effectiveWorkflowUsage } from './reconciliationAccounting';
+import { effectiveActionRows } from './reconciliationEffectiveState';
 
 export function boundedTiming(input:Partial<InvocationTiming>={}):InvocationTiming {
   requireIntegrity(Object.keys(input).every(k=>k in DEFAULT_INVOCATION_TIMING));
@@ -69,7 +71,7 @@ export function artifactBasis(tx:DurableTransaction,id:string):string {
 }
 export function executionState(tx:DurableTransaction,id:string):string {
   const s=readJournal(tx,id).snapshot;
-  return digest({journal:s.events.at(-1),policy:s.policy,usage:s.run.usage,...controlledState(tx,id),
+  return digest({journal:s.events.at(-1),policy:s.policy,usage:effectiveWorkflowUsage(tx,id,s),...controlledState(tx,id),
     reads:tx.all('SELECT * FROM planning_read_calls WHERE workflow_run_id=? ORDER BY read_id',id),
     hold:tx.all('SELECT * FROM recovery_hold_transitions WHERE workflow_run_id=? ORDER BY revision',id)});
 }
@@ -84,7 +86,7 @@ export function assertCleanState(db:DurableDatabase,tx:DurableTransaction,input:
   else requireIntegrity(s.run.status==='RUNNING'||(['BLOCKED','SUSPENDED'].includes(s.run.status)&&input.resume));
   requireIntegrity(tx.get('SELECT coverage FROM model_call_coverage WHERE workflow_run_id=?',id)?.coverage==='TRACKED_FROM_CREATION'
     &&!effectiveModelRows(tx,id).some(r=>r.unresolved));
-  requireIntegrity(!tx.get("SELECT action_id FROM execution_ledger WHERE workflow_run_id=? AND state IN ('DISPATCH_RESERVED','RESULT_RECORDED','REVIEW_REQUIRED')",id));
+  requireIntegrity(!effectiveActionRows(tx,id).some(row=>row.unresolved));
   requireIntegrity(!tx.get("SELECT read_id FROM planning_read_calls WHERE workflow_run_id=? AND state='INTENT'",id));
   requireIntegrity(!runnerSecurityReviewReason(s)&&!runnerEvidenceReviewReason(s));
   for(const row of tx.all('SELECT prepared_action_json FROM pending_actions WHERE workflow_run_id=?',id)) {
@@ -96,12 +98,12 @@ export function assertCleanState(db:DurableDatabase,tx:DurableTransaction,input:
     requireIntegrity(open.length===0&&!tx.get("SELECT action_id FROM execution_ledger WHERE workflow_run_id=? AND state='PREPARED'",id));
   } else {
     const task=s.tasks[input.taskId!];requireIntegrity(task&&open.length===1&&open[0].sessionId===task.sessionId&&open[0].state==='OPEN'&&Object.values(s.tasks).filter(t=>t.sessionId===open[0].sessionId).length===1);
-    if(input.start==='VERIFY_FINALIZED_RESULT')requireIntegrity(['COMPLETED','FAILED'].includes(task.status)&&tx.get("SELECT action_id FROM execution_ledger WHERE workflow_run_id=? AND task_id=? AND state='FINALIZED'",id,task.taskId));
+    if(input.start==='VERIFY_FINALIZED_RESULT')requireIntegrity(['COMPLETED','FAILED'].includes(task.status)&&effectiveActionRows(tx,id).some(row=>row.historical.task_id===task.taskId && (row.historical.state==='FINALIZED'||row.application)));
     else requireIntegrity(task.status==='ASSIGNED'&&tx.get("SELECT action_id FROM execution_ledger WHERE workflow_run_id=? AND task_id=? AND action_id=? AND state='PREPARED'",id,task.taskId,input.actionId!));
   }
   requireIntegrity(Object.values(s.tasks).every(t=>!!tx.get('SELECT task_id FROM execution_ledger WHERE workflow_run_id=? AND task_id=?',id,t.taskId)));
   const budget=modelBudgetPosition(tx,new SqliteCoordinationRunnerStore(db),id);
-  requireIntegrity(!findExhaustedBudget(s.run.budget,s.run.usage,Math.max(0,recoveryTime(tx)-s.run.createdAt)));
+  requireIntegrity(!findExhaustedBudget(s.run.budget,effectiveWorkflowUsage(tx,id,s),Math.max(0,recoveryTime(tx)-s.run.createdAt)));
   requireIntegrity(Object.keys(budget.limit).every(k=>budget.committed[k as keyof typeof budget.limit]+budget.outstanding[k as keyof typeof budget.limit]<=budget.limit[k as keyof typeof budget.limit]));
   if(input.operation==='RELEASE_RECOVERY_HOLD')requireIntegrity(c.hold_state==='HELD'&&!c.planning_review_pending);
   if(c.planning_review_pending) {

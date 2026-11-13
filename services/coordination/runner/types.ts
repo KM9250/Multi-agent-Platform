@@ -1,9 +1,11 @@
 import type { RequestScheduler } from '../../scheduler';
-import type { CoordinationAuditEntry, CoordinationAuditView, CoordinationEvent, CoordinationSnapshot, CoordinationTask } from '../types';
+import type { CoordinationAuditEntry, CoordinationAuditView, CoordinationEvent, CoordinationSnapshot, CoordinationTask, WorkflowUsage } from '../types';
 
 export interface CoordinationRunnerStore {
   readonly persistence?: 'durable';
   getSnapshot(workflowRunId: string): CoordinationSnapshot;
+  /** Current accounting projection; getSnapshot continues to return historical replay. */
+  getEffectiveUsage?(workflowRunId: string): WorkflowUsage;
   append(event: CoordinationEvent): CoordinationSnapshot;
 }
 export interface RunnerClock { now(): number }
@@ -40,10 +42,19 @@ export interface RunnerPlanRequest {
   workflowRunId: string; goal: string; acceptanceCriteria: string[]; satisfiedCriteria: string[];
   audit: CoordinationAuditView; recentTrail: CoordinationAuditEntry[];
   systemContract: string; signal?: AbortSignal;
+  effectiveUsage?: WorkflowUsage;
+  reconciledFacts?: RunnerReconciledFact[];
 }
 export interface RunnerVerifyRequest {
   workflowRunId: string; goal: string; acceptanceCriteria: string[]; task: CoordinationTask;
   evidence: RunnerEvidence[]; audit: CoordinationAuditView; systemContract: string; signal?: AbortSignal;
+  effectiveUsage?: WorkflowUsage;
+  reconciledFacts?: RunnerReconciledFact[];
+}
+/** Normalized, host-authorized facts only. Neither evidence bodies nor authority. */
+export interface RunnerReconciledFact {
+  operationId:string; targetId:string; attemptId:string; verificationId:string;
+  claimDigest:string; outcome:string; resultRef?:string;
 }
 export type RunnerPlanProposal =
   | { kind: 'execute'; objective: string; assigneeAgentId?: string; action: RunnerActionProposal }
@@ -126,6 +137,8 @@ export interface RunnerDurableModelCalls {
  call(input: {workflowRunId:string; roundKey:string; phase:'PLAN'|'VERIFY'; requestCursor:number; requestEventId:string; request:RunnerPlanRequest|RunnerVerifyRequest}): Promise<{value:unknown; modelCallId:string}>;
  apply<T>(id:string,callId:string,cursor:number,fn:()=>T):RunnerModelApplicationResult<T>;
  discard(id:string,callId:string,reason:RunnerModelDiscardReason):void;
+ /** Dedicated authenticated projection for a new reconciliation result reference. */
+ getReconciledEvidence?(id:string,task:CoordinationTask,ref:string):RunnerEvidence|undefined;
 }
 export interface CoordinationRunnerDependencies {
   durableModelCalls?: RunnerDurableModelCalls;

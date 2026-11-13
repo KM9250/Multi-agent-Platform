@@ -210,3 +210,19 @@ no such scope. Workflow, Model Call, phase, round, request/settlement Journal
 positions and current Lease/Generation must match. Complete Action registration
 and APPLIED commit together; failed or caught registration/SQL errors roll both
 back. VERIFY and already-held Workflows cannot use the PLAN exception.
+
+## COORD-5C-4C integration (Schema 10)
+
+[Evidence reconciliation](coordination-reconciliation-design.md) adds one
+`model_usage_authorities` row per dispatched attempt. Normal settlement acquires
+NORMAL authority in its existing transaction; verified reconciliation acquires
+RECONCILED authority with its own operation and approval. Either winning path
+prevents a second UsageRecorded/accounting effect. Migration validates normal
+settlement history before backfill. Legacy non-model usage stays Journal-based.
+
+`getSnapshot()` remains historical replay. `getEffectiveUsage()`,
+`modelBudgetPosition()` and invocation usage include late reconciled usage once.
+A complete settlement resolves its whole outstanding reservation but returns no
+call/send permit/debit. Partial usage keeps the reservation. A missing model
+response remains a separate obligation. Production provider billing verifiers
+are not connected; synthetic signed receipts do not certify a production model.

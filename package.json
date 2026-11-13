@@ -17,10 +17,12 @@
     "test:model-call-ledger": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/coordination-model-call-*.test.ts",
     "test:recovery-authorization": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/coordination-recovery-authorization*.test.ts",
     "test:recovery-execution": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/coordination-recovery-execution*.test.ts",
-    "test:recovery-dispatch": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/coordination-recovery-dispatch*.test.ts",
+    "test:recovery-dispatch": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/coordination-recovery-dispatch*.test.ts test/coordination-reconciliation-redteam-pr36-controlled.test.ts",
     "test:recovery-continuation": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/coordination-recovery-continuation*.test.ts",
     "test:planning-only": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/coordination-planning-only*.test.ts",
-    "test:hold-lifecycle": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/coordination-hold-lifecycle*.test.ts"
+    "test:hold-lifecycle": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/coordination-hold-lifecycle*.test.ts",
+    "test:reconciliation": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/coordination-reconciliation*.test.ts",
+    "test:reconciliation-redteam": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/coordination-reconciliation-redteam*.test.ts"
   },
   "dependencies": {
     "@google/genai": "^1.30.0",

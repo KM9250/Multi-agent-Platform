@@ -11,6 +11,7 @@ import { modelBudgetPosition, validateQuote } from './modelCallLedger';
 import { inspectSafeRecoveryAction } from './safeRecoveryActions';
 import { SAFE_RECOVERY_CONTRACT, SAFE_RECOVERY_OPERATIONS } from './safeRecoveryTypes';
 import type { CreateRecoveryExecutionPlan, RecoveryExecutionBinding, RecoveryExecutionPlan, RecoveryExecutionPreview, SafeRecoveryOperationKind } from './safeRecoveryTypes';
+import { effectiveWorkflowUsage, reconciliationStateDigest } from './reconciliationAccounting';
 
 export function effectiveHoldRevision(tx: DurableTransaction, id: string): number {
   const original = tx.get('SELECT revision,active FROM recovery_holds WHERE workflow_run_id=?', id);
@@ -70,10 +71,10 @@ export function safeRecoveryBinding(db: DurableDatabase, tx: DurableTransaction,
   return {
     workflowRunId: id, operationKind: input.operationKind, targetId: input.targetId,
     journalCursor: snapshot.events.at(-1)!.sequence, journalEventId: snapshot.events.at(-1)!.eventId,
-    actionStateDigest: digest({ ledger: rows('execution_ledger'), actions: rows('pending_actions'), results: rows('execution_results'), evidence: rows('runner_evidence') }),
-    modelStateDigest: digest({ ledger: rows('model_call_ledger'), attempts: rows('model_call_attempts'), resolutions: rows('recovery_model_resolutions'), coverage: rows('model_call_coverage') }),
+    actionStateDigest: digest({ ledger: rows('execution_ledger'), actions: rows('pending_actions'), results: rows('execution_results'), evidence: rows('runner_evidence'), reconciliation:reconciliationStateDigest(tx,id) }),
+    modelStateDigest: digest({ ledger: rows('model_call_ledger'), attempts: rows('model_call_attempts'), resolutions: rows('recovery_model_resolutions'), coverage: rows('model_call_coverage'), reconciliation:reconciliationStateDigest(tx,id) }),
     policyDigest: digest({ workflow: snapshot.policy, recovery: db.recoveryPolicy }),
-    budgetPositionDigest: digest({ budget: modelBudgetPosition(tx, store, id), usage: snapshot.run.usage }),
+    budgetPositionDigest: digest({ budget: modelBudgetPosition(tx, store, id), usage: effectiveWorkflowUsage(tx,id,snapshot) }),
     recoveryHoldRevision: effectiveHoldRevision(tx, id), runtimeInstanceId: String(lease.owner_instance_id), runtimeGeneration: Number(lease.generation),
     authorizationRequirements: { reviews: inspection.authorizationRequirements, approvalPolicy: db.recoveryPolicy[input.operationKind] ?? { minimumApprovers: 1, forbidSelfApproval: false } },
     plannedChanges: input.operationKind === 'REFLECT_RECORDED_RESULT' ? ['RECORDED_RESULT_EVENT','EXECUTION_FINALIZED']

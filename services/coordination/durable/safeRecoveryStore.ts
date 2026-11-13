@@ -14,6 +14,8 @@ import { evaluateRunnerActionRisk } from '../runner/policyGuard';
 import type { PreparedRunnerAction } from '../runner/types';
 import { validateAuditRow } from './recoveryAudit';
 import { findExhaustedBudget } from '../policy';
+import { effectiveActionRows } from './reconciliationEffectiveState';
+import { effectiveWorkflowUsage } from './reconciliationAccounting';
 import { SAFE_RECOVERY_CONTRACT } from './safeRecoveryTypes';
 import type { RecoveryExecutionGrant, RecoveryExecutionGrantScope, RecoveryExecutionPlan, RecoveryOperationReceipt, SafeRecoveryCommand, SafeRecoveryIntent } from './safeRecoveryTypes';
 
@@ -179,16 +181,23 @@ export function readSafeRecoveryReceipt(tx: DurableTransaction, executionPlanId:
   return receipt;
 }
 function nextHoldState(tx: DurableTransaction, id: string): RecoveryOperationReceipt['holdState'] {
-  const unresolvedAction = tx.get("SELECT action_id FROM execution_ledger WHERE workflow_run_id=? AND state IN ('DISPATCH_RESERVED','RESULT_RECORDED','REVIEW_REQUIRED')", id);
+  const unresolvedAction = effectiveActionRows(tx,id).some(row=>row.unresolved);
+  // This participant runs before this transaction's new 4B receipt exists.
+  // Its new resolution is scope-checked; previously committed 4C settlements
+  // are validated by effectiveWorkflowUsage below. Do not read a half-built
+  // 4B receipt via effectiveModelRows at this boundary.
   const unresolvedModel = tx.get(`SELECT m.model_call_id FROM model_call_ledger m WHERE m.workflow_run_id=? AND
-    (m.budget_violation=1 OR (NOT EXISTS (SELECT 1 FROM recovery_model_resolutions r WHERE r.model_call_id=m.model_call_id)
-      AND (m.state IN ('RESERVED','DISPATCH_INTENT','REVIEW_REQUIRED') OR m.application_status='PENDING_APPLICATION')))`, id);
+    (m.budget_violation=1 OR EXISTS(SELECT 1 FROM reconciliation_disputes d WHERE d.workflow_run_id=m.workflow_run_id AND d.target_kind='MODEL' AND d.target_id=m.model_call_id)
+      OR EXISTS(SELECT 1 FROM reconciled_model_usages u WHERE u.workflow_run_id=m.workflow_run_id AND u.model_call_id=m.model_call_id AND (u.budget_violation=1 OR u.response_status='UNAVAILABLE_REVIEW_REQUIRED'))
+      OR (NOT EXISTS (SELECT 1 FROM recovery_model_resolutions r WHERE r.model_call_id=m.model_call_id)
+        AND NOT EXISTS (SELECT 1 FROM model_usage_authorities a WHERE a.workflow_run_id=m.workflow_run_id AND a.model_call_id=m.model_call_id AND a.authority='RECONCILED')
+        AND (m.state IN ('RESERVED','DISPATCH_INTENT','REVIEW_REQUIRED') OR m.application_status='PENDING_APPLICATION')))`, id);
   const snapshot = readJournal(tx, id).snapshot;
   const actions = tx.all('SELECT prepared_action_json FROM pending_actions WHERE workflow_run_id=?', id).map(r => parseJson<PreparedRunnerAction>(r.prepared_action_json));
   const missingHistory = Object.values(snapshot.tasks).some(t => !tx.get('SELECT action_id FROM execution_ledger WHERE workflow_run_id=? AND task_id=?', id, t.taskId));
   const review = runnerSecurityReviewReason(snapshot) || runnerEvidenceReviewReason(snapshot)
     || actions.some(a => evaluateRunnerActionRisk(snapshot, a) === 'DENY' || evaluateRunnerActionRisk(snapshot, a) === 'NEEDS_USER' && !runnerActionApproved(snapshot, a));
-  const exhausted = findExhaustedBudget(snapshot.run.budget, snapshot.run.usage, Math.max(0, recoveryTime(tx) - snapshot.run.createdAt));
+  const exhausted = findExhaustedBudget(snapshot.run.budget, effectiveWorkflowUsage(tx,id,snapshot), Math.max(0, recoveryTime(tx) - snapshot.run.createdAt));
   return unresolvedAction || unresolvedModel || missingHistory || review || exhausted || snapshot.run.status !== 'RUNNING'
     || tx.get('SELECT coverage FROM model_call_coverage WHERE workflow_run_id=?', id)?.coverage !== 'TRACKED_FROM_CREATION'
     ? 'RECOVERY_STEP_APPLIED' : 'READY_FOR_CONTINUATION_REVIEW';

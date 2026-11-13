@@ -1,4 +1,4 @@
-import type { CoordinationSnapshot } from '../types';
+import type { CoordinationSnapshot, WorkflowUsage } from '../types';
 import { findExhaustedBudget } from '../policy';
 import { emptyWorkflowUsage } from '../usage';
 import type { ExecutionStateSummary, RecoveryAuthorizationRequirement, RecoveryDisposition, RecoveryInspection, RecoveryNextStep } from './recoveryTypes';
@@ -9,18 +9,20 @@ export interface RecoveryFacts {
   executions: ExecutionStateSummary[]; missingHistoricalLedger?: boolean;
   integrityReason?: string; unresolvedSecurityReview?: boolean; unresolvedEvidenceReview?: boolean;
   authorizationRequirements?: RecoveryAuthorizationRequirement[];
+  effectiveUsage?: WorkflowUsage;
 }
 /** Static diagnosis only. The result never grants dispatch, model calls, or a resume. */
 export function classifyRecovery(facts: RecoveryFacts): RecoveryInspection {
   const { snapshot: s, executions, inspectedAt } = facts;
   const reasons: string[] = [];
-  const budgetStatus = !s ? 'UNVERIFIED' : findExhaustedBudget(s.run.budget, s.run.usage, Math.max(0, inspectedAt - s.run.createdAt))
+  const budgetStatus = !s ? 'UNVERIFIED' : findExhaustedBudget(s.run.budget, facts.effectiveUsage ?? s.run.usage, Math.max(0, inspectedAt - s.run.createdAt))
     ? 'RECORDED_LIMIT_EXHAUSTED' : 'WITHIN_RECORDED_LIMITS';
   const finish = (disposition: RecoveryDisposition, nextStep: RecoveryNextStep, reason: string): RecoveryInspection => ({
     workflowRunId: facts.workflowRunId, workflowStatus: s?.run.status ?? 'UNKNOWN', disposition, nextStep,
     journalCursor: s?.events.at(-1)?.sequence ?? 0, journalTimestamp: s?.events.at(-1)?.timestamp, inspectedAt,
-    pendingActionIds: executions.filter(e => e.state !== 'FINALIZED').map(e => e.actionId), executionStates: executions,
+    pendingActionIds: executions.filter(e => e.state !== 'FINALIZED' && e.reconciledApplication !== 'APPLIED').map(e => e.actionId), executionStates: executions,
     recordedUsage: { ...(s?.run.usage ?? emptyWorkflowUsage()) }, budgetStatus,
+    effectiveWorkflowUsage: facts.effectiveUsage,
     modelCallCoverage: facts.modelCallCoverage ?? 'UNVERIFIED', modelCalls:facts.modelCalls, requiresExplicitAuthorization: disposition !== 'INACTIVE',
     authorizationRequirements: (facts.authorizationRequirements ?? []).map(requirement => ({ ...requirement })),
     stopJournalEventId: s ? [...s.events].reverse().find(event => ['WorkflowBlocked','WorkflowSuspended'].includes(event.type))?.eventId : undefined,
@@ -28,9 +30,9 @@ export function classifyRecovery(facts: RecoveryFacts): RecoveryInspection {
       ...(facts.modelCallCoverage==='LEGACY_UNTRACKED'?['MODEL_CALL_LEGACY_UNTRACKED']:[]), 'EXECUTION_NOT_AUTHORIZED'])], executable: false, executionAllowed: false,
   });
   if (facts.integrityReason || !s) return finish('RECOVERY_FAILED', 'REQUIRE_OPERATOR_REVIEW', facts.integrityReason ?? 'SAVED_DATA_INVALID');
-  if(facts.modelCalls && ((facts.modelCalls.effectiveReserved ?? facts.modelCalls.reserved)+facts.modelCalls.dispatchIntent+facts.modelCalls.reviewRequired+(facts.modelCalls.effectivePendingApplication ?? facts.modelCalls.pendingApplication)+facts.modelCalls.budgetViolations)>0) return finish('REVIEW_REQUIRED','REQUIRE_OPERATOR_REVIEW','MODEL_CALL_REVIEW_REQUIRED');
+  if(facts.modelCalls && ((facts.modelCalls.effectiveReserved ?? facts.modelCalls.reserved)+(facts.modelCalls.effectiveUnknownUsage ?? facts.modelCalls.dispatchIntent+facts.modelCalls.reviewRequired)+(facts.modelCalls.effectivePendingApplication ?? facts.modelCalls.pendingApplication)+(facts.modelCalls.effectiveBudgetViolations ?? facts.modelCalls.budgetViolations)+(facts.modelCalls.disputed ?? 0))>0) return finish('REVIEW_REQUIRED','REQUIRE_OPERATOR_REVIEW','MODEL_CALL_REVIEW_REQUIRED');
   for (const e of executions) if (e.reviewReason) reasons.push(e.reviewReason);
-  const unknown = executions.some(e => e.state === 'DISPATCH_RESERVED' || e.state === 'REVIEW_REQUIRED' && e.reviewReason !== 'SECURITY_REVIEW_REQUIRED');
+  const unknown = executions.some(e => e.reconciliationUnresolved ?? (e.state === 'DISPATCH_RESERVED' || e.state === 'REVIEW_REQUIRED' && e.reviewReason !== 'SECURITY_REVIEW_REQUIRED'));
   if (unknown) return finish('REVIEW_REQUIRED', s.run.status === 'RUNNING' && executions.some(e => e.safetyStopIncomplete)
     ? 'COMPLETE_SAFETY_STOP' : 'REQUIRE_OPERATOR_REVIEW', 'EXECUTION_OUTCOME_REVIEW_REQUIRED');
   if (facts.unresolvedSecurityReview || facts.unresolvedEvidenceReview) return finish('REVIEW_REQUIRED', 'REQUIRE_OPERATOR_REVIEW',
@@ -44,7 +46,7 @@ export function classifyRecovery(facts: RecoveryFacts): RecoveryInspection {
   if (budgetStatus === 'RECORDED_LIMIT_EXHAUSTED') return finish('REVIEW_REQUIRED', 'REQUIRE_OPERATOR_REVIEW', 'RECORDED_BUDGET_EXHAUSTED');
   const active = executions.filter(e => ['PREPARED','RESULT_RECORDED'].includes(e.state) && e.taskStatus === 'ASSIGNED');
   if (active.length > 1) return finish('RECOVERY_FAILED', 'REQUIRE_OPERATOR_REVIEW', 'EXECUTION_STATE_CONFLICT');
-  const result = executions.find(e => e.state === 'RESULT_RECORDED');
+  const result = executions.find(e => e.state === 'RESULT_RECORDED' && e.reconciledApplication !== 'APPLIED');
   if (result) return result.taskStatus === 'ASSIGNED' && result.sessionState === 'OPEN'
     ? finish('READY_TO_RESUME', 'REFLECT_RECORDED_RESULT', 'RECORDED_RESULT_VALIDATED')
     : finish('REVIEW_REQUIRED', 'REQUIRE_OPERATOR_REVIEW', 'RESULT_REFLECTION_CONDITIONS_UNMET');
