@@ -1,5 +1,33 @@
 # MAP–MACP notification integration (COORD-4C)
 
+## COORD-5D current durable path
+
+The COORD-4C example below describes the retained in-memory/non-durable path.
+For a SQLite store, use the explicit notification runtime/worker described in
+[Durable notifications](coordination-durable-notifications.md). Attaching the old
+observer to a durable store is rejected to prevent double delivery wiring.
+
+The durable integration uses the same unmodified MACP reference
+`e88937d0c8132ae7d18098a24d01ee28bffda655`, authenticated loopback HTTP and temporary
+receiver/MAP SQLite databases:
+
+```sh
+MACP_REPO_PATH=/absolute/path/to/fixed-macp \
+MACP_PYTHON=/absolute/path/to/test-venv/bin/python \
+npm run test:notification-macp
+```
+
+This suite includes same-packet replay, real 401/409, response loss with an
+independent MAP worker restart, same-DB MACP restart, authenticated history,
+live SSE, all four new canonical kinds and business-table invariance. A valid
+receipt confirms MACP acceptance only. A replay need not republish live SSE;
+the receiver database/history remains authoritative. OS Push, reading and
+business approval are separate and are not provided by this integration.
+
+See [validation](coordination-notification-validation.md) for results and limits.
+
+## Historical COORD-4C path
+
 The MAP HTTP adapter runs in a trusted Node process. The Vite application does
 not send authenticated MACP notifications. The operator supplies the destination
 and token; neither a model nor external content chooses them.
