@@ -35,7 +35,7 @@ import type { RunnerModelApplicationResult } from '../runner/types';
 import type { CoordinationEvent } from '../types';
 import type { RunnerEvidence } from '../runner/types';
 import type { EvidenceOwner } from './evidenceStore';
-import type { ControlledCommand, ControlledExecutorRegistry, ControlledTiming, DispatchInspection, DispatchIntent } from './controlledRecoveryTypes';
+import type { ControlledCommand, ControlledExecutorRegistry, ControlledTiming, DispatchInspection, DispatchIntent, DispatchReceipt } from './controlledRecoveryTypes';
 import { controlledBinding, controlledTiming, preparedEligibility, dispatchPostState, assertControlledBudget } from './controlledRecoveryPlanner';
 import { assertDispatchSink, controlledVector, persistControlledDecision, persistDispatchEvidence, persistDispatchResult, readControlledPlan, reserveControlledDispatch } from './recoveryDispatchStore';
 import type { ControlledWriter } from './recoveryDispatchStore';
@@ -89,7 +89,7 @@ interface SafeRecoveryScope {
   tx: DurableTransaction; intent: SafeRecoveryIntent;
   seedUpdates: string[]; ledgerBefore?: Row;
 }
-interface ControlledSqlScope { tx: DurableTransaction; table: string; row: Row; old?: Row; actorId: string }
+interface ControlledSqlScope { tx: DurableTransaction; table: string; row: Row; old?: Row; actorId: string; phase: 'MANAGE'|'RESERVE'|'RESULT' }
 interface DispatchSink { intent: DispatchIntent; lease: WorkflowLease; valid: boolean; collecting: boolean; execution: ControlledExecutionWindow }
 
 /** One synchronous transaction owner. SQLite serializes writers across connections. */
@@ -324,8 +324,26 @@ export class DurableDatabase {
       this.assertWorkflowWrite(tx,lease.workflowRunId);
       requireIntegrity(tables.includes(table) && row.workflow_run_id === lease.workflowRunId && (!old || old.workflow_run_id === lease.workflowRunId)
         && !this.#modelApplication && !this.#safeRecovery);
-      this.#controlledScope = {tx,table,row:jsonCopy(row),old:old && jsonCopy(old),actorId};
+      this.#controlledScope = {tx,table,row:jsonCopy(row),old:old && jsonCopy(old),actorId,phase};
     };
+  }
+  /** End B's exact SQL capability only after its persisted Result, Receipt and audits validate.
+   * The transaction-owned normal fact participant may then acquire its own disjoint scope. */
+  #finishControlledResult(tx: DurableTransaction, lease: WorkflowLease, intent: DispatchIntent, receipt: DispatchReceipt): void {
+    this.assertWorkflowWrite(tx,lease.workflowRunId);
+    const scope=this.#controlledScope;
+    requireIntegrity(this.#context?.kind==='lease' && this.#context.record.handle===lease
+      && intent.workflowRunId===lease.workflowRunId && intent.runtimeInstanceId===lease.runtimeInstanceId && intent.runtimeGeneration===lease.generation
+      && this.#controlledCommand && scope?.tx===tx && scope.phase==='RESULT' && scope.table==='recovery_dispatch_receipts'
+      && !scope.old && scope.actorId===intent.actorId && !this.#safeRecovery && !this.#modelApplication
+      && !this.#reconciliationScope && !this.#normalFactParticipant);
+    const saved=tx.get('SELECT * FROM recovery_dispatch_receipts WHERE operation_id=?',intent.operationId);
+    requireIntegrity(saved && controlledVector(scope.table,saved)===controlledVector(scope.table,scope.row));
+    const inspection=inspectDispatchInTransaction(tx,intent.planId);
+    requireIntegrity(canonicalJson(inspection.intent)===canonicalJson(intent) && canonicalJson(inspection.receipt)===canonicalJson(receipt)
+      && recoveryTime(tx)<intent.resultCollectionDeadline);
+    this.#controlledScope=undefined;
+    // Keep #controlledCommand set through COMMIT so any later SQL rejection still poisons all of B.
   }
   previewControlledDispatch(workflowRunId: string) {
     return this.read(tx => {
@@ -430,8 +448,7 @@ export class DurableDatabase {
         this.#writeFenced(lease,intent.workflowRunId,tx => {
           requireIntegrity(sink.valid && this.#resultSinks.has(sink));
           const receipt = persistDispatchResult(tx,intent,normalized,recordedAt,this.#controlledWriter(tx,lease,intent.actorId,'RESULT'));
-          requireIntegrity(canonicalJson(inspectDispatchInTransaction(tx,planId).receipt) === canonicalJson(receipt)
-            && recoveryTime(tx) < intent.resultCollectionDeadline);
+          this.#finishControlledResult(tx,lease,intent,receipt);
           return receipt;
         });
       } catch (error) {
