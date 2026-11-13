@@ -375,7 +375,7 @@ test(`RT-D09 DL-19: ${kind} AbortSignal is refused before attacker accessors or 
 });
 
 for (const lostAck of [false, true]) for (const revoke of ['VIEW_NOTIFICATION', 'OUTPUT'] as const)
-test(`AU-D04: receipt ${lostAck ? 'lost ACK recovery' : 'first return'} applies current ${revoke} without repeating HTTP`, async t => {
+test(`AU-D04/PR37 F-01: receipt ${lostAck ? 'lost ACK recovery' : 'first return'} separates Service result from current Reader ${revoke} without repeating HTTP`, async t => {
   const f = fixture(t); f.materialize(); const before = f.contents(true); let committed = false;
   f.acl(a => !(committed && a.permission === revoke)); f.output(() => !(committed && revoke === 'OUTPUT'));
   const exec = DatabaseSync.prototype.exec;
@@ -386,10 +386,15 @@ test(`AU-D04: receipt ${lostAck ? 'lost ACK recovery' : 'first return'} applies 
     }
     return result;
   };
-  try { await assert.rejects(f.run(), fixedError); } finally { DatabaseSync.prototype.exec = exec; }
+  try {
+    if (revoke === 'OUTPUT') await assert.rejects(f.run(), fixedError);
+    else assert.deepEqual(await f.run(), { workflowRunId: 'run', operation: 'RUN_ONCE', code: 'NOTIFICATION_SERVICE_CYCLE_COMPLETE', executionAllowed: false });
+  } finally { DatabaseSync.prototype.exec = exec; }
   assert.equal(committed, true); assert.equal(f.packets.length, 1); assert.deepEqual(f.contents(true), before);
   assert.equal(f.raw.prepare('SELECT count(*) AS n FROM notification_delivery_receipts').get()!.n, 1);
-  const after = f.contents(); denied(f, () => f.page()); await assert.rejects(f.run(), fixedError);
+  const after = f.contents(); denied(f, () => f.page());
+  if (revoke === 'OUTPUT') await assert.rejects(f.run(), fixedError);
+  else assert.deepEqual(await f.run(), { workflowRunId: 'run', operation: 'RUN_ONCE', code: 'NOTIFICATION_SERVICE_CYCLE_COMPLETE', executionAllowed: false });
   assert.equal(f.packets.length, 1); assert.deepEqual(f.contents(), after);
   f.acl(() => true); f.output(() => true); assert.equal(f.page().items[0].state, 'DELIVERED'); await f.run();
   assert.equal(f.packets.length, 1); assert.deepEqual(f.contents(), after);

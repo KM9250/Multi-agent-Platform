@@ -76,7 +76,8 @@ try {
     for (let i = start; i < population; i++) {
       const id = `capacity-${i.toString().padStart(5, '0')}`;
       const measured = measure(() => db.notifications.materialize(credential, { workflowRunId: id }));
-      assert.equal(measured.value.items[0].state, 'PENDING'); materialize.push(measured.elapsed);
+      assert.equal(measured.value.code, 'NOTIFICATION_SERVICE_CYCLE_COMPLETE'); materialize.push(measured.elapsed);
+      assert.equal(db.notifications.read(credential, { workflowRunId: id }).items[0].state, 'PENDING');
       if ((i + 1) % 1000 === 0) process.stdout.write(`Materialized ${i + 1} synthetic deliveries\n`);
     }
     const count = db.read(tx => ({ sources: tx.get('SELECT count(*) n FROM notification_sources')!.n,

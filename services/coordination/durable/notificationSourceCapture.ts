@@ -66,15 +66,28 @@ export function initializeNotificationBaselines(tx:DurableTransaction,write:Noti
   }
 }
 
+function verifiedBaseline(tx:DurableTransaction,workflowRunId:string) {
+  const row=tx.get('SELECT * FROM notification_migration_baselines WHERE workflow_run_id=?',workflowRunId);
+  if(!row)return;
+  const ids=parseJson<string[]>(row.occurrence_ids_json);
+  const body={workflowRunId,journalSequence:Number(row.journal_sequence),journalAnchor:String(row.journal_anchor),occurrenceIds:ids};
+  requireIntegrity(Array.isArray(ids)&&ids.every(x=>typeof x==='string')&&new Set(ids).size===ids.length
+    &&canonicalJson([...ids].sort())===canonicalJson(ids)&&row.baseline_digest===digest(body));
+  return {row,ids};
+}
+
+/** Internal read; the public API must first authorize the complete sync target. */
+export function readNotificationSyncBaseline(tx:DurableTransaction,workflowRunId:string):{digest:string;journalSequence:number}|null {
+  const value=verifiedBaseline(tx,workflowRunId);
+  return value?{digest:String(value.row.baseline_digest),journalSequence:Number(value.row.journal_sequence)}:null;
+}
+
 /** Caller already holds explicit SYNC authority and persists its management receipt in this transaction.
  * The baseline is immutable; concurrent subsequent business capture is never advanced or hidden.
  */
 export function syncLegacyNotificationSources(tx:DurableTransaction,workflowRunId:string,expectedBaseline:string,write:NotificationSourceWrite,actorId='system:notification-sync'):string[] {
-  const row=tx.get('SELECT * FROM notification_migration_baselines WHERE workflow_run_id=?',workflowRunId);requireIntegrity(row);
-  const ids=parseJson<string[]>(row.occurrence_ids_json);
-  const body={workflowRunId,journalSequence:Number(row.journal_sequence),journalAnchor:String(row.journal_anchor),occurrenceIds:ids};
-  requireIntegrity(Array.isArray(ids)&&ids.every(x=>typeof x==='string')&&new Set(ids).size===ids.length
-    &&canonicalJson([...ids].sort())===canonicalJson(ids)&&row.baseline_digest===digest(body)&&row.baseline_digest===expectedBaseline);
+  const saved=verifiedBaseline(tx,workflowRunId);requireIntegrity(saved&&saved.row.baseline_digest===expectedBaseline);
+  const ids=saved.ids;
   const baseline=new Set(ids),result:string[]=[];
   for(const s of projectNotificationSources(tx,workflowRunId)) {
     if(!baseline.has(s.sourceId)||s.kind==='workflow_completed'||s.kind==='workflow_cancelled')continue;

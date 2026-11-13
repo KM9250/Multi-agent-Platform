@@ -26,7 +26,9 @@ export function notificationProcessHost(path: string, endpoint = 'http://127.0.0
     enabled: true,
     identityVerifier: { verify(c) { return c === service ? { subjectId: 'notification-service', kind: 'SERVICE' }
       : c === human ? { subjectId: ownerSubject, kind: 'HUMAN' } : undefined; } },
-    authorize: access => ['notification-service', ownerSubject].includes(access.actor.subjectId),
+    authorize: access => access.actor.subjectId === ownerSubject && access.actor.kind === 'HUMAN'
+      || access.actor.subjectId === 'notification-service' && access.actor.kind === 'SERVICE'
+      && ['MATERIALIZE_NOTIFICATION','CLAIM_NOTIFICATION_DELIVERY','SEND_NOTIFICATION','COLLECT_NOTIFICATION_RECEIPT'].includes(access.permission),
     output: () => true,
     registry: { resolve: () => ({ destinationId: 'process-macp', bindingVersion: '1', implementationDigest: 'process-macp-v1',
       receiverRealm: 'process-macp-realm', recipientSubject: ownerSubject, audience: 'local-test', endpoint,

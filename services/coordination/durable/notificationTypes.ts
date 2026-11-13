@@ -52,10 +52,19 @@ export interface NotificationView {
 export interface NotificationReadInput { workflowRunId:string; cursor?:number; limit?:number; includeAudit?:boolean; }
 export interface NotificationPage {
   items:NotificationView[]; nextCursor:number|null; executionAllowed:false;
-  baseline:{digest:string;journalSequence:number}|null;
   /** Aggregate only the individually authorized page; follow nextCursor for more. */
   summary:{scope:'PAGE';sourceCount:number;outstandingCount:number;unroutedCount:number;unknownCount:number;
     oldestOutstandingAt:number|null;stopReasons:Array<{reason:string;count:number}>};
+}
+/** A service cycle acknowledgement, never a delivery receipt or Reader projection. */
+export interface NotificationServiceResult {
+  workflowRunId:string; operation:'MATERIALIZE'|'RUN_ONCE';
+  code:'NOTIFICATION_SERVICE_CYCLE_COMPLETE'; executionAllowed:false;
+}
+export interface NotificationSyncBaselineInput { workflowRunId:string; ownerSubject:string; destinationId:string; }
+/** Workflow-wide migration metadata is available only to the authorized sync operator. */
+export interface NotificationSyncBaseline extends NotificationSyncBaselineInput {
+  baseline:{digest:string;journalSequence:number}|null; executionAllowed:false;
 }
 export interface NotificationManagementCommand {
   operation:'PAUSE'|'RESUME'|'RETRY'|'CLOSE'; workflowRunId:string; deliveryId:string;

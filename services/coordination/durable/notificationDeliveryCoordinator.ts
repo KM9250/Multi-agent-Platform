@@ -6,11 +6,11 @@ import { DATABASE_NOW_SQL } from './leaseSchema';
 import { nativeVerifierPromise } from './reconciliationVerifier';
 import { readNotificationSource, notificationSourceDisposition, sourcePacket } from './notificationSourceProjector';
 import type { NotificationSource } from './notificationSourceProjector';
-import { syncLegacyNotificationSources } from './notificationSourceCapture';
+import { readNotificationSyncBaseline, syncLegacyNotificationSources } from './notificationSourceCapture';
 import { NotificationAuthority, notificationId, notificationInput, notificationLimits } from './notificationDeliveryAuthority';
 import type { BoundNotificationDestination, NotificationTarget } from './notificationDeliveryAuthority';
 import { DURABLE_NOTIFICATION_CONTRACT } from './notificationTypes';
-import type { NotificationDependencies, NotificationLimits, NotificationManagementCommand, NotificationOptions, NotificationPage, NotificationPermission, NotificationReadInput, NotificationSyncCommand, NotificationView } from './notificationTypes';
+import type { NotificationDependencies, NotificationLimits, NotificationManagementCommand, NotificationOptions, NotificationPage, NotificationPermission, NotificationReadInput, NotificationServiceResult, NotificationSyncBaseline, NotificationSyncBaselineInput, NotificationSyncCommand, NotificationView } from './notificationTypes';
 import type { MacpNotificationPacket } from '../notifications/macpPacket';
 import type { NotificationDeliveryReceipt } from '../notifications/deliveryError';
 import { DeliveryError } from '../notifications/deliveryError';
@@ -56,6 +56,14 @@ export class NotificationRuntime {
   #service(credential:unknown,permission:NotificationPermission,target:NotificationTarget) {
     const access=this.#authority.check(credential,permission,target);
     if(access.actor.kind!=='SERVICE')throw new DurableStoreError('NOTIFICATION_UNAUTHORIZED');return access;
+  }
+  #serviceResult(credential:unknown,workflow:string,operation:NotificationServiceResult['operation']):NotificationServiceResult {
+    const permission=operation==='MATERIALIZE'?'MATERIALIZE_NOTIFICATION':'CLAIM_NOTIFICATION_DELIVERY',target=this.#target(workflow);
+    const actor=this.#service(credential,permission,target).actor;
+    const result:NotificationServiceResult={workflowRunId:workflow,operation,code:'NOTIFICATION_SERVICE_CYCLE_COMPLETE',executionAllowed:false};
+    this.#authority.checkOutput(credential,permission,target,result);
+    if(this.#service(credential,permission,target).actor.subjectId!==actor.subjectId)throw new DurableStoreError('NOTIFICATION_UNAUTHORIZED');
+    return result;
   }
   #entry(tx:DurableTransaction,sourceId:string):Entry {
     const source=readNotificationSource(tx,sourceId),delivery=tx.get('SELECT * FROM notification_deliveries WHERE source_id=?',sourceId);
@@ -151,23 +159,38 @@ export class NotificationRuntime {
       if(query.includeAudit)view.audit=tx.all('SELECT event_kind,actor_id,reason,record_digest,recorded_at FROM notification_delivery_audit WHERE source_id=? ORDER BY recorded_at,audit_id',e.source.sourceId);
       return {e,view};}));
     for(const {e,view} of rows)this.#authority.output(credential,this.#target(workflow,e.source,e.delivery),view,query.includeAudit);
-    const baseline=this.#deps.read(tx=>tx.get('SELECT baseline_digest,journal_sequence FROM notification_migration_baselines WHERE workflow_run_id=?',workflow));
     const items=rows.slice(0,limit).map(x=>x.view),outstanding=items.filter(x=>!terminal.has(x.state)),reasons=new Map<string,number>();
     for(const item of outstanding)if(item.stopReason)reasons.set(item.stopReason,(reasons.get(item.stopReason)??0)+1);
     const page:NotificationPage={items,nextCursor:selected.length>limit?cursor+items.length:null,executionAllowed:false,
-      baseline:baseline?{digest:text(baseline.baseline_digest),journalSequence:integer(baseline.journal_sequence)}:null,
       summary:{scope:'PAGE',sourceCount:items.length,outstandingCount:outstanding.length,unroutedCount:items.filter(x=>x.state==='UNROUTED').length,
         unknownCount:items.filter(x=>x.outcomeUnknown).length,oldestOutstandingAt:outstanding.length?Math.min(...outstanding.map(x=>x.occurredAt)):null,
         stopReasons:[...reasons].sort(([a],[b])=>a.localeCompare(b)).map(([reason,count])=>({reason,count}))}};
     return this.#authority.output(credential,this.#target(workflow),page,query.includeAudit);
   }
-  materialize(credential:unknown,input:{workflowRunId:string;limit?:number}):NotificationPage {
+  readSyncBaseline(credential:unknown,input:NotificationSyncBaselineInput):NotificationSyncBaseline {
+    const query=notificationInput(input),workflow=this.#workflow(query.workflowRunId);
+    if(Object.keys(query).length!==3||![query.ownerSubject,query.destinationId].every(notificationId))throw new DurableStoreError('NOTIFICATION_UNAUTHORIZED');
+    this.#authority.check(credential,'SYNC_UNRESOLVED_NOTIFICATIONS',this.#target(workflow));
+    const binding=this.#authority.resolve(workflow);
+    if(!binding||binding.destination.recipientSubject!==query.ownerSubject||binding.destination.destinationId!==query.destinationId)throw new DurableStoreError('NOTIFICATION_UNAUTHORIZED');
+    const target={...this.#target(workflow,undefined,undefined,binding),ownerSubject:query.ownerSubject};
+    const access=this.#authority.check(credential,'SYNC_UNRESOLVED_NOTIFICATIONS',target);
+    const baseline=this.#deps.read(tx=>readNotificationSyncBaseline(tx,workflow));
+    const result:NotificationSyncBaseline={workflowRunId:workflow,ownerSubject:query.ownerSubject,destinationId:query.destinationId,baseline,executionAllowed:false};
+    this.#authority.checkOutput(credential,'SYNC_UNRESOLVED_NOTIFICATIONS',target,result);
+    const current=this.#authority.resolve(workflow);
+    if(!current||current.bindingDigest!==binding.bindingDigest)throw new DurableStoreError('NOTIFICATION_UNAVAILABLE');
+    if(this.#authority.check(credential,'SYNC_UNRESOLVED_NOTIFICATIONS',target).actor.subjectId!==access.actor.subjectId)throw new DurableStoreError('NOTIFICATION_UNAUTHORIZED');
+    this.#authority.assertUnchanged(current);
+    return result;
+  }
+  materialize(credential:unknown,input:{workflowRunId:string;limit?:number}):NotificationServiceResult {
     const query=notificationInput(input),workflow=this.#workflow(query.workflowRunId),limit=query.limit??this.limits.batchSize;
     if(Object.keys(query).some(k=>!['workflowRunId','limit'].includes(k))||!Number.isSafeInteger(limit)||limit<1||limit>1000)throw new DurableStoreError('NOTIFICATION_UNAUTHORIZED');
     this.#service(credential,'MATERIALIZE_NOTIFICATION',this.#target(workflow));
     let binding:BoundNotificationDestination|undefined;
-    try { binding=this.#authority.resolve(workflow); } catch { return this.read(credential,{workflowRunId:workflow}); }
-    if(!binding)return this.read(credential,{workflowRunId:workflow});
+    try { binding=this.#authority.resolve(workflow); } catch { return this.#serviceResult(credential,workflow,'MATERIALIZE'); }
+    if(!binding)return this.#serviceResult(credential,workflow,'MATERIALIZE');
     const entries=this.#deps.read(tx=>tx.all('SELECT s.source_id FROM notification_sources s LEFT JOIN notification_deliveries d ON d.source_id=s.source_id WHERE s.workflow_run_id=? AND d.delivery_id IS NULL ORDER BY s.source_sequence LIMIT ?',workflow,limit).map(r=>this.#entry(tx,text(r.source_id))));
     for(const entry of entries){
       this.#binding(entry,binding);
@@ -192,7 +215,7 @@ export class NotificationRuntime {
         this.#write(tx,'notification_deliveries',row);this.#audit(tx,'NOTIFICATION_MATERIALIZED',actor.subjectId,row,'MATERIALIZED');
       });
     }
-    return this.read(credential,{workflowRunId:workflow});
+    return this.#serviceResult(credential,workflow,'MATERIALIZE');
   }
   manage(credential:unknown,input:NotificationManagementCommand):NotificationPage {
     const command=notificationInput(input),workflow=this.#workflow(command.workflowRunId);
@@ -237,7 +260,7 @@ export class NotificationRuntime {
     this.#authority.check(credential,'SYNC_UNRESOLVED_NOTIFICATIONS',this.#target(workflow));
     const binding=this.#authority.resolve(workflow);
     if(!binding||binding.destination.recipientSubject!==command.ownerSubject||binding.destination.destinationId!==command.destinationId)throw new DurableStoreError('NOTIFICATION_UNAUTHORIZED');
-    const target=this.#target(workflow,undefined,undefined,binding),access=this.#authority.check(credential,'SYNC_UNRESOLVED_NOTIFICATIONS',target);
+    const target={...this.#target(workflow,undefined,undefined,binding),ownerSubject:command.ownerSubject},access=this.#authority.check(credential,'SYNC_UNRESOLVED_NOTIFICATIONS',target);
     this.#authority.output(credential,target,{workflowRunId:workflow,executionAllowed:false});
     const currentAccess=this.#authority.check(credential,'SYNC_UNRESOLVED_NOTIFICATIONS',target);
     if(currentAccess.actor.subjectId!==access.actor.subjectId)throw new DurableStoreError('NOTIFICATION_UNAUTHORIZED');
@@ -406,27 +429,27 @@ export class NotificationRuntime {
     finally{if(timer)clearTimeout(timer);if(signal)EventTarget.prototype.removeEventListener.call(signal,'abort',abort);}
     this.#finish(credential,p,result);
   }
-  async runOnce(credential:unknown,input:{workflowRunId:string;signal?:AbortSignal}):Promise<NotificationPage> {
+  async runOnce(credential:unknown,input:{workflowRunId:string;signal?:AbortSignal}):Promise<NotificationServiceResult> {
     // AbortSignal is a host object, not part of a client supplied JSON command.
     if(!input||utilTypes.isProxy(input)||Object.values(Object.getOwnPropertyDescriptors(input)).some(d=>!('value'in d)))throw new DurableStoreError('NOTIFICATION_UNAUTHORIZED');
     const workflow=this.#workflow(input.workflowRunId);
     if(Object.keys(input).some(k=>!['workflowRunId','signal'].includes(k)))throw new DurableStoreError('NOTIFICATION_UNAUTHORIZED');
     signalAborted(input.signal);
     this.#service(credential,'CLAIM_NOTIFICATION_DELIVERY',this.#target(workflow));
-    if(this.#inflight>=this.limits.concurrency)return this.read(credential,{workflowRunId:workflow});
+    if(this.#inflight>=this.limits.concurrency)return this.#serviceResult(credential,workflow,'RUN_ONCE');
     this.#inflight++;
     try {
       this.materialize(credential,{workflowRunId:workflow});
-      if(!this.#authority.enabled||signalAborted(input.signal))return this.read(credential,{workflowRunId:workflow});
-      const e=this.#first(workflow);if(!e?.delivery)return this.read(credential,{workflowRunId:workflow});
+      if(!this.#authority.enabled||signalAborted(input.signal))return this.#serviceResult(credential,workflow,'RUN_ONCE');
+      const e=this.#first(workflow);if(!e?.delivery)return this.#serviceResult(credential,workflow,'RUN_ONCE');
       const target=this.#target(workflow,e.source,e.delivery),actor=this.#authority.check(credential,'CLAIM_NOTIFICATION_DELIVERY',target).actor;
-      if(!this.#reconcileNecessity(e,actor.subjectId))return this.read(credential,{workflowRunId:workflow});
-      if(['PAUSED','DELIVERY_FAILED'].includes(text(e.delivery.state)))return this.read(credential,{workflowRunId:workflow});
+      if(!this.#reconcileNecessity(e,actor.subjectId))return this.#serviceResult(credential,workflow,'RUN_ONCE');
+      if(['PAUSED','DELIVERY_FAILED'].includes(text(e.delivery.state)))return this.#serviceResult(credential,workflow,'RUN_ONCE');
       try {this.#binding(e,this.#authority.resolve(workflow));this.#authority.sendOutput(credential,target,this.#packet(e.source,e.delivery));this.#service(credential,'COLLECT_NOTIFICATION_RECEIPT',target);}
-      catch(error){this.#pause(e,actor.subjectId,error instanceof DurableStoreError&&error.code==='NOTIFICATION_UNAVAILABLE'?'DESTINATION_CHANGED':'AUTHORIZATION_DENIED');return this.read(credential,{workflowRunId:workflow});}
+      catch(error){this.#pause(e,actor.subjectId,error instanceof DurableStoreError&&error.code==='NOTIFICATION_UNAVAILABLE'?'DESTINATION_CHANGED':'AUTHORIZATION_DENIED');return this.#serviceResult(credential,workflow,'RUN_ONCE');}
       const claimActor=this.#service(credential,'CLAIM_NOTIFICATION_DELIVERY',target).actor;
       const p=this.#claim(e,claimActor.subjectId);if(p)await this.#send(credential,p,input.signal);
-      return this.read(credential,{workflowRunId:workflow});
+      return this.#serviceResult(credential,workflow,'RUN_ONCE');
     } finally {this.#inflight--;}
   }
 }

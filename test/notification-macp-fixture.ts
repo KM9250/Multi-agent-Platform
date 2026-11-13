@@ -15,7 +15,7 @@ export function localMacpHost(endpoint:string, token:string, fetchImpl:typeof fe
     recipientSubject:'operator',audience:'local-map-notifications',endpoint,authenticated:true,transportContract:'macp/0.1.0',idempotencyConfirmed:true,
     allowDevelopmentLoopback:true,transport};
   const options:NotificationOptions={enabled:true,identityVerifier:{verify:value=>value===credential?{subjectId:'notification-worker',kind:'SERVICE'}:value===human?{subjectId:'operator',kind:'HUMAN'}:undefined},
-    authorize:access=>(access.actor.subjectId==='notification-worker'||access.actor.subjectId==='operator')&&(!access.ownerSubject||access.ownerSubject==='operator')
+    authorize:access=>(access.actor.subjectId==='notification-worker'&&['MATERIALIZE_NOTIFICATION','CLAIM_NOTIFICATION_DELIVERY','SEND_NOTIFICATION','COLLECT_NOTIFICATION_RECEIPT'].includes(access.permission)||access.actor.subjectId==='operator')&&(!access.ownerSubject||access.ownerSubject==='operator')
       &&(!access.recipientSubject||access.recipientSubject==='operator'),output:()=>true,registry:{resolve:()=>destination},
     limits:{httpTimeoutMs:3000,claimTtlMs:30000,backoffBaseMs:0,backoffMaxMs:0}};
   return {options,credential,human,transport,stats,destination,rotateToken(value:string){currentToken=value;}};

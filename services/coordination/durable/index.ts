@@ -65,4 +65,4 @@ export { RecoveryContinuationReader } from './recoveryContinuationReader';
 export { DurableNotificationWorker } from './notificationDeliveryWorker';
 export type { NotificationWorkerOptions, NotificationWorkerCycle } from './notificationDeliveryWorker';
 export { DURABLE_NOTIFICATION_CONTRACT } from './notificationTypes';
-export type { NotificationOptions, NotificationPermission, NotificationActor, NotificationAccess, NotificationDestination, NotificationLimits, NotificationView, NotificationPage, NotificationReadInput, NotificationManagementCommand, NotificationSyncCommand } from './notificationTypes';
+export type { NotificationOptions, NotificationPermission, NotificationActor, NotificationAccess, NotificationDestination, NotificationLimits, NotificationView, NotificationPage, NotificationReadInput, NotificationServiceResult, NotificationSyncBaseline, NotificationSyncBaselineInput, NotificationManagementCommand, NotificationSyncCommand } from './notificationTypes';
