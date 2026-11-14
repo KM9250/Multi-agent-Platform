@@ -12,6 +12,7 @@ import { SqliteRunnerEvidenceStore } from '../services/coordination/durable/evid
 import { RecoveryContinuationCoordinator } from '../services/coordination/durable/recoveryContinuationCoordinator.ts';
 import { createRunnerEvent } from '../services/coordination/runner/eventFactory.ts';
 import { runnerPendingApproval } from '../services/coordination/runner/policyGuard.ts';
+import { DATABASE_NOW_SQL } from '../services/coordination/durable/leaseSchema.ts';
 const usage={llmCalls:1,inputTokens:1,outputTokens:1,estimatedCost:0};
 for(const resolution of ['CANCELLED_PRE_DISPATCH','DISCARDED','RECOVERY_DISCARDED','UNKNOWN'] as const)test(`I13: prior VERIFY ${resolution} requires a durable resolution lineage before a new call`,async t=>{
  const f=continuationFixture(t),coordinator=new DurableExecutionCoordinator(f.store,{get:id=>f.options.controlledExecutors.get(id)?.executor});const reg=registration(f.store);coordinator.registerAction(record,reg.expected,reg.sessionEvent,reg.taskEvent);const task=f.store.getSnapshot('run').tasks.task;await coordinator.dispatch('run',task);coordinator.finalizeResult('run',task);
@@ -44,16 +45,34 @@ test('I08/I09: output including reasoning is charged once, over-quote Usage is r
 test('I10: a new planning Invocation cannot reset original Workflow elapsed time',t=>{
  const f=continuationFixture(t);f.admin.createWorkflow(executionSeed('ALLOW','expired',{maxWallTimeMs:1}));const lease=f.manager.acquire('expired'),api=new RecoveryContinuationCoordinator(f.db,lease),x=f.input();x.workflowRunId='expired';assert.throws(()=>api.createPlan(x,f.credential));assert.equal(f.counts.draft,0);
 });
-test('T01: synchronous local Read at 90ms under 25ms remains timed out with no artifact',async t=>{
- const f=continuationFixture(t,{readTimeoutMs:25}),original=fs.readSync;
+test('T01: synchronous local Read crossing its persisted execution deadline remains timed out with no artifact',async t=>{
+ const f=continuationFixture(t,{readTimeoutMs:500}),original=fs.readSync;let entered=false;
  f.hook(async()=>({value:{kind:'read_requests',requests:[{resourceId:'source',digest:f.reads.describe('source')!.digest}]},usage,completeness:'COMPLETE'}));
- fs.readSync=((fd,...args:any[])=>{if(fs.readlinkSync(`/proc/self/fd/${fd}`)===join(f.dir,'input.txt')){const until=performance.now()+90;while(performance.now()<until){}}return (original as any)(fd,...args);}) as typeof fs.readSync;syncBuiltinESMExports();
- try{const p=f.api().createPlan(f.input('PLAN_READ_ONLY'),f.credential),r=await f.api().startAuthorized(p.planId,f.credential);assert.equal(r.counts.readCalls,1);assert.equal(r.artifact,undefined);assert.equal(f.raw.prepare('SELECT state FROM planning_read_calls').get()!.state,'TIMED_OUT');assert.equal(f.counts.draft,1);}
+ fs.readSync=((fd,...args:any[])=>{
+  if(!entered&&fs.readlinkSync(`/proc/self/fd/${fd}`)===join(f.dir,'input.txt')){
+   const step=f.raw.prepare("SELECT execution_deadline FROM recovery_invocation_steps WHERE kind='READ'").get()!;
+   const now=Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now);
+   assert.ok(now<Number(step.execution_deadline),'Actual local Read must enter before its persisted deadline');entered=true;
+   const remaining=Number(step.execution_deadline)-now+25;assert.ok(remaining>0&&remaining<=525);
+   const until=performance.now()+remaining;while(performance.now()<until){}
+  }
+  return (original as any)(fd,...args);
+ }) as typeof fs.readSync;syncBuiltinESMExports();
+ try{const p=f.api().createPlan(f.input('PLAN_READ_ONLY'),f.credential),r=await f.api().startAuthorized(p.planId,f.credential);assert.ok(entered);assert.equal(r.counts.readCalls,1);assert.equal(r.artifact,undefined);assert.equal(f.raw.prepare('SELECT state FROM planning_read_calls').get()!.state,'TIMED_OUT');assert.equal(f.counts.draft,1);}
  finally{fs.readSync=original;syncBuiltinESMExports();}
 });
 test('T02: late Executor evidence is denied while the coordinator records an uncertain result within grace',async t=>{
- const f=continuationFixture(t,{actionTimeoutMs:25}),evidence=new SqliteRunnerEvidenceStore(f.db,f.lease);let rejected=false;
- f.actionHook(async ctx=>{const until=performance.now()+90;while(performance.now()<until){}await assert.rejects(evidence.withOwner({workflowRunId:'run',sessionId:ctx.sessionId,taskId:ctx.taskId,actionId:'action-1'},()=>evidence.put({kind:'late',content:'denied',createdAt:Date.now()})));rejected=true;return {status:'succeeded',summary:'late'};});
+ const f=continuationFixture(t,{actionTimeoutMs:500}),evidence=new SqliteRunnerEvidenceStore(f.db,f.lease);let rejected=false;
+ f.actionHook(async ctx=>{
+  const step=f.raw.prepare("SELECT execution_deadline,collection_deadline FROM recovery_invocation_steps WHERE kind='ACTION'").get()!;
+  const now=Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now);
+  assert.ok(now<Number(step.execution_deadline),'Executor must enter before its persisted execution deadline');
+  const remaining=Number(step.execution_deadline)-now+25;assert.ok(remaining>0&&remaining<=525);
+  const until=performance.now()+remaining;while(performance.now()<until){}
+  const late=Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now);
+  assert.ok(late>Number(step.execution_deadline)&&late<Number(step.collection_deadline));
+  await assert.rejects(evidence.withOwner({workflowRunId:'run',sessionId:ctx.sessionId,taskId:ctx.taskId,actionId:'action-1'},()=>evidence.put({kind:'late',content:'denied',createdAt:Date.now()})));rejected=true;return {status:'succeeded',summary:'late'};
+ });
  hold(f);const p=f.api().createPlan(executeInput(f),f.credential);f.api().authorize(p,f.approver);const r=await f.api().startAuthorized(p.planId,f.credential);assert.ok(rejected);assert.equal(r.invocation?.status,'REVIEW_REQUIRED');assert.equal(f.raw.prepare("SELECT count(*) n FROM runner_evidence WHERE kind='late'").get()!.n,0);assert.equal(f.raw.prepare('SELECT count(*) n FROM execution_results').get()!.n,1);
 });
 test('T04: generation loss during model execution rejects old-generation Usage and never regenerates the response',async t=>{
@@ -61,8 +80,23 @@ test('T04: generation loss during model execution rejects old-generation Usage a
  assert.equal(r.invocation?.status,'REVIEW_REQUIRED');assert.equal(r.invocation?.outcome,'LEASE_LOST');assert.equal(r.usage.committed.inputTokens,0);assert.equal(r.usage.outstanding.inputTokens,20);assert.equal(r.artifact,undefined);await f.api().startAuthorized(p.planId,f.credential);assert.equal(f.counts.draft,1);
 });
 test('T03/T05: after the collection deadline even complete late Usage stays unresolved and no replacement is sent',async t=>{
- const f=continuationFixture(t,{modelTimeoutMs:25,collectionGraceMs:25,finalizationMs:25});f.hook(async()=>{const until=performance.now()+90;while(performance.now()<until){}return {value:{kind:'plan',artifact:content},usage,completeness:'COMPLETE'};});
+ // First reach the real Provider boundary. A 25ms step budget could expire during
+ // reservation/Intent validation under parallel suites, testing pre-send refusal instead.
+ const f=continuationFixture(t,{modelTimeoutMs:500,collectionGraceMs:25,finalizationMs:25});let returnedCompleteUsage=false;
+ f.hook(async()=>{
+  const step=f.raw.prepare("SELECT execution_deadline,collection_deadline FROM recovery_invocation_steps WHERE kind='MODEL'").get()!;
+  const now=Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now);
+  assert.ok(now<Number(step.execution_deadline),'Provider must enter before its persisted execution deadline');
+  const remaining=Number(step.collection_deadline)-now+25;
+  assert.ok(remaining>0&&remaining<=550,'The deliberate event-loop stall is finite and tied to the stored collection deadline');
+  const until=performance.now()+remaining;while(performance.now()<until){}
+  assert.ok(Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now)>Number(step.collection_deadline));
+  returnedCompleteUsage=true;return {value:{kind:'plan',artifact:content},usage,completeness:'COMPLETE'};
+ });
  const p=f.api().createPlan(f.input(),f.credential),r=await f.api().startAuthorized(p.planId,f.credential);assert.equal(r.invocation?.status,'REVIEW_REQUIRED');assert.equal(r.usage.committed.inputTokens,0);assert.equal(r.usage.outstanding.inputTokens,20);assert.equal(f.counts.draft,1);
+ assert.ok(returnedCompleteUsage);assert.equal(r.artifact,undefined);
+ const repeated=await f.api().startAuthorized(p.planId,f.credential);assert.equal(f.counts.draft,1);assert.deepEqual(repeated.usage,r.usage);assert.equal(repeated.artifact,undefined);
+ assert.equal(f.raw.prepare('SELECT count(*) n FROM model_call_ledger').get()!.n,1);
 });
 for(const start of ['RESUME_PREPARED','VERIFY_FINALIZED_RESULT'] as const)test(`R03/R04: ${start} refuses nonexistent task, unresolved Review and terminal resurrection`,t=>{
  const f=continuationFixture(t);hold(f);const x=executeInput(f);x.start=start;x.taskId='foreign';x.actionId='foreign';if(start==='VERIFY_FINALIZED_RESULT'){x.limits.maxActionDispatches=0;x.limits.maxModelCalls=1;}assert.throws(()=>f.api().createPlan(x,f.credential));assert.equal(f.counts.plan,0);

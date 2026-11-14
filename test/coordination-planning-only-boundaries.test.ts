@@ -8,6 +8,7 @@ import { DurableDatabase } from '../services/coordination/durable/db.ts';
 import { RecoveryContinuationCoordinator } from '../services/coordination/durable/recoveryContinuationCoordinator.ts';
 import { createRunnerEvent } from '../services/coordination/runner/eventFactory.ts';
 import { ModelCallLedger } from '../services/coordination/durable/modelCallLedger.ts';
+import { DATABASE_NOW_SQL } from '../services/coordination/durable/leaseSchema.ts';
 const usage={llmCalls:1,inputTokens:1,outputTokens:1,estimatedCost:0};
 for(const path of ['../outside','/etc/passwd','a/../../x','a\\..\\x','C:\\x','//server/share','input.txt:stream','./input.txt'])test(`P04: rejects unsafe local resource ${path}`,t=>{
  const f=continuationFixture(t);assert.throws(()=>createLocalPlanningReadRegistry({root:f.dir,rootId:'test',files:{escape:path}}));
@@ -58,10 +59,20 @@ for(const completeness of ['PARTIAL','UNKNOWN'] as const)test(`I09: ${completene
  const p=f.api().createPlan(f.input(),f.credential),r=await f.api().startAuthorized(p.planId,f.credential);
  assert.equal(r.invocation?.status,'REVIEW_REQUIRED');assert.equal(r.artifact,undefined);assert.equal(r.usage.outstanding.inputTokens,20);assert.throws(()=>f.api().createPlan(f.input(),f.credential));
 });
-test('T01/T03: delayed timers do not admit a synchronous 90ms model response after 25ms; complete usage is settled',async t=>{
- const f=continuationFixture(t,{modelTimeoutMs:25});f.hook(async()=>{const until=performance.now()+90;while(performance.now()<until){}return {value:{kind:'plan',artifact:content},usage,completeness:'COMPLETE'};});
+test('T01/T03: delayed timers do not admit a synchronous model response after its persisted execution deadline; complete usage is settled',async t=>{
+ const f=continuationFixture(t,{modelTimeoutMs:1000});let returnedLate=false;
+ f.hook(async()=>{
+  const step=f.raw.prepare("SELECT execution_deadline,collection_deadline FROM recovery_invocation_steps WHERE kind='MODEL'").get()!;
+  const now=Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now);
+  assert.ok(now<Number(step.execution_deadline),'Provider must enter before its persisted execution deadline');
+  const remaining=Number(step.execution_deadline)-now+25;assert.ok(remaining>0&&remaining<=1025);
+  const until=performance.now()+remaining;while(performance.now()<until){}
+  const late=Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now);
+  assert.ok(late>Number(step.execution_deadline)&&late<Number(step.collection_deadline));returnedLate=true;
+  return {value:{kind:'plan',artifact:content},usage,completeness:'COMPLETE'};
+ });
  const p=f.api().createPlan(f.input(),f.credential),r=await f.api().startAuthorized(p.planId,f.credential);assert.equal(r.invocation?.outcome,'MODEL_TIMEOUT');assert.equal(r.artifact,undefined);assert.equal(r.usage.committed.inputTokens,1);assert.equal(r.usage.outstanding.inputTokens,0);
- assert.equal(f.raw.prepare('SELECT application_status FROM model_call_ledger').get()!.application_status,'NOT_APPLICABLE');
+ assert.equal(returnedLate,true);assert.equal(f.counts.draft,1);assert.equal(f.raw.prepare('SELECT application_status FROM model_call_ledger').get()!.application_status,'NOT_APPLICABLE');
 });
 test('I15: authenticated stop drains a running model and records its usage without applying a plan',async t=>{
  const f=continuationFixture(t);let entered!:()=>void,finish!:()=>void;const ready=new Promise<void>(r=>entered=r),pending=new Promise<void>(r=>finish=r);

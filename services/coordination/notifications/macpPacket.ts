@@ -1,5 +1,5 @@
-import { sanitizeCoordinationNotification } from './sanitize';
-import type { CoordinationNotification, CoordinationNotificationKind } from './types';
+import { sanitizeNotificationContent } from './sanitize';
+import type { NotificationContent, CoordinationNotificationKind } from './types';
 
 /** MACP 0.1.0 protocol.md §3/§8. Unknown task_type/metadata are permitted. */
 export interface MacpNotificationPacket {
@@ -12,8 +12,8 @@ export interface MacpNotificationPacket {
   producer_id: 'map-coordination'; producer_event_id: string;
   created_at: string;
 }
-export function toMacpNotificationPacket(notification: CoordinationNotification): MacpNotificationPacket {
-  const n = sanitizeCoordinationNotification(notification);
+export function toMacpNotificationPacket(notification: NotificationContent): MacpNotificationPacket {
+  const n = sanitizeNotificationContent(notification);
   const review = n.requiresUserAction && n.kind !== 'budget_exhausted';
   return { protocol: 'macp', version: '0.1.0', task_id: n.notificationId, task_type: 'coordination',
     from: { agent_id: 'map-coordination' }, to: { type: 'user' },

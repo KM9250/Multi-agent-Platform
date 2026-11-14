@@ -22,7 +22,7 @@ test('Migration 001–007 generated SQL is byte-for-byte identical to baseline m
 function historical(path:string,version:number){const raw=new DatabaseSync(path);if(version){raw.exec('CREATE TABLE schema_migrations (schema_version INTEGER PRIMARY KEY,migration_id TEXT NOT NULL UNIQUE,applied_at INTEGER NOT NULL) STRICT');for(const m of MIGRATIONS.slice(0,version)){raw.exec(m.sql);raw.prepare('INSERT INTO schema_migrations VALUES (?,?,1)').run(m.version,m.id);}raw.exec(`PRAGMA user_version=${version}`);}return raw;}
 for(const version of [0,1,2,3,4,5,6,7])test(`migration ${version}→9 retains strict, empty controlled tables with no fabricated Intent/Receipt`,t=>{
   const dir=mkdtempSync(join(tmpdir(),'map-v8-')),path=join(dir,'db.sqlite');t.after(()=>rmSync(dir,{recursive:true,force:true}));const raw=historical(path,version);t.after(()=>raw.close());
-  const db=new DurableDatabase({path});t.after(()=>db.close());assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,10);
+  const db=new DurableDatabase({path});t.after(()=>db.close());assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,11);
   assert.equal(raw.prepare('SELECT migration_id FROM schema_migrations WHERE schema_version=8').get()!.migration_id,'008_bounded_recovery_execution');
   for(const table of controlledTables){assert.equal(raw.prepare('SELECT strict FROM pragma_table_list WHERE name=?').get(table)!.strict,1);assert.equal(raw.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n,0);}
   assert.deepEqual(raw.prepare('PRAGMA foreign_key_check').all(),[]);
@@ -39,7 +39,7 @@ test('populated Schema 7 migrates without changing any historical column or mint
   for(const r of triggers)raw.exec(String(r.sql));raw.exec('PRAGMA foreign_keys=ON');const db=new DurableDatabase({path});t.after(()=>db.close());
   for(const [table,rows] of Object.entries(before)){const columns=rows.length?Object.keys(rows[0]):raw.prepare(`PRAGMA table_info(${table})`).all().map(c=>String(c.name));assert.deepEqual(raw.prepare(`SELECT ${columns.join(',')} FROM ${table} ORDER BY rowid`).all(),rows);}
   for(const table of controlledTables)assert.equal(raw.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n,0);
-  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,10);assert.deepEqual(raw.prepare('PRAGMA foreign_key_check').all(),[]);
+  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,11);assert.deepEqual(raw.prepare('PRAGMA foreign_key_check').all(),[]);
 });
 test('migration 008 DDL failure rolls back tables, modified triggers, indexes and migration ledger',t=>{
   const dir=mkdtempSync(join(tmpdir(),'map-v8-ddl-')),path=join(dir,'db.sqlite');t.after(()=>rmSync(dir,{recursive:true,force:true}));const raw=historical(path,7);t.after(()=>raw.close());
@@ -47,7 +47,7 @@ test('migration 008 DDL failure rolls back tables, modified triggers, indexes an
   DatabaseSync.prototype.exec=function(sql:string){const r=exec.call(this,sql);if(sql.includes('CREATE TABLE recovery_controlled_plans'))throw Error('injected');return r;};
   try{assert.throws(()=>new DurableDatabase({path}));}finally{DatabaseSync.prototype.exec=exec;}
   assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,7);assert.deepEqual(raw.prepare('SELECT type,name,sql FROM sqlite_master ORDER BY name').all(),before);
-  const db=new DurableDatabase({path});db.close();assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,10);
+  const db=new DurableDatabase({path});db.close();assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,11);
 });
 for(const boundary of ['before-ddl','after-ddl','before-commit','after-commit'])test(`${terminationName} migration 008 ${boundary} commits all-or-none`,async t=>{
   const dir=mkdtempSync(join(tmpdir(),'map-v8-crash-')),path=join(dir,'db.sqlite');t.after(()=>rmSync(dir,{recursive:true,force:true}));const raw=historical(path,7);t.after(()=>raw.close());
@@ -55,7 +55,7 @@ for(const boundary of ['before-ddl','after-ddl','before-commit','after-commit'])
   let stderr='';p.stderr!.on('data',c=>{stderr+=c;});const timer=setTimeout(()=>terminateChild(p),15000);
   const ended=await new Promise<{code:number|null;signal:string|null}>(resolve=>p.once('exit',(code,signal)=>resolve({code,signal})));clearTimeout(timer);
   assert.equal(ended.signal,process.platform==='win32'?'SIGTERM':'SIGKILL',stderr);const committed=boundary==='after-commit';
-  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,committed?10:7);assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n,committed?10:7);
+  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,committed?11:7);assert.equal(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n,committed?11:7);
   for(const table of controlledTables)assert.equal(raw.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name=? AND type='table'").get(table)!.n,committed?1:0);
-  const db=new DurableDatabase({path});db.close();assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,10);
+  const db=new DurableDatabase({path});db.close();assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version,11);
 });

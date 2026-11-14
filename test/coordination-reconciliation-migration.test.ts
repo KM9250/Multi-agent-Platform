@@ -55,7 +55,7 @@ function copyHistorical(source: DatabaseSync, target: DatabaseSync) {
   return before;
 }
 function assertComplete(raw: DatabaseSync) {
-  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 10);
+  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 11);
   assert.equal(raw.prepare('SELECT migration_id FROM schema_migrations WHERE schema_version=10').get()!.migration_id, '010_evidence_reconciliation');
   assert.deepEqual(raw.prepare('PRAGMA foreign_key_check').all(), []);
   assert.equal(raw.prepare('PRAGMA integrity_check').get()!.integrity_check, 'ok');
@@ -92,7 +92,7 @@ for (const boundary of ['before-ddl','after-ddl','before-backfill','after-backfi
     assert.equal(result.timedOut, false, result.stderr);
     assert.equal(result.signal, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL', result.stderr);
     const committed = boundary === 'after-commit';
-    assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, committed ? 10 : 9);
+    assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, committed ? 11 : 9);
     if (!committed) { assert.deepEqual(contents(raw), before); assert.deepEqual(raw.prepare('SELECT type,name,sql FROM sqlite_master ORDER BY name').all(), schemaBefore); }
     const db = new DurableDatabase({ path }); db.close(); assertComplete(raw);
     assert.equal(raw.prepare('SELECT count(*) n FROM model_usage_authorities').get()!.n, 1);

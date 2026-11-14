@@ -6,6 +6,7 @@ import { continuationFixture } from './continuation-fixture.ts';
 import { createRunnerEvent } from '../services/coordination/runner/eventFactory.ts';
 import type { ContinuationPlanInput } from '../services/coordination/durable/continuationTypes.ts';
 import { hold,executeInput } from './continuation-runner-fixture.ts';
+import { DATABASE_NOW_SQL } from '../services/coordination/durable/leaseSchema.ts';
 test('I04/I05/I06/I14/R02/H02: a real Runner round uses atomic debits and leaves Hold in place',async t=>{
  const f=continuationFixture(t);hold(f);const p=f.api().createPlan(executeInput(f),f.credential);f.api().authorize(p,f.approver);
  const r=await f.api().startAuthorized(p.planId,f.credential);
@@ -32,10 +33,20 @@ test('R01: VERIFY_FINALIZED_RESULT evaluates exactly the specified finalized tas
  assert.equal(r.invocation?.status,'COMPLETED',JSON.stringify(r));assert.equal(f.counts.verify,1);assert.equal(f.counts.plan,0);assert.equal(f.counts.action,before);assert.equal(r.counts.actionDispatches,0);
  assert.equal(f.store.getSnapshot('run').sessions.session.state,'RESOLVED');
 });
-test('T01: synchronous 90ms action under 25ms timeout records uncertainty without a replacement Action',async t=>{
- const f=continuationFixture(t,{actionTimeoutMs:25});f.actionHook(async()=>{const end=performance.now()+90;while(performance.now()<end){}return {status:'succeeded',summary:'late'};});
+test('T01: synchronous action after its persisted execution deadline records uncertainty without a replacement Action',async t=>{
+ const f=continuationFixture(t,{actionTimeoutMs:1000});let returnedLate=false;
+ f.actionHook(async()=>{
+  const step=f.raw.prepare("SELECT execution_deadline,collection_deadline FROM recovery_invocation_steps WHERE kind='ACTION'").get()!;
+  const now=Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now);
+  assert.ok(now<Number(step.execution_deadline),'Executor must enter before its persisted execution deadline');
+  const remaining=Number(step.execution_deadline)-now+25;assert.ok(remaining>0&&remaining<=1025);
+  const end=performance.now()+remaining;while(performance.now()<end){}
+  const late=Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now);
+  assert.ok(late>Number(step.execution_deadline)&&late<Number(step.collection_deadline));returnedLate=true;
+  return {status:'succeeded',summary:'late'};
+ });
  hold(f);const p=f.api().createPlan(executeInput(f),f.credential);f.api().authorize(p,f.approver);const r=await f.api().startAuthorized(p.planId,f.credential);
- assert.equal(f.counts.action,1);assert.equal(f.counts.verify,0);assert.equal(r.invocation?.status,'REVIEW_REQUIRED');
+ assert.equal(returnedLate,true);assert.equal(f.counts.action,1);assert.equal(f.counts.verify,0);assert.equal(r.invocation?.status,'REVIEW_REQUIRED');
  await f.api().startAuthorized(p.planId,f.credential);assert.equal(f.counts.action,1);
 });
 test('I11/T02: Executor receives only its evidence sink, never the parent Invocation capability',async t=>{

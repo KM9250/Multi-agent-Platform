@@ -13,6 +13,7 @@ import { scopeOf } from '../services/coordination/durable/recoveryDecisionStore.
 import { persistDispatchResult } from '../services/coordination/durable/recoveryDispatchStore.ts';
 import { ModelCallLedger as Ledger } from '../services/coordination/durable/modelCallLedger.ts';
 import { RecoveryReader } from '../services/coordination/durable/recoveryReader.ts';
+import { DATABASE_NOW_SQL } from '../services/coordination/durable/leaseSchema.ts';
 import { createRunnerEvent } from '../services/coordination/runner/eventFactory.ts';
 import { clock } from './durable-execution-fixture.ts';
 
@@ -39,10 +40,23 @@ test('expired grant and plan cannot create an Intent',async t=>{
   await assert.rejects(f.execute(p));assert.deepEqual(dispatchContents(f.raw),before);assert.equal(f.calls.execute,0);
 });
 for(const stopped of ['abort','deadline'])test(`after A ${stopped} consumes authorization but starts no executor`,async t=>{
-  const f=fixture(t,{timing:{sendTtlMs:400}}),p=f.plan();f.authorize(p);const controller=new AbortController(),exec=DatabaseSync.prototype.exec;let stoppedOnce=false;
-  DatabaseSync.prototype.exec=function(sql:string){const value=exec.call(this,sql);if(sql==='COMMIT'&&!stoppedOnce&&f.raw.prepare('SELECT count(*) AS n FROM recovery_dispatch_intents').get()!.n===1){stoppedOnce=true;if(stopped==='abort')controller.abort();else Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,430);}return value;};
+  const f=fixture(t,{timing:{sendTtlMs:1000}}),p=f.plan();f.authorize(p);const controller=new AbortController(),exec=DatabaseSync.prototype.exec;let stoppedOnce=false;
+  DatabaseSync.prototype.exec=function(sql:string){
+    const value=exec.call(this,sql);
+    if(sql==='COMMIT'&&!stoppedOnce&&f.raw.prepare('SELECT count(*) AS n FROM recovery_dispatch_intents').get()!.n===1){
+      stoppedOnce=true;const intent=JSON.parse(String(f.raw.prepare('SELECT intent_json FROM recovery_dispatch_intents').get()!.intent_json));
+      const now=Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now);
+      assert.ok(now<intent.sendDeadline,'Transaction A must commit before its persisted send deadline');
+      if(stopped==='abort')controller.abort();else{
+        const remaining=intent.sendDeadline-now+25;assert.ok(remaining>0&&remaining<=1025);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,remaining);
+        assert.ok(Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now)>intent.sendDeadline);
+      }
+    }
+    return value;
+  };
   let result;try{result=await f.execute(p,controller.signal);}finally{DatabaseSync.prototype.exec=exec;}
-  assert.equal(result.status,'REVIEW_REQUIRED');assert.equal(f.calls.execute,0);assert.equal(result.grants[0].status,'CONSUMED');
+  assert.equal(stoppedOnce,true);assert.equal(result.status,'REVIEW_REQUIRED');assert.equal(f.calls.execute,0);assert.equal(result.grants[0].status,'CONSUMED');
   await f.execute(p);assert.equal(f.calls.execute,0);assert.equal(f.raw.prepare('SELECT state FROM execution_ledger').get()!.state,'REVIEW_REQUIRED');
 });
 test('abort during execute records uncertainty and never waits for or overwrites from a late response',async t=>{
@@ -50,12 +64,26 @@ test('abort during execute records uncertainty and never waits for or overwrites
   const result=await f.execute(p,stop.signal);assert.equal(result.status,'REVIEW_REQUIRED');const before=dispatchContents(f.raw);await delay(80);assert.deepEqual(dispatchContents(f.raw),before);assert.equal(f.calls.execute,1);
 });
 test('result collection expiry rejects B and permanently closes the original sink',async t=>{
-  const f=fixture(t,{timing:{sendTtlMs:400,executionTimeoutMs:20,resultGraceMs:20}}),p=f.plan();f.authorize(p);
-  const exec=DatabaseSync.prototype.exec;let armed=false;
-  f.hook(async()=>{armed=true;return {status:'succeeded',summary:'expired'};});
-  DatabaseSync.prototype.exec=function(sql:string){if(armed&&sql==='BEGIN IMMEDIATE'){armed=false;Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,470);}return exec.call(this,sql);};
+  const f=fixture(t,{timing:{sendTtlMs:1000,executionTimeoutMs:20,resultGraceMs:20}}),p=f.plan();f.authorize(p);
+  const exec=DatabaseSync.prototype.exec;let armed=false,crossedCollectionDeadline=false;
+  f.hook(async()=>{
+    const intent=JSON.parse(String(f.raw.prepare('SELECT intent_json FROM recovery_dispatch_intents').get()!.intent_json));
+    assert.ok(Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now)<intent.sendDeadline,'Executor must enter before its persisted send deadline');
+    armed=true;return {status:'succeeded',summary:'expired'};
+  });
+  DatabaseSync.prototype.exec=function(sql:string){
+    if(armed&&sql==='BEGIN IMMEDIATE'){
+      armed=false;const intent=JSON.parse(String(f.raw.prepare('SELECT intent_json FROM recovery_dispatch_intents').get()!.intent_json));
+      const now=Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now);
+      assert.ok(now<intent.resultCollectionDeadline,'Result persistence must enter before its collection deadline');
+      const remaining=intent.resultCollectionDeadline-now+25;assert.ok(remaining>0&&remaining<=1065);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,remaining);
+      assert.ok(Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now)>intent.resultCollectionDeadline);crossedCollectionDeadline=true;
+    }
+    return exec.call(this,sql);
+  };
   try{await assert.rejects(f.execute(p));}finally{DatabaseSync.prototype.exec=exec;}
-  assert.equal(f.raw.prepare('SELECT count(*) AS n FROM execution_results').get()!.n,0);assert.equal((await f.execute(p)).status,'INTENT_RECORDED');assert.equal(f.calls.execute,1);
+  assert.equal(crossedCollectionDeadline,true);assert.equal(f.raw.prepare('SELECT count(*) AS n FROM execution_results').get()!.n,0);assert.equal((await f.execute(p)).status,'INTENT_RECORDED');assert.equal(f.calls.execute,1);
 });
 test('copied DB rows, a Lease DTO, and a copied Intent cannot carry any authority',async t=>{
   const f=fixture(t),p=f.plan();f.authorize(p);const path=join(f.dir,'copy.sqlite');f.db.backup(path);

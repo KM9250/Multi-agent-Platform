@@ -11,13 +11,18 @@ import { ReconciliationEvidenceService } from '../services/coordination/durable/
 import { readReconciliationTarget } from '../services/coordination/durable/reconciliationVerifier.ts';
 import type { ReconciliationTarget } from '../services/coordination/durable/reconciliationTypes.ts';
 import { syntheticSource } from './reconciliation-fixture.ts';
+import { DATABASE_NOW_SQL } from '../services/coordination/durable/leaseSchema.ts';
 
 // PR36 audit IDs are distinct from the retained PR35 audit IDs.
 test('PR36 F-01: adopted Action Outcome remains applicable with new approval after actual Verification expiry', async t => {
-  const f=fixture(t),a=f.action(),{verification:v}=await f.verified(a.target,actionClaim(),{expiresAt:Date.now()+400});
+  const f=fixture(t),a=f.action(),{verification:v}=await f.verified(a.target,actionClaim(),{expiresAt:Date.now()+1500});
   const p=f.plan(a.target,v.verificationId);f.authorize(p);const outcome=f.execute(p);
+  const expiresAt=Number(f.raw.prepare('SELECT expires_at FROM reconciliation_verifications WHERE verification_id=?').get(v.verificationId)!.expires_at);
+  assert.equal(expiresAt,v.expiresAt);assert.equal(outcome.status,'COMMITTED');assert.ok(outcome.committedAt<expiresAt);
+  assert.ok(Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now)<expiresAt,'Outcome adoption must finish before the persisted Verification expires');
   const ledger=f.raw.prepare('SELECT * FROM execution_ledger').all(),old=f.api().evidence.readVerification(v.verificationId,f.credential);
-  await delay(Math.max(0,v.expiresAt-Date.now())+30);
+  await delay(Math.max(0,expiresAt-Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now))+30);
+  assert.ok(Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now)>expiresAt);
   const apply=f.plan(a.target,v.verificationId,'APPLY_RECONCILED_ACTION_RESULT');
   assertRefusedWithoutEffects(f,()=>f.execute(apply));const grant=f.authorize(apply),receipt=f.execute(apply);
   assert.equal(f.store.getSnapshot('run').tasks.task.status,'COMPLETED');
@@ -66,9 +71,16 @@ for(const reason of ['UNADOPTED','REVOKED','DISPUTED','OTHER_VERIFICATION','OTHE
 test(`PR36 F-01: expired evidence ${reason} cannot bypass adoption, trust or target checks`,async t=>{
   let revoked=false;const issuer=signedSyntheticVerifier();
   const f=fixture(t,{keyPair:issuer.pair,reconciliation:{verifiers:{get:()=>issuer.binding,isRevoked:()=>revoked}}}),a=f.action();
-  const {verification:v}=await f.verified(a.target,actionClaim(),{expiresAt:Date.now()+400});
-  if(reason!=='UNADOPTED'){const p=f.plan(a.target,v.verificationId);f.authorize(p);f.execute(p);}
-  await delay(Math.max(0,v.expiresAt-Date.now())+20);
+  const {verification:v}=await f.verified(a.target,actionClaim(),{expiresAt:Date.now()+1500});
+  const expiresAt=Number(f.raw.prepare('SELECT expires_at FROM reconciliation_verifications WHERE verification_id=?').get(v.verificationId)!.expires_at);
+  assert.equal(expiresAt,v.expiresAt);
+  if(reason!=='UNADOPTED'){
+    const p=f.plan(a.target,v.verificationId);f.authorize(p);const receipt=f.execute(p);
+    assert.equal(receipt.status,'COMMITTED');assert.ok(receipt.committedAt<expiresAt);
+  }
+  assert.ok(Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now)<expiresAt,'Positive setup must finish before the persisted Verification expires');
+  await delay(Math.max(0,expiresAt-Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now))+20);
+  assert.ok(Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now)>expiresAt);
   let id=v.verificationId,target=a.target;
   if(reason==='REVOKED')revoked=true;
   if(reason==='DISPUTED')await f.verified(a.target,actionClaim('NOT_EXECUTED_FINAL'));
@@ -80,9 +92,13 @@ test(`PR36 F-01: expired evidence ${reason} cannot bypass adoption, trust or tar
 
 for(const fault of ['BEFORE_COMMIT','LOST_ACK'] as const)
 test(`PR36 F-01: expired adopted Outcome application ${fault} preserves atomic grants and task event`,async t=>{
-  const f=fixture(t),a=f.action(),{verification:v}=await f.verified(a.target,actionClaim(),{expiresAt:Date.now()+400});
-  const outcome=f.plan(a.target,v.verificationId);f.authorize(outcome);f.execute(outcome);
-  await delay(Math.max(0,v.expiresAt-Date.now())+20);
+  const f=fixture(t),a=f.action(),{verification:v}=await f.verified(a.target,actionClaim(),{expiresAt:Date.now()+1500});
+  const outcome=f.plan(a.target,v.verificationId);f.authorize(outcome);const adoption=f.execute(outcome);
+  const expiresAt=Number(f.raw.prepare('SELECT expires_at FROM reconciliation_verifications WHERE verification_id=?').get(v.verificationId)!.expires_at);
+  assert.equal(expiresAt,v.expiresAt);assert.equal(adoption.status,'COMMITTED');assert.ok(adoption.committedAt<expiresAt);
+  assert.ok(Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now)<expiresAt,'Outcome adoption must finish before the persisted Verification expires');
+  await delay(Math.max(0,expiresAt-Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now))+20);
+  assert.ok(Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now)>expiresAt);
   const p=f.plan(a.target,v.verificationId,'APPLY_RECONCILED_ACTION_RESULT');f.authorize(p);const before=reconciliationContents(f.raw);
   if(fault==='BEFORE_COMMIT') {
     f.raw.exec("CREATE TRIGGER pr36_apply_audit_fault BEFORE INSERT ON reconciliation_audit WHEN NEW.event_kind='RECONCILIATION_ACTION_RESULT_APPLIED' BEGIN SELECT RAISE(ABORT,'injected'); END");

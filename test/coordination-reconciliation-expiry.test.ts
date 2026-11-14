@@ -11,6 +11,7 @@ import { ReconciliationExecutor } from '../services/coordination/durable/reconci
 import { ReconciliationReader } from '../services/coordination/durable/reconciliationReader.ts';
 import { readReconciliationTarget } from '../services/coordination/durable/reconciliationVerifier.ts';
 import type { ReconciliationPolicy, ReconciliationTarget } from '../services/coordination/durable/reconciliationTypes.ts';
+import { DATABASE_NOW_SQL } from '../services/coordination/durable/leaseSchema.ts';
 
 test('IN-08: actual committed Verification expiry preserves its authenticated Receipt, accounting and original history without a Generation change', async t => {
   const f = reconciliationFixture(t), model = f.model();
@@ -51,7 +52,7 @@ test('US-12: actual original Invocation deadline expiry rejects old settlement b
     canAccess: () => true, inspectContent: () => true,
   };
   const f = continuationFixture(t, {
-    admissionMs: 250, modelTimeoutMs: 100, actionTimeoutMs: 100, readTimeoutMs: 100,
+    admissionMs: 1000, modelTimeoutMs: 1000, actionTimeoutMs: 100, readTimeoutMs: 100,
     collectionGraceMs: 50, finalizationMs: 50,
   }, undefined, { policy, verifiers: { get: id => id === synthetic.binding.verifierId ? synthetic.binding : undefined } });
   const originalLease = f.lease, usage = { llmCalls: 1, inputTokens: 2, outputTokens: 3, estimatedCost: 0 };
@@ -69,10 +70,18 @@ test('US-12: actual original Invocation deadline expiry rejects old settlement b
   f.hook(async () => {
     const invocation = f.raw.prepare('SELECT * FROM recovery_invocations').get()!;
     assert.equal(invocation.status, 'ACTIVE');
+    const step = f.raw.prepare("SELECT execution_deadline,collection_deadline FROM recovery_invocation_steps WHERE kind='MODEL'").get()!;
+    const now = Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now);
+    assert.ok(now < Math.min(Number(invocation.admission_deadline), Number(step.execution_deadline)),
+      'Provider must enter before both persisted admission and execution deadlines');
     deadline = Number(invocation.collection_deadline);
     // Simulate a synchronous adapter returning after every persisted Invocation/Step deadline.
     // This is elapsed wall time, with neither clock replacement nor a Generation change.
-    while (Date.now() <= deadline + 100) { /* deliberately late external response */ }
+    const remaining = deadline - now + 100;
+    assert.ok(remaining > 0 && remaining <= 2200);
+    const until = performance.now() + remaining;
+    while (performance.now() < until) { /* deliberately late external response */ }
+    assert.ok(Number(f.raw.prepare(`SELECT ${DATABASE_NOW_SQL} AS now`).get()!.now) > Math.max(deadline, Number(step.collection_deadline)));
     beforeLateResponse = preserved();
     return { value: { kind: 'plan', artifact: content }, usage, completeness: 'COMPLETE' };
   });
