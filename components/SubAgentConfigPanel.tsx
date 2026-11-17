@@ -179,9 +179,15 @@ export default function SubAgentConfigPanel({
               <input
                 type="number"
                 className="w-full bg-slate-800 p-2"
-                value={worker.thinkingBudget ?? 0}
+                value={worker.thinkingBudget ?? ""}
+                placeholder="Provider default"
                 onChange={(e) =>
-                  update(index, { thinkingBudget: Number(e.target.value) })
+                  update(index, {
+                    thinkingBudget:
+                      e.target.value === ""
+                        ? undefined
+                        : Number(e.target.value),
+                  })
                 }
               />
             </label>

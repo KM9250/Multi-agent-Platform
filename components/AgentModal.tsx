@@ -513,7 +513,9 @@ const AgentModal: React.FC<AgentModalProps> = ({
                   Reasoning (Budget)
                 </label>
                 <span className="text-xs font-mono text-zinc-500">
-                  {thinkingBudget > 0 ? `${thinkingBudget} tokens` : "Off"}
+                  {thinkingBudget > 0
+                    ? `${thinkingBudget} tokens`
+                    : "0 (model dependent)"}
                 </span>
               </div>
               <input
@@ -526,8 +528,11 @@ const AgentModal: React.FC<AgentModalProps> = ({
                 className="w-full h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-purple-500"
               />
               <p className="text-[10px] text-zinc-500 mt-1">
-                Higher values allow more "thinking" before answering (Gemini 2.5
-                only).
+                Numeric budgets require supported Gemini 2.5 models and must fit
+                the output cap (2048 tokens or less). Zero disables Flash
+                thinking; Pro requires a positive budget. Other models use their
+                default at zero or reject numeric controls. Unsupported values
+                fail generation.
               </p>
             </div>
           </div>
