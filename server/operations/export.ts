@@ -81,6 +81,24 @@ export class ExportService {
       throw new OperationError("INVALID_CURSOR", 409);
     }
   }
+  private legacySources(actor: Actor, targetId: string, kind: string) {
+    const rows = this.app.db
+      .prepare(
+        "SELECT b.source_id,m.source_key,m.details_json FROM import_item_map m JOIN import_batches b USING(workspace_id,batch_id) WHERE m.workspace_id=? AND m.target_id=? AND m.kind=? AND b.status='COMPLETE' LIMIT 51",
+      )
+      .all(actor.workspaceId, targetId, kind);
+    if (rows.length > 50) throw new OperationError("EXPORT_SOURCE_LIMIT", 413);
+    return rows.map((row) => {
+      const details = JSON.parse(String(row.details_json));
+      return {
+        sourceId: row.source_id,
+        sourceKey: row.source_key,
+        ...(details.legacyId
+          ? { legacyId: details.legacyId, legacyRoomId: details.legacyRoomId }
+          : {}),
+      };
+    });
+  }
   async exportRoom(
     actor: Actor,
     roomId: string,
@@ -210,6 +228,11 @@ export class ExportService {
       if (revisions.length)
         messages.push({
           id: current.message_id,
+          legacySources: this.legacySources(
+            actor,
+            String(current.message_id),
+            "message",
+          ),
           role: current.role,
           personaId: current.persona_id,
           currentRevision: current.current_revision,
@@ -241,6 +264,11 @@ export class ExportService {
           timestamp: value.timestamp,
           ...(value.reaction ? { reaction: value.reaction } : {}),
           legacy: true,
+          legacySources: this.legacySources(
+            actor,
+            String(row.decision_id),
+            "decision",
+          ),
         };
       });
     if (decisions.length > 20000)
@@ -254,7 +282,11 @@ export class ExportService {
       WHERE r.workspace_id=? AND r.room_id=? AND b.status='COMPLETE' AND m.deleted_at IS NULL AND p.deleted_at IS NULL LIMIT 20001`,
       )
       .all(actor.workspaceId, roomId)
-      .filter((row) => messages.some((m) => m.id === row.messageId));
+      .filter((row) => messages.some((m) => m.id === row.messageId))
+      .map((row) => ({
+        ...row,
+        legacySources: this.legacySources(actor, String(row.id), "reaction"),
+      }));
     if (reactions.length > 20000)
       throw new OperationError("EXPORT_DIAGNOSTIC_LIMIT", 413);
     const result = {
@@ -286,6 +318,7 @@ export class ExportService {
         currentRoom.agents.map((p) => ({ id: p.id, revision: p.revision })),
       ) !==
         json(room.agents.map((p) => ({ id: p.id, revision: p.revision }))) ||
+      json(currentRoom.historicalPersonas) !== json(room.historicalPersonas) ||
       currentRoom.revision !== room.revision ||
       this.app.db
         .prepare("SELECT acl_revision FROM workspaces WHERE workspace_id=?")

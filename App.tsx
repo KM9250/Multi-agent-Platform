@@ -150,6 +150,18 @@ export default function App() {
   const fileInput = useRef<HTMLInputElement>(null);
   const agents =
     room?.agents.map((persona) => displayAgent(persona, room.id)) ?? [];
+  const speakerName = (personaId?: string) => {
+    const current = agents.find((agent) => agent.id === personaId);
+    const historical = room?.historicalPersonas?.find(
+      (persona) => persona.id === personaId,
+    );
+    return (
+      current?.name ??
+      (historical
+        ? `Deleted Persona (${historical.legacyPersonaId})`
+        : "Persona")
+    );
+  };
   const groups = [...new Set(agents.flatMap((agent) => agent.groups ?? []))];
   const reactions = [
     ...runs.flatMap((run) => run.reactions ?? []),
@@ -968,8 +980,7 @@ export default function App() {
                     <span>
                       {message.role === "user"
                         ? "You"
-                        : (agents.find((agent) => agent.id === message.agentId)
-                            ?.name ?? "Persona")}{" "}
+                        : speakerName(message.agentId)}{" "}
                       ·{" "}
                       {new Date(
                         message.timestamp ?? message.occurredAt,
@@ -1010,11 +1021,9 @@ export default function App() {
                         >
                           {reactionEmoji[String(reaction.semantic)] ??
                             String(reaction.semantic)}{" "}
-                          {agents.find(
-                            (agent) =>
-                              agent.id ===
-                              (reaction.agentId ?? reaction.personaId),
-                          )?.name ?? "Persona"}
+                          {speakerName(
+                            String(reaction.agentId ?? reaction.personaId),
+                          )}
                         </span>
                       ))}
                   </div>

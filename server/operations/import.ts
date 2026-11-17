@@ -286,7 +286,13 @@ export class ImportService {
           persona.sourceDigest,
           () => {
             const created = this.repository.withImport(batchId, () =>
-              this.repository.createPersona(actor, roomId, config),
+              config.historicalIdentity
+                ? this.repository.createHistoricalPersona(
+                    actor,
+                    roomId,
+                    config.historicalIdentity,
+                  )
+                : this.repository.createPersona(actor, roomId, config),
             );
             const stored = this.app.db
               .prepare(
@@ -297,7 +303,13 @@ export class ImportService {
               id: created.id,
               digest: hash(String(stored.config_json)),
               details: {
-                changes: ["SERVER_ASSIGNED_ID", "ROOM_SCOPED_PERSONA"],
+                changes: [
+                  "SERVER_ASSIGNED_ID",
+                  "ROOM_SCOPED_PERSONA",
+                  ...(config.historicalIdentity
+                    ? ["HISTORY_ONLY_NOT_EXECUTABLE"]
+                    : []),
+                ],
               },
             };
           },
@@ -374,6 +386,8 @@ export class ImportService {
                   "SERVER_ASSIGNED_ID",
                   ...(message.incomplete ? ["UNFINISHED_NOT_RESUMED"] : []),
                 ],
+                legacyId: message.oldId,
+                legacyRoomId: room.oldId,
                 originalContentDigest: hash(message.content),
                 segments: message.segments.map((s) => ({
                   sourceId: s.oldId,
@@ -416,7 +430,11 @@ export class ImportService {
             return {
               id: decisionId,
               digest: hash(json(decision)),
-              details: { changes: ["LEGACY_EVENT_NOT_EXECUTION_RECEIPT"] },
+              details: {
+                legacyId: decision.id,
+                legacyRoomId: room.oldId,
+                changes: ["LEGACY_EVENT_NOT_EXECUTION_RECEIPT"],
+              },
             };
           },
         );
@@ -451,7 +469,11 @@ export class ImportService {
             return {
               id: reactionId,
               digest: hash(json(reaction)),
-              details: { changes: ["SERVER_ASSIGNED_ID"] },
+              details: {
+                legacyId: reaction.id,
+                legacyRoomId: room.oldId,
+                changes: ["SERVER_ASSIGNED_ID"],
+              },
             };
           },
         );

@@ -255,7 +255,7 @@ function persona(value: unknown): LegacyPersona {
     isEnabled: boolean(p.isEnabled, true),
     thinkingBudget: integer(p.thinkingBudget, 32768),
     historyWindow: integer(p.historyWindow, 200),
-    pinFirstMessage: boolean(p.pinFirstMessage, false),
+    pinFirstMessage: boolean(p.pinFirstMessage, true),
     groups: array(p.groups, 16, true).map((g) => text(g, 100)),
     participationProfile: text(p.participationProfile, 4000, true),
     subAgents: array(p.subAgents, 4, true).map((raw) => {
@@ -281,7 +281,9 @@ function persona(value: unknown): LegacyPersona {
         systemInstruction: text(a.systemInstruction),
         capabilities: array(a.capabilities, 8, true).map((c) => text(c, 100)),
         isEnabled: boolean(a.isEnabled, true),
-        thinkingBudget: integer(a.thinkingBudget, 32768),
+        ...(a.thinkingBudget === undefined
+          ? {}
+          : { thinkingBudget: integer(a.thinkingBudget, 32768) }),
         maxOutputTokens: integer(a.maxOutputTokens, 8192, 1024),
         maxCallsPerTurn: integer(a.maxCallsPerTurn, 1, 1),
       };
@@ -544,9 +546,16 @@ export function prepareLegacy(input: unknown): LegacyManifest {
     unique(messages);
     const personaIds = new Set(personas.map((p) => p.oldId)),
       messageIds = new Set(messages.map((m) => m.oldId));
-    for (const m of messages)
-      if (m.personaOldId !== undefined && !personaIds.has(m.personaOldId))
-        fail("IMPORT_REFERENCE_MISSING");
+    // A missing legacy agent is an immutable historical identity, never an executable config.
+    const historicalIds = new Set<string>();
+    const referencePersona = (value: unknown) => {
+      const id = ident(value);
+      if (!personaIds.has(id)) historicalIds.add(id);
+    };
+    for (const m of messages) {
+      if (m.role === "user" && m.personaOldId !== undefined) fail();
+      if (m.personaOldId !== undefined) referencePersona(m.personaOldId);
+    }
     const decisions = array(r.decisionEvents, IMPORT_LIMITS.messages, true).map(
       (value) => {
         const d = obj(value, [
@@ -566,7 +575,7 @@ export function prepareLegacy(input: unknown): LegacyManifest {
         ]);
         ident(d.id);
         ident(d.turnId);
-        if (!personaIds.has(ident(d.agentId))) fail("IMPORT_REFERENCE_MISSING");
+        referencePersona(d.agentId);
         if (!["RESPOND", "STAMP", "IGNORE", "ERROR"].includes(d.outcome))
           fail();
         text(d.source, 100);
@@ -595,11 +604,9 @@ export function prepareLegacy(input: unknown): LegacyManifest {
         ]);
         ident(reaction.id);
         ident(reaction.turnId);
-        if (
-          !messageIds.has(ident(reaction.messageId)) ||
-          !personaIds.has(ident(reaction.agentId))
-        )
+        if (!messageIds.has(ident(reaction.messageId)))
           fail("IMPORT_REFERENCE_MISSING");
+        referencePersona(reaction.agentId);
         if (
           !["ACK", "AGREE", "THINK", "AMUSED", "CARE", "DISAGREE"].includes(
             reaction.semantic,
@@ -635,6 +642,25 @@ export function prepareLegacy(input: unknown): LegacyManifest {
     for (const value of Object.values(config.internalStateSettings))
       boolean(value, false);
     timestamp(r.updatedAt);
+    for (const legacyPersonaId of historicalIds) {
+      const config = {
+        name: "Legacy Persona (deleted)",
+        isEnabled: false,
+        historicalIdentity: { legacyRoomId: oldId, legacyPersonaId },
+      };
+      personas.push({
+        oldId: legacyPersonaId,
+        config,
+        attachments: [],
+        sourceDigest: hash(json(config)),
+      });
+    }
+    if (historicalIds.size)
+      warnings.set(
+        "DELETED_PERSONA_HISTORY_ONLY",
+        (warnings.get("DELETED_PERSONA_HISTORY_ONLY") ?? 0) +
+          historicalIds.size,
+      );
     counts.rooms++;
     counts.personas += personas.length;
     counts.messages += messages.length;
@@ -661,6 +687,7 @@ export function prepareLegacy(input: unknown): LegacyManifest {
   unique(rooms);
   if (
     counts.messages > IMPORT_LIMITS.messages ||
+    counts.personas > IMPORT_LIMITS.messages ||
     counts.attachments > IMPORT_LIMITS.attachments
   )
     fail("IMPORT_LIMIT");

@@ -254,7 +254,7 @@ export class ConversationRepository {
       cfg = JSON.parse(row.config_json);
     const personas = this.app.db
       .prepare(
-        "SELECT rp.persona_id FROM room_personas rp JOIN personas p USING(workspace_id,persona_id) WHERE rp.workspace_id=? AND rp.room_id=? AND p.deleted_at IS NULL ORDER BY p.created_at",
+        "SELECT rp.persona_id FROM room_personas rp JOIN personas p USING(workspace_id,persona_id) JOIN persona_revisions pr ON pr.workspace_id=p.workspace_id AND pr.persona_id=p.persona_id AND pr.revision=rp.persona_revision WHERE rp.workspace_id=? AND rp.room_id=? AND p.deleted_at IS NULL AND json_extract(pr.config_json,'$.historicalIdentity') IS NULL ORDER BY p.created_at",
       )
       .all(actor.workspaceId, roomId) as Row[];
     if (
@@ -272,6 +272,15 @@ export class ConversationRepository {
       workspaceId: actor.workspaceId,
       revision: row.revision,
       agents: personas.map((p) => this.getPersona(actor, roomId, p.persona_id)),
+      historicalPersonas: this.app.db
+        .prepare(
+          "SELECT p.persona_id,pr.config_json FROM room_personas rp JOIN personas p USING(workspace_id,persona_id) JOIN persona_revisions pr ON pr.workspace_id=p.workspace_id AND pr.persona_id=p.persona_id AND pr.revision=rp.persona_revision WHERE rp.workspace_id=? AND rp.room_id=? AND p.deleted_at IS NULL AND json_extract(pr.config_json,'$.historicalIdentity') IS NOT NULL",
+        )
+        .all(actor.workspaceId, roomId)
+        .map((p) => ({
+          id: String(p.persona_id),
+          ...JSON.parse(String(p.config_json)).historicalIdentity,
+        })),
       updatedAt: row.modified_at,
     };
   }
@@ -389,6 +398,7 @@ export class ConversationRepository {
         isEnabled: true,
         thinkingBudget: 0,
         historyWindow: 50,
+        pinFirstMessage: true,
         groups: [],
         subAgents: [],
         subAgentPolicy: { mode: "off" },
@@ -547,7 +557,7 @@ export class ConversationRepository {
       this.#room(actor, roomId);
       const count = this.app.db
         .prepare(
-          "SELECT count(*) n FROM room_personas rp JOIN personas p USING(workspace_id,persona_id) WHERE rp.workspace_id=? AND rp.room_id=? AND p.deleted_at IS NULL",
+          "SELECT count(*) n FROM room_personas rp JOIN personas p USING(workspace_id,persona_id) JOIN persona_revisions pr ON pr.workspace_id=p.workspace_id AND pr.persona_id=p.persona_id AND pr.revision=rp.persona_revision WHERE rp.workspace_id=? AND rp.room_id=? AND p.deleted_at IS NULL AND json_extract(pr.config_json,'$.historicalIdentity') IS NULL",
         )
         .get(actor.workspaceId, roomId)!.n;
       if (Number(count) >= APP_LIMITS.personasPerRoom)
@@ -578,6 +588,52 @@ export class ConversationRepository {
         personaId,
         1,
         "CREATE",
+      );
+      return this.getPersona(actor, roomId, personaId);
+    });
+  }
+  /** Only trusted ImportService may create immutable identities for absent legacy agents. */
+  createHistoricalPersona(
+    actor: Actor,
+    roomId: string,
+    identity: { legacyRoomId: string; legacyPersonaId: string },
+  ) {
+    if (!this.#importBatch) throw new AppError("INVALID_IMPORT_SCOPE");
+    this.#assert(actor, "IMPORT_DATA", roomId);
+    object(identity, ["legacyRoomId", "legacyPersonaId"]);
+    string(identity.legacyRoomId, 200);
+    string(identity.legacyPersonaId, 200);
+    return this.app.transaction(() => {
+      this.#room(actor, roomId);
+      const personaId = id(),
+        now = Date.now();
+      const json = canonical({
+        name: "Legacy Persona (deleted)",
+        isEnabled: false,
+        historicalIdentity: identity,
+      });
+      this.app.db
+        .prepare("INSERT INTO personas VALUES(?,?,1,?,?,?,NULL)")
+        .run(actor.workspaceId, personaId, actor.actorId, now, now);
+      this.app.db
+        .prepare("INSERT INTO persona_revisions VALUES(?,?,1,?,?,?)")
+        .run(actor.workspaceId, personaId, json, digest(json), now);
+      this.app.db
+        .prepare("INSERT INTO room_personas VALUES(?,?,?,1,1)")
+        .run(actor.workspaceId, roomId, personaId);
+      this.app.audit(
+        actor.actorId,
+        actor.workspaceId,
+        "IMPORT_HISTORICAL_PERSONA",
+        personaId,
+      );
+      this.app.change(
+        actor.workspaceId,
+        roomId,
+        "PERSONA",
+        personaId,
+        1,
+        "HISTORY_ONLY",
       );
       return this.getPersona(actor, roomId, personaId);
     });
@@ -626,6 +682,8 @@ export class ConversationRepository {
       if (!row) throw new AppError("NOT_FOUND", 404);
       if (row.revision !== x.expectedRevision)
         throw new AppError("REVISION_CONFLICT", 409);
+      if (JSON.parse(row.config_json).historicalIdentity)
+        throw new AppError("HISTORICAL_PERSONA_IMMUTABLE", 409);
       const cfg = this.#personaConfig(input, JSON.parse(row.config_json)),
         rev = row.revision + 1,
         json = canonical(cfg),

@@ -10,6 +10,7 @@ export interface ProviderRequest {
     >;
   }>;
   maxOutputTokens: number;
+  thinkingBudget?: number;
   signal: AbortSignal;
   structured: boolean;
 }
@@ -31,6 +32,7 @@ export interface ProviderAdapter {
   readonly name: string;
   readonly available?: boolean;
   supports(model: string): boolean;
+  validateThinkingBudget?(model: string, budget: number | undefined): void;
   generate(request: ProviderRequest): Promise<ProviderResult>;
 }
 export class ProviderError extends Error {
@@ -68,9 +70,29 @@ export class GeminiProvider implements ProviderAdapter {
   supports(model: string) {
     return this.models.has(model);
   }
+  validateThinkingBudget(model: string, budget: number | undefined) {
+    if (budget === undefined) return;
+    if (!Number.isSafeInteger(budget) || budget < 0)
+      throw new ProviderError("THINKING_BUDGET_UNSUPPORTED");
+    // Only declared numeric-budget models. Gemini 3 uses a different capability;
+    // do not silently translate a numeric budget to a thinking level.
+    if (/^gemini-2\.5-flash(?:-lite)?$/.test(model)) {
+      const minimum = model.endsWith("-lite") ? 512 : 128;
+      if (budget !== 0 && (budget < minimum || budget > 24576))
+        throw new ProviderError("THINKING_BUDGET_UNSUPPORTED");
+    } else if (model === "gemini-2.5-pro") {
+      if (budget < 128 || budget > 32768)
+        throw new ProviderError("THINKING_BUDGET_UNSUPPORTED");
+    } else if (budget > 0 || /^gemini-3/.test(model)) {
+      throw new ProviderError("THINKING_BUDGET_UNSUPPORTED");
+    }
+    // Legacy zero on models without declared thinking capability means no
+    // reasoning override, matching the former client. Positive values fail closed.
+  }
   async generate(request: ProviderRequest): Promise<ProviderResult> {
     if (!this.supports(request.model))
       throw new ProviderError("MODEL_NOT_ALLOWED");
+    this.validateThinkingBudget(request.model, request.thinkingBudget);
     // The key is only in a header; no URL, logs, error messages or browser DTOs.
     const response = await this.fetcher(
       `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(request.model)}:generateContent`,
@@ -87,6 +109,10 @@ export class GeminiProvider implements ProviderAdapter {
           contents: request.contents,
           generationConfig: {
             maxOutputTokens: request.maxOutputTokens,
+            ...(request.thinkingBudget !== undefined &&
+            /^gemini-2\.5-(?:flash(?:-lite)?|pro)$/.test(request.model)
+              ? { thinkingConfig: { thinkingBudget: request.thinkingBudget } }
+              : {}),
             ...(request.structured
               ? { responseMimeType: "application/json" }
               : {}),
@@ -210,6 +236,7 @@ export class FakeProvider implements ProviderAdapter {
   supports(model: string) {
     return model === "synthetic";
   }
+  validateThinkingBudget(_model: string, _budget: number | undefined) {}
   async generate(request: ProviderRequest): Promise<ProviderResult> {
     this.calls.push(
       structuredClone({ ...request, signal: undefined }) as ProviderRequest,

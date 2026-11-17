@@ -274,16 +274,12 @@ export class GenerationCoordinator {
       const room = this.repository.getRoom(actor, roomId);
       if (room.revision !== input.expectedRoomRevision)
         throw new GenerationError("REVISION_CONFLICT", 409);
-      const personas = this.app.db
-        .prepare(
-          "SELECT rp.persona_id FROM room_personas rp JOIN personas p USING(workspace_id,persona_id) WHERE rp.workspace_id=? AND rp.room_id=? AND p.deleted_at IS NULL",
-        )
-        .all(actor.workspaceId, roomId) as any[];
+      const personas = room.agents;
       if (personas.length > this.limits.maxPersonas)
         throw new GenerationError("PERSONA_LIMIT", 413);
-      const active = personas
-        .map((p) => this.repository.getPersona(actor, roomId, p.persona_id))
-        .filter((p) => p.isEnabled !== false);
+      const active = personas.filter(
+        (p: any) => p.isEnabled !== false && !p.historicalIdentity,
+      );
 
       for (const persona of active) {
         this.assert(actor, "GENERATE", roomId, persona.id);
@@ -841,6 +837,15 @@ export class GenerationCoordinator {
         Number(source.current_revision) !== ref.revision
       )
         throw new GenerationError("CONTEXT_CHANGED", 409);
+      if (ref.speaker?.personaId) {
+        const speaker = this.app.db
+          .prepare(
+            "SELECT rp.persona_revision FROM room_personas rp JOIN personas p USING(workspace_id,persona_id) WHERE rp.workspace_id=? AND rp.room_id=? AND rp.persona_id=? AND p.deleted_at IS NULL",
+          )
+          .get(actor.workspaceId, m.roomId, ref.speaker.personaId);
+        if (Number(speaker?.persona_revision) !== ref.speaker.revision)
+          throw new GenerationError("CONTEXT_CHANGED", 409);
+      }
       for (const segment of ref.segments) {
         const saved = this.app.db
           .prepare(
@@ -896,6 +901,13 @@ export class GenerationCoordinator {
       return;
     }
     const claimed = this.app.transaction(() => {
+      // A retry can schedule an unstarted acceptance, never a saved call intent.
+      // Any call record makes a QUEUED run inconsistent and requires host review.
+      this.app.db
+        .prepare(
+          "UPDATE app_generation_runs SET state='NEEDS_REVIEW',error_code='QUEUED_CALL_REQUIRES_REVIEW',completed_at=? WHERE run_id=? AND state='QUEUED' AND EXISTS(SELECT 1 FROM app_provider_calls c WHERE c.run_id=app_generation_runs.run_id)",
+        )
+        .run(this.wall(), runId);
       const active = this.app.db
         .prepare(
           "SELECT COUNT(*) n FROM app_generation_runs WHERE state='RUNNING'",
@@ -1179,6 +1191,15 @@ export class GenerationCoordinator {
         accepted.personaRevisions?.[persona.id]
     )
       throw new GenerationError("CONFIGURATION_REVISION_CHANGED", 409);
+    const budget = context.manifest.thinkingBudget;
+    try {
+      if (this.options.provider.validateThinkingBudget)
+        this.options.provider.validateThinkingBudget(model, budget);
+      else if (budget !== undefined && budget > 0)
+        throw new Error("unsupported");
+    } catch {
+      throw new GenerationError("THINKING_BUDGET_UNSUPPORTED", 409);
+    }
     this.options.hooks?.afterContext?.();
     const callId = randomUUID();
     const pricing = this.options.pricing ?? {
@@ -1301,6 +1322,9 @@ export class GenerationCoordinator {
           systemInstruction: context.systemInstruction,
           contents: context.contents,
           maxOutputTokens: context.manifest.maxOutputTokens,
+          ...(context.manifest.thinkingBudget !== undefined
+            ? { thinkingBudget: context.manifest.thinkingBudget }
+            : {}),
           structured:
             purpose === "memory" ||
             (purpose === "answer" && context.persona.separationEnabled),

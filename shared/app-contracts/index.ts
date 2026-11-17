@@ -104,6 +104,11 @@ export interface RoomDTO {
     showMemoryExport: boolean;
   };
   agents: PersonaDTO[];
+  historicalPersonas?: Array<{
+    id: string;
+    legacyRoomId: string;
+    legacyPersonaId: string;
+  }>;
   updatedAt: number;
   legacyDecisions?: any[];
   legacyReactions?: any[];

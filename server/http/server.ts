@@ -46,6 +46,8 @@ const SAFE_ERRORS = new Set([
   "LOGIN_RATE_LIMIT",
   "AUTH_BUSY",
   "INVALID_INPUT",
+  "HISTORICAL_PERSONA_IMMUTABLE",
+  "EXPORT_SOURCE_LIMIT",
   "INVALID_USERNAME",
   "PASSWORD_LENGTH",
   "NOT_FOUND",
@@ -250,7 +252,7 @@ export function createAppHandler(options: AppServerOptions) {
     policy,
   } = options;
   const enqueue = (receipt: any) => {
-    if (receipt.newlyAccepted === true && generation)
+    if (receipt.status === "QUEUED" && generation)
       setImmediate(() => {
         Promise.resolve(generation.execute(receipt.runId ?? receipt.id)).catch(
           () => {
