@@ -47,6 +47,10 @@ const stateLabels: Record<string, string> = {
   CANCELLED: "Cancelled",
   NEEDS_REVIEW: "Outcome unknown · review required",
 };
+const generationErrorText = (code: string) =>
+  code === "HISTORY_WINDOW_PIN_CONFLICT"
+    ? "履歴を2件以上にするか、最初の発言固定を解除してください。"
+    : code;
 const reactionEmoji: Record<string, string> = {
   ACK: "👍",
   AGREE: "✅",
@@ -885,7 +889,7 @@ export default function App() {
               <summary className="cursor-pointer">
                 Generation, decisions and usage ({runs.length})
                 {runs[0] &&
-                  ` · ${stateLabels[runs[0].status] ?? runs[0].status}${runs[0].errorCode ? ` · ${runs[0].errorCode}` : ""}`}
+                  ` · ${stateLabels[runs[0].status] ?? runs[0].status}${runs[0].errorCode ? ` · ${generationErrorText(runs[0].errorCode)}` : ""}`}
               </summary>
               <div className="max-h-60 overflow-auto space-y-3 py-3">
                 {runs.map((run) => (
@@ -898,7 +902,9 @@ export default function App() {
                       <span>
                         {stateLabels[run.status] ?? run.status} ·{" "}
                         {run.callCount ?? 0} provider calls{" "}
-                        {run.errorCode ? `· ${run.errorCode}` : ""}
+                        {run.errorCode
+                          ? `· ${generationErrorText(run.errorCode)}`
+                          : ""}
                       </span>
                       {busyRun(run) && (
                         <button

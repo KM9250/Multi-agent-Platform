@@ -14,11 +14,13 @@ import { testIdentityProvider } from './recovery-authorization-fixture.ts';
 import { terminationName,terminateChild } from './lease-fixture.ts';
 function location(t:TestContext){const dir=mkdtempSync(join(tmpdir(),'map-dispatch-crash-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));return {dir,path:join(dir,'db.sqlite'),counter:join(dir,'external-count.txt')};}
 function child(t:TestContext,args:string[]){
+  const startedAt=Date.now();
   const proc=fork(fileURLToPath(new URL('./recovery-dispatch-child.ts',import.meta.url)),args,{execArgv:['--experimental-transform-types','--loader',fileURLToPath(new URL('./ts-loader.mjs',import.meta.url))],stdio:['ignore','ignore','pipe','ipc']});
   let stderr='',ready:any,done:any;proc.stderr!.on('data',c=>{stderr+=c;});
+  const diagnostic=()=>JSON.stringify({mode:args[1],boundary:args[2],pid:proc.pid,startedAt,observedAt:Date.now(),timeoutMs:15000,ready:Boolean(ready),done:Boolean(done),exitCode:proc.exitCode,signal:proc.signalCode,killed:proc.killed});
   const exit=new Promise<{code:number|null;signal:string|null}>(resolve=>proc.once('exit',(code,signal)=>resolve({code,signal})));
-  const waitReady=new Promise<any>((resolve,reject)=>{proc.on('message',(m:any)=>{if(m.ready){ready=m;resolve(m);}if(m.done)done=m;});proc.once('error',reject);proc.once('exit',()=>{if(!ready)reject(Error(stderr));});});
-  const timer=setTimeout(()=>terminateChild(proc),15000);t.after(async()=>{clearTimeout(timer);if(proc.exitCode===null&&proc.signalCode===null)terminateChild(proc);await exit;});
+  const waitReady=new Promise<any>((resolve,reject)=>{proc.on('message',(m:any)=>{if(m.ready){ready=m;resolve(m);}if(m.done)done=m;});proc.once('error',reject);proc.once('exit',()=>{if(!ready)reject(Error(`${diagnostic()}\n${stderr}`));});});
+  const timer=setTimeout(()=>{t.diagnostic(`child watchdog: ${diagnostic()}`);terminateChild(proc);},15000);t.after(async()=>{clearTimeout(timer);if(proc.exitCode===null&&proc.signalCode===null)terminateChild(proc);await exit;});
   return {proc,waitReady,async finish(){const result=await exit;clearTimeout(timer);return {...result,ready,done,stderr};}};
 }
 const calls=(path:string)=>existsSync(path)?readFileSync(path,'utf8').trim().split('\n').filter(Boolean).length:0;

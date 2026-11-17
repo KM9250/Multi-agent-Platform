@@ -266,6 +266,28 @@ test("G1-08: real synchronous event-loop blocking cannot turn an expired respons
   });
   await generation.execute(receipt.runId);
   const result = generation.get(f.actor, f.room.id, receipt.runId);
+  if (
+    provider.calls.length !== 1 ||
+    result.errorCode !== "DEADLINE_EXCEEDED" ||
+    result.results.length !== 0 ||
+    result.usage[0]?.completeness !== "COMPLETE"
+  )
+    t.diagnostic(
+      JSON.stringify({
+        observedAt: Date.now(),
+        providerCalls: provider.calls.length,
+        run: f.app.db
+          .prepare(
+            "SELECT state,error_code,accepted_at,dispatch_before,deadline_at,completed_at FROM app_generation_runs WHERE run_id=?",
+          )
+          .get(receipt.runId),
+        calls: f.app.db
+          .prepare(
+            "SELECT state,reason,reserved_at,dispatched_at,completed_at FROM app_provider_calls WHERE run_id=?",
+          )
+          .all(receipt.runId),
+      }),
+    );
   assert.equal(provider.calls.length, 1);
   assert.equal(result.errorCode, "DEADLINE_EXCEEDED");
   assert.equal(result.results.length, 0);

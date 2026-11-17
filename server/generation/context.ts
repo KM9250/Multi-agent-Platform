@@ -158,6 +158,15 @@ export class ContextCompiler {
           ),
         )
         .get(...historyParams, 1) as any;
+      // A pin must never evict the accepted input, including its attachments.
+      // Use the effective Host-bounded window and stable Message identity.
+      if (
+        first &&
+        binding &&
+        historyLimit === 1 &&
+        first.message_id !== binding.messageId
+      )
+        throw new GenerationError("HISTORY_WINDOW_PIN_CONFLICT", 409);
       if (first && !messages.some((m) => m.message_id === first.message_id)) {
         if (messages.length >= historyLimit) messages.pop();
         messages.push(first);

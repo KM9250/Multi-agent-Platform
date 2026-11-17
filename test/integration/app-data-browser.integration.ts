@@ -427,7 +427,15 @@ try {
     title: "Imported browser room",
     description: "fixture",
     type: "Sandbox",
-    agents: [],
+    agents: [
+      {
+        id: "legacy-pin-persona",
+        name: "Imported pin persona",
+        model: "synthetic",
+        historyWindow: 1,
+        pinFirstMessage: true,
+      },
+    ],
     messages: [
       {
         id: "legacy-message",
@@ -470,6 +478,45 @@ try {
     .getByRole("heading", { name: "Imported browser room", exact: true })
     .click();
   await waitText(page, "Legacy original text");
+  // Imported settings stay readable; a later input must fail visibly without losing its attachment.
+  await page
+    .getByRole("textbox", { name: "Message", exact: true })
+    .fill("Pinned conflict input");
+  await page.locator("input[type=file][multiple]").setInputFiles({
+    name: "pin-input.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("Retained pinned input attachment"),
+  });
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  const guidance = "履歴を2件以上にするか、最初の発言固定を解除してください。";
+  await page.locator("summary").filter({ hasText: guidance }).waitFor();
+  await waitText(page, "Pinned conflict input");
+  await page
+    .getByRole("textbox", { name: "Message", exact: true })
+    .fill("Editable after rejection");
+  assert.equal(
+    await page.getByRole("button", { name: "Send", exact: true }).isEnabled(),
+    true,
+  );
+  assert.equal(provider.calls.length, 3);
+  const rejected = app.db
+    .prepare(
+      "SELECT run_id,state FROM app_generation_runs WHERE error_code='HISTORY_WINDOW_PIN_CONFLICT'",
+    )
+    .all();
+  assert.equal(rejected.length, 1);
+  assert.equal(rejected[0].state, "FAILED");
+  assert.equal(
+    app.db
+      .prepare("SELECT count(*) n FROM app_provider_calls WHERE run_id=?")
+      .get(rejected[0].run_id)!.n,
+    0,
+  );
+  await page.reload();
+  await page.locator("summary").filter({ hasText: guidance }).waitFor();
+  await waitText(page, "Pinned conflict input");
+  await page.getByRole("link", { name: /pin-input.txt/ }).waitFor();
+  assert.equal(provider.calls.length, 3);
   sessions.revokeAccount(account.actorId);
   await page
     .getByRole("heading", { name: "Sign in", exact: true })
@@ -507,6 +554,7 @@ try {
         "session revocation clears cache",
         "memory explicit authorized reader",
         "migration dry-run/import",
+        "window-one pin conflict guidance and retained input/attachment after reload",
         "literal HTML/no external requests",
       ],
       providerCalls: provider.calls.length,
@@ -519,8 +567,24 @@ try {
   console.error(
     JSON.stringify({
       providerCalls: provider.calls.length,
+      observedAt: Date.now(),
+      http,
+      consoleErrors,
+      pages: await Promise.all(
+        (browser?.contexts().flatMap((context) => context.pages()) ?? []).map(
+          async (page) => ({
+            path: new URL(page.url()).pathname,
+            body: await page
+              .locator("body")
+              .innerText({ timeout: 2000 })
+              .catch(() => "unavailable"),
+          }),
+        ),
+      ),
       runs: app.db
-        .prepare("SELECT run_id,state,error_code FROM app_generation_runs")
+        .prepare(
+          "SELECT run_id,state,error_code,accepted_at,dispatch_before,deadline_at,completed_at FROM app_generation_runs",
+        )
         .all(),
     }),
   );

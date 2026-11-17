@@ -106,12 +106,13 @@ async function fixture(t: any, options: any = {}) {
     assert.ok(persona.id);
     return { room, persona };
   }
-  async function turn(room: any, key: string) {
+  async function turn(room: any, key: string, extra: any = {}) {
     return request(`/rooms/${room.id}/turns`, "POST", {
       requestId: key,
       expectedRoomRevision: room.revision,
       content: "current input",
       recipient: { type: "all" },
+      ...extra,
     });
   }
   async function done(roomId: string, runId: string) {
@@ -446,27 +447,309 @@ test("PR38 F-03: framework-only requests preserve structured private debug seman
     }
   }
 });
-test("PR38 F-03: pin OFF and one-message pin match old bounded history semantics", async (t) => {
-  const f = await fixture(t);
-  for (const pinFirstMessage of [false, true]) {
-    const { room } = await f.setup({ historyWindow: 1, pinFirstMessage });
+const pinConflict = "HISTORY_WINDOW_PIN_CONFLICT";
+async function currentAttachment(
+  f: any,
+  roomId: string,
+  text = "current attachment marker",
+) {
+  const upload = await f.request(`/rooms/${roomId}/attachments`, "POST", {
+    name: "current.txt",
+    mimeType: "text/plain",
+    data: Buffer.from(text).toString("base64"),
+  });
+  assert.equal(upload.status, 201);
+  return upload.data.id;
+}
+function noCalls(f: any) {
+  assert.equal(f.provider.calls.length, 0);
+  assert.equal(
+    f.app.db.prepare("SELECT count(*) n FROM app_provider_calls").get()!.n,
+    0,
+  );
+}
+for (const mode of ["text", "with-attachment", "attachment-only"])
+  test(`PR38 F-03 follow-up: window one rejects displaced ${mode} input before reservation and preserves acceptance`, async (t) => {
+    const f = await fixture(t),
+      { room, persona } = await f.setup({
+        historyWindow: 1,
+        pinFirstMessage: true,
+      });
+    // Equal text still identifies two different Messages.
+    f.repository.appendMessage(f.actor, room.id, {
+      role: "user",
+      content: "current input",
+    });
+    const attachmentIds =
+      mode === "text" ? [] : [await currentAttachment(f, room.id)];
+    const content = mode === "attachment-only" ? "" : "current input";
+    const input = {
+      content,
+      attachmentIds,
+      recipient: { type: mode === "with-attachment" ? "auto" : "all" },
+    };
+    const accepted = await f.turn(room, mode, input);
+    assert.equal(accepted.status, 202);
+    const result = await f.done(room.id, accepted.data.runId);
+    assert.equal(result.status, "FAILED");
+    assert.equal(result.errorCode, pinConflict);
+    assert.equal(result.callCount, 0);
+    assert.deepEqual(result.results, []);
+    noCalls(f);
+    const saved = f.repository.getMessage(
+      f.actor,
+      room.id,
+      accepted.data.inputMessageId,
+    );
+    assert.equal(saved.content, content);
+    assert.deepEqual(
+      saved.attachments.map((a: any) => a.id),
+      attachmentIds,
+    );
+    const run = f.app.db
+      .prepare(
+        "SELECT state,completed_at FROM app_generation_runs WHERE run_id=?",
+      )
+      .get(accepted.data.runId)!;
+    assert.equal(run.state, "FAILED");
+    assert.ok(run.completed_at);
+    const again = await f.turn(room, mode, input);
+    assert.equal(again.data.runId, accepted.data.runId);
+    assert.equal(again.data.status, "FAILED");
+    const cfg = (await f.request(`/rooms/${room.id}/personas/${persona.id}`))
+      .data;
+    assert.equal(cfg.historyWindow, 1);
+    assert.equal(cfg.pinFirstMessage, true);
+    assert.equal(
+      f.app.db.prepare("SELECT count(*) n FROM app_generation_runs").get()!.n,
+      1,
+    );
+    assert.equal(
+      f.app.db
+        .prepare("SELECT count(*) n FROM messages WHERE role='user'")
+        .get()!.n,
+      2,
+    );
+    noCalls(f);
+  });
+for (const pinFirstMessage of [false, true])
+  for (const attached of [false, true])
+    test(`PR38 F-03 follow-up: window one keeps current input with pin=${pinFirstMessage}, attachment=${attached}`, async (t) => {
+      const f = await fixture(t),
+        { room } = await f.setup({ historyWindow: 1, pinFirstMessage });
+      if (!pinFirstMessage)
+        f.repository.appendMessage(f.actor, room.id, {
+          role: "user",
+          content: "old anchor",
+        });
+      const attachmentIds = attached
+        ? [await currentAttachment(f, room.id)]
+        : [];
+      const content = attached ? "" : "current input";
+      const accepted = await f.turn(room, "compatible", {
+        content,
+        attachmentIds,
+      });
+      const result = await f.done(room.id, accepted.data.runId);
+      assert.equal(result.status, "COMPLETED");
+      assert.equal(f.provider.calls.length, 1);
+      const request = f.provider.calls[0],
+        history = JSON.parse(request.contents[0].parts[0].text);
+      assert.equal(history.messageId, accepted.data.inputMessageId);
+      assert.doesNotMatch(JSON.stringify(request.contents), /old anchor/);
+      assert.match(
+        JSON.stringify(request.contents),
+        attached ? /current attachment marker/ : /current input/,
+      );
+    });
+test("PR38 F-03 follow-up: import/save/read retains window-one pin settings while generation fails explicitly", async (t) => {
+  const f = await fixture(t),
+    input = {
+      sourceId: "pin-legacy",
+      rooms: [
+        {
+          id: "r",
+          title: "Retained legacy settings",
+          agents: [
+            { ...oldPersona("p"), historyWindow: 1, pinFirstMessage: true },
+          ],
+          messages: [
+            {
+              id: "u",
+              role: "user",
+              content: "legacy anchor",
+              timestamp: 1234,
+            },
+          ],
+        },
+      ],
+    };
+  assert.equal(
+    (await f.request("/migrations/dry-run", "POST", input)).status,
+    200,
+  );
+  const imported = await f.request("/migrations/import", "POST", {
+    ...input,
+    requestId: "pin-import",
+  });
+  assert.equal(imported.status, 200);
+  assert.equal(imported.data.status, "COMPLETE");
+  const roomId = imported.data.mappings.find(
+    (m: any) => m.kind === "room",
+  ).targetId;
+  const room = (await f.request(`/rooms/${roomId}`)).data,
+    persona = room.agents[0];
+  assert.equal(persona.historyWindow, 1);
+  assert.equal(persona.pinFirstMessage, true);
+  const saved = await f.request(
+    `/rooms/${roomId}/personas/${persona.id}`,
+    "PATCH",
+    {
+      expectedRevision: persona.revision,
+      historyWindow: 1,
+      pinFirstMessage: true,
+    },
+  );
+  assert.equal(saved.status, 200);
+  assert.equal(saved.data.historyWindow, 1);
+  assert.equal(saved.data.pinFirstMessage, true);
+  assert.equal(
+    (await f.request(`/rooms/${roomId}/messages`)).data.messages[0].content,
+    "legacy anchor",
+  );
+  const accepted = await f.turn(room, "imported-settings");
+  assert.equal(
+    (await f.done(roomId, accepted.data.runId)).errorCode,
+    pinConflict,
+  );
+  noCalls(f);
+});
+test("PR38 F-03 follow-up: window two retains corrected eligible anchor and current attachment, excluding deleted originals", async (t) => {
+  const f = await fixture(t),
+    { room } = await f.setup({ historyWindow: 2, pinFirstMessage: true });
+  const deleted = f.repository.appendMessage(f.actor, room.id, {
+    role: "user",
+    content: "deleted anchor",
+  });
+  f.repository.deleteMessage(f.actor, room.id, deleted.id, {
+    expectedRevision: 1,
+  });
+  const anchor = f.repository.appendMessage(f.actor, room.id, {
+    role: "user",
+    content: "obsolete anchor",
+  });
+  f.repository.correctMessage(f.actor, room.id, anchor.id, {
+    expectedRevision: 1,
+    content: "corrected anchor",
+  });
+  f.repository.appendMessage(f.actor, room.id, {
+    role: "user",
+    content: "discarded middle",
+  });
+  const accepted = await f.turn(room, "two-slots", {
+    attachmentIds: [await currentAttachment(f, room.id)],
+  });
+  assert.equal(
+    (await f.done(room.id, accepted.data.runId)).status,
+    "COMPLETED",
+  );
+  const request = f.provider.calls[0];
+  assert.deepEqual(
+    request.contents.map((c: any) => JSON.parse(c.parts[0].text).messageId),
+    [anchor.id, accepted.data.inputMessageId],
+  );
+  assert.match(JSON.stringify(request), /corrected anchor/);
+  assert.match(JSON.stringify(request), /current input/);
+  assert.match(JSON.stringify(request), /current attachment marker/);
+  assert.doesNotMatch(
+    JSON.stringify(request),
+    /deleted anchor|obsolete anchor|discarded middle/,
+  );
+});
+for (const boundary of ["delete", "correct", "acl"])
+  test(`PR38 F-03 follow-up: window two rechecks ${boundary} after compiling pinned context with attachments`, async (t) => {
+    let change = () => {};
+    const f = await fixture(t, {
+        hooks: {
+          afterContext() {
+            change();
+          },
+        },
+      }),
+      { room } = await f.setup({ historyWindow: 2, pinFirstMessage: true });
+    const anchor = f.repository.appendMessage(f.actor, room.id, {
+      role: "user",
+      content: "pinned anchor",
+    });
+    change = () => {
+      if (boundary === "delete")
+        f.repository.deleteMessage(f.actor, room.id, anchor.id, {
+          expectedRevision: 1,
+        });
+      else if (boundary === "correct")
+        f.repository.correctMessage(f.actor, room.id, anchor.id, {
+          expectedRevision: 1,
+          content: "changed anchor",
+        });
+      else
+        f.policy.revoke(
+          f.actor.actorId,
+          f.actor.workspaceId,
+          "SEND_TO_PROVIDER",
+        );
+    };
+    const accepted = await f.turn(room, boundary, {
+      attachmentIds: [await currentAttachment(f, room.id)],
+    });
+    const result = await f.done(room.id, accepted.data.runId);
+    assert.equal(result.status, "FAILED");
+    assert.equal(
+      result.errorCode,
+      boundary === "acl" ? "GENERATION_FAILED" : "CONTEXT_CHANGED",
+    );
+    assert.equal(f.provider.calls.length, 0);
+    const calls = f.app.db
+      .prepare("SELECT state,dispatched_at FROM app_provider_calls")
+      .all();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].state, "RESERVED");
+    assert.equal(calls[0].dispatched_at, null);
+    assert.equal(
+      f.repository.getMessage(f.actor, room.id, accepted.data.inputMessageId)
+        .content,
+      "current input",
+    );
+  });
+for (const kind of ["history", "tokens"])
+  test(`PR38 F-03 follow-up: pinning never bypasses host ${kind} limit with current attachments`, async (t) => {
+    const f = await fixture(t, {
+        limits:
+          kind === "history" ? { maxHistory: 1 } : { maxInputTokens: 1024 },
+      }),
+      { room } = await f.setup({ historyWindow: 2, pinFirstMessage: true });
     f.repository.appendMessage(f.actor, room.id, {
       role: "user",
       content: "first anchor",
     });
-    const accepted = await f.turn(room, String(pinFirstMessage));
+    const accepted = await f.turn(room, kind, {
+      attachmentIds: [
+        await currentAttachment(
+          f,
+          room.id,
+          kind === "tokens"
+            ? "bounded ".repeat(1000)
+            : "current attachment marker",
+        ),
+      ],
+    });
+    const result = await f.done(room.id, accepted.data.runId);
+    assert.equal(result.status, "FAILED");
     assert.equal(
-      (await f.done(room.id, accepted.data.runId)).status,
-      "COMPLETED",
+      result.errorCode,
+      kind === "history" ? pinConflict : "CONTEXT_LIMIT",
     );
-    const contents = JSON.stringify(f.provider.calls.at(-1).contents);
-    assert.match(contents, pinFirstMessage ? /first anchor/ : /current input/);
-    assert.doesNotMatch(
-      contents,
-      pinFirstMessage ? /current input/ : /first anchor/,
-    );
-  }
-});
+    noCalls(f);
+  });
 test("PR38 F-03: unsupported or over-host thinking fails before dispatch rather than ignoring the setting", async (t) => {
   let sends = 0;
   const provider = new GeminiProvider({
