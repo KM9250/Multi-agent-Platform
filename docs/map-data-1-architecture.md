@@ -2,6 +2,44 @@
 
 この変更の契約は `MAP-DATA-1:SERVER_CONVERSATION:1`。対象は会話のサーバー永続化と、その利用に必要な認証、生成、添付、移行、保全である。全体設計の MEM-1 以降（Vault 公開、承認、全文・ベクトル検索、Embedding、自動要約）は実装対象に含めない。既存 `/memory` は分類された内部メモの生成であり、Vault 公開ではない。
 
+PR #38のF-01〜F-04修正と検証結果は[監査修正報告](map-data-1-pr38-audit.md)を参照。
+
+## PR #38 監査後の履歴・実行契約
+
+旧UIで削除されたPersonaへの参照は、Import専用の履歴Identityとして保存する。
+既存Persona/Revision表の設定JSONに、サーバーだけが作成できる `historicalIdentity`
+（元Room ID・Persona ID）と `isEnabled:false` を記録する。モデルや実行設定は作らない。
+外部キーと旧ID対応表を保持しながら、Room DTOの `historicalPersonas` と現在の `agents` を分ける。
+履歴Identityの更新は拒否し、生成対象・現在Persona数の上限から除外する。
+同名Personaと統合せず、Message・Decision・Reactionだけが残る場合も元時刻・分類を保全する。
+新UIでの明示的な削除は従来どおり現在の削除方針に従い、過去版を復活させる機能ではない。
+
+HTTPの受付再送では、Receiptが `QUEUED` の場合に実行予約へ接続する。
+Coordinatorは原子的に未開始Runをclaimし、現在のSession/認可・原本版・期限を送信前に再確認する。
+すでにCallが存在する不整合な `QUEUED` は `NEEDS_REVIEW` にする。
+保存済み `DISPATCH_INTENT` / `OUTCOME_UNKNOWN` の読取りから送信権限を再生成しない。
+GETのReaderやpollingは実行予約を行わない。
+
+`pinFirstMessage` は省略時true。認可・分類・受理入力の範囲内で最初の人間発言を取得し、
+履歴窓の最古の1枠と置き換える。固定分もHost件数/byte/token上限の内側で扱う。
+旧仕様と同様、窓1・固定ONでは最初の人間発言だけになる。窓0は無制限にせずHost上限を用いる。
+Frameworkは `standard` / `cot` / `react` を区別し、不明値をStandardへ変換しない。
+CoT/ReActは既存の分離用Strategy指示を使用し、簡潔な明示的要約をPrivateの `debug_thoughts` に保存する。
+Roomの分離OFFでも非Standard回答は構造化出力を要求し、要約タグを公開本文へ埋め込まない。
+Providerの隠れた推論や実Tool実行を要求するものではない。
+
+Persona/固定Workerの `thinkingBudget` をManifestとProvider要求へ渡す。
+指定値は実効 `maxOutputTokens` 以下（Host最大2048）でなければ送信前に明示失敗する。
+Geminiの数値budget能力は既知の2.5 Flash/Flash Lite/Proに限定する。3系のthinking levelへの
+推測変換や、未宣言モデルへの正数budgetの無視はしない。詳細とゼロ/省略値は運用手順を参照。
+出力上限は最終本文と推論tokenを含む枠として予約し、既存の実Usage超過・Unknown予約保持を維持する。
+
+Provider履歴は `MAP_HISTORY_MESSAGE` JSON Envelopeとし、サーバー保存メタデータから
+`speaker.kind`（human/persona）、安定Persona ID、表示名、参照Persona版を構成する。
+本文は `segments[].content` の文字列で、本文内の `[User]` や偽JSONを話者として解析しない。
+同名PersonaもIDで区別する。話者版もManifestへ束縛し、compile後・送信直前に変更されたら拒否する。
+公開Contextへ選ぶSegmentの認可・分類条件は維持する。
+
 ## 境界と正本
 
 ```text

@@ -173,4 +173,37 @@ to six times text bytes for JSON escaping. An upload within the storage limit ca
 therefore still exceed the per-call context limit. The compiled request is
 checked again before dispatch; missing provider usage counters remain unknown.
 
+After the PR #38 audit corrections, `pinFirstMessage` defaults to true and occupies
+one slot within the finite history window. A one-message window therefore keeps
+only the first authorized human message, matching the former client. CoT and
+ReAct apply their distinct summary instructions and require structured output
+even with Room separation off. Their explicit debug summaries remain private;
+this does not enable tools or expose provider-hidden reasoning.
+
+The numeric `thinkingBudget` setting now reaches Persona and fixed-worker provider
+requests. The effective output cap (at most 2048, or a smaller worker/Host cap)
+bounds thinking as well as final output. Larger values fail with
+`THINKING_BUDGET_LIMIT`; they are not clamped silently. Declared adapter capabilities:
+
+| Model                    | Numeric budget                                                     |
+| ------------------------ | ------------------------------------------------------------------ |
+| `gemini-2.5-flash`       | 0 to disable, or 128–2048 within the effective output cap          |
+| `gemini-2.5-flash-lite`  | 0 to disable, or 512–2048 within the effective output cap          |
+| `gemini-2.5-pro`         | 128–2048 within the effective output cap; zero is rejected         |
+| Gemini 3 family          | Numeric budget rejected; no inferred thinking-level conversion     |
+| Other allowlisted models | Positive budgets rejected; legacy zero means no reasoning override |
+
+Capability support does not add a model to the Host allowlist. Unknown model
+variants are not remapped. An omitted worker budget retains the provider default;
+the finite output/usage/cost limits still apply. Zero on supported Flash models
+is now sent explicitly, correcting the old omission of the setting. The adapter
+uses the provider's native field without `includeThoughts`. These requests were
+verified over synthetic loopback HTTP, not against a billable provider.
+
+Acceptance retry may schedule a still-unstarted QUEUED run, including recovery
+from an exception after acceptance COMMIT but before the HTTP scheduling step.
+This is not provider retry: current authorization/deadlines are checked again,
+and any persisted call on a QUEUED run requires review. Readers/polling never
+schedule execution. See the [PR #38 audit report](map-data-1-pr38-audit.md).
+
 Run `npm run test:app-data`, `npm run test:app-data-browser` and the individual import/crash/backup/redteam commands listed in `package.json`. The CLI integration test performs a real process sequence: create account → backup → separate restore → refused premature resume → password reset → resume → login/read original; it checks old-session rejection and zero Provider calls. Synthetic tests do not prove live Provider behavior, target-host restore or Windows filesystem guarantees. Use the verification report for actual results and outstanding production gates.

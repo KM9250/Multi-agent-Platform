@@ -13,17 +13,36 @@
 
 同名Personaは自動統合せずRoom内の旧IDから別の安定IDへ対応付ける。同じ旧IDの内容が異なる別ブラウザExportは競合として拒否し、どの原本を採用するか利用者が確認する。同一内容のコピーは既存の確定済み対応へ収束する。IDの変更、Base64からバイナリ添付への変換、未完了状態の隔離を対応表へ記録する。
 
+旧 `agents` にないPersona IDがMessage・Decision・Reactionに残る場合は、削除済みPersonaの
+履歴Identityを作る。Dry Runは `DELETED_PERSONA_HISTORY_ONLY` を警告し、Persona件数には
+この識別用原本も含む。Room DTOの `historicalPersonas` に元Room/Persona IDを示し、
+現在の `agents` や生成対象には含めない。履歴Identityの編集・有効化は拒否する。
+旧名前が存在しない場合に同名の現行Personaを推測せず、画面は削除済みPersonaと旧IDを表示する。
+Private Segmentの所有参照も保持し、別途その安定ID・Visibilityへの明示Grantが必要である。
+Batch全体のPersona Identityは20,000までとし、上限を超えたら拒否する。
+今回のImport以降はExportの `legacySources` にMessage/Decision/Reactionの旧ID・旧Room IDと出所を含める。
+
+DDLは変わらないが、履歴Identityを理解しない監査前サーバーとの後方互換性は保証しない。
+更新後のDBを監査前バイナリで開いて運用しない。バイナリも切り戻す場合は、両サーバーを停止し、
+更新前Backupを別Rootへ復元して確認する。更新後のRootは保全し、新しい履歴を自動で削除・逆変換しない。
+
+設定省略時は旧Clientに合わせ、`pinFirstMessage=true`、`framework=standard`、Personaの
+`thinkingBudget=0`、`historyWindow=0` とする。Workerの省略された推論設定は省略を保つ。
+窓0はサーバーの有限上限内で動作する。監査修正前に完了したImportの設定を自動で書き換えない。
+その時点で省略値がfalse/0として保存された設定は、必要に応じ利用者が内容を確認して明示更新する。
+同一Batchの再実行は元の確定済み対応・版へ収束し、設定変更の手段にはしない。
+
 旧本文をImport時刻で置換しない。`occurred_at` は旧時刻、`ingested_at` は取込時刻である。旧時刻が欠ける場合は0と `timestamp_trust=unknown` を保存する。旧モデル本文・未知分類・不完全な構造化応答は、必要に応じ `developer_only` の `gm_log` に隔離し、公開本文へ変換しない。元の本文は保護された `import_source_records` とそのDigestに保全する。旧Owner、Roleによる権限、承認、実行済みフラグ、`isStreaming` は新しい権限やProvider送信Receiptにならない。
 
 移行照合はRoom・Persona・Message・Revision・Segment・Decision・Reaction・添付の件数に加え、保存された本文・Segment・設定・添付のDigestと時刻を確認する。Legacy Decision／Reactionは履歴として専用表に保存する。既存のGeneration Receiptを偽造しない。Raw Decision／Error本文を通常の診断DTOへ出さない。
 
-サーバーの初期上限は16 MiBの移行JSON、50 Room、Roomあたり16 Persona、合計20,000 Message、1,000添付、各添付4 MiB、各Message本文32,768文字。ブラウザーのファイル選択は8 MiBまでで、これを超える場合は元のID・出所を保持して移行用ファイルを分割する。HTTP入口の共通Body上限がこれより小さい場合は入口が優先する。上限超過は固定エラーで拒否し、切り詰めない。各項目のDB確定とイベントループへのyieldを分離して、長い単一書込みTransactionを作らない。
+サーバーの初期上限は16 MiBの移行JSON、50 Room、Roomあたり16現行Persona、合計20,000 Message、1,000添付、各添付4 MiB、各Message本文32,768文字。ブラウザーのファイル選択は8 MiBまでで、これを超える場合は元のID・出所を保持して移行用ファイルを分割する。HTTP入口の共通Body上限がこれより小さい場合は入口が優先する。上限超過は固定エラーで拒否し、切り詰めない。各項目のDB確定とイベントループへのyieldを分離して、長い単一書込みTransactionを作らない。
 
 ## 認可付き標準Export
 
 `GET /api/app/v1/rooms/:roomId/export?limit=50` は `MAP-DATA-1:EXPORT:1` のJSON Chunkを返す。`nextCursor` がある間、同じRoomとSessionで `cursor` を渡して続きのChunkを取得する。画面は各Chunkを個別ファイルとして保存し、利用者が続きのDownload操作を行う。最終Chunkまで取得して初めて完了と表示するため、途中までのファイルを完全なExportとして扱わない。CursorはActor・Workspace・Room・現在のACL版・期限・Export用途へ暗号的に束縛する。
 
-各Chunkは最大200 Messageで、各Messageの最大1,000 Revision、最大16 MiBの出力に制限する。これらを超えた場合は固定エラーとなる。公開本文と、現在の明示的なPersona／Visibility単位のPrivate閲覧権で許可された原本だけを出力する。Private専用 `/memory` 原本も同じ認可を満たす場合に含まれる。通常の会話閲覧権や管理権限だけでは含まれない。削除済みMessage／Persona本文は過去Revisionを含めて除外する。
+各Chunkは最大200 Messageで、各Messageの最大1,000 Revision、最大16 MiBの出力に制限する。これらを超えた場合は固定エラーとなる。公開本文と、現在の明示的なPersona／Visibility単位のPrivate閲覧権で許可された原本だけを出力する。Private専用 `/memory` 原本も同じ認可を満たす場合に含まれる。通常の会話閲覧権や管理権限だけでは含まれない。新サーバー上で削除されたMessage／Persona本文は過去Revisionを含めて除外する。Importした履歴専用Identityはこの削除状態とは別であり、保持した本文を現在認可に従ってExportする。
 
 JSONにはStable ID、Revision、分類、原本参照、許可されたSegmentのDigest、添付Manifestを含む。添付のバイナリは現在認可付きの `.../attachments/:id/content` から取得する。サーバーパス、Blobキー、Session、Provider生応答、Raw Promptは含めない。Export途中のACL撤回・Room変更・原本削除を確認して固定エラーにし、古い出力を返さない。複数Chunkをまたぐ利用者の同時編集は一つのDB Snapshotとは保証しないため、完全な保全には次の停止中Backupを用いる。
 

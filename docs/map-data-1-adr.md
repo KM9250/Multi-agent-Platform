@@ -2,6 +2,18 @@
 
 Status: proposed for DATA-1 review. Contract: `MAP-DATA-1:SERVER_CONVERSATION:1`.
 
+Audit amendment: PR #38 F-01–F-04 keeps schema 1 and the original COORD boundary.
+Historical-only Persona identities use an immutable server-created JSON
+discriminator in the existing identity/revision tables, without executable
+configuration. Room DTOs separate these from active Persona definitions.
+Acceptance retry schedules only an unstarted QUEUED run; a saved call record
+cannot become send authority. Context now preserves canonical speaker envelopes,
+first-message pinning, explicit framework instructions and supported native
+thinking budgets. Nonstandard frameworks always use private structured debug
+summaries, including when Room separation is off. This deliberately avoids
+restoring the old public debug-tag format. See the
+[audit report](map-data-1-pr38-audit.md) for compatibility and validation evidence.
+
 ## Context and scope
 
 The baseline is `c945bd1228af2c346791012ef3a6935bd5a82d17`. Its React application
