@@ -174,8 +174,15 @@ therefore still exceed the per-call context limit. The compiled request is
 checked again before dispatch; missing provider usage counters remain unknown.
 
 After the PR #38 audit corrections, `pinFirstMessage` defaults to true and occupies
-one slot within the finite history window. A one-message window therefore keeps
-only the first authorized human message, matching the former client. CoT and
+one slot within the finite history window. If that effective window has only one
+slot and the pin is a different Message from the accepted input, generation fails
+with `HISTORY_WINDOW_PIN_CONFLICT` before reserving or sending a call. The screen
+instructs the user to increase history to at least two messages or turn off the
+first-message pin. The saved input, its attachments and the settings remain intact.
+The first turn (where the input is the pin) and a one-message window with pinning
+off still work. A failed Request ID stays failed on replay; changing settings does
+not authorize its replay as a new generation. See the [follow-up report](map-data-1-pr38-pin-followup.md).
+CoT and
 ReAct apply their distinct summary instructions and require structured output
 even with Room separation off. Their explicit debug summaries remain private;
 this does not enable tools or expose provider-hidden reasoning.

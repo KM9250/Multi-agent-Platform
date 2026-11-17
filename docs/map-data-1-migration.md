@@ -32,6 +32,11 @@ DDLは変わらないが、履歴Identityを理解しない監査前サーバー
 その時点で省略値がfalse/0として保存された設定は、必要に応じ利用者が内容を確認して明示更新する。
 同一Batchの再実行は元の確定済み対応・版へ収束し、設定変更の手段にはしない。
 
+`historyWindow=1` / `pinFirstMessage=true` のImport・保存・閲覧も可能で、値を自動変更しない。
+ただし生成時に実効履歴枠1件へ別の先頭発言と現在入力を同時に入れられない場合は、
+`HISTORY_WINDOW_PIN_CONFLICT` でCall予約前に拒否する。履歴枠を2件以上にするか固定を解除する。
+現在入力とその添付は保存され、同じRequest IDの再送は保存済みFAILEDへ収束する。
+
 旧本文をImport時刻で置換しない。`occurred_at` は旧時刻、`ingested_at` は取込時刻である。旧時刻が欠ける場合は0と `timestamp_trust=unknown` を保存する。旧モデル本文・未知分類・不完全な構造化応答は、必要に応じ `developer_only` の `gm_log` に隔離し、公開本文へ変換しない。元の本文は保護された `import_source_records` とそのDigestに保全する。旧Owner、Roleによる権限、承認、実行済みフラグ、`isStreaming` は新しい権限やProvider送信Receiptにならない。
 
 移行照合はRoom・Persona・Message・Revision・Segment・Decision・Reaction・添付の件数に加え、保存された本文・Segment・設定・添付のDigestと時刻を確認する。Legacy Decision／Reactionは履歴として専用表に保存する。既存のGeneration Receiptを偽造しない。Raw Decision／Error本文を通常の診断DTOへ出さない。

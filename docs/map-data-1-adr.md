@@ -14,6 +14,12 @@ summaries, including when Room separation is off. This deliberately avoids
 restoring the old public debug-tag format. See the
 [audit report](map-data-1-pr38-audit.md) for compatibility and validation evidence.
 
+The [window-one follow-up](map-data-1-pr38-pin-followup.md) supersedes the old
+single-slot pin behavior: an effective one-slot window cannot replace the
+accepted input with an earlier Message. Reject that conflict before call
+reservation, retain the input/attachments and configuration, and show an actionable
+setting change. Import/read/save remain valid. Other audit corrections are unchanged.
+
 ## Context and scope
 
 The baseline is `c945bd1228af2c346791012ef3a6935bd5a82d17`. Its React application

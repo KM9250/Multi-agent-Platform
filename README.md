@@ -61,7 +61,8 @@ CDN/service-worker caches. This change does not rotate keys automatically.
 - [Architecture and limits](docs/map-data-1-architecture.md)
 - [Design decisions and compatibility changes](docs/map-data-1-adr.md)
 - [Validation results and production gates](docs/map-data-1-validation.md)
-- [PR #38 audit corrections and current validation](docs/map-data-1-pr38-audit.md)
+- [PR #38 initial audit corrections and validation](docs/map-data-1-pr38-audit.md)
+- [PR #38 window-one follow-up and latest validation](docs/map-data-1-pr38-pin-followup.md)
 
 ```bash
 npm test

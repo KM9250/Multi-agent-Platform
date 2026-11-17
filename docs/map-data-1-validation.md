@@ -1,7 +1,8 @@
 # MAP-DATA-1 検証報告
 
 この文書は初回提出HEAD `76be76a` の検証記録である。PR #38 F-01〜F-04の追加修正、
-最新コードSHA・回帰結果・公開HEADは[監査修正報告](map-data-1-pr38-audit.md)を参照。
+監査修正は[監査修正報告](map-data-1-pr38-audit.md)、最新コードSHA・回帰結果・公開HEADは
+[履歴窓1件の再監査追補](map-data-1-pr38-pin-followup.md)を参照。
 
 検証日: 2026-11-17 UTC。対象は DATA-1 のコード・合成環境での機能検証である。
 **実Provider試験と対象配備環境の復元試験は未実施のため、本稼働Gateは未通過。**

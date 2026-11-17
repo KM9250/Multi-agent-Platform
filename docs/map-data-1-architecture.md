@@ -22,7 +22,10 @@ GETのReaderやpollingは実行予約を行わない。
 
 `pinFirstMessage` は省略時true。認可・分類・受理入力の範囲内で最初の人間発言を取得し、
 履歴窓の最古の1枠と置き換える。固定分もHost件数/byte/token上限の内側で扱う。
-旧仕様と同様、窓1・固定ONでは最初の人間発言だけになる。窓0は無制限にせずHost上限を用いる。
+実効窓1・固定ONで、最初の人間発言と受理した現在入力が別Messageなら、
+`HISTORY_WINDOW_PIN_CONFLICT` でCall予約・送信前に拒否する。現在入力と添付を押し出して生成しない。
+初回の同一Message、固定OFF、両方を保持できる窓2以上は利用できる。窓0にもHost上限を適用する。
+この追補は[履歴窓1件の再監査報告](map-data-1-pr38-pin-followup.md)を参照。
 Frameworkは `standard` / `cot` / `react` を区別し、不明値をStandardへ変換しない。
 CoT/ReActは既存の分離用Strategy指示を使用し、簡潔な明示的要約をPrivateの `debug_thoughts` に保存する。
 Roomの分離OFFでも非Standard回答は構造化出力を要求し、要約タグを公開本文へ埋め込まない。
