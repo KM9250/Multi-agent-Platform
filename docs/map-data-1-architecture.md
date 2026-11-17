@@ -35,19 +35,19 @@ Host試験用のbefore/after COMMIT hookはHTTPから設定できない。実プ
 
 ## データと原本参照
 
-| 保存群 | 責務 |
-| --- | --- |
-| `workspaces`, `principals`, `access_grants` | 所属、現在のACL版、操作別・対象別許可、失効 |
-| `auth_accounts`, `auth_sessions` | scrypt検証情報、不透明Sessionのハッシュ、期限、失効 |
-| `rooms`, `room_memberships` | Room設定・期待版・所属・Import公開障壁 |
-| `personas`, `persona_revisions`, `room_personas` | 安定Persona ID、設定原本、Room内有効版 |
-| `messages`, `message_revisions`, `message_segments` | 安定Message ID、順序、訂正/再生成履歴、分類付き原文 |
-| `attachments`, `attachment_links`, `persona_attachment_links` | 原本Digest、所有者、Message版/Avatar/追加Context参照 |
-| `app_turns`, `app_generation_runs`, `app_provider_calls`, `app_generation_receipts` | 冪等受理、実行状態、送信Intent、Usage、結果参照 |
-| `app_decisions`, `app_reactions` | 参加判断とSTAMPの意味 |
-| `import_batches`, `import_item_map`, `import_source_registry`, `import_source_records` | 移行出所、旧/新ID、内容照合、隔離原本 |
-| `import_decisions`, `import_reactions` | 旧診断・Reactionの履歴。実行Receiptにはしない |
-| `app_audit_events`, `app_generation_audit`, `app_changes` | 本文を複製しない監査、将来MEM向け変更参照 |
+| 保存群                                                                                 | 責務                                                 |
+| -------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| `workspaces`, `principals`, `access_grants`                                            | 所属、現在のACL版、操作別・対象別許可、失効          |
+| `auth_accounts`, `auth_sessions`                                                       | scrypt検証情報、不透明Sessionのハッシュ、期限、失効  |
+| `rooms`, `room_memberships`                                                            | Room設定・期待版・所属・Import公開障壁               |
+| `personas`, `persona_revisions`, `room_personas`                                       | 安定Persona ID、設定原本、Room内有効版               |
+| `messages`, `message_revisions`, `message_segments`                                    | 安定Message ID、順序、訂正/再生成履歴、分類付き原文  |
+| `attachments`, `attachment_links`, `persona_attachment_links`                          | 原本Digest、所有者、Message版/Avatar/追加Context参照 |
+| `app_turns`, `app_generation_runs`, `app_provider_calls`, `app_generation_receipts`    | 冪等受理、実行状態、送信Intent、Usage、結果参照      |
+| `app_decisions`, `app_reactions`                                                       | 参加判断とSTAMPの意味                                |
+| `import_batches`, `import_item_map`, `import_source_registry`, `import_source_records` | 移行出所、旧/新ID、内容照合、隔離原本                |
+| `import_decisions`, `import_reactions`                                                 | 旧診断・Reactionの履歴。実行Receiptにはしない        |
+| `app_audit_events`, `app_generation_audit`, `app_changes`                              | 本文を複製しない監査、将来MEM向け変更参照            |
 
 Messageの訂正は新Revisionを追加する。再生成も成功時だけ新Revisionを追加し、失敗/取消で前回成功版を消さない。過去版は現在の認可と削除状態で取得する。Segmentは `channel` と `visibility` を別々に保存し、公開ChannelをPrivate扱いしたりPrivate Channelをpublicにしたりする不整合を制約で拒否する。
 
@@ -95,6 +95,8 @@ Provider Callは `RESERVED → DISPATCH_INTENT → COMPLETED/REJECTED/INVALID/DI
 
 参加判断、固定直列SubAgent、回答、`/memory` をすべてCall台帳と予算へ含める。Usageの完全性と本文の公開可否は別。非公開/不正/取消応答でも既に発生したUsageを保持し、不明Usageをゼロへ置き換えない。入力/出力Token・Call数・費用・同時数・受付/送信/実行/収集時間に有限上限を適用する。
 
+Geminiの省略されたUsage項目は、保存JSONでも未指定のまま扱う。入力・出力・明示された思考Tokenと総数が整合しない場合は完全なUsageと認定せず、差額から項目を推測しない。添付のContext化では、履歴全体の原本を先に展開せず、保存サイズとBase64展開量から累積上限を読込み前に検査する。保存可能な添付サイズと一回のContextに収まるサイズは別であり、超過は `CONTEXT_LIMIT` として説明する。
+
 公開回答のContextは公開原本と承認済み設定から構成する。Private SegmentやPrivate SubAgent報告を公開回答Promptへ入れない。SubAgentの内部報告は独立した非公開Segmentとして保存する。この境界により、従来の「Private内容を同じモデルへ渡して漏らさないよう指示する」挙動とは互換性差分がある。共有Projectionの承認機能はこの工程で追加しない。
 
 構造化出力はサーバーで完全検証してからSegmentへ分解し、Message版、Usage、Receipt、Auditを対応するTransactionで確定する。Raw JSONや部分応答を先に公開表示しない。再照会も現在認可で出力を再構成する。
@@ -103,18 +105,18 @@ Provider Callは `RESERVED → DISPATCH_INTENT → COMPLETED/REJECTED/INVALID/DI
 
 主要な保存/API上限は `APP_LIMITS` に固定する。
 
-| 項目 | 上限 |
-| --- | --- |
-| Message合計本文 | 32,768文字 |
-| Persona設定 | 65,536文字 |
-| Message版のSegment | 16 |
-| RoomのPersona | 16 |
-| Message添付 | 8 |
-| 添付原本 | 8 MiB/件 |
-| ページ | 既定50、最大200 |
-| JSON深さ | 16 |
-| 固定SubAgent設定 | 4/Persona |
-| 追加Context/Group配列 | 16 |
+| 項目                  | 上限            |
+| --------------------- | --------------- |
+| Message合計本文       | 32,768文字      |
+| Persona設定           | 65,536文字      |
+| Message版のSegment    | 16              |
+| RoomのPersona         | 16              |
+| Message添付           | 8               |
+| 添付原本              | 8 MiB/件        |
+| ページ                | 既定50、最大200 |
+| JSON深さ              | 16              |
+| 固定SubAgent設定      | 4/Persona       |
+| 追加Context/Group配列 | 16              |
 
 上限超過は固定エラーで拒否する。旧 `historyWindow=0` は無制限な全履歴送信へ戻さない。Generationの実効上限はHost設定と `server/generation/types.ts` の上限を参照し、Clientは拡張できない。Import/Exportは別の有限件数・サイズ上限と公開障壁を持つ。
 

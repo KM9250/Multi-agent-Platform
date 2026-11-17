@@ -29,7 +29,7 @@
     "app:serve": "node --experimental-transform-types --loader ./test/ts-loader.mjs server/main.ts",
     "app:admin": "node --experimental-transform-types --loader ./test/ts-loader.mjs server/cli.ts",
     "test:app-data": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/app-data-*.test.ts",
-    "test:app-data-redteam": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/app-data-redteam.test.ts test/app-data-auth.test.ts test/app-data-http.test.ts test/app-data-storage.test.ts test/app-data-attachments.test.ts test/app-data-generation.test.ts test/app-data-import.test.ts test/app-data-backup.test.ts test/app-data-client.test.ts",
+    "test:app-data-redteam": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/app-data-redteam.test.ts test/app-data-auth.test.ts test/app-data-http.test.ts test/app-data-storage.test.ts test/app-data-attachments.test.ts test/app-data-generation*.test.ts test/app-data-import.test.ts test/app-data-backup.test.ts test/app-data-client.test.ts test/app-data-serialization.test.ts",
     "test:app-data-crash": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/app-data-crash.test.ts",
     "test:app-data-import": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/app-data-import.test.ts",
     "test:app-data-backup": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/app-data-backup.test.ts",

@@ -130,16 +130,60 @@ export class GenerationError extends Error {
   }
 }
 export function stable(value: any): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return "[" + value.map(stable).join(",") + "]";
-  return (
-    "{" +
-    Object.keys(value)
-      .sort()
-      .map((k) => JSON.stringify(k) + ":" + stable(value[k]))
-      .join(",") +
-    "}"
-  );
+  const ancestors = new Set<object>();
+  function encode(item: unknown, depth: number): string {
+    if (depth > 20) throw new GenerationError("INVALID_SERIALIZATION");
+    if (item === null || typeof item === "string" || typeof item === "boolean")
+      return JSON.stringify(item);
+    if (typeof item === "number" && Number.isFinite(item))
+      return JSON.stringify(item);
+    if (!item || typeof item !== "object" || ancestors.has(item))
+      throw new GenerationError("INVALID_SERIALIZATION");
+    if (
+      !Array.isArray(item) &&
+      ![Object.prototype, null].includes(Object.getPrototypeOf(item))
+    )
+      throw new GenerationError("INVALID_SERIALIZATION");
+    ancestors.add(item);
+    try {
+      const descriptors = Object.getOwnPropertyDescriptors(item);
+      if (Object.values(descriptors).some((property) => !("value" in property)))
+        throw new GenerationError("INVALID_SERIALIZATION");
+      if (Array.isArray(item)) {
+        return (
+          "[" +
+          Array.from({ length: item.length }, (_, index) => {
+            const child = descriptors[String(index)]?.value;
+            return child === undefined ? "null" : encode(child, depth + 1);
+          }).join(",") +
+          "]"
+        );
+      }
+      // Follow JSON object semantics: an absent usage counter stays absent. It
+      // must never become invalid JSON's `undefined`, nor a fabricated zero.
+      return (
+        "{" +
+        Object.keys(descriptors)
+          .filter(
+            (key) =>
+              descriptors[key].enumerable &&
+              descriptors[key].value !== undefined,
+          )
+          .sort()
+          .map(
+            (key) =>
+              JSON.stringify(key) +
+              ":" +
+              encode(descriptors[key].value, depth + 1),
+          )
+          .join(",") +
+        "}"
+      );
+    } finally {
+      ancestors.delete(item);
+    }
+  }
+  return encode(value, 0);
 }
 export function exact(value: any, keys: string[]): void {
   if (

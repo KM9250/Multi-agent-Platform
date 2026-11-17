@@ -162,6 +162,138 @@ export class ContextCompiler {
         worker?.maxOutputTokens ?? this.limits.maxOutputTokens,
       ),
     };
+    // Preflight all selected sources before reading a single attachment body. The
+    // metadata pass bounds aggregate allocation, including base64 expansion and
+    // worst-case JSON escaping for text. Files remain subject to store integrity
+    // and authorization checks when actually read below.
+    const byteLimit = this.limits.maxInputTokens * 3;
+    let plannedBytes = 2048;
+    const charge = (bytes: number) => {
+      if (
+        !Number.isSafeInteger(bytes) ||
+        bytes < 0 ||
+        plannedBytes + bytes > byteLimit
+      )
+        throw new GenerationError("CONTEXT_LIMIT", 413);
+      plannedBytes += bytes;
+    };
+    charge(
+      Buffer.byteLength(
+        JSON.stringify({
+          name: persona.name,
+          description: persona.description,
+          profile: persona.participationProfile,
+          room: settings.systemInstruction,
+          system: persona.systemInstruction,
+          imported: persona.importedSystemInstruction,
+          worker: worker?.systemInstruction,
+        }),
+        "utf8",
+      ),
+    );
+    const plannedAttachments = new Map<
+      string,
+      { size: number; mimeType: string }
+    >();
+    const planAttachment = (attachmentId: string) => {
+      const metadata = this.app.db
+        .prepare(
+          "SELECT size,mime_type,name FROM attachments WHERE workspace_id=? AND room_id=? AND attachment_id=? AND state='AVAILABLE' AND deleted_at IS NULL",
+        )
+        .get(actor.workspaceId, roomId, attachmentId) as any;
+      if (!metadata) throw new GenerationError("ATTACHMENT_NOT_AVAILABLE", 404);
+      const size = Number(metadata.size);
+      if (!Number.isSafeInteger(size) || size < 0)
+        throw new GenerationError("CONTEXT_LIMIT", 413);
+      charge(
+        (String(metadata.mime_type).startsWith("image/")
+          ? 4 * Math.ceil(size / 3)
+          : 6 * size) +
+          Buffer.byteLength(String(metadata.name), "utf8") +
+          128,
+      );
+      plannedAttachments.set(attachmentId, {
+        size,
+        mimeType: metadata.mime_type,
+      });
+    };
+    for (const message of messages) {
+      const candidates = this.app.db
+        .prepare(
+          "SELECT channel,visibility,owner_persona_id,content FROM message_segments WHERE workspace_id=? AND room_id=? AND message_id=? AND revision=?",
+        )
+        .all(
+          actor.workspaceId,
+          roomId,
+          message.message_id,
+          message.current_revision,
+        ) as any[];
+      const selected = candidates.filter(
+        (segment) =>
+          (segment.visibility === "public" &&
+            ["public_message", "shared_summary"].includes(segment.channel)) ||
+          (purpose === "memory" &&
+            segment.owner_persona_id === personaId &&
+            ["private_state", "memory_export"].includes(segment.channel) &&
+            this.policy.canReadSegment(actor, {
+              workspaceId: actor.workspaceId,
+              roomId,
+              ownerPersonaId: segment.owner_persona_id,
+              channel: segment.channel,
+              visibility: segment.visibility,
+            })),
+      );
+      if (!selected.length) continue;
+      charge(
+        128 +
+          Buffer.byteLength(
+            JSON.stringify(selected.map((segment) => segment.content)),
+            "utf8",
+          ),
+      );
+      const links = this.app.db
+        .prepare(
+          "SELECT attachment_id FROM attachment_links WHERE workspace_id=? AND room_id=? AND message_id=? AND revision=?",
+        )
+        .all(
+          actor.workspaceId,
+          roomId,
+          message.message_id,
+          message.current_revision,
+        ) as any[];
+      for (const link of links) planAttachment(link.attachment_id);
+    }
+    for (const attachmentId of persona.contextAttachmentIds ?? [])
+      planAttachment(attachmentId);
+    for (const ref of binding?.privateReports ?? []) {
+      const segment = this.app.db
+        .prepare(
+          "SELECT content FROM message_segments WHERE workspace_id=? AND room_id=? AND message_id=? AND revision=? AND segment_id=?",
+        )
+        .get(
+          actor.workspaceId,
+          roomId,
+          ref.messageId,
+          ref.revision,
+          ref.segmentId,
+        ) as any;
+      if (segment)
+        charge(Buffer.byteLength(JSON.stringify(segment.content), "utf8"));
+    }
+    const assertPlannedAttachment = (attachmentId: string) => {
+      const planned = plannedAttachments.get(attachmentId);
+      const current = this.app.db
+        .prepare(
+          "SELECT size,mime_type FROM attachments WHERE workspace_id=? AND room_id=? AND attachment_id=? AND state='AVAILABLE' AND deleted_at IS NULL",
+        )
+        .get(actor.workspaceId, roomId, attachmentId);
+      if (
+        !planned ||
+        current?.size !== planned.size ||
+        current?.mime_type !== planned.mimeType
+      )
+        throw new GenerationError("CONTEXT_CHANGED", 409);
+    };
     const contents: ProviderRequest["contents"] = [];
     for (const message of messages.reverse()) {
       const segments = this.app.db
@@ -226,6 +358,7 @@ export class ContextCompiler {
       for (const link of links) {
         if (!this.attachments)
           throw new GenerationError("ATTACHMENT_STORE_REQUIRED");
+        assertPlannedAttachment(link.attachment_id);
         const attachment = await this.attachments.read(
           actor,
           roomId,
@@ -290,6 +423,7 @@ export class ContextCompiler {
     for (const attachmentId of persona.contextAttachmentIds ?? []) {
       if (!this.attachments)
         throw new GenerationError("ATTACHMENT_STORE_REQUIRED");
+      assertPlannedAttachment(attachmentId);
       const attachment = await this.attachments.readForContext(
         actor,
         roomId,

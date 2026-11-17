@@ -146,11 +146,25 @@ export class GeminiProvider implements ProviderAdapter {
     usage.completeness =
       usage.inputTokens !== undefined &&
       usage.outputTokens !== undefined &&
-      usage.totalTokens !== undefined
+      usage.totalTokens !== undefined &&
+      usage.totalTokens ===
+        usage.inputTokens + usage.outputTokens + (usage.thoughtsTokens ?? 0) &&
+      (usage.cachedInputTokens === undefined ||
+        usage.cachedInputTokens <= usage.inputTokens)
         ? "COMPLETE"
         : Object.values(u).length
           ? "PARTIAL"
           : "UNKNOWN";
+    // Missing provider counters remain absent, never synthetic zero or undefined JSON tokens.
+    for (const key of [
+      "inputTokens",
+      "outputTokens",
+      "thoughtsTokens",
+      "cachedInputTokens",
+      "totalTokens",
+    ] as const) {
+      if (usage[key] === undefined) delete usage[key];
+    }
     const candidate =
       Array.isArray(object?.candidates) && object.candidates.length === 1
         ? object.candidates[0]
