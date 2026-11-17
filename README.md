@@ -98,21 +98,31 @@ The goal is to build a foundation for AI systems where intelligence emerges from
 
 ## Internal-state separation
 
-Room Settings can opt a room into **Internal State Separation**. It is off by default for existing and new rooms, preserving legacy streaming and history behavior. When enabled, model output is buffered until completion and parsed as structured JSON; only `public_message` is mirrored into `Message.content`. Canonical `segments` distinguish public messages, private state, shared summaries, debug summaries, GM logs, and memory exports with explicit visibility.
+DATA-1 stores canonical classified segments and immutable revisions on the server.
+Normal message readers return authorized public content; the explicit internal
+reader checks the current session and exact Room, Persona and visibility grants.
+Room display/separation settings do not grant access or reclassify saved private
+content. Public generation excludes private history, private worker reports and
+private memory. `/memory` produces a classified internal memo and does not publish
+to a Vault. Debug summaries are application-requested concise summaries, not
+provider-hidden chain of thought.
 
-Recipient history is fail-closed and channel-labeled: another agent receives labeled public messages and safe shared summaries only. An agent additionally receives clearly marked confidential labels for its own private state and self-visible memory. Debug summaries, GM logs, another agent's private state, and private memory never enter decision or generation history. CoT/ReAct debug fields are application-requested concise summaries only; the application does not request or access provider-hidden chain of thought. Memory exports allow only `self_only`, `self_and_gm`, or `gm_only`; shareable information must use `shared_summary`, and legacy public memory is retained for operator display but never promoted into AI history.
-
-Separated streaming buffers raw JSON only in memory and does not render or persist chunks. Every non-success result, including partial and blocked output, fails closed without storing raw text; abort restores a retry/regenerate target or removes a new unfinished message. Parsing failures show `STRUCTURED_OUTPUT_PARSE_ERROR` without publishing the raw response and can be retried. Retry and regenerate replace every old segment, while a separation-off regeneration explicitly removes old segments and its separation version. An exact `/memory` input creates a memory-export event with no public reply only while separation is enabled; with separation off it remains an ordinary message.
-
-When separation is enabled, `/memory` bypasses the decision model and directly requests an export from every enabled agent. With separation disabled it neither bypasses decisions nor forces every agent to respond.
-
-The collapsible operator panel can display selected internal categories. These switches are presentation controls, not authentication or access control. Segments remain in browser `localStorage`; hiding them does **not** encrypt or cryptographically protect secrets from someone with access to the browser profile or developer tools.
+The earlier client-side separation helpers remain covered by historical isolated
+contract tests. Their localStorage persistence, prompt-based private-history
+injection, streaming and replacement semantics describe that earlier client, not
+the production DATA-1 app. See the [DATA-1 architecture](docs/map-data-1-architecture.md)
+and [compatibility decisions](docs/map-data-1-adr.md) for the current contracts.
 
 ## SubAgent execution foundation (Phase SA-0)
 
 Persona Agents are conversation participants. SubAgents are private task workers owned by a Persona Agent. SubAgent output never enters public Room history directly. The model-independent task boundary, provider registry, and independent run lifecycle are documented in [the SubAgent architecture](docs/subagent-architecture.md).
 
-Phase SA-1 adds an optional fixed serial private SubAgent pipeline. Validated worker reports are injected only into the owning Persona's current generation and are not persisted to Room history.
+The earlier Phase SA-1 client injected private worker reports into its owner's
+generation without saving them to Room history; isolated regression tests retain
+that historical contract. DATA-1's fixed serial pipeline persists classified
+worker reports and current source references. Authorized reports may feed the
+next private worker, but are excluded from public-answer context. The current
+session's grants also apply when explicitly reading saved private reports.
 
 ## Autonomous coordination foundation
 

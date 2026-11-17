@@ -50,17 +50,17 @@ Real calls require an explicit operational decision and approved cost limits. No
 
 Required real-provider settings are:
 
-| Variable | Meaning |
-|---|---|
-| `MAP_PROVIDER=gemini` | Select the Google adapter |
-| `GEMINI_API_KEY` | Server-only credential |
-| `MAP_MODELS` | Comma-separated allowed model IDs |
-| `MAP_DEFAULT_MODEL` | One model from the allowlist |
-| `MAP_PRICING_VERSION` | Operator-controlled pricing configuration version |
-| `MAP_INPUT_MICROS_PER_MILLION` | Integer micro-currency units per million input tokens |
+| Variable                        | Meaning                                                |
+| ------------------------------- | ------------------------------------------------------ |
+| `MAP_PROVIDER=gemini`           | Select the Google adapter                              |
+| `GEMINI_API_KEY`                | Server-only credential                                 |
+| `MAP_MODELS`                    | Comma-separated allowed model IDs                      |
+| `MAP_DEFAULT_MODEL`             | One model from the allowlist                           |
+| `MAP_PRICING_VERSION`           | Operator-controlled pricing configuration version      |
+| `MAP_INPUT_MICROS_PER_MILLION`  | Integer micro-currency units per million input tokens  |
 | `MAP_OUTPUT_MICROS_PER_MILLION` | Integer micro-currency units per million output tokens |
-| `MAP_ORIGIN` | Exact HTTPS origin, including a nonstandard port |
-| `MAP_TLS_CERT`, `MAP_TLS_KEY` | Protected PEM paths for direct HTTPS |
+| `MAP_ORIGIN`                    | Exact HTTPS origin, including a nonstandard port       |
+| `MAP_TLS_CERT`, `MAP_TLS_KEY`   | Protected PEM paths for direct HTTPS                   |
 
 Remove `MAP_DEV_HTTP` for production. The default bind address is loopback. LAN binding is an explicit `MAP_HOST` setting and still requires HTTPS and the exact allowed Host/Origin. Direct HTTPS validates configuration before opening the listener. Do not assume a missing key permits anonymous or synthetic operation.
 
@@ -69,6 +69,29 @@ Alternatively, terminate TLS at a trusted local reverse proxy with `MAP_TRUST_LO
 Production cookies are opaque, `HttpOnly`, `Secure`, `SameSite=Strict`, and root-path scoped. Session IDs are hashed at rest. Sessions expire after twelve hours or thirty minutes idle. Login always issues a fresh token; password reset, account revocation and logout invalidate existing sessions. Mutations require the exact Origin plus the current session CSRF token. API responses use `Cache-Control: no-store`; session tokens are never put in URLs or logs.
 
 If an older deployment embedded a Gemini key, arrange a key rotation, withdraw its old bundles/source maps, and invalidate CDN/service-worker/browser caches. Rotation is an operator action; this implementation does not rotate real credentials.
+
+The separately gated smoke test is `npm run test:app-data-provider`. Before an
+authorized run, build the UI and install Chromium (or set `CHROMIUM_PATH`). Inject
+`GEMINI_API_KEY` securely and set all of the following explicitly:
+
+| Variable                             | Test requirement                             |
+| ------------------------------------ | -------------------------------------------- |
+| `MAP_LIVE_PROVIDER_ENABLE`           | Exactly `synthetic-only-billable-test`       |
+| `MAP_LIVE_MODEL`                     | Approved Gemini model ID                     |
+| `MAP_LIVE_MAX_CALLS`                 | `1`                                          |
+| `MAP_LIVE_MAX_COST_MICROS`           | Approved positive ceiling, at most `1000000` |
+| `MAP_LIVE_INPUT_MICROS_PER_MILLION`  | Current approved input pricing               |
+| `MAP_LIVE_OUTPUT_MICROS_PER_MILLION` | Current approved output pricing              |
+| `MAP_LIVE_PRICING_VERSION`           | Identifier for that pricing configuration    |
+
+The test creates a temporary account and synthetic conversation, authenticates
+over loopback, sends one real provider request, verifies persisted response and
+complete usage, then reloads the authenticated browser twice. It reports model,
+actual HTTP count, usage and configured-price cost without printing a credential
+or raw prompt. Missing configuration or browser support fails the command; it
+does not count as a skipped success. Reservations limit attempted work, but a
+provider's actual billing or pricing changes cannot be guaranteed by this local
+ceiling. This command has not been executed for the current DATA-1 submission.
 
 ## Scope and private readers
 
@@ -95,7 +118,7 @@ Account revocation, password reset and grant changes use short DB transactions a
 4. Review reconciliation, including original text/segment digests, binary attachment digests, timestamps and ID mappings. Incomplete batches remain hidden from normal Rooms. Importing `isStreaming` or role/owner flags cannot start a model or grant authority.
 5. Open the imported Rooms and attachments from a fresh browser. Keep the old browser storage until this check succeeds. The migration panel's separate explicit clear action removes only the known old keys; it never clears all browser storage.
 
-The legacy import envelope is limited to 16 MiB, 50 Rooms, 16 Personas per Room, 20,000 messages, 1,000 attachments and 4 MiB per legacy attachment. Depth and HTTP node-count bounds also apply; divide larger sources into independently named manifests instead of increasing limits casually. Unknown internal information is quarantined; source originals and normalization mappings are retained, not promoted to public text.
+The server legacy import envelope is limited to 16 MiB, 50 Rooms, 16 Personas per Room, 20,000 messages, 1,000 attachments and 4 MiB per legacy attachment. The browser file selector has a smaller 8 MiB limit. Depth and HTTP node-count bounds also apply; divide larger sources into deliberately identified manifests while preserving original IDs and provenance instead of increasing limits casually. Unknown internal information is quarantined; source originals and normalization mappings are retained, not promoted to public text.
 
 Use **Export** to download bounded chunks of at most 200 authorized messages with revisions, classification/source references and an attachment manifest. Download every advertised continuation chunk. Export files are not encrypted; store them outside public folders. Export permission does not add private read permission. Attachment originals remain available only through their authenticated download routes.
 
@@ -142,5 +165,12 @@ The second command is an explicit removal action. It preserves every referenced 
 Normal messages are limited to 32,768 characters, settings to 65,536, current page size to 50 by default/200 maximum, uploads to 8 MiB binary/12 MiB JSON, attachments to eight per message, Personas to sixteen per Room, and segments to sixteen per revision. SVG and HTML attachment types are rejected. External URLs are not fetched. Attachment names are display metadata; clients never choose a server path. POSIX symlink/hardlink/root traversal checks are covered; Windows Junction/Reparse Point behavior still needs target-OS verification.
 
 Default generation caps are eight Personas, three subagents per Persona, forty calls per run, two concurrently executing runs, one hundred history messages, 16,384 input tokens per call, 2,048 output tokens per call, 131,072 total tokens, and 1,000,000 micro-currency units. Acceptance/dispatch windows are thirty seconds, run deadline 120 seconds and collection window 180 seconds. Unknown usage retains its reservation; over-budget confirmed usage is recorded without truncation and stops later calls. `historyWindow=0` uses finite host bounds. Server shutdown waits up to five seconds for active dispatch cleanup.
+
+Context size checks are conservative resource bounds rather than an exact model
+tokenizer. Before reading any attachment body, the compiler checks the aggregate
+metadata against `maxInputTokens × 3` bytes, accounting for base64 images and up
+to six times text bytes for JSON escaping. An upload within the storage limit can
+therefore still exceed the per-call context limit. The compiled request is
+checked again before dispatch; missing provider usage counters remain unknown.
 
 Run `npm run test:app-data`, `npm run test:app-data-browser` and the individual import/crash/backup/redteam commands listed in `package.json`. The CLI integration test performs a real process sequence: create account → backup → separate restore → refused premature resume → password reset → resume → login/read original; it checks old-session rejection and zero Provider calls. Synthetic tests do not prove live Provider behavior, target-host restore or Windows filesystem guarantees. Use the verification report for actual results and outstanding production gates.

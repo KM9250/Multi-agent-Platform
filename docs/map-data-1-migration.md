@@ -17,11 +17,11 @@
 
 移行照合はRoom・Persona・Message・Revision・Segment・Decision・Reaction・添付の件数に加え、保存された本文・Segment・設定・添付のDigestと時刻を確認する。Legacy Decision／Reactionは履歴として専用表に保存する。既存のGeneration Receiptを偽造しない。Raw Decision／Error本文を通常の診断DTOへ出さない。
 
-初期上限は16 MiBの移行JSON、50 Room、Roomあたり16 Persona、合計20,000 Message、1,000添付、各添付4 MiB、各Message本文32,768文字。HTTP入口の共通Body上限がこれより小さい場合は入口が優先する。上限超過は固定エラーで拒否し、切り詰めない。大きな移行は別Exportへ分割し、元のIDと出所を保持する。各項目のDB確定とイベントループへのyieldを分離して、長い単一書込みTransactionを作らない。
+サーバーの初期上限は16 MiBの移行JSON、50 Room、Roomあたり16 Persona、合計20,000 Message、1,000添付、各添付4 MiB、各Message本文32,768文字。ブラウザーのファイル選択は8 MiBまでで、これを超える場合は元のID・出所を保持して移行用ファイルを分割する。HTTP入口の共通Body上限がこれより小さい場合は入口が優先する。上限超過は固定エラーで拒否し、切り詰めない。各項目のDB確定とイベントループへのyieldを分離して、長い単一書込みTransactionを作らない。
 
 ## 認可付き標準Export
 
-`GET /api/app/v1/rooms/:roomId/export?limit=50` は `MAP-DATA-1:EXPORT:1` のJSON Chunkを返す。`nextCursor` がある間、同じRoomとSessionで `cursor` を渡して続きのChunkを取得する。画面は全Chunkの取得が完了した場合だけ完了したExportとして保存する。CursorはActor・Workspace・Room・現在のACL版・期限・Export用途へ暗号的に束縛する。
+`GET /api/app/v1/rooms/:roomId/export?limit=50` は `MAP-DATA-1:EXPORT:1` のJSON Chunkを返す。`nextCursor` がある間、同じRoomとSessionで `cursor` を渡して続きのChunkを取得する。画面は各Chunkを個別ファイルとして保存し、利用者が続きのDownload操作を行う。最終Chunkまで取得して初めて完了と表示するため、途中までのファイルを完全なExportとして扱わない。CursorはActor・Workspace・Room・現在のACL版・期限・Export用途へ暗号的に束縛する。
 
 各Chunkは最大200 Messageで、各Messageの最大1,000 Revision、最大16 MiBの出力に制限する。これらを超えた場合は固定エラーとなる。公開本文と、現在の明示的なPersona／Visibility単位のPrivate閲覧権で許可された原本だけを出力する。Private専用 `/memory` 原本も同じ認可を満たす場合に含まれる。通常の会話閲覧権や管理権限だけでは含まれない。削除済みMessage／Persona本文は過去Revisionを含めて除外する。
 
