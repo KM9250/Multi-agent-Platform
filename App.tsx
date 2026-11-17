@@ -1,792 +1,1267 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Menu, Send, StopCircle, Trash2, BrainCircuit, Paperclip, X, FileText, Settings, Box, Gamepad2, AlertTriangle, MonitorPlay } from 'lucide-react';
-import AgentSidebar from './components/AgentSidebar';
-import AgentModal from './components/AgentModal';
-import MessageBubble from './components/MessageBubble';
-import RelationshipGraphModal from './components/RelationshipGraphModal';
-import RoomModal from './components/RoomModal';
-import SceneView from './components/SceneView';
-import DecisionDiagnosticsPanel from './components/DecisionDiagnosticsPanel';
-import SubAgentDiagnosticsPanel from './components/SubAgentDiagnosticsPanel';
-import { streamAgentResponse, evaluateShouldRespond, hasApiKey } from './services/geminiService';
-import { INITIAL_ROOMS, createNewRoom, calculateRelationshipWeights, ROOM_TAGS } from './constants';
-import { normalizePersistedRooms } from './utils/persistenceMigration';
-import { appendDecisionEvents, createDecisionEvent } from './utils/decisionDiagnostics';
-import { classifyStreamCompletion } from './utils/streamCompletion';
-import { GenerationMode, GenerationSession, isSameGenerationSession, shouldAcceptStreamChunk } from './utils/generationSession';
-import { canRegenerateGeneration, canRetryGeneration } from './utils/retryPolicy';
-import { DEFAULT_INTERNAL_STATE_SETTINGS, isMemoryExportRequest } from './utils/messageVisibility';
-import { finalizeLegacyGeneration, finalizeSeparatedFailure, finalizeSeparatedSuccess, prepareMessageForRegeneration, restoreMessageAfterAbort } from './utils/generationFinalization';
-import { partitionTurnDecisions, resolveTurnDecisions } from './utils/turnDecisions';
-import { Agent, Message, Room, Attachment, RoomTag, AgentDecisionEvent, GenerationContext, InternalStateSettings } from './types';
-import { GenerationSubAgentCache, extractPublicTaskInputs, formatPrivateSubAgentContext, createRuntimeSubAgentProviderRegistry, type SubAgentRunDiagnostic } from './services/subagents';
-import { RequestScheduler } from './services/scheduler';
-import { createRecipientSnapshot, type RecipientSelection } from './utils/recipientTargets';
-import { clearMessageReactions, upsertMessageReaction } from './utils/messageReactions';
+import React, { useEffect, useRef, useState } from "react";
+import {
+  Menu,
+  Send,
+  Paperclip,
+  Settings,
+  X,
+  LogOut,
+  RefreshCw,
+} from "lucide-react";
+import AgentSidebar from "./components/AgentSidebar";
+import AgentModal from "./components/AgentModal";
+import RoomModal from "./components/RoomModal";
+import RelationshipGraphModal from "./components/RelationshipGraphModal";
+import {
+  DataDialog,
+  LoginPanel,
+  MigrationPanel,
+} from "./components/AppDataPanels";
+import {
+  AppAPIError,
+  appRequest,
+  authorizedAttachmentURL,
+  downloadJSON,
+  fileToBase64,
+  roomPath,
+  setSessionToken,
+  type SessionDTO,
+  type RoomDTO,
+  type PersonaDTO,
+  type MessageDTO,
+  type AttachmentDTO,
+  type RunDTO,
+} from "./services/appClient";
+import {
+  createRecipientSnapshot,
+  type RecipientSelection,
+} from "./utils/recipientTargets";
+import type { Agent, Room, RoomTag, InternalStateSettings } from "./types";
+
+const stateLabels: Record<string, string> = {
+  QUEUED: "Server accepted",
+  RUNNING: "Generating",
+  COMPLETED: "Result saved",
+  PARTIAL: "Partially saved",
+  FAILED: "Generation failed",
+  CANCELLED: "Cancelled",
+  NEEDS_REVIEW: "Outcome unknown · review required",
+};
+const reactionEmoji: Record<string, string> = {
+  ACK: "👍",
+  AGREE: "✅",
+  THINK: "🤔",
+  AMUSED: "😂",
+  CARE: "❤️",
+  DISAGREE: "👎",
+};
+const busyRun = (run: RunDTO) =>
+  run.status === "QUEUED" || run.status === "RUNNING";
+const list = <T,>(value: T[] | { [key: string]: T[] }, key: string): T[] =>
+  Array.isArray(value) ? value : (value[key] ?? []);
+function displayAgent(persona: PersonaDTO, roomId: string): Agent {
+  return {
+    id: persona.id,
+    name: persona.name,
+    description: persona.description ?? "",
+    systemInstruction: persona.systemInstruction ?? "",
+    model: persona.model,
+    framework: (persona.framework as Agent["framework"]) ?? "standard",
+    color: typeof persona.color === "string" ? persona.color : "bg-blue-600",
+    avatar: persona.avatarAttachmentId
+      ? authorizedAttachmentURL(roomId, { id: persona.avatarAttachmentId })
+      : persona.avatarType !== "image" && typeof persona.avatar === "string"
+        ? persona.avatar.slice(0, 64)
+        : "🤖",
+    avatarType: persona.avatarAttachmentId ? "image" : "emoji",
+    isEnabled: persona.isEnabled !== false,
+    thinkingBudget: Number(persona.thinkingBudget ?? 0),
+    historyWindow: Number(persona.historyWindow ?? 0),
+    pinFirstMessage: persona.pinFirstMessage !== false,
+    groups: (persona.groups as string[]) ?? [],
+    participationProfile: (persona.participationProfile as string) ?? "",
+    subAgents: (persona.subAgents as Agent["subAgents"]) ?? [],
+    subAgentPolicy: (persona.subAgentPolicy as Agent["subAgentPolicy"]) ?? {
+      mode: "off",
+    },
+    additionalContextFiles: [],
+    importedSystemInstruction: persona.importedSystemInstruction,
+    importedSystemInstructionFileName:
+      persona.importedSystemInstructionFileName,
+  };
+}
+function displayRoom(room: RoomDTO, messages: MessageDTO[] = []): Room {
+  return {
+    ...room,
+    agents: room.agents.map((persona) => displayAgent(persona, room.id)),
+    messages: messages.map((message) => ({
+      ...message,
+      attachments: undefined,
+      segments: undefined,
+    })),
+  };
+}
 
 export default function App() {
-  // --- State ---
-  const [rooms, setRooms] = useState<Room[]>(() => {
-    try {
-      const saved = localStorage.getItem('rooms');
-      if (!saved) return INITIAL_ROOMS;
-      // A reload during generation persists isStreaming: true, which would
-      // leave a forever-blinking cursor and "Thinking" badges. Clear it.
-      const parsed: Room[] = JSON.parse(saved);
-      return normalizePersistedRooms(parsed);
-    } catch (e) {
-      console.error('Failed to restore rooms from localStorage:', e);
-      return INITIAL_ROOMS;
+  const [session, setSession] = useState<SessionDTO | null>();
+  const [rooms, setRooms] = useState<RoomDTO[]>([]);
+  const [scopeVersion, setScopeVersion] = useState(0);
+  const [roomId, setRoomId] = useState("");
+  const [room, setRoom] = useState<RoomDTO>();
+  const [messages, setMessages] = useState<MessageDTO[]>([]);
+  const [pageAfter, setPageAfter] = useState<string>();
+  const afterRef = useRef<string>();
+  const [cursor, setCursor] = useState<string>();
+  const [runs, setRuns] = useState<RunDTO[]>([]);
+  const [input, setInput] = useState("");
+  const [files, setFiles] = useState<File[]>([]);
+  const [recipient, setRecipient] = useState<RecipientSelection>("auto");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [sending, setSending] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [roomEditSnapshot, setRoomEditSnapshot] = useState<
+    Room & { revision: number }
+  >();
+  const [sidebar, setSidebar] = useState(false);
+  const [roomEditor, setRoomEditor] = useState<"new" | "edit">();
+  const [agentEditor, setAgentEditor] = useState<Agent | null | undefined>();
+  const personaEditRevision = useRef<number>();
+  const [savedContexts, setSavedContexts] = useState<
+    { id: string; name: string; url: string }[]
+  >([]);
+  const [exportState, setExportState] = useState<{
+    roomId: string;
+    nextCursor?: string;
+    part: number;
+    complete: boolean;
+  }>();
+  const [migration, setMigration] = useState(false);
+  const [graph, setGraph] = useState(false);
+  const [reader, setReader] = useState<{ title: string; data: unknown }>();
+  const [correction, setCorrection] = useState<{
+    message: MessageDTO;
+    content: string;
+  }>();
+  const epoch = useRef(0);
+  const selected = useRef("");
+  const sessionRef = useRef<SessionDTO | null>(null);
+  const pendingTurn = useRef<{ roomId: string; path: string; body: unknown }>();
+  const fileInput = useRef<HTMLInputElement>(null);
+  const agents =
+    room?.agents.map((persona) => displayAgent(persona, room.id)) ?? [];
+  const groups = [...new Set(agents.flatMap((agent) => agent.groups ?? []))];
+  const reactions = [
+    ...runs.flatMap((run) => run.reactions ?? []),
+    ...(room?.legacyReactions ?? []),
+  ];
+
+  function clearIdentity() {
+    epoch.current++;
+    sessionRef.current = null;
+    setSessionToken();
+    setSession(null);
+    setRooms([]);
+    selected.current = "";
+    setRoomId("");
+    setRoom(undefined);
+    setMessages([]);
+    setRuns([]);
+    setCursor(undefined);
+    afterRef.current = undefined;
+    setPageAfter(undefined);
+    setInput("");
+    setFiles([]);
+    setReader(undefined);
+    setCorrection(undefined);
+    pendingTurn.current = undefined;
+    setPending(false);
+    setSending(false);
+    setAgentEditor(undefined);
+    setRoomEditor(undefined);
+    setRoomEditSnapshot(undefined);
+    setSavedContexts([]);
+    personaEditRevision.current = undefined;
+    setMigration(false);
+    setGraph(false);
+    setExportState(undefined);
+    setNotice("");
+  }
+  function fail(cause: unknown) {
+    if (cause instanceof DOMException && cause.name === "AbortError") return;
+    const code =
+      cause instanceof AppAPIError ? cause.code : "CONNECTION_FAILED";
+    if (cause instanceof AppAPIError && cause.status === 401) clearIdentity();
+    else if (cause instanceof AppAPIError && cause.status === 403) {
+      epoch.current++;
+      setRoom(undefined);
+      setMessages([]);
+      setRuns([]);
+      setReader(undefined);
+      setCorrection(undefined);
     }
-  });
-
-  const [activeRoomId, setActiveRoomId] = useState<string>(() => {
-    const saved = localStorage.getItem('activeRoomId');
-    // A stale id (e.g. the room was deleted in a previous session) would make
-    // every room update silently miss, so validate it against the loaded rooms.
-    if (saved && rooms.some(r => r.id === saved)) return saved;
-    return rooms[0]?.id ?? '';
-  });
-
-  const [input, setInput] = useState('');
-  const [attachments, setAttachments] = useState<Attachment[]>([]);
-  const [recipientSelection, setRecipientSelection] = useState<RecipientSelection>('auto');
-  
-  // UI Toggles
-  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-  const [isAgentModalOpen, setIsAgentModalOpen] = useState(false);
-  const [isGraphModalOpen, setIsGraphModalOpen] = useState(false);
-  const [isRoomModalOpen, setIsRoomModalOpen] = useState(false);
-  const [is3DMode, setIs3DMode] = useState(false); 
-  
-  const [editingAgent, setEditingAgent] = useState<Agent | null>(null);
-  const [editingRoom, setEditingRoom] = useState<Room | null>(null);
-  
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [planningAgents, setPlanningAgents] = useState<string[]>([]);
-  const [isDragging, setIsDragging] = useState(false);
-  const [storageWarning, setStorageWarning] = useState<string | null>(null);
-  const [subAgentDiagnostics, setSubAgentDiagnostics] = useState<SubAgentRunDiagnostic[]>([]);
-  
-  const isGeneratingRef = useRef(false);
-  const generationSessionRef = useRef<GenerationSession | null>(null);
-  const subAgentCacheRef = useRef(new GenerationSubAgentCache());
-  const schedulerRef = useRef<RequestScheduler | null>(null);
-  if (!schedulerRef.current) schedulerRef.current = new RequestScheduler();
-  const subAgentRegistryRef = useRef<ReturnType<typeof createRuntimeSubAgentProviderRegistry> | null>(null);
-  if (!subAgentRegistryRef.current) subAgentRegistryRef.current = createRuntimeSubAgentProviderRegistry(process.env.API_KEY, schedulerRef.current);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
-  // Derived State
-  const activeRoom = rooms.find(r => r.id === activeRoomId) || rooms[0];
-  const messages = activeRoom?.messages || [];
-  const agents = activeRoom?.agents || [];
-  const recipientGroups = [...new Set(agents.flatMap(agent => agent.groups ?? []))].sort();
-
-  const generatingAgentIds = messages
-    .filter(m => m.isStreaming && m.role === 'model' && m.agentId)
-    .map(m => m.agentId!);
-
-  const allThinkingAgentIds = [...new Set([...planningAgents, ...generatingAgentIds])];
-  const currentSpeakingAgentId = generatingAgentIds.length > 0 ? generatingAgentIds[0] : null;
-
-  // --- Effects ---
-  useEffect(() => {
-    try {
-      localStorage.setItem('rooms', JSON.stringify(rooms));
-    } catch (e) {
-      // Base64 image attachments/avatars can exceed the ~5MB storage quota.
-      // Keep the app running; the session simply won't survive a reload.
-      console.error('Failed to persist rooms to localStorage:', e);
-      setStorageWarning('Some data could not be saved locally. The current session will continue, but recent changes may be lost after reload.');
+    setError(code);
+  }
+  function signIn(value: SessionDTO) {
+    clearIdentity();
+    sessionRef.current = value;
+    setSessionToken(value);
+    setSession(value);
+    setError("");
+  }
+  async function loadRooms() {
+    const ticket = epoch.current;
+    const value = await appRequest<RoomDTO[] | { rooms: RoomDTO[] }>("/rooms");
+    if (ticket !== epoch.current || !sessionRef.current) return;
+    const values = list(value, "rooms");
+    setRooms(values);
+    if (
+      !selected.current ||
+      !values.some((item) => item.id === selected.current)
+    ) {
+      selected.current = values[0]?.id ?? "";
+      setRoomId(selected.current);
     }
-  }, [rooms]);
-
-  useEffect(() => { setRecipientSelection('auto'); }, [activeRoomId]);
-  useEffect(() => {
-    if (recipientSelection.startsWith('agent:') && !agents.some(agent => agent.isEnabled && agent.id === recipientSelection.slice(6))) setRecipientSelection('auto');
-    if (recipientSelection.startsWith('group:') && !recipientGroups.includes(recipientSelection.slice(6))) setRecipientSelection('auto');
-  }, [agents, recipientGroups.join('|'), recipientSelection]);
-
-  useEffect(() => {
-    localStorage.setItem('activeRoomId', activeRoomId);
-  }, [activeRoomId]);
-
-  const scrollToBottom = () => {
-    setTimeout(() => {
-        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, 100);
-  };
-
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages.length, activeRoomId, planningAgents.length, is3DMode]);
-
-  // --- File Handling ---
-  const processFiles = (files: FileList | File[]) => {
-    Array.from(files).forEach((file: File) => {
-      const reader = new FileReader();
-      if (file.type.startsWith('image/')) {
-        reader.onload = (event) => {
-          const result = event.target?.result as string;
-          setAttachments(prev => [...prev, {
-            id: crypto.randomUUID(),
-            type: 'image',
-            name: file.name,
-            mimeType: file.type,
-            data: result
-          }]);
-        };
-        reader.readAsDataURL(file);
-      } else {
-        reader.onload = (event) => {
-          const result = event.target?.result as string;
-          setAttachments(prev => [...prev, {
-            id: crypto.randomUUID(),
-            type: 'text',
-            name: file.name,
-            mimeType: file.type || 'text/plain',
-            data: result
-          }]);
-        };
-        reader.readAsText(file);
-      }
-    });
-  };
-
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) {
-      processFiles(e.target.files);
-    }
-    if (fileInputRef.current) fileInputRef.current.value = '';
-  };
-
-  const handleDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
-    if (isGenerating) return;
-    setIsDragging(true);
-  };
-
-  const handleDragLeave = (e: React.DragEvent) => {
-    e.preventDefault();
-    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
-    setIsDragging(false);
-  };
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-    if (isGenerating) return;
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      processFiles(e.dataTransfer.files);
-    }
-  };
-
-  const removeAttachment = (id: string) => {
-    setAttachments(prev => prev.filter(a => a.id !== id));
-  };
-
-  const addDecisionEvents = (roomId: string, events: AgentDecisionEvent[]) => {
-    if (events.length === 0) return;
-    setRooms(prev => prev.map(r => r.id === roomId ? { ...appendDecisionEvents(r, events), updatedAt: Date.now() } : r));
-  };
-
-  const updateLocalHistory = (roomId: string, msgId: string, content: string, streaming: boolean, error: boolean = false, errorCode?: string, errorDetail?: string) => {
-    setRooms(prev => prev.map(r => {
-       if (r.id !== roomId) return r;
-       return {
-           ...r,
-           messages: r.messages.map(m => m.id === msgId ? { ...m, content, isStreaming: streaming, error, errorCode, errorDetail } : m)
-       };
-    }));
-  };
-
-  const replaceLocalMessage = (roomId: string, msgId: string, transform: (message: Message) => Message) => {
-    setRooms(prev => prev.map(room => room.id === roomId
-      ? { ...room, messages: room.messages.map(message => message.id === msgId ? transform(message) : message), updatedAt: Date.now() }
-      : room));
-  };
-
-  const removeMessageFromRoom = (roomId: string, msgId: string) => {
-    setRooms(prev => prev.map(r => r.id === roomId
-      ? { ...r, messages: r.messages.filter(m => m.id !== msgId) }
-      : r
-    ));
-  };
-
-
-  const isCurrentGenerationSession = (sessionId: string, turnId: string, roomId: string): boolean =>
-    isSameGenerationSession(generationSessionRef.current, { sessionId, turnId, roomId });
-
-  const finishGenerationSession = (sessionId: string, turnId: string, roomId: string) => {
-    if (!isCurrentGenerationSession(sessionId, turnId, roomId)) return;
-    setIsGenerating(false);
-    isGeneratingRef.current = false;
-    setPlanningAgents([]);
-    generationSessionRef.current = null;
-    subAgentCacheRef.current.clear();
-  };
-
-  // --- Conversation Loop ---
-  const processConversationTurn = async (currentHistory: Message[], turnDepth: number, turnId: string, roomId: string, sessionId: string) => {
-    if (!isCurrentGenerationSession(sessionId, turnId, roomId)) return;
-
-    if (turnDepth >= 3) {
-        finishGenerationSession(sessionId, turnId, roomId);
-        return;
-    }
-
-    const targetRoom = rooms.find(room => room.id === roomId);
-    if (!targetRoom) {
-        finishGenerationSession(sessionId, turnId, roomId);
-        return;
-    }
-
-    const roomAgents = targetRoom.agents;
-    const roomSystemInstruction = targetRoom.systemInstruction;
-    const internalStateSettings = { ...DEFAULT_INTERNAL_STATE_SETTINGS, ...targetRoom.internalStateSettings };
-    const memoryRequest = isMemoryExportRequest(currentHistory[currentHistory.length - 1], internalStateSettings.enabled);
-    const requestSignal = generationSessionRef.current?.controller.signal;
-
-    const activeAgents = roomAgents.filter(a => a.isEnabled);
-    if (activeAgents.length === 0) {
-        finishGenerationSession(sessionId, turnId, roomId);
-        return;
-    }
-
-    // Without a key, the decision module silently returns IGNORE for every
-    // agent and the user gets no feedback at all — surface the error instead.
-    if (!hasApiKey()) {
-        addDecisionEvents(roomId, activeAgents.map(agent => createDecisionEvent(turnId, agent, { outcome: 'ERROR', source: 'api_error', latencyMs: 0, decisionModel: 'none', errorCode: 'AUTH_ERROR', errorDetail: 'API key is missing.' })));
-        const errMsg: Message = {
-            id: crypto.randomUUID(),
-            role: 'model',
-            content: 'Authentication failed.',
-            timestamp: Date.now(),
-            turnId,
-            error: true,
-            errorCode: 'AUTH_ERROR',
-            errorDetail: 'The API key is missing. Set GEMINI_API_KEY in .env.local and restart the dev server.'
-        };
-        setRooms(prev => prev.map(r => r.id === roomId ? { ...r, messages: [...currentHistory, errMsg], updatedAt: Date.now() } : r));
-        finishGenerationSession(sessionId, turnId, roomId);
-        return;
-    }
-
-    if (isCurrentGenerationSession(sessionId, turnId, roomId)) {
-      setPlanningAgents(activeAgents.map(a => a.id));
-    }
-    const relationshipWeights = calculateRelationshipWeights(rooms);
-
-    const finalDecisions = await resolveTurnDecisions({
-      activeAgents,
-      history: currentHistory,
-      turnDepth,
-      memoryRequest,
-      evaluateDecision: (agent, participationContext) => evaluateShouldRespond(agent, currentHistory, roomSystemInstruction, {
-          agents: roomAgents,
-          signal: requestSignal,
-          internalStateSettings,
-          scheduler: schedulerRef.current!
-      }, participationContext)
-    });
-    const decisionEvents = finalDecisions.map(d => createDecisionEvent(turnId, d.agent, d.decision));
-    addDecisionEvents(roomId, decisionEvents);
-    const reactionTarget = currentHistory.at(-1);
-    if (reactionTarget) {
-      setRooms(prev => prev.map(room => {
-        if (room.id !== roomId) return room;
-        const reactions = finalDecisions.reduce((all, result) => result.decision.outcome === 'STAMP' && result.decision.reaction
-          ? upsertMessageReaction(all, { messageId: reactionTarget.id, agentId: result.agent.id, semantic: result.decision.reaction, turnId })
-          : all, room.reactions ?? []);
-        return { ...room, reactions };
-      }));
-    }
-
-    if (!isCurrentGenerationSession(sessionId, turnId, roomId)) return;
-    setPlanningAgents([]);
-
-    const respondingAgents = partitionTurnDecisions(finalDecisions).responding.map(d => d.agent);
-    if (respondingAgents.length === 0) {
-        finishGenerationSession(sessionId, turnId, roomId);
-        return; 
-    }
-
-    const sortedAgents = respondingAgents.sort((a, b) => {
-        let scoreA = 0;
-        let scoreB = 0;
-        const lastIdxA = currentHistory.map(m => m.agentId).lastIndexOf(a.id);
-        const lastIdxB = currentHistory.map(m => m.agentId).lastIndexOf(b.id);
-        scoreA += (lastIdxA === -1 ? 10 : currentHistory.length - lastIdxA) * 10;
-        scoreB += (lastIdxB === -1 ? 10 : currentHistory.length - lastIdxB) * 10;
-        return scoreB - scoreA;
-    });
-
-    const timestamp = Date.now();
-    const agentMessageIds: Record<string, string> = {};
-    const newAgentMessages: Message[] = sortedAgents.map((agent, idx) => {
-      const msgId = crypto.randomUUID();
-      agentMessageIds[agent.id] = msgId;
-      return {
-        id: msgId,
-        role: 'model',
-        content: '',
-        agentId: agent.id,
-        // Distinct timestamps keep ordering stable for sorting and the graph
-        timestamp: timestamp + idx + 1,
-        isStreaming: true,
-        turnId,
-        generationContext: {
-          historyMessageIds: currentHistory.map(message => message.id),
-          attempt: 1,
-          modelId: agent.model
-        },
-        ...(internalStateSettings.enabled ? { segments: [], separationVersion: 1 as const } : {})
-      };
-    });
-
-    let nextHistory = [...currentHistory, ...newAgentMessages];
-    setRooms(prev => prev.map(r => r.id === roomId ? { ...r, messages: nextHistory, updatedAt: Date.now() } : r));
-
-    let hadGenerationError = false;
-    const agentPromises = sortedAgents.map(async agent => {
-      const prepared = memoryRequest ? { outcome: { status: 'not_configured' as const, reports: [], diagnostics: [] }, diagnosticsToDisplay: [] } : await subAgentCacheRef.current.prepareForDiagnostics(agent, { sessionId, inputs: extractPublicTaskInputs(currentHistory), signal: requestSignal, registry: subAgentRegistryRef.current! });
-      const pipeline = prepared.outcome;
-      setSubAgentDiagnostics(previous => [...previous, ...prepared.diagnosticsToDisplay]);
-      const msgId = agentMessageIds[agent.id];
-      if (pipeline.status === 'aborted' || requestSignal?.aborted) {
-        removeMessageFromRoom(roomId, msgId);
-        nextHistory = nextHistory.filter(message => message.id !== msgId);
-        return;
-      }
-      const privateSubAgentContext = formatPrivateSubAgentContext(pipeline.reports, pipeline.status === 'failed' || pipeline.status === 'partial');
-      return new Promise<void>((resolve) => {
-        let accumulatedText = "";
-        streamAgentResponse(
-          agent,
-          [...currentHistory],
-          roomSystemInstruction,
-          (chunk) => {
-            if (!shouldAcceptStreamChunk(isCurrentGenerationSession(sessionId, turnId, roomId), !!requestSignal?.aborted)) return;
-            accumulatedText += chunk;
-            if (!internalStateSettings.enabled) updateLocalHistory(roomId, msgId, accumulatedText, true);
-          },
-          (result) => {
-            const completionKind = classifyStreamCompletion(accumulatedText, !!requestSignal?.aborted);
-            if (completionKind === 'aborted_empty' || (internalStateSettings.enabled && result.outcome === 'ABORTED')) {
-              removeMessageFromRoom(roomId, msgId);
-              nextHistory = nextHistory.filter(m => m.id !== msgId);
-              resolve();
-              return;
-            }
-            if (internalStateSettings.enabled && completionKind === 'complete' && result.outcome === 'SUCCESS') {
-              const finalized = finalizeSeparatedSuccess(nextHistory.find(m => m.id === msgId)!, result.text, memoryRequest);
-              if (finalized.error) hadGenerationError = true;
-              replaceLocalMessage(roomId, msgId, () => finalized);
-              nextHistory = nextHistory.map(m => m.id === msgId ? finalized : m);
-              resolve(); return;
-            }
-            if (internalStateSettings.enabled) {
-              hadGenerationError = true;
-              const failed = finalizeSeparatedFailure(nextHistory.find(m => m.id === msgId)!, result);
-              replaceLocalMessage(roomId, msgId, () => failed);
-              nextHistory = nextHistory.map(m => m.id === msgId ? failed : m);
-              resolve(); return;
-            }
-            if (completionKind === 'aborted_partial' || (completionKind === 'complete' && result.outcome === 'SUCCESS')) {
-              replaceLocalMessage(roomId, msgId, m => finalizeLegacyGeneration(m, accumulatedText));
-              nextHistory = nextHistory.map(m => m.id === msgId ? finalizeLegacyGeneration(m, accumulatedText) : m);
-              resolve();
-              return;
-            }
-
-            hadGenerationError = true;
-            const code = result.errorCode || 'EMPTY_RESPONSE';
-            const detail = result.errorDetail || 'The response stream completed without any text.';
-            const message = code === 'PARTIAL_RESPONSE' && accumulatedText ? accumulatedText : (code === 'EMPTY_RESPONSE' ? 'Empty response from model.' : (result.finishMessage || 'Agent response failed.'));
-            updateLocalHistory(roomId, msgId, message, false, true, code, detail);
-            nextHistory = nextHistory.map(m => m.id === msgId ? { ...m, content: message, isStreaming: false, error: true, errorCode: code, errorDetail: detail } : m);
-            resolve();
-          },
-          (errorInfo) => {
-            hadGenerationError = true;
-            if (internalStateSettings.enabled) {
-              const failed = finalizeSeparatedFailure(nextHistory.find(m => m.id === msgId)!, { errorCode: errorInfo.code, errorDetail: errorInfo.detail });
-              replaceLocalMessage(roomId, msgId, () => failed);
-              nextHistory = nextHistory.map(m => m.id === msgId ? failed : m);
-            } else {
-              updateLocalHistory(roomId, msgId, errorInfo.message, false, true, errorInfo.code, errorInfo.detail);
-              nextHistory = nextHistory.map(m => m.id === msgId
-                ? { ...m, content: errorInfo.message, isStreaming: false, error: true, errorCode: errorInfo.code, errorDetail: errorInfo.detail }
-                : m);
-            }
-            resolve();
-          },
-          {
-            agents: roomAgents,
-            signal: requestSignal,
-            mode: generationSessionRef.current?.mode || 'normal',
-            internalStateSettings,
-            memoryRequest,
-            privateSubAgentContext,
-            scheduler: schedulerRef.current!
-          }
-        );
-      });
-    });
-
-    await Promise.all(agentPromises);
-    if (hadGenerationError) {
-        finishGenerationSession(sessionId, turnId, roomId);
-        return;
-    }
-    if (memoryRequest) {
-        finishGenerationSession(sessionId, turnId, roomId);
-        return;
-    }
-
-    if (isCurrentGenerationSession(sessionId, turnId, roomId) && !requestSignal?.aborted) {
-        await new Promise(r => setTimeout(r, 500));
-        if (!isCurrentGenerationSession(sessionId, turnId, roomId) || requestSignal?.aborted) return;
-        await processConversationTurn(nextHistory, turnDepth + 1, turnId, roomId, sessionId);
-    }
-  };
-
-  // --- Handlers ---
-  const handleSaveRoom = (title: string, description: string, type: RoomTag, systemInstruction: string, internalStateSettings: InternalStateSettings) => {
-    if (editingRoom) {
-      setRooms(prev => prev.map(r => r.id === editingRoom.id ? { ...r, title, description, type, systemInstruction, internalStateSettings, updatedAt: Date.now() } : r));
-      setEditingRoom(null);
-    } else {
-      const newRoom = createNewRoom(title, description, type, systemInstruction);
-      newRoom.internalStateSettings = internalStateSettings;
-      setRooms(prev => [newRoom, ...prev]);
-      setActiveRoomId(newRoom.id);
-    }
-    if (window.innerWidth < 768) setIsSidebarOpen(false);
-  };
-
-  const handleSwitchRoom = (id: string) => {
-    setActiveRoomId(id);
-    if (window.innerWidth < 768) setIsSidebarOpen(false);
-  };
-
-  const handleDeleteRoom = (id: string) => {
-    if (rooms.length <= 1) return;
-    if (confirm("Are you sure you want to delete this chat?")) {
-        const newRooms = rooms.filter(r => r.id !== id);
-        setRooms(newRooms);
-        if (activeRoomId === id) setActiveRoomId(newRooms[0].id);
-    }
-  };
-
-  const updateActiveRoom = (updates: Partial<Room>) => {
-    setRooms(prev => prev.map(r => r.id === activeRoomId ? { ...r, ...updates, updatedAt: Date.now() } : r));
-  };
-
-  const handleSendMessage = async () => {
-    if ((!input.trim() && attachments.length === 0) || isGenerating || !activeRoom) return;
-    const turnId = crypto.randomUUID();
-    const roomId = activeRoom.id;
-    const sessionId = crypto.randomUUID();
-    const controller = new AbortController();
-    subAgentCacheRef.current.clear();
-    setSubAgentDiagnostics([]);
-    generationSessionRef.current = { sessionId, turnId, roomId, controller, mode: 'normal' };
-    setIsGenerating(true);
-    isGeneratingRef.current = true;
-    const newUserMessage: Message = {
-      id: crypto.randomUUID(),
-      role: 'user',
-      content: input,
-      attachments: [...attachments],
-      timestamp: Date.now(),
-      turnId,
-      recipientTarget: createRecipientSnapshot(recipientSelection, agents)
-    };
-    const updatedMessages = [...messages, newUserMessage];
-    updateActiveRoom({ messages: updatedMessages });
-    setInput('');
-    setAttachments([]);
-    setRecipientSelection('auto');
-    await processConversationTurn(updatedMessages, 0, turnId, roomId, sessionId);
-  };
-
-  const runSingleMessageGeneration = async (messageId: string, mode: GenerationMode) => {
-    if (isGenerating) return;
-    const room = rooms.find(r => r.messages.some(m => m.id === messageId));
-    if (!room) return;
-    const targetMessage = room.messages.find(m => m.id === messageId);
-    if (!targetMessage?.agentId || !targetMessage.generationContext) return;
-    const agent = room.agents.find(a => a.id === targetMessage.agentId);
-    if (!agent) return;
-    const history = targetMessage.generationContext.historyMessageIds
-      .map(id => room.messages.find(m => m.id === id))
-      .filter((message): message is Message => !!message);
-    if (history.length !== targetMessage.generationContext.historyMessageIds.length) {
-      updateLocalHistory(room.id, messageId, 'Cannot regenerate because some source history messages were deleted.', false, true, 'HISTORY_MISSING', 'One or more messages used for the original generation no longer exist.');
+  }
+  async function refresh(id: string, ticket: number, signal?: AbortSignal) {
+    const after = afterRef.current;
+    const [nextRoom, page, nextRuns] = await Promise.all([
+      appRequest<RoomDTO>(roomPath(id), "GET", undefined, signal),
+      appRequest<{ messages: MessageDTO[]; cursor?: string }>(
+        `${roomPath(id)}/messages?limit=50${after ? `&cursor=${encodeURIComponent(after)}` : ""}`,
+        "GET",
+        undefined,
+        signal,
+      ),
+      appRequest<RunDTO[] | { generations: RunDTO[] }>(
+        `${roomPath(id)}/generations`,
+        "GET",
+        undefined,
+        signal,
+      ),
+    ]);
+    if (
+      ticket !== epoch.current ||
+      selected.current !== id ||
+      !sessionRef.current ||
+      after !== afterRef.current
+    )
       return;
-    }
-
-    setRooms(prev => prev.map(candidate => candidate.id === room.id ? { ...candidate, reactions: clearMessageReactions(candidate.reactions ?? [], messageId) } : candidate));
-
-    const turnId = targetMessage.turnId || crypto.randomUUID();
-    const sessionId = crypto.randomUUID();
+    setRoom(nextRoom);
+    setMessages(page.messages);
+    setCursor(page.cursor);
+    setRuns(list(nextRuns, "generations"));
+    setRooms((current) =>
+      current.map((item) => (item.id === id ? nextRoom : item)),
+    );
+  }
+  function switchRoom(id: string) {
+    epoch.current++;
+    setScopeVersion((value) => value + 1);
+    selected.current = id;
+    setRoomId(id);
+    setRoom(undefined);
+    setMessages([]);
+    setRuns([]);
+    setCursor(undefined);
+    afterRef.current = undefined;
+    setPageAfter(undefined);
+    setInput("");
+    setFiles([]);
+    setReader(undefined);
+    setCorrection(undefined);
+    setExportState(undefined);
+    setRoomEditSnapshot(undefined);
+    setSavedContexts([]);
+    personaEditRevision.current = undefined;
+    setAgentEditor(undefined);
+    setRoomEditor(undefined);
+    setRecipient("auto");
+    setNotice("");
+    setError("");
+    setSidebar(false);
+    pendingTurn.current = undefined;
+    setPending(false);
+    setSending(false);
+  }
+  useEffect(() => {
     const controller = new AbortController();
-    generationSessionRef.current = { sessionId, turnId, roomId: room.id, controller, targetMessageId: messageId, mode };
-    setIsGenerating(true);
-    isGeneratingRef.current = true;
-    setPlanningAgents([agent.id]);
-
-    const nextContext: GenerationContext = {
-      ...targetMessage.generationContext,
-      attempt: targetMessage.generationContext.attempt + 1,
-      modelId: agent.model
+    appRequest<SessionDTO>("/session", "GET", undefined, controller.signal)
+      .then((value) => {
+        if (!controller.signal.aborted) signIn(value);
+      })
+      .catch((cause) => {
+        if (!controller.signal.aborted) {
+          clearIdentity();
+          if (!(cause instanceof AppAPIError && cause.status === 401))
+            fail(cause);
+        }
+      });
+    return () => controller.abort();
+  }, []);
+  useEffect(() => {
+    if (session) void loadRooms().catch(fail);
+  }, [session?.actorId]);
+  useEffect(() => {
+    if (!session || !roomId) return;
+    const controller = new AbortController();
+    const ticket = epoch.current;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        await refresh(roomId, ticket, controller.signal);
+      } catch (cause) {
+        if (!controller.signal.aborted && ticket === epoch.current) fail(cause);
+      }
+      if (!controller.signal.aborted && ticket === epoch.current)
+        timer = setTimeout(poll, 2000);
     };
-    const internalStateSettings = { ...DEFAULT_INTERNAL_STATE_SETTINGS, ...room.internalStateSettings };
-    const memoryRequest = isMemoryExportRequest(history[history.length - 1], internalStateSettings.enabled);
-    setRooms(prev => prev.map(r => r.id === room.id ? {
-      ...r,
-      messages: r.messages.map(m => m.id === messageId ? { ...prepareMessageForRegeneration(m, internalStateSettings.enabled), generationContext: nextContext } : m),
-      updatedAt: Date.now()
-    } : r));
+    void poll();
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+  }, [session?.actorId, roomId, pageAfter, scopeVersion]);
 
-    let accumulatedText = '';
-    const requestSignal = controller.signal;
-    const pipeline = memoryRequest ? { status: 'not_configured' as const, reports: [], diagnostics: [] } : await new GenerationSubAgentCache().prepare(agent, { sessionId, inputs: extractPublicTaskInputs(history), signal: requestSignal, registry: subAgentRegistryRef.current! });
-    setSubAgentDiagnostics(pipeline.diagnostics);
-    if (pipeline.status === 'aborted' || requestSignal.aborted) { replaceLocalMessage(room.id, messageId, () => restoreMessageAfterAbort(targetMessage)); finishGenerationSession(sessionId, turnId, room.id); return; }
-    const privateSubAgentContext = formatPrivateSubAgentContext(pipeline.reports, pipeline.status === 'failed' || pipeline.status === 'partial');
-    await new Promise<void>((resolve) => {
-      streamAgentResponse(
-        { ...agent, model: nextContext.modelId },
-        history,
-        room.systemInstruction,
-        (chunk) => {
-          if (!shouldAcceptStreamChunk(isCurrentGenerationSession(sessionId, turnId, room.id), requestSignal.aborted)) return;
-          accumulatedText += chunk;
-          if (!internalStateSettings.enabled) updateLocalHistory(room.id, messageId, accumulatedText, true);
-        },
-        (result) => {
-          const completionKind = classifyStreamCompletion(accumulatedText, requestSignal.aborted);
-          if (completionKind === 'aborted_empty' || (internalStateSettings.enabled && result.outcome === 'ABORTED')) {
-            replaceLocalMessage(room.id, messageId, () => restoreMessageAfterAbort(targetMessage));
-            resolve();
-            return;
-          }
-          if (internalStateSettings.enabled && completionKind === 'complete' && result.outcome === 'SUCCESS') {
-            replaceLocalMessage(room.id, messageId, message => finalizeSeparatedSuccess(message, result.text, memoryRequest));
-            resolve(); return;
-          }
-          if (internalStateSettings.enabled) {
-            replaceLocalMessage(room.id, messageId, message => finalizeSeparatedFailure(message, result));
-            resolve(); return;
-          }
-          if (completionKind === 'aborted_partial' || (completionKind === 'complete' && result.outcome === 'SUCCESS')) {
-            replaceLocalMessage(room.id, messageId, message => finalizeLegacyGeneration(message, accumulatedText));
-            resolve();
-            return;
-          }
-          const code = result.errorCode || 'EMPTY_RESPONSE';
-          const detail = result.errorDetail || 'The response stream completed without any text.';
-          const message = code === 'PARTIAL_RESPONSE' && accumulatedText ? accumulatedText : (code === 'EMPTY_RESPONSE' ? 'Empty response from model.' : (result.finishMessage || 'Agent response failed.'));
-          updateLocalHistory(room.id, messageId, message, false, true, code, detail);
-          resolve();
-        },
-        (errorInfo) => {
-          if (internalStateSettings.enabled) {
-            replaceLocalMessage(room.id, messageId, message => finalizeSeparatedFailure(message, { errorCode: errorInfo.code, errorDetail: errorInfo.detail }));
-          } else {
-            updateLocalHistory(room.id, messageId, errorInfo.message, false, true, errorInfo.code, errorInfo.detail);
-          }
-          resolve();
-        },
-        { agents: room.agents, signal: requestSignal, mode, internalStateSettings, memoryRequest, privateSubAgentContext, scheduler: schedulerRef.current! }
+  async function logout() {
+    try {
+      await appRequest("/session/logout", "POST", {});
+      clearIdentity();
+      setError("");
+    } catch (cause) {
+      fail(cause);
+      setNotice(
+        "Logout was not confirmed by the server. Retry when connected.",
       );
-    });
-    finishGenerationSession(sessionId, turnId, room.id);
-  };
-
-  const handleRetryMessage = (messageId: string) => runSingleMessageGeneration(messageId, 'retry');
-  const handleRegenerateMessage = (messageId: string) => runSingleMessageGeneration(messageId, 'regenerate');
-
-  const handleStop = () => {
-    // Cancels only the active generation session; old callbacks may clean up
-    // their own messages but must not mutate global generation state.
-    const session = generationSessionRef.current;
-    if (!session) return;
-    session.controller.abort();
-    generationSessionRef.current = null;
-    setIsGenerating(false);
-    isGeneratingRef.current = false;
-    subAgentCacheRef.current.clear();
-    setPlanningAgents([]);
-  };
-
-  const handleClearChat = () => {
-    if (confirm("Are you sure you want to clear the conversation for this room?")) {
-        updateActiveRoom({ messages: [], decisionEvents: [], reactions: [] });
     }
-  };
-
-  const handleAgentToggle = (agentId: string) => {
-    updateActiveRoom({ agents: agents.map(a => a.id === agentId ? { ...a, isEnabled: !a.isEnabled } : a) });
-  };
-  const handleAgentDelete = (agentId: string) => {
-    if (confirm("Delete this agent from this room?")) {
-      updateActiveRoom({ agents: agents.filter(a => a.id !== agentId) });
+  }
+  async function saveRoom(
+    title: string,
+    description: string,
+    type: RoomTag,
+    systemInstruction: string,
+    internalStateSettings: InternalStateSettings,
+  ) {
+    const ticket = epoch.current;
+    try {
+      const value = await appRequest<RoomDTO>(
+        roomEditor === "edit" && room ? roomPath(room.id) : "/rooms",
+        roomEditor === "edit" ? "PATCH" : "POST",
+        {
+          title,
+          description,
+          type,
+          systemInstruction,
+          internalStateSettings,
+          ...(roomEditor === "edit"
+            ? { expectedRevision: roomEditSnapshot?.revision }
+            : {}),
+        },
+      );
+      if (ticket !== epoch.current) return false;
+      await loadRooms();
+      switchRoom(value.id);
+      setRoomEditor(undefined);
+      return true;
+    } catch (cause) {
+      fail(cause);
+      return false;
     }
-  };
-  const handleAgentSave = (agent: Agent) => {
-    const updatedAgents = agents.some(a => a.id === agent.id) 
-        ? agents.map(a => a.id === agent.id ? agent : a)
-        : [...agents, agent];
-    updateActiveRoom({ agents: updatedAgents });
-    setEditingAgent(null);
-  };
+  }
+  async function upload(
+    roomId: string,
+    file: Blob,
+    name: string,
+    mimeType: string,
+  ) {
+    return appRequest<AttachmentDTO>(
+      `${roomPath(roomId)}/attachments`,
+      "POST",
+      { name, mimeType, data: await fileToBase64(file) },
+    );
+  }
+  async function saveAgent(agent: Agent) {
+    if (!room) return false;
+    const id = room.id;
+    const ticket = epoch.current;
+    const previous = room.agents.find((item) => item.id === agent.id);
+    try {
+      let avatarAttachmentId = previous?.avatarAttachmentId;
+      if (
+        agent.avatarType === "image" &&
+        agent.avatar.startsWith("data:image/")
+      ) {
+        const match =
+          /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/.exec(
+            agent.avatar,
+          );
+        if (!match) throw new AppAPIError("INVALID_AVATAR", 400);
+        const result = await appRequest<AttachmentDTO>(
+          `${roomPath(id)}/attachments`,
+          "POST",
+          { name: "avatar", mimeType: match[1], data: match[2] },
+        );
+        avatarAttachmentId = result.id;
+      }
+      if (agent.avatarType !== "image") avatarAttachmentId = undefined;
+      const contextAttachmentIds = previous
+        ? savedContexts.map((item) => item.id)
+        : [];
+      for (const file of agent.additionalContextFiles ?? []) {
+        if (ticket !== epoch.current) return false;
+        const attachment = await upload(
+          id,
+          new Blob([file.content]),
+          file.name,
+          "text/plain",
+        );
+        contextAttachmentIds.push(attachment.id);
+      }
+      if (ticket !== epoch.current) return false;
+      const {
+        id: _id,
+        additionalContextFiles: _files,
+        avatar: _avatar,
+        ...settings
+      } = agent;
+      const body = {
+        ...settings,
+        avatar: agent.avatarType === "image" ? "" : agent.avatar,
+        ...(avatarAttachmentId ? { avatarAttachmentId } : {}),
+        contextAttachmentIds,
+        ...(previous ? { expectedRevision: personaEditRevision.current } : {}),
+      };
+      await appRequest(
+        `${roomPath(id)}/personas${previous ? `/${encodeURIComponent(previous.id)}` : ""}`,
+        previous ? "PATCH" : "POST",
+        body,
+      );
+      await refresh(id, ticket);
+      return true;
+    } catch (cause) {
+      fail(cause);
+      return false;
+    }
+  }
+  async function toggleAgent(id: string) {
+    const persona = room?.agents.find((item) => item.id === id);
+    if (!persona || !room) return;
+    try {
+      await appRequest(
+        `${roomPath(room.id)}/personas/${encodeURIComponent(id)}`,
+        "PATCH",
+        { expectedRevision: persona.revision, isEnabled: !persona.isEnabled },
+      );
+      await refresh(room.id, epoch.current);
+    } catch (cause) {
+      fail(cause);
+    }
+  }
+  async function remove(kind: "room" | "persona" | "message", id: string) {
+    const targetRoom =
+      kind === "room" ? rooms.find((item) => item.id === id) : room;
+    if (
+      !targetRoom ||
+      !window.confirm(
+        `Delete this ${kind}? It will be removed from current views and future context.`,
+      )
+    )
+      return;
+    const revision =
+      kind === "room"
+        ? targetRoom.revision
+        : kind === "persona"
+          ? targetRoom.agents.find((item) => item.id === id)?.revision
+          : messages.find((item) => item.id === id)?.revision;
+    try {
+      await appRequest(
+        `${roomPath(targetRoom.id)}${kind === "room" ? "" : `/${kind === "persona" ? "personas" : "messages"}/${encodeURIComponent(id)}`}`,
+        "DELETE",
+        { expectedRevision: revision },
+      );
+      if (kind === "room") {
+        switchRoom("");
+        await loadRooms();
+      } else await refresh(targetRoom.id, epoch.current);
+    } catch (cause) {
+      fail(cause);
+    }
+  }
+  async function send(retry = false) {
+    if (!room || sending || (!retry && !input.trim() && files.length === 0))
+      return;
+    const id = room.id;
+    const ticket = epoch.current;
+    setSending(true);
+    setError("");
+    setNotice("Not sent");
+    try {
+      if (!pendingTurn.current) {
+        const attachmentIds: string[] = [];
+        for (const file of files) {
+          if (ticket !== epoch.current) return;
+          const attachment = await upload(
+            id,
+            file,
+            file.name,
+            file.type || "text/plain",
+          );
+          attachmentIds.push(attachment.id);
+        }
+        if (ticket !== epoch.current) return;
+        pendingTurn.current = {
+          roomId: id,
+          path: `${roomPath(id)}/turns`,
+          body: {
+            requestId: crypto.randomUUID(),
+            expectedRoomRevision: room.revision,
+            content: input,
+            attachmentIds,
+            recipient: createRecipientSnapshot(
+              recipient,
+              agents.filter((agent) => agent.isEnabled),
+            ),
+          },
+        };
+        setPending(true);
+      }
+      const isTurn = pendingTurn.current.path.endsWith("/turns");
+      const receipt = await appRequest<RunDTO>(
+        pendingTurn.current.path,
+        "POST",
+        pendingTurn.current.body,
+      );
+      if (ticket !== epoch.current) return;
+      pendingTurn.current = undefined;
+      setPending(false);
+      if (isTurn) {
+        setInput("");
+        setFiles([]);
+      }
+      setNotice(stateLabels[receipt.status] ?? "Server accepted");
+      await refresh(id, ticket);
+    } catch (cause) {
+      if (ticket === epoch.current) {
+        fail(cause);
+        const rejected =
+          cause instanceof AppAPIError &&
+          [
+            "INVALID_INPUT",
+            "REVISION_CONFLICT",
+            "MODEL_NOT_ALLOWED",
+            "RECIPIENT_NOT_FOUND",
+            "PERSONA_LIMIT",
+            "NO_ACTIVE_PERSONA",
+            "ATTACHMENT_NOT_AVAILABLE",
+            "ATTACHMENT_LIMIT",
+            "INPUT_TOO_LARGE",
+          ].includes(cause.code);
+        if (rejected) {
+          pendingTurn.current = undefined;
+          setPending(false);
+          setNotice(
+            "Request rejected before acceptance. Your draft is retained; review the current settings and send explicitly.",
+          );
+          await refresh(id, ticket).catch(fail);
+        } else
+          setNotice(
+            pendingTurn.current
+              ? "Acceptance not confirmed. Retry the same request to recover its receipt."
+              : "Save failed. Input is still unsent.",
+          );
+      }
+    } finally {
+      if (ticket === epoch.current) setSending(false);
+    }
+  }
+  async function regenerate(message: MessageDTO) {
+    if (!room || pendingTurn.current || sending) return;
+    pendingTurn.current = {
+      roomId: room.id,
+      path: `${roomPath(room.id)}/messages/${encodeURIComponent(message.id)}/regenerate`,
+      body: {
+        requestId: crypto.randomUUID(),
+        expectedRevision: message.revision,
+      },
+    };
+    setPending(true);
+    await send(true);
+  }
+  async function editPersona(agent: Agent) {
+    if (!room) return;
+    const ticket = epoch.current;
+    const id = room.id;
+    const saved = room.agents.find((item) => item.id === agent.id);
+    personaEditRevision.current = saved?.revision;
+    const refs = saved?.contextAttachmentIds ?? [];
+    setSavedContexts(
+      refs.map((id) => ({
+        id,
+        name: id,
+        url: authorizedAttachmentURL(room.id, { id }),
+      })),
+    );
+    setAgentEditor(agent);
+    try {
+      const meta = await Promise.all(
+        refs.map((ref) =>
+          appRequest<AttachmentDTO>(
+            `${roomPath(id)}/attachments/${encodeURIComponent(ref)}`,
+          ),
+        ),
+      );
+      if (ticket === epoch.current)
+        setSavedContexts(
+          meta.map((item) => ({
+            id: item.id,
+            name: item.name,
+            url: authorizedAttachmentURL(id, item),
+          })),
+        );
+    } catch (cause) {
+      fail(cause);
+    }
+  }
+  async function cancel(run: RunDTO) {
+    if (!room) return;
+    try {
+      await appRequest(
+        `${roomPath(room.id)}/generations/${encodeURIComponent(run.runId ?? run.id)}/cancel`,
+        "POST",
+        {},
+      );
+      await refresh(room.id, epoch.current);
+    } catch (cause) {
+      fail(cause);
+    }
+  }
+  async function readRunInternal(run: RunDTO) {
+    if (!room) return;
+    const ticket = epoch.current;
+    try {
+      const data = await appRequest(
+        `${roomPath(room.id)}/generations/${encodeURIComponent(run.runId ?? run.id)}/internal`,
+      );
+      if (ticket === epoch.current)
+        setReader({ title: "Authorized internal result", data });
+    } catch (cause) {
+      if (ticket === epoch.current) fail(cause);
+    }
+  }
+  async function readMessage(message: MessageDTO, privateReader: boolean) {
+    if (!room) return;
+    const ticket = epoch.current;
+    try {
+      const data = await appRequest(
+        `${roomPath(room.id)}/messages/${encodeURIComponent(message.id)}/${privateReader ? `private?revision=${message.revision}` : "history"}`,
+      );
+      if (ticket === epoch.current)
+        setReader({
+          title: privateReader
+            ? "Authorized internal segments"
+            : "Revision history",
+          data,
+        });
+    } catch (cause) {
+      fail(cause);
+    }
+  }
+  async function correct() {
+    if (!room || !correction) return;
+    try {
+      await appRequest(
+        `${roomPath(room.id)}/messages/${encodeURIComponent(correction.message.id)}`,
+        "PATCH",
+        {
+          expectedRevision: correction.message.revision,
+          content: correction.content,
+        },
+      );
+      setCorrection(undefined);
+      await refresh(room.id, epoch.current);
+    } catch (cause) {
+      fail(cause);
+    }
+  }
+  async function exportRoom() {
+    if (
+      !room ||
+      !exportState ||
+      exportState.complete ||
+      exportState.roomId !== room.id
+    )
+      return;
+    const ticket = epoch.current;
+    try {
+      const result = await appRequest<{ nextCursor?: string }>(
+        `${roomPath(room.id)}/export?limit=200${exportState.nextCursor ? `&cursor=${encodeURIComponent(exportState.nextCursor)}` : ""}`,
+      );
+      if (ticket !== epoch.current) return;
+      downloadJSON(`map-room-export-part-${exportState.part}.json`, result);
+      setExportState({
+        ...exportState,
+        nextCursor: result.nextCursor ?? undefined,
+        part: exportState.part + 1,
+        complete: !result.nextCursor,
+      });
+    } catch (cause) {
+      if (ticket === epoch.current) fail(cause);
+    }
+  }
+  async function older() {
+    if (!room || !cursor) return;
+    afterRef.current = cursor;
+    setPageAfter(cursor);
+    setMessages([]);
+  }
+  function latest() {
+    afterRef.current = undefined;
+    setPageAfter(undefined);
+    setMessages([]);
+  }
 
-  if (!activeRoom) return null;
-
+  if (session === undefined)
+    return (
+      <main className="p-8 text-zinc-400" role="status">
+        Connecting to your conversation server…
+      </main>
+    );
+  if (!session)
+    return (
+      <>
+        <LoginPanel onLogin={signIn} />
+        {error && (
+          <div
+            role="alert"
+            className="fixed bottom-4 inset-x-4 text-center text-red-300"
+          >
+            {error}
+          </div>
+        )}
+      </>
+    );
   return (
-    <div className="flex h-screen bg-zinc-950 text-zinc-100 font-sans selection:bg-blue-500/30">
-      <AgentSidebar 
-        rooms={rooms}
-        activeRoomId={activeRoomId}
-        onSwitchRoom={handleSwitchRoom}
-        onNewRoom={() => { setEditingRoom(null); setIsRoomModalOpen(true); }}
-        onDeleteRoom={handleDeleteRoom}
+    <div className="h-screen w-full flex bg-zinc-950 text-zinc-100">
+      <AgentSidebar
+        rooms={rooms.map((item) => displayRoom(item))}
+        activeRoomId={roomId}
         agents={agents}
-        onToggleAgent={handleAgentToggle}
-        onDeleteAgent={handleAgentDelete}
-        onEditAgent={(a) => { setEditingAgent(a); setIsAgentModalOpen(true); }}
-        onAddAgent={() => { setEditingAgent(null); setIsAgentModalOpen(true); }}
-        thinkingAgentIds={allThinkingAgentIds}
-        onShowGraph={() => setIsGraphModalOpen(true)}
-        isOpen={isSidebarOpen}
-        onClose={() => setIsSidebarOpen(false)}
+        onSwitchRoom={switchRoom}
+        onNewRoom={() => setRoomEditor("new")}
+        onDeleteRoom={(id) => void remove("room", id)}
+        onToggleAgent={(id) => void toggleAgent(id)}
+        onDeleteAgent={(id) => void remove("persona", id)}
+        onEditAgent={(agent) => void editPersona(agent)}
+        onAddAgent={() => {
+          personaEditRevision.current = undefined;
+          setSavedContexts([]);
+          setAgentEditor(null);
+        }}
+        thinkingAgentIds={
+          runs.some(busyRun)
+            ? agents.filter((agent) => agent.isEnabled).map((agent) => agent.id)
+            : []
+        }
+        onShowGraph={() => setGraph(true)}
+        isOpen={sidebar}
+        onClose={() => setSidebar(false)}
       />
-      <div className="flex-1 flex flex-col h-full relative w-full transition-all duration-300">
-        <header className="h-14 border-b border-zinc-800 flex items-center justify-between px-4 bg-zinc-950/80 backdrop-blur z-10 shrink-0">
-          <div className="flex items-center gap-3">
-            <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="p-2 -ml-2 hover:bg-zinc-800 rounded-lg text-zinc-400 hover:text-white transition-colors md:hidden">
-              <Menu className="w-5 h-5" />
+      <main className="min-w-0 flex-1 flex flex-col">
+        <header className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 border-b border-zinc-800">
+          <div className="flex gap-3 items-center min-w-0">
+            <button
+              className="map-button md:hidden"
+              onClick={() => setSidebar(true)}
+              aria-label="Open rooms"
+            >
+              <Menu size={18} />
             </button>
-            <div className="flex flex-col">
-                 <div className="flex items-center gap-2 group cursor-pointer" onClick={() => { setEditingRoom(activeRoom); setIsRoomModalOpen(true); }}>
-                    <h1 className="font-bold text-sm md:text-lg tracking-tight bg-gradient-to-r from-white to-zinc-400 bg-clip-text text-transparent group-hover:text-blue-300 transition-colors">
-                      {activeRoom.title}
-                    </h1>
-                    {activeRoom.type && (
-                      <span className={`inline-flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded-md ${ROOM_TAGS.find(t => t.value === activeRoom.type)?.color || 'text-zinc-500'}`}>
-                        {activeRoom.type === 'Sandbox' && <Box className="w-3 h-3" />}
-                        {activeRoom.type === 'Recreation' && <Gamepad2 className="w-3 h-3" />}
-                        {activeRoom.type === 'Hard' && <AlertTriangle className="w-3 h-3" />}
-                        {activeRoom.type}
-                      </span>
-                    )}
-                    <Settings className="w-3.5 h-3.5 text-zinc-600 group-hover:text-zinc-400 transition-colors opacity-0 group-hover:opacity-100" />
-                 </div>
+            <div>
+              <h1 className="font-semibold truncate">
+                {room?.title ?? "Multi-Agent Nexus"}
+              </h1>
+              <p className="text-xs text-zinc-500">
+                Server conversation ·{" "}
+                {room ? `revision ${room.revision}` : "Choose or create a room"}
+              </p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-             <button onClick={() => setIs3DMode(!is3DMode)} className={`p-2 rounded-lg transition-colors border ${is3DMode ? 'bg-blue-500/10 text-blue-400 border-blue-500/30' : 'text-zinc-400 hover:bg-zinc-800 border-transparent'}`} title="Toggle 3D View">
-                <MonitorPlay className="w-4 h-4" />
-             </button>
-             {messages.length > 0 && (
-                <button onClick={handleClearChat} className="p-2 hover:bg-zinc-800 rounded-lg text-zinc-400 hover:text-red-400 transition-colors" title="Clear Chat">
-                  <Trash2 className="w-4 h-4" />
+          <div className="flex gap-2 flex-wrap">
+            <button className="map-button" onClick={() => setMigration(true)}>
+              Migration
+            </button>
+            {room && (
+              <>
+                <button
+                  className="map-button"
+                  onClick={() =>
+                    setExportState({
+                      roomId: room.id,
+                      part: 1,
+                      complete: false,
+                    })
+                  }
+                >
+                  Export
                 </button>
-             )}
+                <button
+                  className="map-button"
+                  onClick={() => {
+                    setRoomEditSnapshot({
+                      ...displayRoom(room),
+                      revision: room.revision,
+                    });
+                    setRoomEditor("edit");
+                  }}
+                  aria-label="Room settings"
+                >
+                  <Settings size={16} />
+                </button>
+              </>
+            )}
+            <button
+              className="map-button flex gap-2 items-center"
+              onClick={() => void logout()}
+            >
+              <LogOut size={16} />
+              Logout
+            </button>
           </div>
         </header>
-        <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-          {storageWarning && (
-            <div className="mx-4 mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200 flex items-center justify-between gap-3">
-              <span>{storageWarning}</span>
-              <button onClick={() => setStorageWarning(null)} className="text-amber-100 hover:text-white"><X className="w-4 h-4" /></button>
-            </div>
-          )}
-          <DecisionDiagnosticsPanel events={activeRoom.decisionEvents || []} />
-          <SubAgentDiagnosticsPanel diagnostics={subAgentDiagnostics} />
-          {is3DMode && (
-            <div className="h-1/2 min-h-[300px] border-b border-zinc-800 relative animate-in fade-in slide-in-from-top-4 duration-300">
-               <SceneView agents={agents} speakingAgentId={currentSpeakingAgentId} />
-            </div>
-          )}
-          <div className={`flex-1 flex flex-col min-h-0 relative ${is3DMode ? 'h-1/2' : 'h-full'}`}>
-            <div className="flex-1 overflow-y-auto p-4 md:p-6 scroll-smooth">
-              <div className="max-w-4xl mx-auto min-h-full flex flex-col">
-                {messages.length === 0 ? (
-                  <div className="flex-1 flex flex-col items-center justify-center text-zinc-500 space-y-4 pb-20 opacity-50">
-                      <div className="w-16 h-16 rounded-2xl bg-zinc-900 border border-zinc-800 flex items-center justify-center text-4xl mb-2">⚡</div>
-                      <p className="text-sm font-medium text-zinc-400">Welcome to {activeRoom.title}</p>
-                  </div>
-                ) : (
-                  messages.map(msg => (
-                    <MessageBubble 
-                      key={msg.id} 
-                      message={msg} 
-                      agent={msg.role === 'model' && msg.agentId ? agents.find(a => a.id === msg.agentId) : undefined}
-                      onRetry={msg.error && canRetryGeneration(msg.errorCode) ? handleRetryMessage : undefined}
-                      onRegenerate={msg.role === 'model' && !msg.isStreaming && canRegenerateGeneration(msg.errorCode) ? handleRegenerateMessage : undefined}
-                      internalStateSettings={{ ...DEFAULT_INTERNAL_STATE_SETTINGS, ...activeRoom.internalStateSettings }}
-                      reactions={(activeRoom.reactions ?? []).filter(reaction => reaction.messageId === msg.id)}
-                      agents={agents}
-                    />
-                  ))
-                )}
-                {planningAgents.length > 0 && (
-                    <div className="flex flex-col gap-2 items-start ml-4 mb-6 mt-2 animate-in fade-in duration-300">
-                        <div className="flex items-center gap-2 text-xs text-zinc-400 font-medium bg-zinc-900/50 px-3 py-1.5 rounded-full border border-zinc-800">
-                          <BrainCircuit className="w-3.5 h-3.5 text-purple-400" /> Deciding...
-                        </div>
-                    </div>
-                )}
-                <div ref={messagesEndRef} className="h-4" />
-              </div>
-            </div>
-            <div className="p-4 border-t border-zinc-800 bg-zinc-950 shrink-0">
-              <div className="max-w-4xl mx-auto mb-2 flex items-center gap-2 text-xs text-zinc-400">
-                <label htmlFor="recipient">To:</label>
-                <select id="recipient" value={recipientSelection} onChange={event => setRecipientSelection(event.target.value as RecipientSelection)} disabled={isGenerating} className="bg-zinc-900 border border-zinc-800 rounded-md px-2 py-1 text-zinc-200">
-                  <option value="auto">Auto</option>
-                  <option value="all">All</option>
-                  {agents.filter(agent => agent.isEnabled).map(agent => <option key={agent.id} value={`agent:${agent.id}`}>{agent.name}</option>)}
-                  {recipientGroups.map(group => <option key={group} value={`group:${group}`}>{group}</option>)}
-                </select>
-              </div>
-              <div className={`max-w-4xl mx-auto relative bg-zinc-900 border rounded-xl transition-all duration-200 ${isDragging ? 'border-blue-500 bg-zinc-800' : 'border-zinc-800'}`} onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}>
-                {attachments.length > 0 && (
-                  <div className="flex gap-2 p-3 pb-0 overflow-x-auto">
-                    {attachments.map(att => (
-                      <div key={att.id} className="relative group shrink-0 w-20 h-20 bg-zinc-800 rounded-lg border border-zinc-700 overflow-hidden flex items-center justify-center">
-                        {att.type === 'image' ? <img src={att.data} className="w-full h-full object-cover" /> : <FileText className="w-8 h-8 text-zinc-500" />}
-                        <button onClick={() => removeAttachment(att.id)} className="absolute top-1 right-1 p-0.5 bg-black/60 rounded-full text-white opacity-0 group-hover:opacity-100 transition-opacity"><X className="w-3.5 h-3.5" /></button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                <div className="flex items-end">
-                    <div className="p-2">
-                      <input type="file" multiple ref={fileInputRef} className="hidden" onChange={handleFileSelect}/>
-                      <button onClick={() => fileInputRef.current?.click()} className="p-2 text-zinc-400 hover:text-white rounded-lg" disabled={isGenerating}><Paperclip className="w-5 h-5" /></button>
-                    </div>
-                    <textarea value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendMessage(); } }} placeholder={`Message ${activeRoom.title}...`} className="w-full bg-transparent border-0 text-zinc-100 px-2 py-3.5 focus:outline-none resize-none min-h-[50px] max-h-32" rows={1} disabled={isGenerating}/>
-                    <div className="p-2">
-                        <button onClick={isGenerating ? handleStop : handleSendMessage} disabled={(!input.trim() && attachments.length === 0) && !isGenerating} className={`p-2 rounded-lg ${(input.trim() || attachments.length > 0 || isGenerating) ? 'bg-white text-black' : 'bg-zinc-800 text-zinc-500'}`}>
-                          {isGenerating ? <StopCircle className="w-5 h-5 animate-pulse text-red-500" /> : <Send className="w-5 h-5" />}
-                        </button>
-                    </div>
-                </div>
-              </div>
-            </div>
+        {error && (
+          <div
+            role="alert"
+            className="flex justify-between gap-2 border-b border-red-900 bg-red-950/30 px-4 py-3 text-sm text-red-300"
+          >
+            <span>
+              {error}
+              {error.includes("REVISION") &&
+                " · Reload current settings before editing again."}
+            </span>
+            <button onClick={() => setError("")} aria-label="Dismiss error">
+              <X size={16} />
+            </button>
           </div>
-        </div>
-      </div>
-      <AgentModal isOpen={isAgentModalOpen} onClose={() => setIsAgentModalOpen(false)} onSave={handleAgentSave} editingAgent={editingAgent}/>
-      <RoomModal isOpen={isRoomModalOpen} onClose={() => setIsRoomModalOpen(false)} onSave={handleSaveRoom} editingRoom={editingRoom}/>
-      <RelationshipGraphModal isOpen={isGraphModalOpen} onClose={() => setIsGraphModalOpen(false)} rooms={rooms}/>
+        )}
+        {notice && (
+          <p
+            role="status"
+            className="px-4 py-2 text-sm text-blue-300 border-b border-zinc-800"
+          >
+            {notice}
+          </p>
+        )}
+        {!room && (
+          <section className="flex-1 flex items-center justify-center p-6">
+            <div className="text-center space-y-4">
+              <h2 className="text-xl">Your conversations, on the server</h2>
+              <p className="text-sm text-zinc-400">
+                Create a room or import your legacy browser data.
+              </p>
+              <button
+                className="map-button"
+                onClick={() => setRoomEditor("new")}
+              >
+                Create room
+              </button>
+            </div>
+          </section>
+        )}
+        {room && (
+          <>
+            <details className="border-b border-zinc-800 px-4 py-2 text-xs text-zinc-400">
+              <summary className="cursor-pointer">
+                Generation, decisions and usage ({runs.length})
+                {runs[0] &&
+                  ` · ${stateLabels[runs[0].status] ?? runs[0].status}${runs[0].errorCode ? ` · ${runs[0].errorCode}` : ""}`}
+              </summary>
+              <div className="max-h-60 overflow-auto space-y-3 py-3">
+                {runs.map((run) => (
+                  <div
+                    key={run.runId ?? run.id}
+                    data-run-id={run.runId ?? run.id}
+                    className="rounded border border-zinc-800 p-3"
+                  >
+                    <div className="flex justify-between gap-2">
+                      <span>
+                        {stateLabels[run.status] ?? run.status} ·{" "}
+                        {run.callCount ?? 0} provider calls{" "}
+                        {run.errorCode ? `· ${run.errorCode}` : ""}
+                      </span>
+                      {busyRun(run) && (
+                        <button
+                          className="map-button"
+                          onClick={() => void cancel(run)}
+                        >
+                          Cancel generation
+                        </button>
+                      )}
+                    </div>
+                    <button
+                      className="map-button mt-2"
+                      onClick={() => void readRunInternal(run)}
+                    >
+                      Read authorized internal result
+                    </button>
+                    <pre className="mt-2 whitespace-pre-wrap break-words">
+                      {JSON.stringify(
+                        {
+                          decisions: run.decisions,
+                          reactions: run.reactions,
+                          usage: run.usage,
+                        },
+                        null,
+                        2,
+                      )}
+                    </pre>
+                  </div>
+                ))}
+                {room.legacyDecisions?.length ||
+                room.legacyReactions?.length ? (
+                  <div className="rounded border border-zinc-800 p-3">
+                    <p>Imported decisions and reactions</p>
+                    <pre className="mt-2 whitespace-pre-wrap break-words">
+                      {JSON.stringify(
+                        {
+                          decisions: room.legacyDecisions,
+                          reactions: room.legacyReactions,
+                        },
+                        null,
+                        2,
+                      )}
+                    </pre>
+                  </div>
+                ) : null}
+              </div>
+            </details>
+            <section
+              className="flex-1 overflow-y-auto p-4 md:p-8"
+              aria-label="Conversation"
+            >
+              {pageAfter && (
+                <div className="text-center mb-3">
+                  <button className="map-button" onClick={latest}>
+                    Latest messages
+                  </button>
+                </div>
+              )}
+              {cursor && (
+                <div className="text-center mb-5">
+                  <button className="map-button" onClick={() => void older()}>
+                    Load older messages
+                  </button>
+                </div>
+              )}
+              {messages.length === 0 && (
+                <p className="text-center text-zinc-500 py-16">
+                  No saved messages yet. Add a Persona and select a
+                  host-configured model to begin.
+                </p>
+              )}
+              {messages.map((message) => (
+                <article
+                  key={`${message.id}:${message.revision}`}
+                  className={`mb-5 max-w-3xl ${message.role === "user" ? "ml-auto" : "mr-auto"}`}
+                  data-message-id={message.id}
+                >
+                  <div className="text-xs text-zinc-500 mb-2 flex justify-between gap-2">
+                    <span>
+                      {message.role === "user"
+                        ? "You"
+                        : (agents.find((agent) => agent.id === message.agentId)
+                            ?.name ?? "Persona")}{" "}
+                      ·{" "}
+                      {new Date(
+                        message.timestamp ?? message.occurredAt,
+                      ).toLocaleString()}
+                    </span>
+                    <span>revision {message.revision} · saved</span>
+                  </div>
+                  <div
+                    className={`border rounded-2xl p-4 ${message.role === "user" ? "bg-zinc-800 border-zinc-700" : "bg-zinc-900 border-zinc-800"}`}
+                  >
+                    <p className="whitespace-pre-wrap break-words">
+                      {message.content || "(No public text)"}
+                    </p>
+                    {message.attachments?.length > 0 && (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {message.attachments.map((attachment) => (
+                          <a
+                            className="map-button inline-flex items-center gap-1"
+                            key={attachment.id}
+                            href={authorizedAttachmentURL(room.id, attachment)}
+                            download={attachment.name}
+                            rel="noreferrer"
+                          >
+                            <Paperclip size={14} />
+                            {attachment.name} ({attachment.size} bytes)
+                          </a>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex gap-2 mt-2">
+                    {reactions
+                      .filter((reaction) => reaction.messageId === message.id)
+                      .map((reaction) => (
+                        <span
+                          key={String(reaction.id)}
+                          className="text-xs rounded-full border border-zinc-700 px-2 py-1"
+                        >
+                          {reactionEmoji[String(reaction.semantic)] ??
+                            String(reaction.semantic)}{" "}
+                          {agents.find(
+                            (agent) =>
+                              agent.id ===
+                              (reaction.agentId ?? reaction.personaId),
+                          )?.name ?? "Persona"}
+                        </span>
+                      ))}
+                  </div>
+                  <div className="flex gap-3 flex-wrap mt-2 text-xs text-zinc-500">
+                    <button onClick={() => void readMessage(message, false)}>
+                      Revision history
+                    </button>
+                    <button
+                      onClick={() =>
+                        setCorrection({ message, content: message.content })
+                      }
+                    >
+                      Correct
+                    </button>
+                    {message.role === "model" && (
+                      <>
+                        <button
+                          onClick={() => void regenerate(message)}
+                          disabled={runs.some(busyRun) || pending || sending}
+                        >
+                          Regenerate
+                        </button>
+                        <button onClick={() => void readMessage(message, true)}>
+                          Read internal segments
+                        </button>
+                      </>
+                    )}
+                    <button onClick={() => void remove("message", message.id)}>
+                      Delete
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </section>
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                void send();
+              }}
+              className="border-t border-zinc-800 p-4 space-y-3"
+            >
+              <div className="flex flex-wrap items-center gap-3">
+                <label className="text-xs text-zinc-400">
+                  Recipient{" "}
+                  <select
+                    aria-label="Recipient"
+                    value={recipient}
+                    onChange={(event) =>
+                      setRecipient(event.target.value as RecipientSelection)
+                    }
+                    disabled={pending || sending}
+                    className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 ml-2"
+                  >
+                    <option value="auto">Auto</option>
+                    <option value="all">All Personas</option>
+                    {agents
+                      .filter((agent) => agent.isEnabled)
+                      .map((agent) => (
+                        <option key={agent.id} value={`agent:${agent.id}`}>
+                          {agent.name}
+                        </option>
+                      ))}
+                    {groups.map((group) => (
+                      <option key={group} value={`group:${group}`}>
+                        Group: {group}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {session.models.length === 0 && (
+                  <span className="text-xs text-amber-300">
+                    Provider is not configured · generation unavailable
+                  </span>
+                )}
+                <span className="text-xs text-zinc-500">
+                  /memory: internal memo only · Vault unpublished
+                </span>
+              </div>
+              {files.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {files.map((file, index) => (
+                    <button
+                      type="button"
+                      key={index}
+                      className="text-xs map-button"
+                      disabled={sending || pending}
+                      onClick={() =>
+                        setFiles((current) =>
+                          current.filter((_, at) => at !== index),
+                        )
+                      }
+                    >
+                      {file.name} ×
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div className="flex items-end gap-2">
+                <textarea
+                  aria-label="Message"
+                  className="map-input min-h-20 max-h-48 resize-y"
+                  maxLength={32000}
+                  placeholder="Write a message…"
+                  value={input}
+                  onChange={(event) => setInput(event.target.value)}
+                  disabled={sending || pending}
+                />
+                <input
+                  ref={fileInput}
+                  type="file"
+                  multiple
+                  accept="text/plain,text/markdown,.md,.txt,image/png,image/jpeg,image/webp"
+                  className="hidden"
+                  onChange={(event) => {
+                    const incoming: File[] = Array.from(
+                      event.currentTarget.files ?? [],
+                    );
+                    if (
+                      files.length + incoming.length > 8 ||
+                      incoming.some((file) => file.size > 8 * 1024 * 1024)
+                    ) {
+                      setError("ATTACHMENT_LIMIT");
+                    } else setFiles((current) => [...current, ...incoming]);
+                    event.target.value = "";
+                  }}
+                />
+                <button
+                  type="button"
+                  className="map-button"
+                  aria-label="Attach files"
+                  disabled={sending || pending}
+                  onClick={() => fileInput.current?.click()}
+                >
+                  <Paperclip size={20} />
+                </button>
+                <button
+                  className="map-button flex items-center gap-2"
+                  disabled={
+                    sending || pending || (!input.trim() && files.length === 0)
+                  }
+                >
+                  <Send size={18} />
+                  {sending ? "Saving…" : "Send"}
+                </button>
+              </div>
+              {pending && (
+                <button
+                  type="button"
+                  className="map-button"
+                  disabled={sending}
+                  onClick={() => void send(true)}
+                >
+                  <RefreshCw className="inline mr-2" size={14} />
+                  Recover acceptance with the same request
+                </button>
+              )}
+            </form>
+          </>
+        )}
+      </main>
+      <RoomModal
+        isOpen={!!roomEditor}
+        onClose={() => setRoomEditor(undefined)}
+        onSave={saveRoom}
+        editingRoom={roomEditor === "edit" ? roomEditSnapshot : null}
+      />
+      <AgentModal
+        isOpen={agentEditor !== undefined}
+        onClose={() => setAgentEditor(undefined)}
+        onSave={saveAgent}
+        editingAgent={agentEditor}
+        allowedModels={session.models}
+        savedContextAttachments={savedContexts}
+        onRemoveSavedContext={(id) =>
+          setSavedContexts((items) => items.filter((item) => item.id !== id))
+        }
+      />
+      {migration && (
+        <MigrationPanel
+          close={() => setMigration(false)}
+          imported={loadRooms}
+          onError={fail}
+        />
+      )}
+      {exportState && (
+        <DataDialog
+          title="Export conversation"
+          close={() => setExportState(undefined)}
+        >
+          <p className="text-sm text-zinc-400 mb-4">
+            Exports contain authorized originals, revisions and an attachment
+            manifest. Keep these unencrypted files in a protected location.
+            Download bounded chunks of up to 200 messages; the export is
+            complete only after the final chunk.
+          </p>
+          {exportState.complete ? (
+            <p role="status">
+              All {exportState.part - 1} export chunks downloaded.
+            </p>
+          ) : (
+            <button className="map-button" onClick={() => void exportRoom()}>
+              Download chunk {exportState.part}
+            </button>
+          )}
+        </DataDialog>
+      )}
+      {reader && (
+        <DataDialog title={reader.title} close={() => setReader(undefined)}>
+          <p className="text-xs text-zinc-400 mb-3">
+            Current server authorization applies. Internal memory is not
+            published to a Vault.
+          </p>
+          <pre className="text-sm whitespace-pre-wrap break-words max-h-[60vh] overflow-auto">
+            {JSON.stringify(reader.data, null, 2)}
+          </pre>
+        </DataDialog>
+      )}
+      {correction && (
+        <DataDialog
+          title="Correct message"
+          close={() => setCorrection(undefined)}
+        >
+          <p className="text-sm text-zinc-400 mb-3">
+            Save a new revision. The previous original remains in authorized
+            history.
+          </p>
+          <textarea
+            aria-label="Corrected message"
+            className="map-input h-48"
+            value={correction.content}
+            maxLength={32000}
+            onChange={(event) =>
+              setCorrection({ ...correction, content: event.target.value })
+            }
+          />
+          <button className="map-button mt-3" onClick={() => void correct()}>
+            Save correction
+          </button>
+        </DataDialog>
+      )}
+      {graph && room && (
+        <RelationshipGraphModal
+          isOpen={graph}
+          onClose={() => setGraph(false)}
+          rooms={[displayRoom(room, messages)]}
+        />
+      )}
     </div>
   );
 }

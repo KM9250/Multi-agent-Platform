@@ -32,68 +32,54 @@ It is a prototype environment for testing how a network of AI agents can functio
 
 ## Getting started
 
-Requirements: Node.js 22.13+ and a Google Gemini API key ([Google AI Studio](https://aistudio.google.com/apikey)).
+Requirements: Node.js 22.13+ and local, protected storage for the application DB
+and attachments. DATA-1 uses server sessions and server-side provider calls.
+A real Gemini key is needed only for explicitly enabled real-provider use.
 
 ```bash
-npm install
-```
-
-### Gemini API key setup
-
-Create `.env.local` in the project root (the same directory as `package.json`) and write your Gemini API key in this format:
-
-```env
-GEMINI_API_KEY=your_actual_gemini_api_key
-```
-
-Save `.env.local` as UTF-8 no BOM, and never put a real API key in README files, issues, pull requests, or any GitHub commit.
-
-After creating or editing `.env.local`, restart the Vite dev server so the environment variable is reloaded:
-
-```bash
-npm run dev
-```
-
-#### Windows PowerShell / VSCode terminal note
-
-On Windows, do not use PowerShell commands such as `echo ... > .env.local` or `Out-File` to create `.env.local`. Depending on the environment, they can create a UTF-16 LE file, and Vite's `loadEnv` may not read `GEMINI_API_KEY`, causing this error:
-
-```txt
-The API key is missing. Set GEMINI_API_KEY in .env.local and restart the dev server.
-```
-
-Use an editor that saves UTF-8 no BOM, or create `.env.local` safely from PowerShell with .NET:
-
-```powershell
-$apiKey = "your_actual_gemini_api_key"
-$content = "GEMINI_API_KEY=$apiKey`n"
-[System.IO.File]::WriteAllText(
-  (Join-Path (Get-Location) ".env.local"),
-  $content,
-  [System.Text.UTF8Encoding]::new($false)
-)
-```
-
-To check the file encoding, inspect the first bytes with a PowerShell-version-independent command:
-
-```powershell
-Format-Hex .env.local
-```
-
-If the first bytes are `FF FE`, the file is likely UTF-16 LE and should be recreated as UTF-8 no BOM. A normal UTF-8 file should begin with the bytes for `GEMINI...`, for example `47 45 4D 49 4E 49 ...`.
-
-```bash
-# Development server (http://localhost:3000)
-npm run dev
-
-# Production build
+npm ci
 npm run build
 ```
 
-> **Note:** The API key is injected into the client bundle at build time
-> (`vite.config.ts` → `define`). Anyone who can load the page can extract it,
-> so do not deploy a build made this way to a public URL with a key you care
-> about — use a server-side proxy for real deployments.
+Follow the [DATA-1 runbook](docs/map-data-1-runbook.md) to provision a local account,
+start the authenticated server, and log in. The runbook includes an explicit
+synthetic development provider, storage-only operation, and production TLS and
+model/pricing configuration. Keep the data root outside the repository, static
+web directory, Vault and synchronization folders.
+
+The browser no longer loads saved rooms automatically from localStorage. Use the
+explicit migration screen and [migration/backup/restore procedure](docs/map-data-1-migration.md).
+Refreshing or connecting from another browser reads server-confirmed data;
+reconnection never starts another generation. Ambiguous provider results remain
+available for diagnosis and require an explicit decision to regenerate.
+
+Provider credentials must be supplied to the Node process. Vite does not embed
+keys. For a deployment previously built with a client-side key, rotate that key
+through the provider's account controls and remove old bundles, source maps and
+CDN/service-worker caches. This change does not rotate keys automatically.
+
+- [Architecture and limits](docs/map-data-1-architecture.md)
+- [Design decisions and compatibility changes](docs/map-data-1-adr.md)
+- [Validation results and production gates](docs/map-data-1-validation.md)
+
+```bash
+npm test
+npm run typecheck
+npm run build
+npm run test:app-data
+npm run test:app-data-redteam
+npm run test:app-data-crash
+npm run test:app-data-import
+npm run test:app-data-backup
+npm run test:app-data-browser
+npm run bench:app-data
+```
+
+The browser suite uses installed Chromium (set `CHROMIUM_PATH` when necessary).
+Real-provider testing is a separately gated command, `npm run test:app-data-provider`;
+it is never part of ordinary tests or an automatic startup probe. DATA-1 does not
+implement MEM-1–4 or publish `/memory` to an Obsidian Vault. Production readiness
+requires the separately documented live-provider and target-host restore gates.
 
 ## Related repository
 

@@ -25,7 +25,17 @@
     "test:reconciliation-redteam": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/coordination-reconciliation-redteam*.test.ts",
     "test:notification-outbox": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/coordination-notification-outbox.test.ts test/coordination-notification-source*.test.ts test/coordination-notification-migration.test.ts test/coordination-notification-process.test.ts test/coordination-notification-crash.test.ts test/coordination-notification-db.test.ts test/coordination-notification-worker.test.ts test/coordination-notification-db-review.test.ts test/coordination-notification-reader.test.ts test/coordination-notification-ordering.test.ts test/coordination-notification-audit-pr37.test.ts",
     "test:notification-redteam": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/coordination-notification-redteam*.test.ts",
-    "test:notification-macp": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/integration/coordination-notification-macp.integration.ts"
+    "test:notification-macp": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/integration/coordination-notification-macp.integration.ts",
+    "app:serve": "node --experimental-transform-types --loader ./test/ts-loader.mjs server/main.ts",
+    "app:admin": "node --experimental-transform-types --loader ./test/ts-loader.mjs server/cli.ts",
+    "test:app-data": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/app-data-*.test.ts",
+    "test:app-data-redteam": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/app-data-redteam.test.ts test/app-data-auth.test.ts test/app-data-http.test.ts test/app-data-storage.test.ts test/app-data-attachments.test.ts test/app-data-generation.test.ts test/app-data-import.test.ts test/app-data-backup.test.ts test/app-data-client.test.ts",
+    "test:app-data-crash": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/app-data-crash.test.ts",
+    "test:app-data-import": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/app-data-import.test.ts",
+    "test:app-data-backup": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/app-data-backup.test.ts",
+    "test:app-data-browser": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/integration/app-data-browser.integration.ts",
+    "test:app-data-provider": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/integration/app-data-provider.integration.ts",
+    "bench:app-data": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/bench/app-data.bench.ts"
   },
   "dependencies": {
     "@google/genai": "^1.30.0",
@@ -37,7 +47,11 @@
     "@types/jsdom": "^21.1.7",
     "@types/node": "^22.14.0",
     "@vitejs/plugin-react": "^5.0.0",
+    "autoprefixer": "10.6.2",
     "jsdom": "^26.1.0",
+    "playwright": "1.65.1",
+    "postcss": "8.5.33",
+    "tailwindcss": "3.4.17",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"
   },
