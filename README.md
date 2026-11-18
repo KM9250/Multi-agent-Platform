@@ -32,68 +32,56 @@ It is a prototype environment for testing how a network of AI agents can functio
 
 ## Getting started
 
-Requirements: Node.js 22.13+ and a Google Gemini API key ([Google AI Studio](https://aistudio.google.com/apikey)).
+Requirements: Node.js 22.13+ and local, protected storage for the application DB
+and attachments. DATA-1 uses server sessions and server-side provider calls.
+A real Gemini key is needed only for explicitly enabled real-provider use.
 
 ```bash
-npm install
-```
-
-### Gemini API key setup
-
-Create `.env.local` in the project root (the same directory as `package.json`) and write your Gemini API key in this format:
-
-```env
-GEMINI_API_KEY=your_actual_gemini_api_key
-```
-
-Save `.env.local` as UTF-8 no BOM, and never put a real API key in README files, issues, pull requests, or any GitHub commit.
-
-After creating or editing `.env.local`, restart the Vite dev server so the environment variable is reloaded:
-
-```bash
-npm run dev
-```
-
-#### Windows PowerShell / VSCode terminal note
-
-On Windows, do not use PowerShell commands such as `echo ... > .env.local` or `Out-File` to create `.env.local`. Depending on the environment, they can create a UTF-16 LE file, and Vite's `loadEnv` may not read `GEMINI_API_KEY`, causing this error:
-
-```txt
-The API key is missing. Set GEMINI_API_KEY in .env.local and restart the dev server.
-```
-
-Use an editor that saves UTF-8 no BOM, or create `.env.local` safely from PowerShell with .NET:
-
-```powershell
-$apiKey = "your_actual_gemini_api_key"
-$content = "GEMINI_API_KEY=$apiKey`n"
-[System.IO.File]::WriteAllText(
-  (Join-Path (Get-Location) ".env.local"),
-  $content,
-  [System.Text.UTF8Encoding]::new($false)
-)
-```
-
-To check the file encoding, inspect the first bytes with a PowerShell-version-independent command:
-
-```powershell
-Format-Hex .env.local
-```
-
-If the first bytes are `FF FE`, the file is likely UTF-16 LE and should be recreated as UTF-8 no BOM. A normal UTF-8 file should begin with the bytes for `GEMINI...`, for example `47 45 4D 49 4E 49 ...`.
-
-```bash
-# Development server (http://localhost:3000)
-npm run dev
-
-# Production build
+npm ci
 npm run build
 ```
 
-> **Note:** The API key is injected into the client bundle at build time
-> (`vite.config.ts` → `define`). Anyone who can load the page can extract it,
-> so do not deploy a build made this way to a public URL with a key you care
-> about — use a server-side proxy for real deployments.
+Follow the [DATA-1 runbook](docs/map-data-1-runbook.md) to provision a local account,
+start the authenticated server, and log in. The runbook includes an explicit
+synthetic development provider, storage-only operation, and production TLS and
+model/pricing configuration. Keep the data root outside the repository, static
+web directory, Vault and synchronization folders.
+
+The browser no longer loads saved rooms automatically from localStorage. Use the
+explicit migration screen and [migration/backup/restore procedure](docs/map-data-1-migration.md).
+Refreshing or connecting from another browser reads server-confirmed data;
+reconnection never starts another generation. Ambiguous provider results remain
+available for diagnosis and require an explicit decision to regenerate.
+
+Provider credentials must be supplied to the Node process. Vite does not embed
+keys. For a deployment previously built with a client-side key, rotate that key
+through the provider's account controls and remove old bundles, source maps and
+CDN/service-worker caches. This change does not rotate keys automatically.
+
+- [Architecture and limits](docs/map-data-1-architecture.md)
+- [Design decisions and compatibility changes](docs/map-data-1-adr.md)
+- [Validation results and production gates](docs/map-data-1-validation.md)
+- [PR #38 initial audit corrections and validation](docs/map-data-1-pr38-audit.md)
+- [PR #38 window-one follow-up and latest validation](docs/map-data-1-pr38-pin-followup.md)
+
+```bash
+npm test
+npm run typecheck
+npm run build
+npm run test:app-data
+npm run test:app-data-redteam
+npm run test:app-data-crash
+npm run test:app-data-import
+npm run test:app-data-backup
+npm run test:app-data-browser
+npm run bench:app-data
+```
+
+The browser suite uses installed Chromium (set `CHROMIUM_PATH` when necessary).
+Real-provider testing is a separately gated command, `npm run test:app-data-provider`;
+it is never part of ordinary tests or an automatic startup probe. DATA-1 does not
+implement MEM-1–4 or publish `/memory` to an Obsidian Vault. Production readiness
+requires the separately documented live-provider and target-host restore gates.
 
 ## Related repository
 
@@ -112,21 +100,31 @@ The goal is to build a foundation for AI systems where intelligence emerges from
 
 ## Internal-state separation
 
-Room Settings can opt a room into **Internal State Separation**. It is off by default for existing and new rooms, preserving legacy streaming and history behavior. When enabled, model output is buffered until completion and parsed as structured JSON; only `public_message` is mirrored into `Message.content`. Canonical `segments` distinguish public messages, private state, shared summaries, debug summaries, GM logs, and memory exports with explicit visibility.
+DATA-1 stores canonical classified segments and immutable revisions on the server.
+Normal message readers return authorized public content; the explicit internal
+reader checks the current session and exact Room, Persona and visibility grants.
+Room display/separation settings do not grant access or reclassify saved private
+content. Public generation excludes private history, private worker reports and
+private memory. `/memory` produces a classified internal memo and does not publish
+to a Vault. Debug summaries are application-requested concise summaries, not
+provider-hidden chain of thought.
 
-Recipient history is fail-closed and channel-labeled: another agent receives labeled public messages and safe shared summaries only. An agent additionally receives clearly marked confidential labels for its own private state and self-visible memory. Debug summaries, GM logs, another agent's private state, and private memory never enter decision or generation history. CoT/ReAct debug fields are application-requested concise summaries only; the application does not request or access provider-hidden chain of thought. Memory exports allow only `self_only`, `self_and_gm`, or `gm_only`; shareable information must use `shared_summary`, and legacy public memory is retained for operator display but never promoted into AI history.
-
-Separated streaming buffers raw JSON only in memory and does not render or persist chunks. Every non-success result, including partial and blocked output, fails closed without storing raw text; abort restores a retry/regenerate target or removes a new unfinished message. Parsing failures show `STRUCTURED_OUTPUT_PARSE_ERROR` without publishing the raw response and can be retried. Retry and regenerate replace every old segment, while a separation-off regeneration explicitly removes old segments and its separation version. An exact `/memory` input creates a memory-export event with no public reply only while separation is enabled; with separation off it remains an ordinary message.
-
-When separation is enabled, `/memory` bypasses the decision model and directly requests an export from every enabled agent. With separation disabled it neither bypasses decisions nor forces every agent to respond.
-
-The collapsible operator panel can display selected internal categories. These switches are presentation controls, not authentication or access control. Segments remain in browser `localStorage`; hiding them does **not** encrypt or cryptographically protect secrets from someone with access to the browser profile or developer tools.
+The earlier client-side separation helpers remain covered by historical isolated
+contract tests. Their localStorage persistence, prompt-based private-history
+injection, streaming and replacement semantics describe that earlier client, not
+the production DATA-1 app. See the [DATA-1 architecture](docs/map-data-1-architecture.md)
+and [compatibility decisions](docs/map-data-1-adr.md) for the current contracts.
 
 ## SubAgent execution foundation (Phase SA-0)
 
 Persona Agents are conversation participants. SubAgents are private task workers owned by a Persona Agent. SubAgent output never enters public Room history directly. The model-independent task boundary, provider registry, and independent run lifecycle are documented in [the SubAgent architecture](docs/subagent-architecture.md).
 
-Phase SA-1 adds an optional fixed serial private SubAgent pipeline. Validated worker reports are injected only into the owning Persona's current generation and are not persisted to Room history.
+The earlier Phase SA-1 client injected private worker reports into its owner's
+generation without saving them to Room history; isolated regression tests retain
+that historical contract. DATA-1's fixed serial pipeline persists classified
+worker reports and current source references. Authorized reports may feed the
+next private worker, but are excluded from public-answer context. The current
+session's grants also apply when explicitly reading saved private reports.
 
 ## Autonomous coordination foundation
 

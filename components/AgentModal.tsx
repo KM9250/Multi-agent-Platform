@@ -1,43 +1,79 @@
-
-import React, { useState, useEffect, useRef } from 'react';
-import { X, Shuffle, Brain, Upload, Image as ImageIcon, Smile, Cpu, History } from 'lucide-react';
-import { Agent, ModelType, AgentFramework, AgentContextFile, SubAgentDefinition, SubAgentExecutionPolicy } from '../types';
-import { AVATAR_COLORS, MODEL_OPTIONS, FRAMEWORK_OPTIONS } from '../constants';
-import { getStrategy } from '../services/agentStrategies';
-import AgentContextFileList from './AgentContextFileList';
-import { createAgentContextFile, normalizeAgent, normalizeContextFileOrder } from '../utils/contextFiles';
-import SubAgentConfigPanel from './SubAgentConfigPanel';
+import React, { useState, useEffect, useRef } from "react";
+import {
+  X,
+  Shuffle,
+  Brain,
+  Upload,
+  Image as ImageIcon,
+  Smile,
+  Cpu,
+  History,
+} from "lucide-react";
+import {
+  Agent,
+  ModelType,
+  AgentFramework,
+  AgentContextFile,
+  SubAgentDefinition,
+  SubAgentExecutionPolicy,
+} from "../types";
+import { AVATAR_COLORS, MODEL_OPTIONS, FRAMEWORK_OPTIONS } from "../constants";
+import { getStrategy } from "../services/agentStrategies";
+import AgentContextFileList from "./AgentContextFileList";
+import {
+  createAgentContextFile,
+  normalizeAgent,
+  normalizeContextFileOrder,
+} from "../utils/contextFiles";
+import SubAgentConfigPanel from "./SubAgentConfigPanel";
 
 interface AgentModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onSave: (agent: Agent) => void;
+  onSave: (agent: Agent) => void | boolean | Promise<void | boolean>;
+  allowedModels?: string[];
+  savedContextAttachments?: { id: string; name: string; url: string }[];
+  onRemoveSavedContext?: (id: string) => void;
   editingAgent?: Agent | null;
 }
 
-const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editingAgent }) => {
-  const [name, setName] = useState('');
-  const [description, setDescription] = useState('');
-  const [systemInstruction, setSystemInstruction] = useState('');
+const AgentModal: React.FC<AgentModalProps> = ({
+  isOpen,
+  onClose,
+  onSave,
+  editingAgent,
+  allowedModels,
+  savedContextAttachments = [],
+  onRemoveSavedContext,
+}) => {
+  const [name, setName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState(false);
+  const [description, setDescription] = useState("");
+  const [systemInstruction, setSystemInstruction] = useState("");
   const [model, setModel] = useState<string>(ModelType.GEMINI_2_5_FLASH);
-  const [framework, setFramework] = useState<AgentFramework>('standard');
-  
-  const [additionalContextFiles, setAdditionalContextFiles] = useState<AgentContextFile[]>([]);
+  const [framework, setFramework] = useState<AgentFramework>("standard");
+
+  const [additionalContextFiles, setAdditionalContextFiles] = useState<
+    AgentContextFile[]
+  >([]);
   const [contextUploadErrors, setContextUploadErrors] = useState<string[]>([]);
 
   // Avatar state
-  const [avatarType, setAvatarType] = useState<'emoji' | 'image'>('emoji');
-  const [emojiAvatar, setEmojiAvatar] = useState('🤖');
-  const [imageAvatar, setImageAvatar] = useState<string>('');
-  
+  const [avatarType, setAvatarType] = useState<"emoji" | "image">("emoji");
+  const [emojiAvatar, setEmojiAvatar] = useState("🤖");
+  const [imageAvatar, setImageAvatar] = useState<string>("");
+
   const [color, setColor] = useState(AVATAR_COLORS[0]);
   const [thinkingBudget, setThinkingBudget] = useState<number>(0);
   const [historyWindow, setHistoryWindow] = useState<number>(0);
   const [pinFirstMessage, setPinFirstMessage] = useState<boolean>(true);
   const [subAgents, setSubAgents] = useState<SubAgentDefinition[]>([]);
-  const [subAgentPolicy, setSubAgentPolicy] = useState<SubAgentExecutionPolicy>({ mode: 'off' });
-  const [groups, setGroups] = useState('');
-  const [participationProfile, setParticipationProfile] = useState('');
+  const [subAgentPolicy, setSubAgentPolicy] = useState<SubAgentExecutionPolicy>(
+    { mode: "off" },
+  );
+  const [groups, setGroups] = useState("");
+  const [participationProfile, setParticipationProfile] = useState("");
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mdInputRef = useRef<HTMLInputElement>(null);
@@ -47,27 +83,29 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       setName(editingAgent.name);
       setDescription(editingAgent.description);
       setSystemInstruction(editingAgent.systemInstruction);
-      setAdditionalContextFiles(normalizeAgent(editingAgent).additionalContextFiles || []);
+      setAdditionalContextFiles(
+        normalizeContextFileOrder(editingAgent.additionalContextFiles || []),
+      );
       setContextUploadErrors([]);
       setModel(editingAgent.model);
-      setFramework(editingAgent.framework || 'standard');
+      setFramework(editingAgent.framework || "standard");
       setColor(editingAgent.color);
       setThinkingBudget(editingAgent.thinkingBudget);
       setHistoryWindow(editingAgent.historyWindow ?? 0);
       setPinFirstMessage(editingAgent.pinFirstMessage ?? true);
       setSubAgents(editingAgent.subAgents ?? []);
-      setSubAgentPolicy(editingAgent.subAgentPolicy ?? { mode: 'off' });
-      setGroups((editingAgent.groups ?? []).join(', '));
-      setParticipationProfile(editingAgent.participationProfile ?? '');
-      
-      if (editingAgent.avatarType === 'image') {
-        setAvatarType('image');
+      setSubAgentPolicy(editingAgent.subAgentPolicy ?? { mode: "off" });
+      setGroups((editingAgent.groups ?? []).join(", "));
+      setParticipationProfile(editingAgent.participationProfile ?? "");
+
+      if (editingAgent.avatarType === "image") {
+        setAvatarType("image");
         setImageAvatar(editingAgent.avatar);
-        setEmojiAvatar('🤖'); // Reset to default fallback
+        setEmojiAvatar("🤖"); // Reset to default fallback
       } else {
-        setAvatarType('emoji');
+        setAvatarType("emoji");
         setEmojiAvatar(editingAgent.avatar);
-        setImageAvatar('');
+        setImageAvatar("");
       }
     } else {
       resetForm();
@@ -75,73 +113,119 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
   }, [editingAgent, isOpen]);
 
   const resetForm = () => {
-    setName('');
-    setDescription('');
-    setSystemInstruction('You are a helpful AI assistant.');
+    setName("");
+    setDescription("");
+    setSystemInstruction("You are a helpful AI assistant.");
     setAdditionalContextFiles([]);
     setContextUploadErrors([]);
-    setModel(ModelType.GEMINI_2_5_FLASH);
-    setFramework('standard');
-    setAvatarType('emoji');
-    setEmojiAvatar('🤖');
-    setImageAvatar('');
+    setModel(allowedModels?.[0] ?? "");
+    setFramework("standard");
+    setAvatarType("emoji");
+    setEmojiAvatar("🤖");
+    setImageAvatar("");
     setColor(AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)]);
     setThinkingBudget(0);
     setHistoryWindow(0);
     setPinFirstMessage(true);
     setSubAgents([]);
-    setSubAgentPolicy({ mode: 'off' });
-    setGroups('');
-    setParticipationProfile('');
+    setSubAgentPolicy({ mode: "off" });
+    setGroups("");
+    setParticipationProfile("");
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     // If the image tab is selected but nothing was uploaded, fall back to the
     // emoji avatar entirely — saving avatarType 'image' with an emoji string
     // would render a broken <img> everywhere the avatar is shown.
-    const effectiveAvatarType = avatarType === 'image' && imageAvatar ? 'image' : 'emoji';
-    onSave({
-      id: editingAgent ? editingAgent.id : crypto.randomUUID(),
-      name: name || 'Unnamed Agent',
-      description,
-      systemInstruction,
-      additionalContextFiles: normalizeContextFileOrder(additionalContextFiles),
-      model,
-      framework,
-      color,
-      avatar: effectiveAvatarType === 'image' ? imageAvatar : emojiAvatar,
-      avatarType: effectiveAvatarType,
-      isEnabled: editingAgent ? editingAgent.isEnabled : true,
-      thinkingBudget,
-      historyWindow,
-      pinFirstMessage,
-      subAgents,
-      subAgentPolicy,
-      groups: [...new Set(groups.split(',').map(value => value.trim()).filter(Boolean))],
-      participationProfile: participationProfile.trim()
-    });
-    onClose();
+    const effectiveAvatarType =
+      avatarType === "image" && imageAvatar ? "image" : "emoji";
+    setSaving(true);
+    setSaveError(false);
+    try {
+      const saved = await onSave({
+        id: editingAgent ? editingAgent.id : crypto.randomUUID(),
+        name: name || "Unnamed Agent",
+        description,
+        systemInstruction,
+        ...(editingAgent?.importedSystemInstruction !== undefined
+          ? {
+              importedSystemInstruction: editingAgent.importedSystemInstruction,
+              importedSystemInstructionFileName:
+                editingAgent.importedSystemInstructionFileName,
+            }
+          : {}),
+        additionalContextFiles: normalizeContextFileOrder(
+          additionalContextFiles,
+        ),
+        model,
+        framework,
+        color,
+        avatar: effectiveAvatarType === "image" ? imageAvatar : emojiAvatar,
+        avatarType: effectiveAvatarType,
+        isEnabled: editingAgent ? editingAgent.isEnabled : true,
+        thinkingBudget,
+        historyWindow,
+        pinFirstMessage,
+        subAgents,
+        subAgentPolicy,
+        groups: [
+          ...new Set(
+            groups
+              .split(",")
+              .map((value) => value.trim())
+              .filter(Boolean),
+          ),
+        ],
+        participationProfile: participationProfile.trim(),
+      });
+      if (saved !== false) onClose();
+      else setSaveError(true);
+    } catch {
+      setSaveError(true);
+    } finally {
+      setSaving(false);
+    }
   };
 
   const generateRandomAvatar = () => {
-    const emojis = ['🤖', '👽', '👻', '🤡', '🤠', '🧠', '⚡', '🐉', '🦉', '🦊', '🐯', '🦄', '🐳', '🦖'];
+    const emojis = [
+      "🤖",
+      "👽",
+      "👻",
+      "🤡",
+      "🤠",
+      "🧠",
+      "⚡",
+      "🐉",
+      "🦉",
+      "🦊",
+      "🐯",
+      "🦄",
+      "🐳",
+      "🦖",
+    ];
     setEmojiAvatar(emojis[Math.floor(Math.random() * emojis.length)]);
   };
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
+    if (
+      !file ||
+      !["image/png", "image/jpeg", "image/webp"].includes(file.type) ||
+      file.size > 8 * 1024 * 1024
+    )
+      return;
 
     const reader = new FileReader();
     reader.onload = (event) => {
       const img = new Image();
       img.onload = () => {
         // Create canvas for cropping/resizing
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d');
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d");
         const size = 128; // Standardize size
-        
+
         canvas.width = size;
         canvas.height = size;
 
@@ -152,7 +236,7 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
 
         if (ctx) {
           ctx.drawImage(img, sx, sy, minDim, minDim, 0, 0, size, size);
-          const dataUrl = canvas.toDataURL('image/jpeg', 0.85); // Compress slightly
+          const dataUrl = canvas.toDataURL("image/jpeg", 0.85); // Compress slightly
           setImageAvatar(dataUrl);
         }
       };
@@ -165,30 +249,42 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
     const selected: File[] = Array.from(e.target.files ?? []);
     if (selected.length === 0) return;
 
-    const results = await Promise.all(selected.map(async (file, index) => {
-      try {
-        const text = await file.text();
-        return { file: createAgentContextFile(file, text, additionalContextFiles.length + index) };
-      } catch {
-        return { error: `Failed to read ${file.name}` };
-      }
-    }));
+    const results = await Promise.all(
+      selected.map(async (file, index) => {
+        try {
+          const text = await file.text();
+          return {
+            file: createAgentContextFile(
+              file,
+              text,
+              additionalContextFiles.length + index,
+            ),
+          };
+        } catch {
+          return { error: `Failed to read ${file.name}` };
+        }
+      }),
+    );
 
-    const newFiles = results.flatMap(r => r.file ? [r.file] : []);
-    const errors = results.flatMap(r => r.error ? [r.error] : []);
-    setAdditionalContextFiles(prev => normalizeContextFileOrder([...prev, ...newFiles]));
+    const newFiles = results.flatMap((r) => (r.file ? [r.file] : []));
+    const errors = results.flatMap((r) => (r.error ? [r.error] : []));
+    setAdditionalContextFiles((prev) =>
+      normalizeContextFileOrder([...prev, ...newFiles]),
+    );
     setContextUploadErrors(errors);
-    if (mdInputRef.current) mdInputRef.current.value = '';
+    if (mdInputRef.current) mdInputRef.current.value = "";
   };
 
   const deleteContextFile = (id: string) => {
-    setAdditionalContextFiles(prev => normalizeContextFileOrder(prev.filter(file => file.id !== id)));
+    setAdditionalContextFiles((prev) =>
+      normalizeContextFileOrder(prev.filter((file) => file.id !== id)),
+    );
   };
 
   const moveContextFile = (id: string, dir: -1 | 1) => {
-    setAdditionalContextFiles(prev => {
+    setAdditionalContextFiles((prev) => {
       const sorted = normalizeContextFileOrder(prev);
-      const index = sorted.findIndex(file => file.id === id);
+      const index = sorted.findIndex((file) => file.id === id);
       const target = index + dir;
       if (index < 0 || target < 0 || target >= sorted.length) return sorted;
       const next = sorted.slice();
@@ -198,7 +294,7 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
   };
 
   if (!isOpen) return null;
-  
+
   const currentStrategy = getStrategy(framework);
 
   return (
@@ -206,30 +302,41 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
       <div className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto shadow-2xl animate-in fade-in zoom-in-95 duration-200">
         <div className="flex justify-between items-center p-5 border-b border-zinc-800 sticky top-0 bg-zinc-900 z-10">
           <h2 className="text-xl font-bold text-white">
-            {editingAgent ? 'Edit Agent' : 'Create New Agent'}
+            {editingAgent ? "Edit Agent" : "Create New Agent"}
           </h2>
-          <button onClick={onClose} className="p-2 hover:bg-zinc-800 rounded-full text-zinc-400 hover:text-white">
+          <button
+            aria-label="Close Persona editor"
+            onClick={onClose}
+            className="p-2 hover:bg-zinc-800 rounded-full text-zinc-400 hover:text-white"
+          >
             <X className="w-5 h-5" />
           </button>
         </div>
 
         <form onSubmit={handleSubmit} className="p-6 space-y-6">
+          {saveError && (
+            <p role="alert" className="text-red-300 text-sm">
+              Save failed. Review the server error and reload on revision
+              conflict.
+            </p>
+          )}
           {/* Identity Section */}
           <div className="flex flex-col sm:flex-row gap-6">
-            
             {/* Avatar Selector */}
             <div className="shrink-0 flex flex-col items-center space-y-3">
-              <div 
-                className={`w-20 h-20 rounded-2xl flex items-center justify-center text-4xl shadow-lg ring-2 ring-zinc-800 overflow-hidden relative ${avatarType === 'emoji' ? color : 'bg-zinc-800'}`}
+              <div
+                className={`w-20 h-20 rounded-2xl flex items-center justify-center text-4xl shadow-lg ring-2 ring-zinc-800 overflow-hidden relative ${avatarType === "emoji" ? color : "bg-zinc-800"}`}
               >
-                {avatarType === 'emoji' ? (
+                {avatarType === "emoji" ? (
                   <span>{emojiAvatar}</span>
+                ) : imageAvatar ? (
+                  <img
+                    src={imageAvatar}
+                    alt="Avatar"
+                    className="w-full h-full object-cover"
+                  />
                 ) : (
-                  imageAvatar ? (
-                    <img src={imageAvatar} alt="Avatar" className="w-full h-full object-cover" />
-                  ) : (
-                    <ImageIcon className="w-8 h-8 text-zinc-500" />
-                  )
+                  <ImageIcon className="w-8 h-8 text-zinc-500" />
                 )}
               </div>
 
@@ -237,9 +344,11 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
               <div className="flex p-1 bg-zinc-800 rounded-lg w-full max-w-[140px]">
                 <button
                   type="button"
-                  onClick={() => setAvatarType('emoji')}
+                  onClick={() => setAvatarType("emoji")}
                   className={`flex-1 flex items-center justify-center py-1.5 rounded text-xs font-medium transition-all ${
-                    avatarType === 'emoji' ? 'bg-zinc-600 text-white shadow' : 'text-zinc-400 hover:text-zinc-300'
+                    avatarType === "emoji"
+                      ? "bg-zinc-600 text-white shadow"
+                      : "text-zinc-400 hover:text-zinc-300"
                   }`}
                   title="Use Emoji"
                 >
@@ -247,9 +356,11 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
                 </button>
                 <button
                   type="button"
-                  onClick={() => setAvatarType('image')}
+                  onClick={() => setAvatarType("image")}
                   className={`flex-1 flex items-center justify-center py-1.5 rounded text-xs font-medium transition-all ${
-                    avatarType === 'image' ? 'bg-zinc-600 text-white shadow' : 'text-zinc-400 hover:text-zinc-300'
+                    avatarType === "image"
+                      ? "bg-zinc-600 text-white shadow"
+                      : "text-zinc-400 hover:text-zinc-300"
                   }`}
                   title="Upload Image"
                 >
@@ -258,33 +369,39 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
               </div>
 
               {/* Action Buttons based on Type */}
-              {avatarType === 'emoji' ? (
+              {avatarType === "emoji" ? (
                 <div className="flex gap-2">
-                   <button 
-                    type="button" 
+                  <button
+                    type="button"
                     onClick={generateRandomAvatar}
                     className="text-xs flex items-center gap-1 text-zinc-400 hover:text-zinc-200 px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 transition-colors"
                   >
                     <Shuffle className="w-3 h-3" /> Random
                   </button>
-                   <button 
-                    type="button" 
-                    onClick={() => setColor(AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)])}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setColor(
+                        AVATAR_COLORS[
+                          Math.floor(Math.random() * AVATAR_COLORS.length)
+                        ],
+                      )
+                    }
                     className="w-6 h-6 rounded-full border border-zinc-600 bg-gradient-to-tr from-blue-500 to-purple-500 hover:opacity-80 transition-opacity"
                     title="Change Color"
                   />
                 </div>
               ) : (
                 <>
-                  <input 
-                    type="file" 
+                  <input
+                    type="file"
                     ref={fileInputRef}
-                    accept="image/*"
+                    accept="image/png,image/jpeg,image/webp"
                     onChange={handleImageUpload}
                     className="hidden"
                   />
-                  <button 
-                    type="button" 
+                  <button
+                    type="button"
                     onClick={() => fileInputRef.current?.click()}
                     className="text-xs flex items-center gap-1 text-blue-400 hover:text-blue-300 px-3 py-1.5 rounded bg-blue-500/10 hover:bg-blue-500/20 transition-colors border border-blue-500/20"
                   >
@@ -297,8 +414,11 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
             {/* Inputs */}
             <div className="flex-1 space-y-4">
               <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-1">Name</label>
+                <label className="block text-sm font-medium text-zinc-300 mb-1">
+                  Name
+                </label>
                 <input
+                  aria-label="Persona Name"
                   type="text"
                   required
                   value={name}
@@ -308,7 +428,9 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-1">Description</label>
+                <label className="block text-sm font-medium text-zinc-300 mb-1">
+                  Description
+                </label>
                 <input
                   type="text"
                   value={description}
@@ -324,40 +446,77 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
 
           <div className="space-y-4">
             <div>
-              <label className="block text-sm font-medium text-zinc-300 mb-1">Groups</label>
-              <input value={groups} onChange={event => setGroups(event.target.value)} className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-white" placeholder="umamusume, supervisor" />
+              <label className="block text-sm font-medium text-zinc-300 mb-1">
+                Groups
+              </label>
+              <input
+                value={groups}
+                onChange={(event) => setGroups(event.target.value)}
+                className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-white"
+                placeholder="umamusume, supervisor"
+              />
             </div>
             <div>
-              <label className="block text-sm font-medium text-zinc-300 mb-1">Participation Profile</label>
-              <textarea value={participationProfile} onChange={event => setParticipationProfile(event.target.value)} rows={3} className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-white resize-none" placeholder="When should this Persona join the conversation?" />
-              <p className="text-[10px] text-zinc-500 mt-1">Used only to decide whether this Persona should participate in a turn.</p>
+              <label className="block text-sm font-medium text-zinc-300 mb-1">
+                Participation Profile
+              </label>
+              <textarea
+                value={participationProfile}
+                onChange={(event) =>
+                  setParticipationProfile(event.target.value)
+                }
+                rows={3}
+                className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-white resize-none"
+                placeholder="When should this Persona join the conversation?"
+              />
+              <p className="text-[10px] text-zinc-500 mt-1">
+                Used only to decide whether this Persona should participate in a
+                turn.
+              </p>
             </div>
           </div>
 
           {/* Model Config */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm font-medium text-zinc-300 mb-1">Model</label>
+              <label className="block text-sm font-medium text-zinc-300 mb-1">
+                Model
+              </label>
               <div className="relative">
                 <select
+                  aria-label="Model"
                   value={model}
                   onChange={(e) => setModel(e.target.value)}
                   className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50 appearance-none"
                 >
-                  {MODEL_OPTIONS.map(opt => (
-                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  {(allowedModels
+                    ? [
+                        ...new Set([
+                          ...allowedModels,
+                          ...(model ? [model] : []),
+                        ]),
+                      ].map((value) => ({ value, label: value }))
+                    : MODEL_OPTIONS
+                  ).map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
                   ))}
                 </select>
               </div>
             </div>
-            
+
             <div className="border border-zinc-800 rounded-lg p-3 bg-zinc-900/50">
               <div className="flex items-center justify-between mb-2">
                 <label className="flex items-center gap-2 text-sm font-medium text-zinc-300">
                   <Brain className="w-4 h-4 text-purple-400" />
                   Reasoning (Budget)
                 </label>
-                <span className="text-xs font-mono text-zinc-500">{thinkingBudget > 0 ? `${thinkingBudget} tokens` : 'Off'}</span>
+                <span className="text-xs font-mono text-zinc-500">
+                  {thinkingBudget > 0
+                    ? `${thinkingBudget} tokens`
+                    : "0 (model dependent)"}
+                </span>
               </div>
               <input
                 type="range"
@@ -369,7 +528,11 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
                 className="w-full h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-purple-500"
               />
               <p className="text-[10px] text-zinc-500 mt-1">
-                Higher values allow more "thinking" before answering (Gemini 2.5 only).
+                Numeric budgets require supported Gemini 2.5 models and must fit
+                the output cap (2048 tokens or less). Zero disables Flash
+                thinking; Pro requires a positive budget. Other models use their
+                default at zero or reject numeric controls. Unsupported values
+                fail generation.
               </p>
             </div>
           </div>
@@ -382,27 +545,33 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
                 Memory Window
               </label>
               <span className="text-xs font-mono text-zinc-500">
-                {historyWindow > 0 ? `last ${historyWindow} msgs` : 'Unlimited'}
+                {historyWindow > 0
+                  ? `last ${historyWindow} msgs`
+                  : "Host bounded default"}
               </span>
             </div>
             <div className="grid grid-cols-5 gap-2">
-              {[0, 8, 16, 32, 64].map(n => (
+              {[0, 8, 16, 32, 64].map((n) => (
                 <button
                   key={n}
                   type="button"
                   onClick={() => setHistoryWindow(n)}
                   className={`
                     px-2 py-1.5 rounded-lg text-xs font-medium border transition-all
-                    ${historyWindow === n
-                      ? 'bg-sky-500/10 text-sky-300 border-sky-500/30'
-                      : 'bg-zinc-900 text-zinc-400 border-zinc-800 hover:bg-zinc-800'}
+                    ${
+                      historyWindow === n
+                        ? "bg-sky-500/10 text-sky-300 border-sky-500/30"
+                        : "bg-zinc-900 text-zinc-400 border-zinc-800 hover:bg-zinc-800"
+                    }
                   `}
                 >
-                  {n === 0 ? 'Off' : n}
+                  {n === 0 ? "Default" : n}
                 </button>
               ))}
             </div>
-            <label className={`flex items-center gap-2 mt-3 text-xs ${historyWindow > 0 ? 'text-zinc-300 cursor-pointer' : 'text-zinc-600 cursor-not-allowed'}`}>
+            <label
+              className={`flex items-center gap-2 mt-3 text-xs ${historyWindow > 0 ? "text-zinc-300 cursor-pointer" : "text-zinc-600 cursor-not-allowed"}`}
+            >
               <input
                 type="checkbox"
                 checked={pinFirstMessage}
@@ -413,42 +582,47 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
               Always keep the first user message
             </label>
             <p className="text-[10px] text-zinc-500 mt-1">
-              Limits how many recent messages this agent sees per turn (per room). Reduces token usage in long conversations.
+              Limits how many recent messages this agent sees per turn (per
+              room). Reduces token usage in long conversations.
             </p>
           </div>
 
           {/* Framework Strategy Config */}
           <div className="border border-zinc-800 rounded-lg p-3 bg-zinc-900/30">
-             <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-2">
-                <Cpu className="w-4 h-4 text-teal-400" />
-                Agent Framework / Strategy
-             </label>
-             <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-               {FRAMEWORK_OPTIONS.map((opt) => (
-                 <button
-                   key={opt.value}
-                   type="button"
-                   onClick={() => setFramework(opt.value)}
-                   className={`
+            <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-2">
+              <Cpu className="w-4 h-4 text-teal-400" />
+              Agent Framework / Strategy
+            </label>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+              {FRAMEWORK_OPTIONS.map((opt) => (
+                <button
+                  key={opt.value}
+                  type="button"
+                  onClick={() => setFramework(opt.value)}
+                  className={`
                      px-3 py-2 rounded-lg text-xs font-medium border transition-all text-left
-                     ${framework === opt.value 
-                       ? 'bg-teal-500/10 text-teal-300 border-teal-500/30' 
-                       : 'bg-zinc-900 text-zinc-400 border-zinc-800 hover:bg-zinc-800'}
+                     ${
+                       framework === opt.value
+                         ? "bg-teal-500/10 text-teal-300 border-teal-500/30"
+                         : "bg-zinc-900 text-zinc-400 border-zinc-800 hover:bg-zinc-800"
+                     }
                    `}
-                 >
-                   {opt.label}
-                 </button>
-               ))}
-             </div>
-             <p className="text-[10px] text-zinc-500 mt-2">
-               {currentStrategy.description}
-             </p>
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+            <p className="text-[10px] text-zinc-500 mt-2">
+              {currentStrategy.description}
+            </p>
           </div>
 
           {/* System Prompt */}
           <div>
             <div className="flex justify-between items-center mb-1">
-               <label className="block text-sm font-medium text-zinc-300">System Instructions (Manual)</label>
+              <label className="block text-sm font-medium text-zinc-300">
+                System Instructions (Manual)
+              </label>
             </div>
             <textarea
               value={systemInstruction}
@@ -457,9 +631,39 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
               className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-white placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-blue-500/50 font-mono text-sm resize-none"
               placeholder="How should this agent behave?"
             />
-            
+
+            {editingAgent?.importedSystemInstruction && (
+              <details className="mt-3 text-xs text-zinc-400">
+                <summary>
+                  Preserved imported instructions ·{" "}
+                  {editingAgent.importedSystemInstructionFileName ||
+                    "legacy instructions"}
+                </summary>
+                <pre className="whitespace-pre-wrap break-words max-h-40 overflow-auto mt-2">
+                  {editingAgent.importedSystemInstruction}
+                </pre>
+              </details>
+            )}
             {/* Additional Context File Upload */}
             <div className="mt-4">
+              {savedContextAttachments.length > 0 && (
+                <div className="space-y-2 text-sm">
+                  <p className="text-zinc-400">Saved context attachments</p>
+                  {savedContextAttachments.map((file) => (
+                    <div key={file.id} className="flex justify-between gap-3">
+                      <a href={file.url} download className="text-blue-300">
+                        {file.name}
+                      </a>
+                      <button
+                        type="button"
+                        onClick={() => onRemoveSavedContext?.(file.id)}
+                      >
+                        Remove from Persona
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
               <AgentContextFileList
                 files={additionalContextFiles}
                 errors={contextUploadErrors}
@@ -478,14 +682,21 @@ const AgentModal: React.FC<AgentModalProps> = ({ isOpen, onClose, onSave, editin
             </div>
           </div>
 
-          <SubAgentConfigPanel policy={subAgentPolicy} workers={subAgents} onPolicyChange={setSubAgentPolicy} onWorkersChange={setSubAgents} />
+          <SubAgentConfigPanel
+            allowedModels={allowedModels}
+            policy={subAgentPolicy}
+            workers={subAgents}
+            onPolicyChange={setSubAgentPolicy}
+            onWorkersChange={setSubAgents}
+          />
 
           <div className="pt-2">
             <button
               type="submit"
+              disabled={saving}
               className="w-full bg-white text-black font-semibold py-2.5 rounded-lg hover:bg-zinc-200 transition-colors"
             >
-              {editingAgent ? 'Save Changes' : 'Create Agent'}
+              {editingAgent ? "Save Changes" : "Create Agent"}
             </button>
           </div>
         </form>

@@ -14,11 +14,13 @@ async function child(t: TestContext,path:string,mode:string,effectPath:string){
     execArgv:['--experimental-transform-types','--loader',fileURLToPath(new URL('./ts-loader.mjs',import.meta.url))],stdio:['ignore','ignore','ignore','ipc'],
   });
   let readyResolve!:()=>void,resolve!:(v:any)=>void,reject!:(e:Error)=>void;
+  let readyAt:number|null=null;
   const ready=new Promise<void>(r=>{readyResolve=r;}),result=new Promise<any>((r,j)=>{resolve=r;reject=j;});void result.catch(()=>{});
   const closed=new Promise<void>(r=>process.on('exit',()=>r()));
-  const timer=setTimeout(()=>{terminateChild(process);readyResolve();reject(Error('Child timeout'));},15000);
+  const watchdogStartedAt=Date.now();
+  const timer=setTimeout(()=>{t.diagnostic(JSON.stringify({mode,pid:process.pid,readyAt,watchdogStartedAt,deadlineAt:watchdogStartedAt+15000,observedAt:Date.now(),exitCode:process.exitCode,signal:process.signalCode,killed:process.killed,connected:process.connected}));terminateChild(process);readyResolve();reject(Error('Child timeout'));},15000);
   process.on('error',e=>{readyResolve();reject(e);});
-  process.on('message',(message:any)=>{if(message.ready)readyResolve();else{clearTimeout(timer);resolve(message);}});
+  process.on('message',(message:any)=>{if(message.ready){readyAt=Date.now();readyResolve();}else{clearTimeout(timer);resolve(message);}});
   process.on('exit',(code,signal)=>{clearTimeout(timer);readyResolve();if(code||signal)reject(Error('Child terminated'));});
   t.after(async()=>{clearTimeout(timer);if(process.exitCode===null&&process.signalCode===null)terminateChild(process);await closed;});
   return {process,ready,result,closed};
