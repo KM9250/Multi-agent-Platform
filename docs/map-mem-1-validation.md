@@ -4,7 +4,34 @@
 
 ## 結果
 
-実装・試験コードの対象コミットは `90e7ca049ef27bdab4a75c4496c2fe9b711df8ea`。型検査とbuildは成功し、MEM-1専用試験は通常の並列度2で40件すべて成功した。全体回帰・直列条件の集計を実行中。
+検証日 2026-11-21。対象コミットは `90e7ca049ef27bdab4a75c4496c2fe9b711df8ea`。開始時の基準mainでも、通常並列設定の既存試験2,125件すべての成功を確認した。表の件数には同じテストが含まれるため、コマンド間では合算しない。
+
+| コマンド・条件 | 成功 / 失敗 / Skip | 実行時間 |
+| --- | ---: | ---: |
+| `npm run test:memory`（並列度2） | 40 / 0 / 0 | 12.1秒 |
+| `npm test`（通常設定、並列度2。他のスイートとの重複なし） | 2,169 / 0 / 0 | 379.3秒 |
+| 全 `test/*.test.ts` を `--test-concurrency=1` で単独実行 | 2,169 / 0 / 0 | 713.5秒 |
+| DATA-1・MEM-1の `test/app-*.test.ts test/memory*.test.ts` を並列度1で実行 | 190 / 0 / 0 | 77.3秒 |
+| `npm run test:app-data-redteam` | 131 / 0 / 0 | 26.9秒 |
+| `npm run test:app-data-crash` | 17 / 0 / 0 | 9.5秒 |
+| `npm run test:macp`（固定Receiver・一時loopback） | 9 / 0 / 0 | 1.2秒 |
+| `npm run test:notification-macp`（同じReceiver） | 8 / 0 / 0 | 4.7秒 |
+| `npm run typecheck` | 成功 | 7秒 |
+| `npm run build` | 成功 | 4秒 |
+| `npm run test:memory-browser` | 成功 | 17秒 |
+| `npm run test:app-data-browser` | 成功 | 17秒 |
+
+既存の合成 `npm run bench:app-data` も成功した。10万件の会話を用いた最新50件のHTTP読取で、ウォーム時のp95は29.6ms、4読者同時のp95は90.9ms。これは会話読取の測定値である。MEM-1の走査中の制御返却は専用試験で別に確認した。
+
+先行した通常並列実行（並列度2、ほかにCOORD直列スイートが同時稼働）では2,168成功・1失敗・Skip 0、407.7秒だった。`coordination-execution-crash.test.ts:63` でSIGKILL前の子プロセス応答の `stage` が期待値 `uncertain-legacy-task` にならず、実測値は `undefined` だった。コードも試験条件も変えず、通常並列設定をホスト上で単独再実行した結果が上表である。同時稼働が失敗を引き起こしたかは確定していない。
+
+標準スイートはリポジトリ既定の並列度2で実行した。全体直列は以下の単一プロセスで、ほかの検証コマンド終了後に実行した。個別スイートの性能は、その時点のホスト負荷に依存する。MACP参照は `e88937d0c8132ae7d18098a24d01ee28bffda655` に固定した。一時ReceiverのSSEとSQLiteを使用した。
+
+```bash
+node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=1 test/*.test.ts
+```
+
+開発中に復元直後の履歴読取試験が `MAINTENANCE` になったため、停止をアサートした上で、資格情報を再設定して明示再開したRootから履歴を検査するよう試験を修正した。共有先への再試行権限と初回承認の不一致、登録件数の増加や初回走査量による読取停止もレビューで修正し、回帰試験を加えた。データ消失・不一致を許容するassert変更や、期限延長による成功扱いは行っていない。
 
 ## 確認した障害境界
 
