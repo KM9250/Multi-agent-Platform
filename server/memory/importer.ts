@@ -3,6 +3,7 @@ import {
   MEMORY_KINDS,
   MEMORY_SCOPES,
 } from "../../shared/memory-contracts.ts";
+import type { DatabaseSync } from "node:sqlite";
 import { lstatSync, opendirSync, watch, type FSWatcher } from "node:fs";
 import { join } from "node:path";
 import { setImmediate as yieldLoop } from "node:timers/promises";
@@ -48,7 +49,7 @@ export const MEMORY_SETTLE_MS = 500;
 const PERIOD_MS = 10_000;
 const active = new WeakMap<AppDatabase, Promise<{ status: string }>>();
 const terminal = (state: string) =>
-  state === "NEEDS_REVIEW" || state === "RETRACTED";
+  ["LINEAGE_PENDING", "NEEDS_REVIEW", "RETRACTED"].includes(state);
 function running(app: AppDatabase) {
   return !!app.db
     .prepare(
@@ -93,8 +94,7 @@ async function inventory(
           throw new AppError("VAULT_SCAN_LIMIT", 409);
         if (count % 8 === 0) {
           await yieldLoop();
-          if (cancelled() || !running(app))
-            throw new AppError("VAULT_PAUSED", 409);
+          if (cancelled()) throw new AppError("VAULT_PAUSED", 409);
         }
         if (entry.name.startsWith(".")) continue;
         const path = dir ? dir + "/" + entry.name : entry.name;
@@ -128,8 +128,7 @@ async function inventory(
         if (bytesRead >= byteSlice) {
           bytesRead = 0;
           await yieldLoop();
-          if (cancelled() || !running(app))
-            throw new AppError("VAULT_PAUSED", 409);
+          if (cancelled()) throw new AppError("VAULT_PAUSED", 409);
         }
       }
     } finally {
@@ -138,6 +137,38 @@ async function inventory(
   }
   previousFiles.set(app, current);
   return { paths, ids, current };
+}
+
+/** Duplicate IDs are positive evidence even when a note is temporarily excluded from normal reconciliation. */
+export function holdDuplicateLineage(
+  db: DatabaseSync,
+  ids: ReadonlyMap<string, string[]>,
+): void {
+  const ambiguous = Array.from(ids)
+    .filter(([, paths]) => paths.length > 1)
+    .map(([note]) => note);
+  if (!ambiguous.length) return;
+  db.prepare(
+    `UPDATE memory_lineage_work SET invalidated=1 WHERE mode='LEGACY' AND status='PENDING' AND invalidated=0
+    AND candidate_id IN (SELECT d.candidate_id FROM json_each(?) seen JOIN memory_documents d ON d.note_id=seen.value)`,
+  ).run(JSON.stringify(ambiguous));
+}
+
+/** Read the registered Vault once, with the same limits and yields as the watcher.
+ * Backup holds the exclusive Host maintenance lock, which intentionally pauses normal scans. */
+export async function inventoryForBackup(app: AppDatabase) {
+  const maintained = () =>
+    app.db
+      .prepare(
+        "SELECT maintenance,restored FROM app_operational_state WHERE singleton=1",
+      )
+      .get();
+  const allowed = () => {
+    const op = maintained();
+    return op?.maintenance === 1 && op.restored === 0;
+  };
+  if (!allowed()) throw new AppError("MAINTENANCE_REQUIRED", 409);
+  return inventory(app, () => !allowed());
 }
 
 function reconcile(
@@ -274,8 +305,17 @@ async function scan(
   try {
     if (documents.length > MAX_LIVE_NOTES)
       throw new AppError("VAULT_SCAN_LIMIT", 409);
-    const files = await inventory(app, cancelled, byteSlice),
+    const files = await inventory(
+        app,
+        () => cancelled() || !running(app),
+        byteSlice,
+      ),
       policy = new AuthorizationPolicy(app);
+    if (running(app) && !cancelled())
+      app.transaction(
+        () => holdDuplicateLineage(app.db, files.ids),
+        "memory_lineage_scan_conflicts",
+      );
     for (let n = 0; n < documents.length; n++) {
       if (!running(app) || cancelled()) return { status: "PAUSED" };
       app.transaction(() => {
@@ -453,7 +493,7 @@ export async function registerHandwrittenNote(
   }
   if (check()) return receipt;
   if (!running(app)) throw new AppError("VAULT_PAUSED", 409);
-  const files = await inventory(app, () => false);
+  const files = await inventory(app, () => !running(app));
   return app.transaction(() => {
     if (check()) return receipt;
     if (!running(app)) throw new AppError("VAULT_PAUSED", 409);

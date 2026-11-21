@@ -1,6 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { AppDatabase } from "../app-data/db.ts";
 
+import { revokeActiveGrants } from "./revocations.ts";
+
+import {
+  APP_OPERATIONS,
+  SCOPED_MEMORY_OPERATIONS,
+  requiresExactScope,
+} from "./operations.ts";
+export { APP_OPERATIONS, PUBLIC_USER_OPERATIONS } from "./operations.ts";
+
 export interface Actor {
   actorId: string;
   workspaceId: string;
@@ -13,38 +22,6 @@ export interface ResourceScope {
   provider?: string;
   visibility?: string;
 }
-// Account creation and DATA-1 migrations must never implicitly grant future capabilities.
-export const PUBLIC_USER_OPERATIONS = [
-  "READ_ROOM",
-  "READ_CONVERSATION",
-  "WRITE_MESSAGE",
-  "EDIT_ROOM",
-  "EDIT_PERSONA",
-  "GENERATE",
-  "CANCEL_GENERATION",
-  "SEND_TO_PROVIDER",
-  "UPLOAD_ATTACHMENT",
-  "READ_ATTACHMENT",
-  "IMPORT_DATA",
-  "EXPORT_DATA",
-] as const;
-const SCOPED_MEMORY_OPERATIONS: ReadonlySet<string> = new Set([
-  "READ_MEMORY",
-  "PROPOSE_MEMORY",
-  "EDIT_MEMORY",
-  "REVIEW_MEMORY",
-  "PUBLISH_MEMORY",
-  "CHANGE_MEMORY_SCOPE",
-  "RETRACT_MEMORY",
-]);
-export const APP_OPERATIONS = [
-  ...PUBLIC_USER_OPERATIONS,
-  "READ_PRIVATE_SEGMENT",
-  "BACKUP_DATA",
-  "RESTORE_BACKUP",
-  ...SCOPED_MEMORY_OPERATIONS,
-  "MANAGE_VAULT",
-];
 function hasMemoryScope(scope: ResourceScope): boolean {
   return (
     typeof scope.roomId === "string" &&
@@ -158,7 +135,7 @@ export class AuthorizationPolicy {
       throw new AuthError();
     const memoryOperation = SCOPED_MEMORY_OPERATIONS.has(operation);
     if (memoryOperation && !hasMemoryScope(scope)) throw new AuthError();
-    const exactScope = privateRead || memoryOperation;
+    const exactScope = requiresExactScope(operation);
     const row = this.app.db
       .prepare(
         `SELECT 1 FROM access_grants WHERE workspace_id=? AND actor_id=? AND operation=? AND revoked_at IS NULL
@@ -281,35 +258,23 @@ export class AuthorizationPolicy {
 
   revoke(actorId: string, workspaceId: string, operation?: string): void {
     this.app.transaction(() => {
-      const sql = `UPDATE access_grants SET revoked_at=? WHERE workspace_id=? AND actor_id=?${operation ? " AND operation=?" : ""}`;
-      this.app.db
-        .prepare(sql)
-        .run(
-          ...[
-            this.now(),
-            workspaceId,
-            actorId,
-            ...(operation ? [operation] : []),
-          ],
-        );
-      this.app.db
+      const epoch = this.app.db
         .prepare(
-          "UPDATE workspaces SET acl_revision=acl_revision+1 WHERE workspace_id=?",
+          "UPDATE workspaces SET acl_revision=acl_revision+1 WHERE workspace_id=? RETURNING acl_revision",
         )
-        .run(workspaceId);
-      this.app.audit(actorId, workspaceId, "ACL_REVOKE", operation ?? "ALL");
-      this.app.change?.(
+        .get(workspaceId);
+      if (!epoch) throw new AuthError("NOT_FOUND", 404);
+      const revision = Number(epoch.acl_revision);
+      revokeActiveGrants(
+        this.app.db,
         workspaceId,
-        null,
-        "ACL",
         actorId,
-        Number(
-          this.app.db
-            .prepare("SELECT acl_revision FROM workspaces WHERE workspace_id=?")
-            .get(workspaceId)!.acl_revision,
-        ),
-        "REVOKE",
+        revision,
+        operation,
+        this.now(),
       );
+      this.app.audit(actorId, workspaceId, "ACL_REVOKE", operation ?? "ALL");
+      this.app.change?.(workspaceId, null, "ACL", actorId, revision, "REVOKE");
     });
   }
 }

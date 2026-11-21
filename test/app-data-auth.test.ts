@@ -3,6 +3,10 @@ import test, { before } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { AUTH_SCHEMA } from "../server/auth/schema.ts";
 import {
+  REVOCATION_SCHEMA,
+  createHistoricalGrantCheck,
+} from "../server/auth/revocations.ts";
+import {
   AuthorizationPolicy,
   AuthError,
   secretHash,
@@ -23,6 +27,10 @@ function fixture(t: any) {
   db.exec("PRAGMA foreign_keys=ON");
   db.exec(AUTH_SCHEMA);
   db.exec(
+    `CREATE TABLE app_changes(workspace_id TEXT,target_id TEXT,target_type TEXT,revision INTEGER,action TEXT) STRICT;`,
+  );
+  db.exec(REVOCATION_SCHEMA);
+  db.exec(
     "CREATE TABLE audit(actor TEXT,workspace TEXT,action TEXT,target TEXT) STRICT",
   );
   const app: any = {
@@ -37,6 +45,22 @@ function fixture(t: any) {
         db.exec("ROLLBACK");
         throw e;
       }
+    },
+    change(
+      workspace: string,
+      _room: string | null,
+      type: string,
+      target: string,
+      revision: number,
+      action: string,
+    ) {
+      db.prepare("INSERT INTO app_changes VALUES(?,?,?,?,?)").run(
+        workspace,
+        target,
+        type,
+        revision,
+        action,
+      );
     },
     audit(actor: string, workspace: string, action: string, target: string) {
       db.prepare("INSERT INTO audit VALUES(?,?,?,?)").run(
@@ -348,4 +372,186 @@ test("memory grants are opt-in and bind operation, workspace, room, owner and di
   assert.equal(policy.can(actor, "REVIEW_MEMORY", scope), false);
   policy.revoke(actor.actorId, actor.workspaceId, "READ_MEMORY");
   assert.equal(policy.can(actor, "READ_MEMORY", scope), false);
+});
+
+test("ACL history records actual withdrawn grants, zero matches, wildcard coverage and revoke-all", (t) => {
+  const { app, actor, db } = fixture(t),
+    policy = new AuthorizationPolicy(app);
+  const historical = createHistoricalGrantCheck(db);
+  const source = {
+    operation: "READ_PRIVATE_SEGMENT",
+    roomId: "room-a",
+    personaId: "p",
+    visibility: "self_only",
+  };
+  const grant = (op: string, scope = {}) =>
+    policy.grant(actor.actorId, actor.workspaceId, op, scope);
+  const revoke = (op?: string) =>
+    policy.revoke(actor.actorId, actor.workspaceId, op);
+  const details = () =>
+    db
+      .prepare(
+        "SELECT action,requested_operation,grant_count FROM auth_revocations ORDER BY revision",
+      )
+      .all();
+  grant(source.operation, {
+    roomId: source.roomId,
+    personaId: source.personaId,
+    visibility: source.visibility,
+  });
+  grant(source.operation, {
+    roomId: "room-b",
+    personaId: "other",
+    visibility: "gm_only",
+  });
+  grant("MANAGE_VAULT");
+  const epoch = policy.revision(actor);
+  const continuous = (
+    required: [
+      typeof source | { operation: string; roomId: string; provider?: string },
+    ],
+    since = epoch,
+  ) => historical(actor.workspaceId, actor.actorId, since, required);
+  revoke("MANAGE_VAULT");
+  assert.equal(continuous([source]), true);
+  revoke("MANAGE_VAULT");
+  assert.deepEqual(
+    details().map((x) => x.grant_count),
+    [1, 0],
+  );
+  revoke(source.operation);
+  assert.equal(continuous([source]), false);
+  grant(source.operation, {
+    roomId: source.roomId,
+    personaId: source.personaId,
+    visibility: source.visibility,
+  });
+  policy.assert(actor, source.operation, {
+    roomId: source.roomId,
+    personaId: source.personaId,
+    visibility: source.visibility,
+  });
+  assert.equal(continuous([source]), false);
+  assert.equal(continuous([{ ...source, personaId: "another-persona" }]), true);
+  assert.equal(continuous([{ ...source, visibility: "self_and_gm" }]), true);
+  assert.equal(continuous([{ ...source, roomId: "room-c" }]), true);
+  const events = details();
+  assert.deepEqual(
+    events.map((x) => x.grant_count),
+    [1, 0, 2],
+  );
+  assert.equal(
+    db.prepare("SELECT COUNT(*) n FROM auth_revoked_grants").get()!.n,
+    3,
+  );
+  grant("READ_CONVERSATION"); // generic room grant covers every room
+  grant("READ_ATTACHMENT", { roomId: "room-a", provider: "synthetic" });
+  const beforeAll = policy.revision(actor);
+  revoke();
+  assert.equal(details().at(-1)!.requested_operation, null);
+  assert.equal(details().at(-1)!.grant_count, 3);
+  assert.equal(
+    continuous(
+      [{ operation: "READ_CONVERSATION", roomId: "room-c" }],
+      beforeAll,
+    ),
+    false,
+  );
+  assert.equal(
+    continuous(
+      [
+        {
+          operation: "READ_ATTACHMENT",
+          roomId: "room-a",
+          provider: "synthetic",
+        },
+      ],
+      beforeAll,
+    ),
+    false,
+  );
+  assert.equal(
+    continuous(
+      [
+        {
+          operation: "READ_ATTACHMENT",
+          roomId: "room-a",
+          provider: "elsewhere",
+        },
+      ],
+      beforeAll,
+    ),
+    true,
+  );
+  assert.equal(
+    continuous(
+      [
+        {
+          operation: "READ_ATTACHMENT",
+          roomId: "room-c",
+          provider: "synthetic",
+        },
+      ],
+      beforeAll,
+    ),
+    true,
+  );
+  const afterAll = policy.revision(actor);
+  revoke();
+  assert.equal(details().at(-1)!.grant_count, 0);
+  assert.equal(continuous([source], afterAll), true);
+});
+
+test("ACL withdrawal evidence commits atomically; account and unprovable historical withdrawals fail closed", (t) => {
+  const { app, actor, db } = fixture(t),
+    policy = new AuthorizationPolicy(app);
+  policy.grant(actor.actorId, actor.workspaceId, "READ_ROOM");
+  const historical = createHistoricalGrantCheck(db),
+    epoch = policy.revision(actor);
+  const continuous = (since = epoch) =>
+    historical(actor.workspaceId, actor.actorId, since, [
+      { operation: "READ_ROOM", roomId: "r" },
+    ]);
+  db.exec(`CREATE TRIGGER fail_acl_audit BEFORE INSERT ON audit WHEN NEW.action='ACL_REVOKE'
+    BEGIN SELECT RAISE(ABORT,'synthetic interrupted revocation'); END`);
+  assert.throws(
+    () => policy.revoke(actor.actorId, actor.workspaceId, "READ_ROOM"),
+    /synthetic interrupted/,
+  );
+  assert.equal(policy.revision(actor), epoch);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) n FROM auth_revocations").get()!.n,
+    0,
+  );
+  assert.equal(
+    db.prepare("SELECT COUNT(*) n FROM auth_revoked_grants").get()!.n,
+    0,
+  );
+  assert.equal(
+    db
+      .prepare("SELECT COUNT(*) n FROM app_changes WHERE action='REVOKE'")
+      .get()!.n,
+    0,
+  );
+  policy.assert(actor, "READ_ROOM", { roomId: "r" });
+  assert.equal(continuous(), true);
+  db.exec("DROP TRIGGER fail_acl_audit");
+  // Before schema 4, only the Actor and epoch of a REVOKE were recorded.
+  db.prepare("INSERT INTO app_changes VALUES(?,?,'ACL',?,'REVOKE')").run(
+    actor.workspaceId,
+    actor.actorId,
+    epoch + 1,
+  );
+  db.prepare("UPDATE workspaces SET acl_revision=? WHERE workspace_id=?").run(
+    epoch + 1,
+    actor.workspaceId,
+  );
+  assert.equal(continuous(), false);
+  assert.equal(continuous(epoch + 1), true);
+  new SessionService(app).revokeAccount(actor.actorId);
+  assert.equal(continuous(epoch + 1), false);
+  assert.equal(
+    db.prepare("SELECT action FROM auth_revocations").get()!.action,
+    "ACCOUNT_REVOKE",
+  );
 });

@@ -26,11 +26,11 @@ export function memoryRecordsDigest(db: DatabaseSync): string {
   };
   for (const { name: table } of db
     .prepare(
-      "SELECT name FROM sqlite_schema WHERE type='table' AND name GLOB 'memory_*' AND name<>'memory_vault' ORDER BY name",
+      "SELECT name FROM sqlite_schema WHERE type='table' AND ((name GLOB 'memory_*' AND name<>'memory_vault') OR name IN ('auth_revocations','auth_revoked_grants')) ORDER BY name",
     )
     .iterate()) {
     const name = String(table);
-    if (!/^memory_[a-z_]+$/.test(name))
+    if (!/^(?:memory_[a-z_]+|auth_revocations|auth_revoked_grants)$/.test(name))
       throw new Error("BACKUP_SCHEMA_INVALID");
     const keys = db
       .prepare("SELECT name FROM pragma_table_info(?) WHERE pk>0 ORDER BY pk")

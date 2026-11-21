@@ -79,7 +79,7 @@ test("F-03/F-04: previous MEM-1 binary backups and paused restore reports stay r
       assert.equal(
         app.db.prepare("SELECT schema_version FROM app_metadata").get()!
           .schema_version,
-        3,
+        4,
       );
       assert.deepEqual(
         app.db

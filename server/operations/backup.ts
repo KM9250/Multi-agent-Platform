@@ -9,6 +9,10 @@ import {
 import { open, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import {
+  holdDuplicateLineage,
+  inventoryForBackup,
+} from "../memory/importer.ts";
 import { createHash, randomBytes } from "node:crypto";
 import {
   AppDatabase,
@@ -22,7 +26,11 @@ import {
 } from "../../shared/app-contracts/index.ts";
 import { hash, json, OperationError } from "./legacy.ts";
 import { acquireHostLock } from "./locks.ts";
-import { MAX_NOTE_BYTES, validVaultPath } from "../memory/vault.ts";
+import {
+  MAX_NOTE_BYTES,
+  readVaultFile,
+  validVaultPath,
+} from "../memory/vault.ts";
 import { memoryRecordsDigest, summarizeRows } from "./memory-ledger.ts";
 import { parseMemoryMarkdown } from "../memory/markdown.ts";
 
@@ -72,7 +80,7 @@ type ManifestHeader = {
 };
 type SnapshotManifest = ManifestHeader & {
   schema: "MAP-MEM-1:BACKUP:3";
-  appSchema: 2 | 3;
+  appSchema: 2 | 3 | 4;
   attachments: Inventory;
   memory: MemoryInventory;
 };
@@ -368,12 +376,97 @@ function versionRows(db: DatabaseSync) {
     .iterate() as unknown as Iterable<VersionEntry>;
 }
 function currentNotes(db: DatabaseSync, byPath = false) {
+  const hasWitnesses = db
+    .prepare(
+      "SELECT 1 FROM sqlite_schema WHERE name='memory_backup_observed_files'",
+    )
+    .get();
+  const observed = hasWitnesses
+    ? ` OR EXISTS (SELECT 1 FROM memory_backup_observed_files f
+    JOIN memory_lineage_work w ON w.candidate_id=d.candidate_id AND w.status='PENDING'
+    WHERE f.note_id=d.note_id AND f.version=d.version AND f.digest=d.digest
+      AND f.relative_path=d.relative_path AND d.state IN ('NEEDS_REVIEW','LINEAGE_PENDING'))`
+    : "";
   return db
     .prepare(
-      `SELECT note_id AS noteId,version AS revision,digest,relative_path AS path
-    FROM memory_documents WHERE state='PUBLISHED' ORDER BY ${byPath ? "relative_path,note_id" : "note_id"}`,
+      `SELECT d.note_id AS noteId,d.version AS revision,d.digest,d.relative_path AS path
+    FROM memory_documents d WHERE d.state='PUBLISHED'${observed}
+    ORDER BY ${byPath ? "d.relative_path,d.note_id" : "d.note_id"}`,
     )
     .iterate() as unknown as Iterable<CurrentEntry>;
+}
+
+// A pending legacy proof needs evidence that the editable file still exists. Record a
+// positive observation only in the private outgoing snapshot; do not recreate missing files.
+async function observePendingFiles(app: AppDatabase, path: string) {
+  const snapshot = new DatabaseSync(path);
+  try {
+    snapshot.exec(
+      "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; BEGIN IMMEDIATE",
+    );
+    snapshot.exec("DELETE FROM memory_backup_observed_files");
+    const capture = snapshot.prepare(
+      "INSERT INTO memory_backup_observed_files VALUES (?,?,?,?)",
+    );
+    const pending =
+      snapshot.prepare(`SELECT d.note_id,d.version,d.digest,d.relative_path
+      FROM memory_lineage_work w JOIN memory_documents d USING(candidate_id)
+      JOIN memory_receipts r ON r.note_id=d.note_id
+      WHERE w.status='PENDING' AND w.mode='LEGACY' AND w.invalidated=0
+        AND d.state IN ('LINEAGE_PENDING','NEEDS_REVIEW')`);
+    if (!pending.get()) {
+      snapshot.exec("COMMIT");
+      return;
+    }
+    let files: Awaited<ReturnType<typeof inventoryForBackup>>;
+    try {
+      files = await inventoryForBackup(app);
+    } catch (error) {
+      // Missing or unscannable live Vault: preserve protected history; it cannot attest a held editable copy.
+      if (
+        !(error instanceof Error && "code" in error) ||
+        String(error.code).startsWith("ERR_SQLITE")
+      )
+        throw error;
+      snapshot.exec("COMMIT");
+      return;
+    }
+    holdDuplicateLineage(snapshot, files.ids);
+    app.maintenanceTransaction(
+      () => holdDuplicateLineage(app.db, files.ids),
+      "memory_backup_lineage_conflicts",
+    );
+    for (const note of pending.iterate()) {
+      await pause();
+      const paths = files.ids.get(String(note.note_id));
+      if (
+        paths?.length !== 1 ||
+        paths[0] !== note.relative_path ||
+        files.current.get(paths[0])?.digest !== note.digest
+      )
+        continue;
+      let bytes: Buffer;
+      try {
+        bytes = readVaultFile(app, String(note.relative_path));
+      } catch {
+        continue;
+      }
+      if (
+        hash(bytes) === note.digest &&
+        parseMemoryMarkdown(bytes).noteId === note.note_id
+      ) {
+        capture.run(
+          note.note_id,
+          note.version,
+          note.digest,
+          note.relative_path,
+        );
+      }
+    }
+    snapshot.exec("COMMIT");
+  } finally {
+    snapshot.close();
+  }
 }
 async function memorySnapshot(db: DatabaseSync): Promise<MemoryInventory> {
   let inspected = 0;
@@ -645,6 +738,7 @@ export class BackupService {
       const databasePath = join(root, "app-data.sqlite");
       this.app.db.prepare("VACUUM INTO ?").run(databasePath);
       chmodSync(databasePath, 0o600);
+      await observePendingFiles(this.app, databasePath);
       const snapshot = openSnapshot(databasePath);
       let manifest: SnapshotManifest;
       try {
@@ -767,7 +861,7 @@ async function verifyBackup(
       break;
     case "MAP-MEM-1:BACKUP:3":
       if (
-        ![2, 3].includes(manifest.appSchema) ||
+        ![2, 3, 4].includes(manifest.appSchema) ||
         manifest.memory?.contract !== MEMORY_CONTRACT ||
         !validInventory(manifest.attachments) ||
         !validInventory(manifest.memory.versions) ||
@@ -877,6 +971,9 @@ export async function restoreBackup(
         if (json(await memorySnapshot(snapshot)) !== json(expected))
           throw new OperationError("RESTORE_REFERENCE_MISMATCH", 409);
         await copyVersions(source, destination, snapshot);
+        // The verified source catalogue contains the complete inventory for this backup
+        // generation, even if a subsequent migration temporarily withholds the note.
+        await restoreVault(destination, snapshot);
       }
     } finally {
       snapshot.close();
@@ -884,7 +981,7 @@ export async function restoreBackup(
     const app = new AppDatabase({ root: destination });
     try {
       app.db.exec("PRAGMA temp_store=FILE");
-      await restoreVault(destination, app.db);
+
       app.maintenanceTransaction(() => {
         // A detached restore cannot witness whether an interrupted link was
         // already exposed then renamed/deleted by a human. Leave it for review.
@@ -965,7 +1062,7 @@ export async function restoreBackup(
       await writeDurableJson(
         join(destination, "restore-report.json"),
         {
-          schema: "MAP-MEM-1:RESTORE:3",
+          schema: "MAP-MEM-1:RESTORE:4",
           memoryRecordsDigest: memory.recordsDigest,
           vaultVersionsVerified: memory.versions.count,
           vaultDocumentsRestored: memory.current.count,
@@ -1025,16 +1122,33 @@ export async function resumeRestore(root: string): Promise<void> {
       )
         throw new OperationError("RESTORE_REFERENCE_MISMATCH", 409);
       const memory = await memorySnapshot(app.db);
-      const migrationReceipt = app.db
+      const migration = app.db
         .prepare(
-          "SELECT before_digest,after_digest FROM app_restore_migration_receipt WHERE singleton=1",
+          "SELECT * FROM app_restore_lineage_migration WHERE singleton=1",
         )
         .get();
-      const digestMatches =
-        report.schema === "MAP-MEM-1:RESTORE:2" && migrationReceipt
-          ? migrationReceipt.before_digest === report.memoryRecordsDigest &&
-            migrationReceipt.after_digest === memory.recordsDigest
-          : report.memoryRecordsDigest === memory.recordsDigest;
+      let verifiedDigest = memory.recordsDigest;
+      if (migration && report.schema !== "MAP-MEM-1:RESTORE:4") {
+        if (verifiedDigest !== migration.after_digest)
+          throw new OperationError("RESTORE_REFERENCE_MISMATCH", 409);
+        verifiedDigest = String(migration.before_digest);
+        if (
+          migration.source_schema === 3 &&
+          report.schema === "MAP-MEM-1:RESTORE:2"
+        ) {
+          const older = app.db
+            .prepare(
+              "SELECT before_digest,after_digest FROM app_restore_migration_receipt WHERE singleton=1",
+            )
+            .get();
+          if (older) {
+            if (older.after_digest !== verifiedDigest)
+              throw new OperationError("RESTORE_REFERENCE_MISMATCH", 409);
+            verifiedDigest = String(older.before_digest);
+          }
+        }
+      }
+      const digestMatches = report.memoryRecordsDigest === verifiedDigest;
       const data1Restore =
         report.schema === "MAP-DATA-1:RESTORE:1" &&
         !memory.registered &&

@@ -34,11 +34,14 @@ import { readNote } from "./notes.ts";
 export { assertSourceAccess, assertSourcesCurrent } from "./sources.ts";
 
 const select = `SELECT c.*,v.revision,v.body,v.body_digest,v.sources_json,v.sources_digest,v.kind,v.assertion_type,v.scope,
-  p.run_id,p.provider,p.model,p.completed_at,p.manifest_digest FROM memory_candidates c
+  p.run_id,p.provider,p.model,p.completed_at,p.manifest_digest, recheck.candidate_id AS rechecking
+  FROM memory_candidates c
   JOIN memory_candidate_revisions v ON c.candidate_id=v.candidate_id AND c.current_revision=v.revision
   JOIN rooms room ON room.room_id=c.room_id AND room.workspace_id=c.workspace_id AND room.deleted_at IS NULL
   JOIN personas owner ON owner.persona_id=c.owner_persona_id AND owner.workspace_id=c.workspace_id AND owner.deleted_at IS NULL
-  LEFT JOIN app_provider_calls p ON c.call_id=p.call_id`;
+  LEFT JOIN app_provider_calls p ON c.call_id=p.call_id
+  LEFT JOIN memory_lineage_work recheck ON recheck.candidate_id=c.candidate_id
+    AND recheck.mode='LEGACY' AND recheck.status='PENDING'`;
 function bind(row: Row): MemoryBinding {
   return {
     candidateId: row.candidate_id,
@@ -53,7 +56,9 @@ function bind(row: Row): MemoryBinding {
   };
 }
 function dto(row: Row, sourceVisible: boolean): MemoryCandidateDTO {
-  const current = row.state !== "NEEDS_REVIEW" && row.state !== "RETRACTED";
+  const current = !["LINEAGE_PENDING", "NEEDS_REVIEW", "RETRACTED"].includes(
+    row.state,
+  );
   return {
     id: row.candidate_id,
     revision: row.current_revision,
@@ -64,6 +69,9 @@ function dto(row: Row, sourceVisible: boolean): MemoryCandidateDTO {
     kind: row.kind,
     assertionType: row.assertion_type,
     state: row.state,
+    ...(row.state === "NEEDS_REVIEW" && row.rechecking
+      ? { rechecking: true as const }
+      : {}),
     createdAt: row.created_at,
     sourceRefs: current && sourceVisible ? JSON.parse(row.sources_json) : [],
     binding: bind(row),
@@ -111,11 +119,7 @@ function checkRead(
   }
 }
 
-export function assertPublishable(
-  app: MemoryDB,
-  policy: MemoryPolicy,
-  job: Row,
-) {
+export function assertPublicationBinding(app: MemoryDB, job: Row) {
   const row = app.db
     .prepare(
       select + " WHERE c.candidate_id=? AND c.workspace_id=? AND c.room_id=?",
@@ -157,10 +161,19 @@ export function assertPublishable(
     frozen.relativePath !== job.relative_path
   )
     throw new AppError("PUBLICATION_BINDING_MISMATCH", 409);
-  const actor = { workspaceId: job.workspace_id, actorId: job.reviewer_id };
-  assertSourcesCurrent(app, policy, actor, row.candidate_id);
-  assertSourceAccess(app, policy, actor, row.candidate_id);
   return bind(row);
+}
+
+export function assertPublishable(
+  app: MemoryDB,
+  policy: MemoryPolicy,
+  job: Row,
+) {
+  const binding = assertPublicationBinding(app, job);
+  const actor = { workspaceId: job.workspace_id, actorId: job.reviewer_id };
+  assertSourcesCurrent(app, policy, actor, binding.candidateId);
+  assertSourceAccess(app, policy, actor, binding.candidateId);
+  return binding;
 }
 
 export class MemoryCandidates {
@@ -563,6 +576,7 @@ export class MemoryCandidates {
         if (
           ![
             "PENDING_REVIEW",
+            "LINEAGE_PENDING",
             "APPROVED",
             "PUBLISHING",
             "MANUAL_PROPOSAL",

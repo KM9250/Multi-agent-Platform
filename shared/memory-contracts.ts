@@ -34,6 +34,8 @@ export interface MemoryCandidateDTO {
   assertionType: (typeof ASSERTION_TYPES)[number];
   scope: MemoryScope;
   state: string;
+  /** A held candidate is undergoing verification after migration. */
+  rechecking?: true;
   ownerPersonaId: string;
   createdAt: number;
   sourceRefs: string[];

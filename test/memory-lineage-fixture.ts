@@ -11,16 +11,18 @@ import { MemoryCandidates } from "../server/memory/candidates.ts";
 import { publishNext } from "../server/memory/worker.ts";
 import { registerVault, setVaultPaused } from "../server/memory/vault.ts";
 
-export function lineageFixture() {
+export function lineageFixture(options: { useDefaultPersona?: boolean } = {}) {
   const f = appFixture();
   const vault = mkdtempSync(join(tmpdir(), "map-lineage-vault-"));
   registerVault(f.app, vault);
   setVaultPaused(f.app, false);
-  f.repository.updatePersona(f.actor, f.room.id, f.persona.id, {
-    expectedRevision: 1,
-    historyWindow: 2,
-    pinFirstMessage: false,
-  });
+  if (!options.useDefaultPersona) {
+    f.repository.updatePersona(f.actor, f.room.id, f.persona.id, {
+      expectedRevision: 1,
+      historyWindow: 2,
+      pinFirstMessage: false,
+    });
+  }
   const room = f.repository.updateRoom(f.actor, f.room.id, {
     expectedRevision: f.room.revision,
     internalStateSettings: { enabled: true },
@@ -69,9 +71,9 @@ export function lineageFixture() {
     attachmentStore,
   });
   const candidates = new MemoryCandidates(f.app, f.policy);
-  async function turn(content: string) {
+  async function turn(content: string, requestId: string = randomUUID()) {
     const run = generation.accept(f.actor, room.id, {
-      requestId: randomUUID(),
+      requestId,
       expectedRoomRevision: room.revision,
       content,
       recipient: { type: "all" },
@@ -83,8 +85,8 @@ export function lineageFixture() {
     );
     return run.runId;
   }
-  async function memory() {
-    const runId = await turn("/memory");
+  async function memory(requestId?: string) {
+    const runId = await turn("/memory", requestId);
     const receipt = f.app.db
       .prepare(
         "SELECT c.candidate_id,p.manifest_json,t.message_id FROM memory_candidates c JOIN app_provider_calls p USING(call_id) JOIN app_generation_receipts t USING(call_id) WHERE p.run_id=?",
@@ -96,6 +98,7 @@ export function lineageFixture() {
       String(receipt.candidate_id),
     );
     return {
+      runId,
       candidate,
       noteId: candidate.binding.targetNoteId,
       outputId: String(receipt.message_id),
@@ -132,6 +135,8 @@ export function lineageFixture() {
   return {
     ...f,
     attachmentStore,
+    generation,
+    provider,
     room,
     candidates,
     memory,

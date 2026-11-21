@@ -26,6 +26,7 @@ const labels: Record<string, string> = {
   persona_private: "Private to Persona",
   room_shared: "Shared with room",
   PENDING_REVIEW: "Awaiting review",
+  LINEAGE_PENDING: "Verifying sources",
   APPROVED: "Approved",
   PUBLISHING: "Publishing",
   PUBLISHED: "Published",
@@ -198,7 +199,11 @@ function CandidateCard({
           )}
           {name}
         </label>
-        <span className="text-xs text-blue-300">{label(item.state)}</span>
+        <span className="text-xs text-blue-300">
+          {item.rechecking
+            ? "Needs review · rechecking saved sources"
+            : label(item.state)}
+        </span>
       </div>
       <p className={small}>
         {label(item.scope)} · {label(item.kind)} · {label(item.assertionType)} ·
@@ -260,6 +265,7 @@ function CandidateCard({
       </details>
       {[
         "PENDING_REVIEW",
+        "LINEAGE_PENDING",
         "APPROVED",
         "PUBLISHING",
         "MANUAL_PROPOSAL",

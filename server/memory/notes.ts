@@ -254,7 +254,7 @@ export function readNote(
       if (!old) throw missing();
       if (
         row.candidate_id &&
-        ["RETRACTED", "NEEDS_REVIEW"].includes(row.state)
+        ["RETRACTED", "NEEDS_REVIEW", "LINEAGE_PENDING"].includes(row.state)
       ) {
         // A revoked dependency cannot be recovered as a shared current answer via a history URL.
         try {
@@ -294,7 +294,10 @@ export function listVersions(
   before?: number,
 ) {
   const row = lookup(app, policy, actor, noteId);
-  if (row.candidate_id && ["RETRACTED", "NEEDS_REVIEW"].includes(row.state)) {
+  if (
+    row.candidate_id &&
+    ["RETRACTED", "NEEDS_REVIEW", "LINEAGE_PENDING"].includes(row.state)
+  ) {
     try {
       assertSourceAccess(app, policy, actor, row.candidate_id);
     } catch {
@@ -331,9 +334,14 @@ export function retractNote(
         : string(values.expectedState, 32),
     requestId = string(values.requestId, 128);
   if (
-    !["PUBLISHED", "DELETED", "DIRTY", "CONFLICT", "NEEDS_REVIEW"].includes(
-      expectedState,
-    )
+    ![
+      "PUBLISHED",
+      "DELETED",
+      "DIRTY",
+      "CONFLICT",
+      "LINEAGE_PENDING",
+      "NEEDS_REVIEW",
+    ].includes(expectedState)
   )
     throw new AppError("INVALID_INPUT");
   const requestDigest = digest(

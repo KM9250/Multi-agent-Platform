@@ -1,4 +1,4 @@
-import { generationLineage, storeLineage } from "./lineage.ts";
+import { checkNewLineage } from "./lineage.ts";
 import { AppError, type Actor } from "../../shared/app-contracts/index.ts";
 import type { AppDatabasePort, PolicyPort } from "../generation/types.ts";
 import type { ContextManifest } from "../generation/context.ts";
@@ -140,7 +140,7 @@ export function captureExports(
       AND s.owner_persona_id=p.persona_id AND s.channel='memory_export' AND s.visibility='self_only'`,
     )
     .all(actor.workspaceId, roomId, callId, personaId) as Row[];
-  const lineage = generationLineage(app.db, actor.workspaceId, roomId, callId);
+  const candidateIds: string[] = [];
   for (const output of outputs) {
     const candidateId = id();
     app.db
@@ -195,8 +195,9 @@ export function captureExports(
     );
     authority(app, policy, actor, candidateId, "READ_CONVERSATION", roomId);
     authority(app, policy, actor, candidateId, "READ_ROOM", roomId);
-    storeLineage(app.db, actor.workspaceId, roomId, candidateId, lineage);
+    candidateIds.push(candidateId);
   }
+  checkNewLineage(app.db, candidateIds);
 }
 
 /** Current-source gate for the approver, outbox, and ordinary note read. No private source body crosses it. */
@@ -215,7 +216,7 @@ export function assertSourcesCurrent(
     .get(actor.workspaceId, candidateId);
   if (
     !candidate ||
-    ["RETRACTED", "SUPERSEDED", "NEEDS_REVIEW"].includes(
+    ["RETRACTED", "SUPERSEDED", "NEEDS_REVIEW", "LINEAGE_PENDING"].includes(
       String(candidate.state),
     )
   )

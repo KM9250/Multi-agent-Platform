@@ -73,6 +73,7 @@ for (const migration of [
   "migration",
   "app_002_memory_vault",
   "app_003_memory_integrity",
+  "app_004_resumable_memory_lineage",
 ])
   for (const when of ["before", "after"])
     test(`C1-08: real SIGKILL ${when} ${migration} COMMIT recovers schema exactly once`, async (t) => {
@@ -85,8 +86,15 @@ for (const migration of [
           readOnly: true,
         });
         try {
-          const target = migration === "app_002_memory_vault" ? 2 : 3;
-          const expectedVersion = when === "before" ? target - 1 : target;
+          const schema2 = migration === "app_002_memory_vault";
+          // Migration 003 and 004 share a commit for a direct upgrade from schema 2.
+          const expectedVersion = schema2
+            ? when === "before"
+              ? 1
+              : 2
+            : when === "before"
+              ? 2
+              : 4;
           assert.equal(
             beforeRestart
               .prepare("SELECT schema_version FROM app_metadata")
@@ -115,6 +123,14 @@ for (const migration of [
               .get()!.n,
             Number(expectedVersion >= 3),
           );
+          assert.equal(
+            beforeRestart
+              .prepare(
+                "SELECT count(*) AS n FROM sqlite_schema WHERE name='memory_lineage_work'",
+              )
+              .get()!.n,
+            Number(expectedVersion >= 4),
+          );
         } finally {
           beforeRestart.close();
         }
@@ -130,6 +146,7 @@ for (const migration of [
           "app_001_conversation_persistence",
           "app_002_memory_vault",
           "app_003_memory_integrity",
+          "app_004_resumable_memory_lineage",
         ],
       );
       assert.deepEqual(app.db.prepare("PRAGMA foreign_key_check").all(), []);

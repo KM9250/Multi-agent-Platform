@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { lineageFixture } from "./memory-lineage-fixture.ts";
+import { advanceLineage } from "../server/memory/lineage.ts";
 import { readNote } from "../server/memory/notes.ts";
 
 test("PR39 F-01 two memory exports in a two-message window both follow the original correction", async (t) => {
@@ -138,5 +139,47 @@ test("PR39 F-01 a message attachment also configured as persona context retains 
   assert.throws(
     () => readNote(f.app, f.policy, f.actor, next.noteId),
     /MEMORY_UNAVAILABLE/,
+  );
+});
+
+test("PR39 F-06 new arrivals cannot overtake queued proofs, and a checked source correction cancels promotion", async (t) => {
+  const f = lineageFixture();
+  t.after(f.close);
+  for (let n = 0; n < 14; n++) await f.turn("Synthetic history " + n);
+  const first = await f.memory(),
+    second = await f.memory();
+  const work = f.app.db.prepare(
+    "SELECT calls_done,status FROM memory_lineage_work WHERE candidate_id=?",
+  );
+  const count = (id: string) => Number(work.get(id)?.calls_done);
+  const a = first.candidate.id,
+    b = second.candidate.id;
+  const beforeA = count(a),
+    beforeB = count(b);
+  assert.equal(advanceLineage(f.app), true);
+  assert.ok(count(a) > beforeA);
+  assert.equal(count(b), beforeB);
+  const third = await f.memory();
+  assert.equal(third.candidate.state, "LINEAGE_PENDING");
+  assert.equal(advanceLineage(f.app), true);
+  assert.ok(count(b) > beforeB);
+  // Both the root export and its original /memory command were checked in the first slice.
+  const command = f.app.db
+    .prepare(
+      `SELECT t.input_message_id FROM memory_candidates c JOIN app_provider_calls p USING(call_id)
+    JOIN app_generation_runs r USING(workspace_id,room_id,run_id) JOIN app_turns t USING(workspace_id,room_id,turn_id)
+    WHERE c.candidate_id=?`,
+    )
+    .get(a)!;
+  f.correct(String(command.input_message_id));
+  assert.equal(f.candidates.get(f.actor, f.room.id, a).state, "NEEDS_REVIEW");
+  for (let n = 0; n < 20 && work.get(a)?.status === "PENDING"; n++) {
+    assert.equal(advanceLineage(f.app), true);
+  }
+  assert.equal(work.get(a)?.status, "INVALID");
+  assert.equal(f.candidates.get(f.actor, f.room.id, a).state, "NEEDS_REVIEW");
+  assert.equal(
+    f.app.db.prepare("SELECT count(*) n FROM memory_jobs").get()?.n,
+    0,
   );
 });

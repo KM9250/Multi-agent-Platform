@@ -1,18 +1,22 @@
 // Revoking a source changes the validity of an approval in the same SQLite
 // transaction. Regranting authority never reactivates an old approval.
-const live =
+export const LIVE_CANDIDATES =
   "state IN ('DRAFT','PENDING_REVIEW','APPROVED','PUBLISHING','PUBLISHED','MANUAL_PROPOSAL','FAILED','CONFLICT')";
 
-function invalidateDependencies(type: string, id: string) {
-  return `UPDATE memory_candidates SET state='NEEDS_REVIEW'
+export function invalidationSchema(
+  live: string,
+  unavailableNote = "NEW.state<>'PUBLISHED'",
+) {
+  function invalidateDependencies(type: string, id: string) {
+    return `UPDATE memory_candidates SET state='NEEDS_REVIEW'
     WHERE ${live} AND candidate_id IN (
       SELECT candidate_id FROM memory_dependencies
       WHERE workspace_id=OLD.workspace_id AND room_id=OLD.room_id
         AND resource_type='${type}' AND resource_id=OLD.${id}
     );`;
-}
+  }
 
-export const INVALIDATION_SCHEMA = `
+  return `
 CREATE TRIGGER memory_message_changed AFTER UPDATE OF current_revision,deleted_at ON messages
 WHEN NEW.current_revision<>OLD.current_revision OR NEW.deleted_at IS NOT OLD.deleted_at
 BEGIN
@@ -26,7 +30,7 @@ BEGIN
 END;
 
 CREATE TRIGGER memory_source_note_changed AFTER UPDATE OF version,digest,state ON memory_documents
-WHEN NEW.version<>OLD.version OR NEW.digest<>OLD.digest OR (NEW.state<>OLD.state AND NEW.state<>'PUBLISHED')
+WHEN NEW.version<>OLD.version OR NEW.digest<>OLD.digest OR (NEW.state<>OLD.state AND ${unavailableNote})
 BEGIN
   ${invalidateDependencies("NOTE", "note_id")}
 END;
@@ -75,3 +79,5 @@ BEGIN
     );
 END;
 `;
+}
+export const INVALIDATION_SCHEMA = invalidationSchema(LIVE_CANDIDATES);

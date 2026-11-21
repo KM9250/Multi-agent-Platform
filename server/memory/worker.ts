@@ -6,6 +6,7 @@ import {
 } from "../../shared/app-contracts/index.ts";
 import { canonical, digest, object, string } from "../app-data/validation.ts";
 import { assertPublicationCapacity } from "./limits.ts";
+import { advanceLineage } from "./lineage.ts";
 import { assertPublishable } from "./candidates.ts";
 import {
   memoryScope,
@@ -94,7 +95,8 @@ export function publishNext(
   if (!active(app)) return false;
   const job = app.db
     .prepare(
-      `SELECT * FROM memory_jobs WHERE status IN ('PENDING','PUBLISHING')
+      `SELECT j.* FROM memory_jobs j WHERE j.status IN ('PENDING','PUBLISHING')
+      AND NOT EXISTS (SELECT 1 FROM memory_lineage_work w WHERE w.candidate_id=j.candidate_id AND w.status='PENDING')
     ORDER BY created_at,operation_id LIMIT 1`,
     )
     .get() as Job | undefined;
@@ -199,8 +201,7 @@ export function retryPublication(
         "SELECT * FROM memory_jobs WHERE workspace_id=? AND room_id=? AND candidate_id=? AND reviewer_id=?",
       )
       .get(actor.workspaceId, roomId, candidateId, actor.actorId) as
-      | (Job & { prepared: number })
-      | undefined;
+      (Job & { prepared: number }) | undefined;
     if (!job) throw new AppError("NOT_FOUND", 404);
     const candidateScope = memoryScope(actor, roomId, job.owner_persona_id);
     const destinationScope = memoryScope(
@@ -283,4 +284,22 @@ export function startPublicationWorker(
   }, 500);
   timer.unref();
   return () => clearInterval(timer);
+}
+
+/** Verification runs even before a Vault is registered. Each writer yields after one bounded slice. */
+export function startLineageWorker(app: AppDatabase): () => void {
+  let timer: NodeJS.Timeout;
+  const poll = () => {
+    let busy = false;
+    try {
+      busy = advanceLineage(app);
+    } catch {
+      /* A busy or paused database is retried on the idle interval. */
+    }
+    timer = setTimeout(poll, busy ? 25 : 500);
+    timer.unref();
+  };
+  timer = setTimeout(poll, 0);
+  timer.unref();
+  return () => clearTimeout(timer);
 }

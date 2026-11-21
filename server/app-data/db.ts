@@ -23,7 +23,9 @@ import { AUTH_SCHEMA } from "../auth/schema.ts";
 import { GENERATION_SCHEMA } from "../generation/schema.ts";
 import { OPERATIONS_SCHEMA } from "../operations/schema.ts";
 import { MEMORY_SCHEMA_SQL } from "../memory/schema.ts";
-import { backfillMemoryLineage } from "../memory/lineage.ts";
+import { LINEAGE_WORK_SCHEMA } from "../memory/lineage-work-schema.ts";
+import { enqueueLegacyLineage } from "../memory/lineage-recovery.ts";
+import { REVOCATION_SCHEMA } from "../auth/revocations.ts";
 import { memoryRecordsDigest } from "../operations/memory-ledger.ts";
 
 const METADATA_SCHEMA = `CREATE TABLE app_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),contract TEXT NOT NULL,schema_version INTEGER NOT NULL,cursor_key TEXT NOT NULL) STRICT; CREATE TABLE app_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at INTEGER NOT NULL) STRICT;`;
@@ -32,6 +34,7 @@ const migrations = [
   "app_001_conversation_persistence",
   "app_002_memory_vault",
   "app_003_memory_integrity",
+  "app_004_resumable_memory_lineage",
 ] as const;
 const definitions = [
   [
@@ -49,6 +52,19 @@ const definitions = [
    CREATE TABLE app_restore_migration_receipt(
      singleton INTEGER PRIMARY KEY CHECK(singleton=1),before_digest TEXT NOT NULL,after_digest TEXT NOT NULL
    ) STRICT;`,
+  [
+    REVOCATION_SCHEMA,
+    LINEAGE_WORK_SCHEMA,
+    `
+    CREATE TABLE app_restore_lineage_migration(
+      singleton INTEGER PRIMARY KEY CHECK(singleton=1), source_schema INTEGER NOT NULL CHECK(source_schema IN (2,3)),
+      before_digest TEXT NOT NULL, after_digest TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE memory_backup_observed_files(
+      note_id TEXT PRIMARY KEY REFERENCES memory_documents(note_id),
+      version INTEGER NOT NULL, digest TEXT NOT NULL, relative_path TEXT NOT NULL
+    ) STRICT;`,
+  ].join("\n"),
 ];
 function schemaObjects(db: DatabaseSync): string {
   return JSON.stringify(
@@ -76,7 +92,7 @@ function expectedCatalogue(version: number): string {
   }
   return catalogue;
 }
-export function identifyAppSchema(db: DatabaseSync): 1 | 2 | 3 {
+export function identifyAppSchema(db: DatabaseSync): 1 | 2 | 3 | 4 {
   try {
     const meta = db
       .prepare(
@@ -86,7 +102,7 @@ export function identifyAppSchema(db: DatabaseSync): 1 | 2 | 3 {
     const version = meta?.schema_version;
     if (
       meta?.contract !== APP_CONTRACT ||
-      (version !== 1 && version !== 2 && version !== 3)
+      (version !== 1 && version !== 2 && version !== 3 && version !== 4)
     )
       throw new AppError("WRONG_DATABASE");
     const ledger = db
@@ -113,29 +129,13 @@ export function identifyAppSchema(db: DatabaseSync): 1 | 2 | 3 {
   }
 }
 
-/** Called with the schema-2 database identified and the migration writer lock held. */
-function upgradeMemoryIntegrity(db: DatabaseSync, root: string): void {
-  const pausedRestore =
-    db
-      .prepare("SELECT restored FROM app_operational_state WHERE singleton=1")
-      .get()?.restored === 1;
-  const before = pausedRestore ? memoryRecordsDigest(db) : undefined;
-  backfillMemoryLineage(db);
-  if (pausedRestore || existsSync(join(root, "restore-report.json"))) {
-    // The schema-2 restore path cleared 'prepared' and rewound PUBLISHING jobs.
-    // Its detached copy lost the evidence of first exposure, including for FAILED retries.
-    db.exec(`UPDATE memory_candidates SET state='CONFLICT'
-      WHERE state IN ('APPROVED','PUBLISHING','FAILED') AND candidate_id IN
-        (SELECT candidate_id FROM memory_jobs WHERE status IN ('PENDING','PUBLISHING','FAILED'));
-      UPDATE memory_jobs SET status='CONFLICT',error_code='RESTORE_PUBLICATION_UNCERTAIN'
-      WHERE status IN ('PENDING','PUBLISHING','FAILED');`);
-  }
-  if (before !== undefined) {
-    db.prepare("INSERT INTO app_restore_migration_receipt VALUES(1,?,?)").run(
-      before,
-      memoryRecordsDigest(db),
-    );
-  }
+/** Old detached restores discarded the evidence of first file exposure. */
+function fenceOldRestoredJobs(db: DatabaseSync): void {
+  db.exec(`UPDATE memory_candidates SET state='CONFLICT'
+    WHERE state IN ('APPROVED','PUBLISHING','FAILED') AND candidate_id IN
+      (SELECT candidate_id FROM memory_jobs WHERE status IN ('PENDING','PUBLISHING','FAILED'));
+    UPDATE memory_jobs SET status='CONFLICT',error_code='RESTORE_PUBLICATION_UNCERTAIN'
+    WHERE status IN ('PENDING','PUBLISHING','FAILED');`);
 }
 
 export interface AppDatabaseOptions {
@@ -292,32 +292,66 @@ export class AppDatabase {
         for (;;) {
           this.db.exec("BEGIN IMMEDIATE");
           const version = identifyAppSchema(this.db);
-          if (version === 3) {
+          if (version === 4) {
             this.db.exec("COMMIT");
             break;
           }
-          const next = version + 1;
-          const name = migrations[version];
-          this.db.exec(definitions[version]);
+          const record = (next: 2 | 3 | 4) => {
+            this.db
+              .prepare("INSERT INTO app_migrations VALUES(?,?,?)")
+              .run(next, migrations[next - 1], Date.now());
+            this.db
+              .prepare(
+                "UPDATE app_metadata SET schema_version=? WHERE singleton=1",
+              )
+              .run(next);
+            this.hooks?.beforeCommit?.(migrations[next - 1]);
+          };
           if (version === 1) {
+            this.db.exec(definitions[1]);
             this.db
               .prepare("INSERT INTO app_feature_contracts VALUES(?)")
               .run(MEMORY_CONTRACT);
-          } else {
-            upgradeMemoryIntegrity(this.db, this.root);
+            record(2);
+            this.db.exec("COMMIT");
+            this.hooks?.afterCommit?.(migrations[1]);
+            continue;
           }
-          this.db
-            .prepare("INSERT INTO app_migrations VALUES(?,?,?)")
-            .run(next, name, Date.now());
-          this.db
-            .prepare(
-              "UPDATE app_metadata SET schema_version=? WHERE singleton=1",
-            )
-            .run(next);
-          this.hooks?.beforeCommit?.(name);
+          // A direct upgrade retains the original schema-2 state and never exposes an
+          // intermediate schema-3 catalogue without its required source validation.
+          const pausedRestore =
+            this.db
+              .prepare(
+                "SELECT restored FROM app_operational_state WHERE singleton=1",
+              )
+              .get()?.restored === 1;
+          const before = pausedRestore
+            ? memoryRecordsDigest(this.db)
+            : undefined;
+          if (version === 2) {
+            this.db.exec(definitions[2]);
+            if (
+              pausedRestore ||
+              existsSync(join(this.root, "restore-report.json"))
+            ) {
+              fenceOldRestoredJobs(this.db);
+            }
+            record(3);
+          }
+          this.db.exec(definitions[3]);
+          enqueueLegacyLineage(this.db, version);
+          if (before !== undefined) {
+            this.db
+              .prepare(
+                "INSERT INTO app_restore_lineage_migration VALUES(1,?,?,?)",
+              )
+              .run(version, before, memoryRecordsDigest(this.db));
+          }
+          record(4);
           this.db.exec("COMMIT");
-          this.hooks?.afterCommit?.(name);
-          if (next === migrations.length) break;
+          if (version === 2) this.hooks?.afterCommit?.(migrations[2]);
+          this.hooks?.afterCommit?.(migrations[3]);
+          break;
         }
       } catch (e) {
         if (this.db.isTransaction) this.db.exec("ROLLBACK");

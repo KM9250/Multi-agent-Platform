@@ -1,4 +1,9 @@
 import type { DatabaseSync } from "node:sqlite";
+import type { AppDatabase } from "../app-data/db.ts";
+import { createHistoricalGrantCheck } from "../auth/revocations.ts";
+import { recoverHeldCandidate } from "./lineage-recovery.ts";
+import { APP_LIMITS } from "../../shared/app-contracts/index.ts";
+import { DEFAULT_GENERATION_LIMITS } from "../generation/types.ts";
 import { digest } from "../app-data/validation.ts";
 import type { ContextManifest } from "../generation/context.ts";
 
@@ -17,24 +22,30 @@ interface SourceGrant {
 interface Lineage {
   dependencies: Map<string, Dependency>;
   grants: Map<string, SourceGrant>;
+  parents: Set<string>;
+  refs: number;
 }
-// Limits are per candidate batch, including repeated references in overlapping manifests.
-const maxCalls = 256,
-  maxRefs = 16384;
+// These released thresholds identify legacy holds after a complete proof; they no longer bound the graph.
+const oldCalls = 256,
+  oldRefs = 16384;
+export const LINEAGE_CALLS_PER_SLICE = 4;
+const maxManifestMessages =
+  DEFAULT_GENERATION_LIMITS.maxHistory + DEFAULT_GENERATION_LIMITS.maxSubAgents;
+const maxPersonaContextAttachments = 16; // DATA-1 persona configuration limit.
 class Unverifiable extends Error {}
 function requireFact(proven: unknown): asserts proven {
   if (!proven) throw new Unverifiable();
 }
 
-/** Walk the persisted generation graph. Its inputs are invalidation dependencies, never claim citations. */
-export function generationLineage(
+/** Validate one receipt and its bounded manifest. Causal parents are separate durable work items. */
+function inspector(
   db: DatabaseSync,
   workspaceId: string,
   roomId: string,
   rootCallId: string,
-): Lineage | null {
+) {
   const callStatement =
-    db.prepare(`SELECT p.purpose,p.persona_id,p.manifest_digest,p.manifest_json,t.message_id,t.revision,run.actor_id,w.acl_revision
+    db.prepare(`SELECT p.purpose,p.persona_id,p.manifest_digest,p.manifest_json,t.rowid AS receipt_order,t.message_id,t.revision,run.actor_id,w.acl_revision
     FROM app_generation_receipts t JOIN app_provider_calls p USING(workspace_id,room_id,run_id,call_id)
     JOIN app_generation_runs run USING(workspace_id,room_id,run_id)
     JOIN workspaces w USING(workspace_id)
@@ -53,7 +64,7 @@ export function generationLineage(
     db.prepare(`SELECT segment_id,digest,visibility,owner_persona_id FROM message_segments
     WHERE workspace_id=? AND room_id=? AND message_id=? AND revision=?`);
   const producerStatement =
-    db.prepare(`SELECT call_id FROM app_generation_receipts
+    db.prepare(`SELECT call_id,rowid AS receipt_order FROM app_generation_receipts
     WHERE workspace_id=? AND room_id=? AND message_id=? AND revision=? LIMIT 2`);
   const attachmentStatement =
     db.prepare(`SELECT a.digest,EXISTS(SELECT 1 FROM persona_attachment_links l WHERE l.workspace_id=a.workspace_id
@@ -64,57 +75,48 @@ export function generationLineage(
     FROM attachments a WHERE a.workspace_id=? AND a.room_id=? AND a.attachment_id=? AND a.state='AVAILABLE' AND a.deleted_at IS NULL`);
   const grantStatement =
     db.prepare(`SELECT 1 FROM access_grants g JOIN principals p USING(workspace_id,actor_id)
-    WHERE p.active=1 AND g.workspace_id=? AND g.actor_id=? AND g.operation=? AND g.revoked_at IS NULL AND g.provider='*'
+    WHERE p.active=1 AND g.workspace_id=? AND g.actor_id=? AND g.operation=? AND g.revoked_at IS NULL AND g.provider IN ('*','')
     AND g.room_id IN ('*',?) AND g.persona_id IN ('*',?) AND g.visibility IN ('*',?)
     AND (g.operation<>'READ_PRIVATE_SEGMENT' OR (g.room_id=? AND g.persona_id=? AND g.visibility=?)) LIMIT 1`);
-  // DATA-1's historical ACL change feed identifies the actor and revision but does not contain the revoked grant scope.
-  const withdrawn =
-    db.prepare(`SELECT 1 FROM app_changes WHERE workspace_id=? AND target_type='ACL'
-    AND target_id=? AND action='REVOKE' AND revision>? LIMIT 1`);
-
-  const seen = new Set<string>(),
-    path = new Set<string>(),
-    dependencies = new Map<string, Dependency>(),
-    grants = new Map<string, SourceGrant>();
-  let remaining = maxRefs;
-  function remember(dep: Dependency) {
-    const key = dep.type + ":" + dep.id,
-      previous = dependencies.get(key);
-    requireFact(
-      !previous ||
-        (previous.revision === dep.revision && previous.digest === dep.digest),
-    );
-    dependencies.set(key, dep);
-  }
-  function grant(
-    actorId: string,
-    operation: string,
-    personaId = "",
-    visibility = "",
-  ) {
-    const key = JSON.stringify([actorId, operation, personaId, visibility]);
-    if (grants.has(key)) return;
-    requireFact(
-      grantStatement.get(
-        workspaceId,
-        actorId,
-        operation,
-        roomId,
-        personaId,
-        visibility,
-        roomId,
-        personaId,
-        visibility,
-      ),
-    );
-    grants.set(key, { actorId, operation, personaId, visibility });
-  }
-  function visit(callId: string) {
-    requireFact(!path.has(callId));
-    if (seen.has(callId)) return;
-    requireFact(seen.size < maxCalls);
-    seen.add(callId);
-    path.add(callId);
+  const historicalGrantsCurrent = createHistoricalGrantCheck(db);
+  return (callId: string): Lineage => {
+    const parents = new Set<string>(),
+      dependencies = new Map<string, Dependency>(),
+      grants = new Map<string, SourceGrant>();
+    let refs = 0;
+    function remember(dep: Dependency) {
+      const key = dep.type + ":" + dep.id,
+        previous = dependencies.get(key);
+      requireFact(
+        !previous ||
+          (previous.revision === dep.revision &&
+            previous.digest === dep.digest),
+      );
+      dependencies.set(key, dep);
+    }
+    function grant(
+      actorId: string,
+      operation: string,
+      personaId = "",
+      visibility = "",
+    ) {
+      const key = JSON.stringify([actorId, operation, personaId, visibility]);
+      if (grants.has(key)) return;
+      requireFact(
+        grantStatement.get(
+          workspaceId,
+          actorId,
+          operation,
+          roomId,
+          personaId,
+          visibility,
+          roomId,
+          personaId,
+          visibility,
+        ),
+      );
+      grants.set(key, { actorId, operation, personaId, visibility });
+    }
     const row = callStatement.get(workspaceId, roomId, callId);
     requireFact(
       row &&
@@ -145,12 +147,17 @@ export function generationLineage(
         m.aclRevision <= row.acl_revision,
     );
     const actor = String(row.actor_id);
-    if (callId !== rootCallId)
-      requireFact(!withdrawn.get(workspaceId, actor, m.aclRevision));
     grant(actor, "READ_ROOM");
     grant(actor, "READ_CONVERSATION");
-    remaining -= m.messages.length + m.attachments.length;
-    requireFact(remaining >= 0);
+    // The DATA-1 compiler captures at most 100 history messages (+3 fixed workers),
+    // eight attachments per message and separately configured persona context files.
+    requireFact(
+      m.messages.length <= maxManifestMessages &&
+        m.attachments.length <=
+          m.messages.length * APP_LIMITS.attachmentsPerMessage +
+            maxPersonaContextAttachments,
+    );
+    refs += m.messages.length + m.attachments.length;
     for (const ref of m.messages) {
       requireFact(
         ref &&
@@ -160,10 +167,9 @@ export function generationLineage(
           ref.revision > 0 &&
           Array.isArray(ref.segments) &&
           ref.segments.length > 0 &&
-          ref.segments.length <= 16,
+          ref.segments.length <= APP_LIMITS.segmentsPerRevision,
       );
-      remaining -= ref.segments.length;
-      requireFact(remaining >= 0);
+      refs += ref.segments.length;
       const message = messageStatement.get(
         workspaceId,
         roomId,
@@ -216,7 +222,14 @@ export function generationLineage(
           ref.revision,
         );
         requireFact(producers.length <= 1);
-        if (producers.length) visit(String(producers[0].call_id));
+        if (producers.length) {
+          // The coordinator commits an input receipt before compiling its consumer. A strict
+          // order on these append-only SQLite rows rejects cycles across verification slices.
+          requireFact(
+            Number(producers[0].receipt_order) < Number(row.receipt_order),
+          );
+          parents.add(String(producers[0].call_id));
+        }
         // Host imports and explicit human corrections are standalone records. An unexplained model revision isn't.
         else
           requireFact(
@@ -251,80 +264,188 @@ export function generationLineage(
       if (a.persona_link) grant(actor, "GENERATE", m.personaId);
       if (a.message_link) grant(actor, "READ_ATTACHMENT");
     }
-    path.delete(callId);
-  }
-  try {
-    visit(rootCallId);
-    return { dependencies, grants };
-  } catch (error) {
-    if (error instanceof Unverifiable) return null;
-    throw error;
-  }
+    const used = Array.from(grants.values(), (g) => ({ ...g, roomId }));
+    requireFact(
+      historicalGrantsCurrent(workspaceId, actor, m.aclRevision, used),
+    );
+    return { parents, dependencies, grants, refs };
+  };
 }
 
-export function storeLineage(
+/** Caller owns the receipt/migration transaction. Duplicate submission never restarts an existing proof. */
+export function queueLineage(
+  db: DatabaseSync,
+  candidateId: string,
+  mode: "NEW" | "LEGACY",
+) {
+  const added = db
+    .prepare(
+      `INSERT INTO memory_lineage_work(candidate_id,mode,prior_state,status,last_step)
+    SELECT candidate_id,?,state,'PENDING',(SELECT coalesce(max(last_step),0)+1 FROM memory_lineage_work WHERE status='PENDING') FROM memory_candidates WHERE candidate_id=?
+    ON CONFLICT(candidate_id) DO NOTHING`,
+    )
+    .run(mode, candidateId);
+  if (!added.changes) return;
+  db.prepare(
+    `INSERT INTO memory_lineage_queue(candidate_id,call_id)
+    SELECT candidate_id,call_id FROM memory_candidates WHERE candidate_id=? AND call_id IS NOT NULL`,
+  ).run(candidateId);
+  if (mode === "NEW")
+    db.prepare(
+      "UPDATE memory_candidates SET state='LINEAGE_PENDING' WHERE candidate_id=?",
+    ).run(candidateId);
+}
+
+function recordManifest(
   db: DatabaseSync,
   workspaceId: string,
   roomId: string,
   candidateId: string,
-  lineage: Lineage | null,
+  callId: string,
+  proof: Lineage,
 ) {
-  if (!lineage) {
-    db.prepare(
-      "UPDATE memory_candidates SET state='NEEDS_REVIEW' WHERE candidate_id=?",
-    ).run(candidateId);
-    return;
-  }
-  const dep = db.prepare(
-    "INSERT OR IGNORE INTO memory_dependencies(candidate_id,workspace_id,room_id,resource_type,resource_id,revision,digest) VALUES(?,?,?,?,?,?,?)",
+  const deps = JSON.stringify([...proof.dependencies.values()]);
+  // A resource cannot acquire a different expected revision/digest under an existing proof.
+  requireFact(
+    !db
+      .prepare(
+        `SELECT 1 FROM json_each(?) p JOIN memory_dependencies d
+    ON d.candidate_id=? AND d.resource_type=p.value->>'$.type' AND d.resource_id=p.value->>'$.id'
+    WHERE d.revision<>p.value->>'$.revision' OR d.digest<>p.value->>'$.digest' LIMIT 1`,
+      )
+      .get(deps, candidateId),
   );
-  for (const d of lineage.dependencies.values())
-    dep.run(
-      candidateId,
-      workspaceId,
-      roomId,
-      d.type,
-      d.id,
-      d.revision,
-      d.digest,
-    );
-  const permission = db.prepare(
-    "INSERT OR IGNORE INTO memory_authorities(candidate_id,actor_id,operation,room_id,persona_id,visibility) VALUES(?,?,?,?,?,?)",
-  );
-  for (const g of lineage.grants.values())
-    permission.run(
-      candidateId,
-      g.actorId,
-      g.operation,
-      roomId,
-      g.personaId,
-      g.visibility,
-    );
+  db.prepare(
+    `INSERT OR IGNORE INTO memory_dependencies(candidate_id,workspace_id,room_id,resource_type,resource_id,revision,digest)
+    SELECT ?,?,?,value->>'$.type',value->>'$.id',value->>'$.revision',value->>'$.digest' FROM json_each(?)`,
+  ).run(candidateId, workspaceId, roomId, deps);
+  db.prepare(
+    `INSERT OR IGNORE INTO memory_authorities(candidate_id,actor_id,operation,room_id,persona_id,visibility)
+    SELECT ?,value->>'$.actorId',value->>'$.operation',?,value->>'$.personaId',value->>'$.visibility' FROM json_each(?)`,
+  ).run(candidateId, roomId, JSON.stringify([...proof.grants.values()]));
+  db.prepare(
+    "INSERT OR IGNORE INTO memory_lineage_queue(candidate_id,call_id) SELECT ?,value FROM json_each(?)",
+  ).run(candidateId, JSON.stringify([...proof.parents]));
+  db.prepare(
+    "UPDATE memory_lineage_queue SET checked=1 WHERE candidate_id=? AND call_id=?",
+  ).run(candidateId, callId);
+  db.prepare(
+    `UPDATE memory_lineage_work SET calls_done=calls_done+1,refs_done=refs_done+?,
+      last_step=(SELECT coalesce(max(last_step),0)+1 FROM memory_lineage_work WHERE status='PENDING') WHERE candidate_id=?`,
+  ).run(proof.refs, candidateId);
 }
 
-/** Runs inside migration 003. A missing or stale ancestry withholds the current version while preserving its bytes and receipt. */
-export function backfillMemoryLineage(db: DatabaseSync) {
-  const page =
-    db.prepare(`SELECT c.candidate_id,c.workspace_id,c.room_id,c.call_id,EXISTS(
-    SELECT 1 FROM app_generation_receipts t JOIN message_segments s USING(workspace_id,room_id,message_id,revision)
-    JOIN messages m USING(workspace_id,room_id,message_id)
-    WHERE t.workspace_id=c.workspace_id AND t.room_id=c.room_id AND t.call_id=c.call_id
-    AND m.deleted_at IS NULL AND t.revision=m.current_revision AND s.segment_id=c.source_segment_id
-    AND s.owner_persona_id=c.owner_persona_id AND s.channel='memory_export' AND s.visibility='self_only') bound
-    FROM memory_candidates c WHERE c.candidate_id>? AND (c.call_id IS NOT NULL OR c.target_version IS NULL)
-    AND c.state NOT IN ('RETRACTED','SUPERSEDED','REJECTED','NEEDS_REVIEW') ORDER BY c.candidate_id LIMIT 64`);
-  let cursor = "";
-  for (;;) {
-    const batch = page.all(cursor);
-    if (!batch.length) return;
-    for (const row of batch) {
-      cursor = String(row.candidate_id);
-      const workspaceId = String(row.workspace_id),
-        roomId = String(row.room_id);
-      const lineage = row.bound
-        ? generationLineage(db, workspaceId, roomId, String(row.call_id))
-        : null;
-      storeLineage(db, workspaceId, roomId, cursor, lineage);
+type LegacyFinish = (
+  id: string,
+  exceeded: boolean,
+  priorState: string,
+) => boolean;
+function workSlice(
+  db: DatabaseSync,
+  candidateId: string,
+  limit: number,
+  recover?: LegacyFinish,
+): number {
+  const job = db
+    .prepare(
+      `SELECT w.*,c.workspace_id,c.room_id,c.call_id,c.state FROM memory_lineage_work w
+    JOIN memory_candidates c USING(candidate_id) WHERE w.candidate_id=? AND w.status='PENDING'`,
+    )
+    .get(candidateId);
+  if (!job) return 0;
+  const workspaceId = String(job.workspace_id),
+    roomId = String(job.room_id),
+    rootCallId = String(job.call_id);
+  const next = db.prepare(
+    "SELECT call_id FROM memory_lineage_queue WHERE candidate_id=? AND checked=0 ORDER BY call_id LIMIT 1",
+  );
+  let processed = 0;
+  try {
+    requireFact(
+      !job.invalidated &&
+        job.call_id &&
+        (job.state === "LINEAGE_PENDING" ||
+          (job.mode === "LEGACY" && job.state === "NEEDS_REVIEW")),
+    );
+    const inspect = inspector(db, workspaceId, roomId, rootCallId);
+    for (; processed < limit; processed++) {
+      const item = next.get(candidateId);
+      if (!item) break;
+      const callId = String(item.call_id);
+      recordManifest(
+        db,
+        workspaceId,
+        roomId,
+        candidateId,
+        callId,
+        inspect(callId),
+      );
     }
+    if (next.get(candidateId)) return processed;
+    // Source/ACL mutations invalidate checked rows in the source transaction. The last
+    // slice holds the same SQLite writer lock as final promotion and any legacy receipt checks.
+    const complete = db
+      .prepare(
+        "SELECT calls_done,refs_done,invalidated FROM memory_lineage_work WHERE candidate_id=?",
+      )
+      .get(candidateId)!;
+    requireFact(!complete.invalidated && Number(complete.calls_done) > 0);
+    if (job.mode === "LEGACY") {
+      if (!recover) throw new Error("LEGACY_RECOVERY_CALLBACK_REQUIRED");
+      requireFact(
+        recover(
+          candidateId,
+          Number(complete.calls_done) > oldCalls ||
+            Number(complete.refs_done) > oldRefs,
+          String(job.prior_state),
+        ),
+      );
+    } else
+      db.prepare(
+        "UPDATE memory_candidates SET state='PENDING_REVIEW' WHERE candidate_id=? AND state='LINEAGE_PENDING'",
+      ).run(candidateId);
+    db.prepare(
+      "UPDATE memory_lineage_work SET status='DONE' WHERE candidate_id=?",
+    ).run(candidateId);
+  } catch (error) {
+    if (!(error instanceof Unverifiable)) throw error;
+    db.prepare(
+      "UPDATE memory_lineage_work SET status='INVALID' WHERE candidate_id=?",
+    ).run(candidateId);
+    db.prepare(
+      "UPDATE memory_candidates SET state='NEEDS_REVIEW' WHERE candidate_id=? AND state='LINEAGE_PENDING'",
+    ).run(candidateId);
+    return processed + 1;
   }
+  return processed;
+}
+
+/** Short healthy exports are immediately reviewable. The same persistent frontier continues after ACK loss or restart. */
+export function checkNewLineage(db: DatabaseSync, candidateIds: string[]) {
+  let remaining = LINEAGE_CALLS_PER_SLICE;
+  for (const candidateId of candidateIds) {
+    queueLineage(db, candidateId, "NEW");
+    if (remaining > 0) remaining -= workSlice(db, candidateId, remaining);
+  }
+}
+
+/** At most one candidate and four previously unvisited receipts in a single writer transaction. No external side effects. */
+export function advanceLineage(app: AppDatabase): boolean {
+  const next = app.db.prepare(
+    `SELECT candidate_id FROM memory_lineage_work WHERE status='PENDING'
+      AND EXISTS (SELECT 1 FROM app_operational_state WHERE singleton=1 AND maintenance=0 AND restored=0)
+      ORDER BY last_step,candidate_id LIMIT 1`,
+  );
+  if (!next.get()) return false;
+  return app.transaction(() => {
+    const item = next.get();
+    if (!item) return false;
+    workSlice(
+      app.db,
+      String(item.candidate_id),
+      LINEAGE_CALLS_PER_SLICE,
+      (id, exceeded, prior) => recoverHeldCandidate(app, id, exceeded, prior),
+    );
+    return true;
+  }, "memory_lineage_slice");
 }

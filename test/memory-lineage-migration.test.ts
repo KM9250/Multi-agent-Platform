@@ -14,6 +14,7 @@ import { AppDatabase } from "../server/app-data/db.ts";
 import { AuthorizationPolicy } from "../server/auth/authorization.ts";
 import { ConversationRepository } from "../server/app-data/repository.ts";
 import { MemoryCandidates } from "../server/memory/candidates.ts";
+import { advanceLineage } from "../server/memory/lineage.ts";
 import { readNote } from "../server/memory/notes.ts";
 
 // Run the audited program to obtain its genuine ledger, receipt graph, private originals, and working Vault.
@@ -96,6 +97,9 @@ test("PR39 F-01 migrates existing lineage and withholds stale or unprovable ance
     ],
     { cwd: old },
   );
+  let batches = 0;
+  while (advanceLineage(app))
+    assert.ok(++batches < 2000, "legacy verification must converge");
   const policy = new AuthorizationPolicy(app),
     candidates = new MemoryCandidates(app, policy),
     repo = new ConversationRepository(app, policy);
