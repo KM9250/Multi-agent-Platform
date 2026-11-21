@@ -106,7 +106,7 @@ npm run app:admin -- account-revoke --actor ACTOR_ID
 
 The supported private categories are `self_only`, `self_and_gm`, `gm_only` and `developer_only`; grant the intended category explicitly. Wildcard Room/Persona grants cannot grant private reads. A Persona owner or UI checkbox is not authorization. Turning separation off does not change stored segment classification. Normal message DTOs contain public segments only; the explicit internal-state reader applies current private grants.
 
-Public output uses public-approved source/configuration. Private worker summaries and memory output are not silently injected into public answers. `/memory` is stored as classified `memory_export`; the UI says it is not published to a Vault. This is a compatibility change from client prompt isolation, and does not implement MEM publication.
+Public output uses public-approved source/configuration. Private worker summaries and memory output are not silently injected into public answers. `/memory` is stored as classified `memory_export`. See the [MEM-1 runbook](map-mem-1.md) for scoped candidate review and Vault publication.
 
 Account revocation, password reset and grant changes use short DB transactions and can run while the HTTP process is active. These identity-management commands do not take the maintenance host lock, so emergency revocation is effective immediately. Backup, restore, resumption and orphan maintenance require exclusive host access. Ordinary message and generation readers, cache retries and attachment downloads all recheck current authority.
 

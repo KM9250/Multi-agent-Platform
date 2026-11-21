@@ -19,6 +19,8 @@ import { ImportService } from "./operations/import.ts";
 import { ExportService } from "./operations/export.ts";
 import { acquireHostLock, assertOperationalRoot } from "./operations/locks.ts";
 import { inspectDataHealth } from "./operations/health.ts";
+import { startLineageWorker, startPublicationWorker } from "./memory/worker.ts";
+import { startVaultWatcher } from "./memory/importer.ts";
 
 function numberSetting(
   value: string | undefined,
@@ -150,7 +152,6 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
       pricing: config.pricing,
       attachmentStore: attachments,
     } as any);
-    generation.recoverInterrupted();
     const imports = new ImportService(app, repository, attachments, policy),
       exports = new ExportService(app, repository, attachments, policy);
     const options = {
@@ -182,6 +183,7 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
             createAppHandler(options),
           )
         : createAppServer(options);
+    generation.recoverInterrupted();
     server.requestTimeout = 30_000;
     server.headersTimeout = 10_000;
     server.maxHeadersCount = 64;
@@ -189,11 +191,17 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
       server.once("error", reject);
       server.listen(config.port, config.host, () => resolve());
     });
+    const stopLineage = startLineageWorker(app);
+    const stopPublisher = startPublicationWorker(app, policy);
+    const stopWatching = startVaultWatcher(app);
     let closed = false;
     const close = async () => {
       if (closed) return;
       closed = true;
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      stopLineage();
+      stopPublisher();
+      await stopWatching();
       await generation.shutdown();
       app!.close();
       release();

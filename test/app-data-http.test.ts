@@ -290,3 +290,252 @@ test("HTTP forgery, CSRF, unknown fields, stale revisions, cross-room grants and
   );
   assert.equal(f.provider.calls.length, 0);
 });
+
+test("memory HTTP isolates owner rows, direct ID lookups and original private material", async (t) => {
+  const f = await fixture(t);
+  assert.equal((await f.request("/memory/vault")).response.status, 401);
+  const login = await f.login();
+  assert.deepEqual(login.data.memoryLimits, {
+    maxCalls: f.generation.limits.maxCalls,
+    maxTotalTokens: f.generation.limits.maxTotalTokens,
+    maxHistory: f.generation.limits.maxHistory,
+  });
+  const room = f.repository.createRoom(f.actor, {
+    title: "Synthetic memories",
+    internalStateSettings: { enabled: true },
+  });
+  const a = f.repository.createPersona(f.actor, room.id, {
+    name: "One",
+    model: "synthetic",
+  });
+  const b = f.repository.createPersona(f.actor, room.id, {
+    name: "Two",
+    model: "synthetic",
+  });
+  const scope = (personaId: string) => ({
+    roomId: room.id,
+    personaId,
+    visibility: "persona_private",
+  });
+  for (const persona of [a, b])
+    f.policy.grant(
+      f.actor.actorId,
+      f.actor.workspaceId,
+      "PROPOSE_MEMORY",
+      scope(persona.id),
+    );
+  const run = f.generation.accept(f.actor, room.id, {
+    requestId: "http-memory-owner-1",
+    expectedRoomRevision: f.repository.getRoom(f.actor, room.id).revision,
+    content: " /memory ",
+  });
+  await f.generation.execute(run.runId);
+  const candidates = f.app.db
+    .prepare(
+      "SELECT candidate_id,owner_persona_id FROM memory_candidates ORDER BY candidate_id",
+    )
+    .all();
+  assert.equal(candidates.length, 2);
+  const prefix = `/rooms/${room.id}/memory`;
+  const privateList = await f.request(prefix + "/candidates");
+  assert.equal(privateList.response.status, 200);
+  assert.deepEqual(privateList.data.items, []);
+  f.policy.grant(
+    f.actor.actorId,
+    f.actor.workspaceId,
+    "READ_MEMORY",
+    scope(a.id),
+  );
+  const allowed = await f.request(prefix + "/candidates");
+  assert.equal(allowed.response.status, 200);
+  assert.equal(allowed.response.headers.get("cache-control"), "no-store");
+  assert.equal(allowed.data.items.length, 1);
+  assert.equal(allowed.data.items[0].ownerPersonaId, a.id);
+  const sourcePath =
+    prefix + "/candidates/" + allowed.data.items[0].id + "/source";
+  const deniedSource = await f.request(sourcePath);
+  assert.equal(deniedSource.response.status, 404);
+  assert.ok(
+    !JSON.stringify(deniedSource.data).includes(allowed.data.items[0].body),
+  );
+  f.policy.grant(f.actor.actorId, f.actor.workspaceId, "READ_PRIVATE_SEGMENT", {
+    roomId: room.id,
+    personaId: a.id,
+    visibility: "self_only",
+  });
+  const source = await f.request(sourcePath);
+  assert.equal(source.response.status, 200);
+  assert.equal(source.data.body, allowed.data.items[0].body);
+  const hidden = candidates.find((row) => row.owner_persona_id === b.id)!;
+  const hiddenResult = await f.request(
+    prefix + "/candidates/" + hidden.candidate_id,
+  );
+  const absentResult = await f.request(prefix + "/candidates/absent");
+  assert.equal(hiddenResult.response.status, 404);
+  assert.deepEqual(hiddenResult.data, absentResult.data);
+  const wrongRoom = await f.request(
+    "/rooms/other-room/memory/candidates/" + allowed.data.items[0].id,
+  );
+  assert.equal(wrongRoom.response.status, 404);
+  const publicPage = await f.request(`/rooms/${room.id}/messages`);
+  assert.ok(
+    !JSON.stringify(publicPage.data).includes(allowed.data.items[0].body),
+  );
+  assert.equal((await f.request("/memory/vault")).response.status, 403);
+  f.policy.grant(f.actor.actorId, f.actor.workspaceId, "MANAGE_VAULT");
+  assert.deepEqual((await f.request("/memory/vault")).data, {
+    registered: false,
+    paused: true,
+    trustNew: false,
+  });
+  assert.equal(
+    (await f.request(prefix + "/candidates/" + hidden.candidate_id)).response
+      .status,
+    404,
+  );
+  const review = {
+    requestId: "http-memory-review",
+    decision: "approve",
+    items: [allowed.data.items[0].binding],
+  };
+  for (const headers of [
+    { "x-csrf-token": "wrong" },
+    { origin: "https://other.example" },
+  ]) {
+    const rejected = await f.request(
+      prefix + "/reviews",
+      "POST",
+      review,
+      headers,
+    );
+    assert.equal(rejected.response.status, 403);
+  }
+  assert.equal(
+    (await f.request(prefix + "/reviews", "POST", review)).response.status,
+    403,
+  );
+  assert.equal(
+    f.app.db.prepare("SELECT COUNT(*) n FROM memory_jobs").get()!.n,
+    0,
+  );
+  assert.equal(f.provider.calls.length, 2);
+  f.app.db
+    .prepare("UPDATE memory_candidates SET state='CONFLICT' WHERE room_id=?")
+    .run(room.id);
+  const conflicts = await f.request(prefix + "/conflicts");
+  assert.equal(conflicts.response.status, 200);
+  assert.deepEqual(
+    conflicts.data.publications.map((item: any) => item.candidateId),
+    [allowed.data.items[0].id],
+  );
+  assert.ok(
+    !JSON.stringify(conflicts.data).includes(String(hidden.candidate_id)),
+  );
+});
+
+test("memory change API resets a still-visible checkpoint on gain and loss of private access", async (t) => {
+  const f = await fixture(t);
+  await f.login();
+  const { actor, policy, app, repository } = f;
+  const room = repository.createRoom(actor, { title: "Synthetic feed" });
+  const persona = repository.createPersona(actor, room.id, {
+    name: "Owner",
+    model: "synthetic",
+  });
+  const secondRoom = repository.createRoom(actor, {
+    title: "Second synthetic feed",
+  });
+  const scope = (visibility: string) => ({
+    roomId: room.id,
+    personaId: persona.id,
+    visibility,
+  });
+  const source = (roomId: string, after?: string) =>
+    f.request(
+      `/rooms/${roomId}/memory/changes` +
+        (after === undefined ? "" : "?after=" + encodeURIComponent(after)),
+    );
+  for (const [noteId, visibility] of [
+    ["earlier-private", "persona_private"],
+    ["later-shared", "room_shared"],
+  ]) {
+    app.transaction(() => {
+      const digest = "e".repeat(64),
+        path = noteId + ".md";
+      app.db
+        .prepare(
+          `INSERT INTO memory_documents(note_id,workspace_id,room_id,owner_persona_id,scope,
+        state,relative_path,version,digest,body_digest,trusted) VALUES(?,?,?,?,?,'PUBLISHED',?,1,?,?,0)`,
+        )
+        .run(
+          noteId,
+          actor.workspaceId,
+          room.id,
+          persona.id,
+          visibility,
+          path,
+          digest,
+          digest,
+        );
+      app.db
+        .prepare("INSERT INTO memory_versions VALUES(?,1,?,?,?,1)")
+        .run(noteId, digest, digest, path);
+    });
+  }
+  policy.grant(
+    actor.actorId,
+    actor.workspaceId,
+    "READ_MEMORY",
+    scope("room_shared"),
+  );
+  const original = (await source(room.id)).data;
+  assert.deepEqual(
+    original.items.map((x: any) => x.noteId),
+    ["later-shared"],
+  );
+  assert.equal(original.mode, "baseline");
+  assert.equal(original.hasMore, false);
+  async function expectReset(roomId: string, cursor: string) {
+    const response = await source(roomId, cursor);
+    assert.equal(response.response.status, 409);
+    assert.deepEqual(response.data, {
+      error: { code: "MEMORY_RESYNC_REQUIRED" },
+    });
+  }
+  await expectReset(room.id, original.items[0].changeId); // pre-audit plain change ID
+  await expectReset(room.id, "m1." + "A".repeat(60));
+  await expectReset(secondRoom.id, original.cursor);
+  policy.grant(
+    actor.actorId,
+    actor.workspaceId,
+    "READ_MEMORY",
+    scope("persona_private"),
+  );
+  await expectReset(room.id, original.cursor);
+  const gained = (await source(room.id)).data;
+  assert.deepEqual(
+    gained.items.map((x: any) => x.noteId),
+    ["earlier-private", "later-shared"],
+  );
+  assert.deepEqual((await source(room.id, gained.cursor)).data.items, []);
+  policy.revoke(actor.actorId, actor.workspaceId, "READ_MEMORY");
+  policy.grant(
+    actor.actorId,
+    actor.workspaceId,
+    "READ_MEMORY",
+    scope("room_shared"),
+  );
+  await expectReset(room.id, gained.cursor);
+  // Simulate replacement of the old projection, including removal of disappeared scopes.
+  const replacement = (await source(room.id)).data;
+  assert.equal(replacement.mode, "baseline");
+  assert.deepEqual(
+    replacement.items.map((x: any) => x.noteId),
+    ["later-shared"],
+  );
+  assert.ok(!JSON.stringify(replacement).includes("earlier-private"));
+  policy.revoke(actor.actorId, actor.workspaceId, "READ_ROOM");
+  assert.deepEqual((await source(room.id, replacement.cursor)).data, {
+    error: { code: "FORBIDDEN" },
+  });
+});

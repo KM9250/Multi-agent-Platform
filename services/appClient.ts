@@ -4,6 +4,11 @@ export interface SessionDTO {
   workspaceId: string;
   csrfToken: string;
   models: string[];
+  memoryLimits?: {
+    maxCalls: number;
+    maxHistory: number;
+    maxTotalTokens: number;
+  };
 }
 export type {
   AttachmentDTO,
