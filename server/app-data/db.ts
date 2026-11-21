@@ -23,10 +23,16 @@ import { AUTH_SCHEMA } from "../auth/schema.ts";
 import { GENERATION_SCHEMA } from "../generation/schema.ts";
 import { OPERATIONS_SCHEMA } from "../operations/schema.ts";
 import { MEMORY_SCHEMA_SQL } from "../memory/schema.ts";
+import { backfillMemoryLineage } from "../memory/lineage.ts";
+import { memoryRecordsDigest } from "../operations/memory-ledger.ts";
 
 const METADATA_SCHEMA = `CREATE TABLE app_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),contract TEXT NOT NULL,schema_version INTEGER NOT NULL,cursor_key TEXT NOT NULL) STRICT; CREATE TABLE app_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at INTEGER NOT NULL) STRICT;`;
 const FEATURE_SCHEMA = `CREATE TABLE app_feature_contracts(contract TEXT PRIMARY KEY) STRICT;`;
-const migrations = ["app_001_conversation_persistence", "app_002_memory_vault"];
+const migrations = [
+  "app_001_conversation_persistence",
+  "app_002_memory_vault",
+  "app_003_memory_integrity",
+] as const;
 const definitions = [
   [
     METADATA_SCHEMA,
@@ -36,6 +42,13 @@ const definitions = [
     OPERATIONS_SCHEMA,
   ].join("\n"),
   [FEATURE_SCHEMA, MEMORY_SCHEMA_SQL].join("\n"),
+  `CREATE INDEX memory_receipt_source ON app_generation_receipts(workspace_id,room_id,message_id,revision)
+     WHERE message_id IS NOT NULL;
+   CREATE INDEX memory_acl_revocations ON app_changes(workspace_id,target_id,revision)
+     WHERE target_type='ACL' AND action='REVOKE';
+   CREATE TABLE app_restore_migration_receipt(
+     singleton INTEGER PRIMARY KEY CHECK(singleton=1),before_digest TEXT NOT NULL,after_digest TEXT NOT NULL
+   ) STRICT;`,
 ];
 function schemaObjects(db: DatabaseSync): string {
   return JSON.stringify(
@@ -63,7 +76,7 @@ function expectedCatalogue(version: number): string {
   }
   return catalogue;
 }
-export function identifyAppSchema(db: DatabaseSync): 1 | 2 {
+export function identifyAppSchema(db: DatabaseSync): 1 | 2 | 3 {
   try {
     const meta = db
       .prepare(
@@ -71,7 +84,10 @@ export function identifyAppSchema(db: DatabaseSync): 1 | 2 {
       )
       .get();
     const version = meta?.schema_version;
-    if (meta?.contract !== APP_CONTRACT || (version !== 1 && version !== 2))
+    if (
+      meta?.contract !== APP_CONTRACT ||
+      (version !== 1 && version !== 2 && version !== 3)
+    )
       throw new AppError("WRONG_DATABASE");
     const ledger = db
       .prepare("SELECT version,name FROM app_migrations ORDER BY version")
@@ -84,7 +100,7 @@ export function identifyAppSchema(db: DatabaseSync): 1 | 2 {
       schemaObjects(db) !== expectedCatalogue(version)
     )
       throw new AppError("WRONG_DATABASE");
-    if (version === 2) {
+    if (version >= 2) {
       const contracts = db
         .prepare("SELECT contract FROM app_feature_contracts")
         .all();
@@ -94,6 +110,31 @@ export function identifyAppSchema(db: DatabaseSync): 1 | 2 {
     return version;
   } catch {
     throw new AppError("WRONG_DATABASE");
+  }
+}
+
+/** Called with the schema-2 database identified and the migration writer lock held. */
+function upgradeMemoryIntegrity(db: DatabaseSync, root: string): void {
+  const pausedRestore =
+    db
+      .prepare("SELECT restored FROM app_operational_state WHERE singleton=1")
+      .get()?.restored === 1;
+  const before = pausedRestore ? memoryRecordsDigest(db) : undefined;
+  backfillMemoryLineage(db);
+  if (pausedRestore || existsSync(join(root, "restore-report.json"))) {
+    // The schema-2 restore path cleared 'prepared' and rewound PUBLISHING jobs.
+    // Its detached copy lost the evidence of first exposure, including for FAILED retries.
+    db.exec(`UPDATE memory_candidates SET state='CONFLICT'
+      WHERE state IN ('APPROVED','PUBLISHING','FAILED') AND candidate_id IN
+        (SELECT candidate_id FROM memory_jobs WHERE status IN ('PENDING','PUBLISHING','FAILED'));
+      UPDATE memory_jobs SET status='CONFLICT',error_code='RESTORE_PUBLICATION_UNCERTAIN'
+      WHERE status IN ('PENDING','PUBLISHING','FAILED');`);
+  }
+  if (before !== undefined) {
+    db.prepare("INSERT INTO app_restore_migration_receipt VALUES(1,?,?)").run(
+      before,
+      memoryRecordsDigest(db),
+    );
   }
 }
 
@@ -230,7 +271,7 @@ export class AppDatabase {
         `PRAGMA busy_timeout=${timeout}; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;`,
       );
       // Re-read the version after acquiring the SQLite write lock. Independent
-      // startup processes may have finished either migration since the probe.
+      // startup processes may have finished a migration since the probe.
       this.db.exec("BEGIN IMMEDIATE");
       try {
         const exists = this.db
@@ -248,23 +289,35 @@ export class AppDatabase {
         }
         this.db.exec("COMMIT");
         if (!exists) this.hooks?.afterCommit?.("migration");
-        this.db.exec("BEGIN IMMEDIATE");
-        if (identifyAppSchema(this.db) === 1) {
-          this.db.exec(definitions[1]);
+        for (;;) {
+          this.db.exec("BEGIN IMMEDIATE");
+          const version = identifyAppSchema(this.db);
+          if (version === 3) {
+            this.db.exec("COMMIT");
+            break;
+          }
+          const next = version + 1;
+          const name = migrations[version];
+          this.db.exec(definitions[version]);
+          if (version === 1) {
+            this.db
+              .prepare("INSERT INTO app_feature_contracts VALUES(?)")
+              .run(MEMORY_CONTRACT);
+          } else {
+            upgradeMemoryIntegrity(this.db, this.root);
+          }
           this.db
-            .prepare("INSERT INTO app_feature_contracts VALUES(?)")
-            .run(MEMORY_CONTRACT);
+            .prepare("INSERT INTO app_migrations VALUES(?,?,?)")
+            .run(next, name, Date.now());
           this.db
-            .prepare("INSERT INTO app_migrations VALUES(2,?,?)")
-            .run(migrations[1], Date.now());
-          this.db.exec(
-            "UPDATE app_metadata SET schema_version=2 WHERE singleton=1",
-          );
-          this.hooks?.beforeCommit?.(migrations[1]);
+            .prepare(
+              "UPDATE app_metadata SET schema_version=? WHERE singleton=1",
+            )
+            .run(next);
+          this.hooks?.beforeCommit?.(name);
           this.db.exec("COMMIT");
-          this.hooks?.afterCommit?.(migrations[1]);
-        } else {
-          this.db.exec("COMMIT");
+          this.hooks?.afterCommit?.(name);
+          if (next === migrations.length) break;
         }
       } catch (e) {
         if (this.db.isTransaction) this.db.exec("ROLLBACK");

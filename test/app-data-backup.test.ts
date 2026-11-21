@@ -98,7 +98,7 @@ test("C1-09/C1-10 backup and verified separate-root restore preserve bytes/revis
     const manifest = await new BackupService(f.app).backup(f.backup);
     assert.equal(manifest.integrity, "ok");
     assert.equal(manifest.restoreTested, false);
-    assert.equal(manifest.attachments.length, 1);
+    assert.equal(manifest.attachments.count, 1);
     const sourceBytes = readFileSync(join(f.backup, "app-data.sqlite"));
     await restoreBackup(f.backup, f.restored);
     assert.deepEqual(
@@ -187,9 +187,8 @@ test("C1-09/C1-10 backup and verified separate-root restore preserve bytes/revis
 test("C1-10 restored queued run and reserved call remain diagnostic and never dispatch", async () => {
   const f = fixture();
   try {
-    const { GenerationCoordinator } = await import(
-        "../server/generation/coordinator.ts"
-      ),
+    const { GenerationCoordinator } =
+        await import("../server/generation/coordinator.ts"),
       { FakeProvider } = await import("../server/generation/provider.ts");
     const provider = new FakeProvider(),
       generation = new GenerationCoordinator(f.app, f.repo, f.policy, {
@@ -289,8 +288,15 @@ test("Restore rejects changed attachment bytes and symlinked originals before de
       mimeType: "text/plain",
       data: Buffer.from("original bytes"),
     });
-    const manifest = await new BackupService(f.app).backup(f.backup),
-      file = join(f.backup, "attachments", manifest.attachments[0].blobKey);
+    const manifest = await new BackupService(f.app).backup(f.backup);
+    assert.equal(manifest.attachments.count, 1);
+    const file = join(
+      f.backup,
+      "attachments",
+      String(
+        f.app.db.prepare("SELECT blob_key FROM attachments").get()!.blob_key,
+      ),
+    );
     writeFileSync(file, "changed bytes");
     await assert.rejects(
       restoreBackup(f.backup, f.restored),

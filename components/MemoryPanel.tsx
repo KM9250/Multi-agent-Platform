@@ -75,6 +75,7 @@ type Write = {
   data: Record<string, unknown>;
   success: string;
   done?: () => void;
+  conflict?: () => void;
 };
 type Save = (operation: Write) => void;
 
@@ -489,6 +490,7 @@ function NoteReader({
     expectedVersion: number;
   }>();
   const [confirmRetract, setConfirmRetract] = useState<{
+    expectedState: string;
     expectedDigest: string;
     expectedVersion: number;
   }>();
@@ -515,6 +517,12 @@ function NoteReader({
     data?.digest === note.digest &&
     note.state === "PUBLISHED";
   const readable = version ? data?.version === version : current;
+  const retractChanged =
+    confirmRetract &&
+    (confirmRetract.expectedState !== note.state ||
+      confirmRetract.expectedVersion !== note.version ||
+      confirmRetract.expectedDigest !== note.digest);
+
   return (
     <div className="space-y-3 border-t border-zinc-700 pt-3">
       <button
@@ -644,10 +652,11 @@ function NoteReader({
       {!version && note.state !== "RETRACTED" && !confirmRetract && (
         <button
           className="map-button"
-          disabled={locked}
+          disabled={locked || (note.state === "PUBLISHED" && !current)}
           onClick={() => {
             setProposal(undefined);
             setConfirmRetract({
+              expectedState: note.state,
               expectedVersion: note.version,
               expectedDigest: note.digest,
             });
@@ -707,14 +716,28 @@ function NoteReader({
             Withdraw registered version {confirmRetract.expectedVersion} from
             current memory?
           </p>
+          <p className={small}>
+            Reviewed publication state · {label(confirmRetract.expectedState)}
+          </p>
+          {confirmRetract.expectedState !== "PUBLISHED" && (
+            <p className={small}>
+              This withdraws the registered publication. The Vault file is
+              preserved.
+            </p>
+          )}
+          {retractChanged && (
+            <p role="alert">
+              The publication changed. Cancel and review its current state
+              before confirming.
+            </p>
+          )}
           <button
             className="map-button"
             disabled={
               locked ||
               !!version ||
-              note.state === "RETRACTED" ||
-              confirmRetract.expectedVersion !== note.version ||
-              confirmRetract.expectedDigest !== note.digest
+              retractChanged ||
+              (confirmRetract.expectedState === "PUBLISHED" && !current)
             }
             onClick={() =>
               save({
@@ -723,6 +746,7 @@ function NoteReader({
                 data: confirmRetract,
                 success: "Publication retracted.",
                 done: () => setConfirmRetract(undefined),
+                conflict: () => setConfirmRetract(undefined),
               })
             }
           >
@@ -825,6 +849,7 @@ export default function MemoryPanel({
       }
       if (cause instanceof AppAPIError && cause.status < 500) {
         setUncertain(undefined);
+        if (cause.status === 409) write.conflict?.();
         setNotice(errorText(cause));
       } else {
         setUncertain(write);

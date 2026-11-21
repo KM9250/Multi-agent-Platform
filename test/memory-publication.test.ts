@@ -373,6 +373,7 @@ test("MEM-1 a full Vault defers a new file; withdrawal frees a slot reserved unt
     expectedVersion: 1,
     expectedDigest: hash,
     requestId: "withdraw-slot",
+    expectedState: "DELETED",
   });
   assert.equal(retry().state, "PENDING");
   publishNext(f.app, f.policy, {
@@ -390,3 +391,173 @@ test("MEM-1 a full Vault defers a new file; withdrawal frees a slot reserved unt
   );
   assert.equal(readFileSync(f.file, "utf8"), f.job.markdown);
 });
+
+for (const change of [
+  "delete",
+  "rename",
+  "replace",
+  "replace-identical",
+] as const)
+  test(
+    "F-03 first visible link + SIGKILL + external " +
+      change +
+      " preserves the user's file state",
+    async (t) => {
+      const f = await approved(t);
+      await assert.rejects(
+        child(f.root, "afterLink"),
+        (e: any) => e.signal === "SIGKILL",
+      );
+      assert.equal(
+        statSync(f.file).nlink,
+        2,
+        "stop at first visibility, before stage cleanup",
+      );
+      const moved = join(f.vault, "human-name.md");
+      if (change === "delete") unlinkSync(f.file);
+      else if (change === "rename") renameSync(f.file, moved);
+      else {
+        const replacement = join(f.outer, "replacement");
+        writeFileSync(
+          replacement,
+          change === "replace" ? "Human replacement" : String(f.job.markdown),
+        );
+        renameSync(replacement, f.file);
+      }
+      await child(f.root);
+      const result = {
+        status: f.app.db.prepare("SELECT status FROM memory_jobs").get()
+          ?.status,
+        receipts: f.app.db
+          .prepare("SELECT count(*) AS n FROM memory_receipts")
+          .get()?.n,
+        file: existsSync(f.file),
+        moved: existsSync(moved),
+      };
+      assert.deepEqual(result, {
+        status: "CONFLICT",
+        receipts: 0,
+        file: change.startsWith("replace"),
+        moved: change === "rename",
+      });
+      if (change === "replace")
+        assert.equal(readFileSync(f.file, "utf8"), "Human replacement");
+      if (change === "replace-identical")
+        assert.equal(readFileSync(f.file, "utf8"), f.job.markdown);
+      if (change === "rename")
+        assert.equal(readFileSync(moved, "utf8"), f.job.markdown);
+      assert.equal(publishNext(f.app, f.policy), false);
+      assert.equal(
+        f.app.db.prepare("SELECT count(*) AS n FROM app_provider_calls").get()
+          ?.n,
+        1,
+      );
+    },
+  );
+
+test("F-03 SIGKILL after consuming publication intent but before link leaves the missing name untouched", async (t) => {
+  const f = await approved(t);
+  await assert.rejects(
+    child(f.root, "beforeLink"),
+    (e: any) => e.signal === "SIGKILL",
+  );
+  assert.equal(existsSync(f.file), false);
+  await child(f.root);
+  assert.equal(existsSync(f.file), false);
+  assert.equal(
+    f.app.db.prepare("SELECT status FROM memory_jobs").get()?.status,
+    "CONFLICT",
+  );
+  assert.equal(
+    f.app.db.prepare("SELECT count(*) AS n FROM memory_receipts").get()?.n,
+    0,
+  );
+});
+
+test("F-03 preparation is bound to a specific private-stage inode, even if replacement bytes match", async (t) => {
+  const f = await approved(t);
+  await assert.rejects(
+    child(f.root, "afterPrepared"),
+    (e: any) => e.signal === "SIGKILL",
+  );
+  const operation = String(
+    f.app.db.prepare("SELECT operation_id FROM memory_jobs").get()
+      ?.operation_id,
+  );
+  const stage = join(f.vault, ".map-staging", operation + ".stage");
+  const replacement = join(f.outer, "other");
+  writeFileSync(replacement, String(f.job.markdown));
+  renameSync(replacement, stage);
+  await child(f.root);
+  assert.equal(
+    f.app.db.prepare("SELECT status FROM memory_jobs").get()?.status,
+    "CONFLICT",
+  );
+  assert.equal(existsSync(f.file), false);
+});
+
+test("F-03 receipt checks original file identity after the staging link has been removed", async (t) => {
+  const f = await approved(t);
+  await assert.rejects(
+    child(f.root, "beforeReceipt"),
+    (e: any) => e.signal === "SIGKILL",
+  );
+  assert.equal(statSync(f.file).nlink, 1);
+  const replacement = join(f.outer, "other");
+  writeFileSync(replacement, String(f.job.markdown));
+  renameSync(replacement, f.file);
+  await child(f.root);
+  assert.equal(
+    f.app.db.prepare("SELECT status FROM memory_jobs").get()?.status,
+    "CONFLICT",
+  );
+  assert.equal(readFileSync(f.file, "utf8"), f.job.markdown);
+  assert.equal(
+    f.app.db.prepare("SELECT count(*) AS n FROM memory_receipts").get()?.n,
+    0,
+  );
+});
+
+for (const legacy of ["lone-stage", "original-pair", "lone-target"] as const)
+  test(
+    "F-03 pre-witness PUBLISHING job " +
+      legacy +
+      " recovers only with positive identity evidence",
+    async (t) => {
+      const f = await approved(t);
+      const phase =
+        legacy === "lone-stage"
+          ? "afterPrepared"
+          : legacy === "original-pair"
+            ? "afterLink"
+            : "beforeReceipt";
+      await assert.rejects(
+        child(f.root, phase),
+        (e: any) => e.signal === "SIGKILL",
+      );
+      const operation = String(
+        f.app.db.prepare("SELECT operation_id FROM memory_jobs").get()
+          ?.operation_id,
+      );
+      // Remove the extension evidence only. The baseline binary leaves exactly this committed DB/stage/target layout.
+      unlinkSync(
+        join(
+          f.root,
+          "memory-publication-state",
+          operation + (phase === "afterPrepared" ? ".ready" : ".attempt"),
+        ),
+      );
+      await child(f.root);
+      assert.equal(
+        f.app.db.prepare("SELECT status FROM memory_jobs").get()?.status,
+        legacy === "original-pair" ? "PUBLISHED" : "CONFLICT",
+      );
+      assert.equal(
+        f.app.db.prepare("SELECT count(*) AS n FROM memory_receipts").get()?.n,
+        legacy === "original-pair" ? 1 : 0,
+      );
+      assert.equal(existsSync(f.file), legacy !== "lone-stage");
+      if (existsSync(f.file))
+        assert.equal(readFileSync(f.file, "utf8"), f.job.markdown);
+    },
+  );

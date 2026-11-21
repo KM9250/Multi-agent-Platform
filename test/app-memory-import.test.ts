@@ -86,6 +86,8 @@ test("live digest blocks stale content without an event, accepts a stable edit a
   const { app, policy, actor, room, read, state, path, markdown, noteId } =
     await fixture(t);
   assert.equal(read().body, "original body");
+  const baseline = listNoteChanges(app, policy, actor, room.id);
+  assert.deepEqual(baseline.items.map(item => item.action), ["BASELINE"]);
   writeFileSync(path, markdown.replace("original body", "half"));
   assert.throws(() => read(), { code: "MEMORY_UNAVAILABLE" });
   assert.equal(state(), "DIRTY");
@@ -110,8 +112,8 @@ test("live digest blocks stale content without an event, accepts a stable edit a
     [2, 1],
   );
   assert.deepEqual(
-    listNoteChanges(app, policy, actor, room.id).map((c) => c.action),
-    ["PUBLISHED", "DIRTY", "BODY_CHANGED"],
+    listNoteChanges(app, policy, actor, room.id, baseline.cursor).items.map((c) => c.action),
+    ["DIRTY", "BODY_CHANGED"],
   );
 });
 test("rename, duplicate identity, deletion, unknown files and restore of a matching file", async (t) => {
@@ -195,7 +197,7 @@ test("unauthorized summaries, history, cursor and retraction stay hidden; retrac
     personaId: "other-persona",
   });
   assert.deepEqual(listNotes(app, policy, other, room.id), []);
-  assert.deepEqual(listNoteChanges(app, policy, other, room.id), []);
+  assert.deepEqual(listNoteChanges(app, policy, other, room.id).items, []);
   assert.throws(() => listVersions(app, policy, other, noteId), {
     code: "NOT_FOUND",
   });
@@ -423,4 +425,175 @@ test("a cold inventory spans byte slices and ignores terminal rows retained sole
   unlinkSync(join(vault, "dup.md"));
   assert.equal((await scanVault(app, 32)).status, "COMPLETE");
   assert.equal(read().version, 1);
+});
+
+test("F-02 retraction at the watcher gap preserves an unimported external edit and its publication", async (t) => {
+  const { app, policy, actor, read, state, path, markdown, noteId } =
+    await fixture(t);
+  const shown = read();
+  const request = {
+    requestId: "withdraw-shown",
+    expectedVersion: shown.version,
+    expectedDigest: shown.digest,
+  };
+  const edited = markdown.replace(
+    "original body",
+    "A human saved after confirmation opened",
+  );
+  writeFileSync(path, edited);
+  let response: string;
+  try {
+    response = retractNote(app, policy, actor, noteId, request).state;
+  } catch (error) {
+    response = (error as { code: string }).code;
+  }
+  const receipts = () =>
+    app.db
+      .prepare(
+        "SELECT count(*) AS n FROM memory_retract_requests WHERE note_id=?",
+      )
+      .get(noteId)!.n;
+  assert.deepEqual(
+    {
+      response,
+      state: state(),
+      receipts: receipts(),
+      file: readFileSync(path, "utf8"),
+    },
+    {
+      response: "REVISION_CONFLICT",
+      state: "DIRTY",
+      receipts: 0,
+      file: edited,
+    },
+  );
+
+  assert.throws(() => retractNote(app, policy, actor, noteId, request), {
+    code: "REVISION_CONFLICT",
+  });
+  assert.throws(
+    () =>
+      retractNote(app, policy, actor, noteId, {
+        ...request,
+        expectedState: "PUBLISHED",
+      }),
+    { code: "REVISION_CONFLICT" },
+  );
+  const explicit = { ...request, expectedState: "DIRTY" };
+  const result = retractNote(app, policy, actor, noteId, explicit);
+  unlinkSync(path);
+  assert.deepEqual(retractNote(app, policy, actor, noteId, explicit), result);
+  assert.equal(receipts(), 1);
+  assert.throws(
+    () =>
+      retractNote(app, policy, actor, noteId, {
+        ...explicit,
+        expectedState: "DELETED",
+      }),
+    { code: "REQUEST_CONFLICT" },
+  );
+});
+
+test("F-02 deleted files and identity conflicts require acknowledgement of the recorded state", async (t) => {
+  for (const outcome of ["DELETED", "CONFLICT"]) {
+    const { app, policy, actor, read, state, path, markdown, noteId } =
+      await fixture(t);
+    const shown = read(),
+      request = {
+        requestId: "withdraw",
+        expectedVersion: shown.version,
+        expectedDigest: shown.digest,
+        expectedState: shown.state,
+      };
+    if (outcome === "DELETED") unlinkSync(path);
+    else writeFileSync(path, markdown.replace("mem_fixture", "different_note"));
+    assert.throws(() => retractNote(app, policy, actor, noteId, request), {
+      code: "REVISION_CONFLICT",
+    });
+    assert.equal(state(), outcome);
+    assert.equal(
+      retractNote(app, policy, actor, noteId, {
+        ...request,
+        expectedState: outcome,
+      }).state,
+      "RETRACTED",
+    );
+  }
+});
+
+test("F-02 identical successful published retraction remains replayable after a later external save", async (t) => {
+  const { app, policy, actor, read, path, markdown, noteId } = await fixture(t);
+  const shown = read(),
+    request = {
+      requestId: "withdraw",
+      expectedVersion: shown.version,
+      expectedDigest: shown.digest,
+      expectedState: "PUBLISHED",
+    };
+  const result = retractNote(app, policy, actor, noteId, request);
+  writeFileSync(path, markdown + " later external edit");
+  assert.deepEqual(retractNote(app, policy, actor, noteId, request), result);
+  assert.equal(
+    app.db.prepare("SELECT count(*) AS n FROM memory_retract_requests").get()!
+      .n,
+    1,
+  );
+  assert.throws(
+    () =>
+      retractNote(app, policy, actor, noteId, {
+        ...request,
+        expectedState: "DIRTY",
+      }),
+    { code: "REQUEST_CONFLICT" },
+  );
+  assert.equal(readFileSync(path, "utf8"), markdown + " later external edit");
+});
+
+test("F-02 a successful receipt created before state-bound requests replays with current authorization", async (t) => {
+  const { app, policy, actor, read, path, noteId } = await fixture(t);
+  const shown = read(),
+    request = {
+      requestId: "older-request",
+      expectedVersion: shown.version,
+      expectedDigest: shown.digest,
+    };
+  // Receipt and document shape written by the earlier MEM-1 build, which had no state-binding entry.
+  app.transaction(() => {
+    app.db
+      .prepare("INSERT INTO memory_retract_requests VALUES(?,?,?,?,?,?)")
+      .run(
+        actor.workspaceId,
+        actor.actorId,
+        request.requestId,
+        noteId,
+        shown.version,
+        shown.digest,
+      );
+    app.db
+      .prepare("UPDATE memory_documents SET state='RETRACTED' WHERE note_id=?")
+      .run(noteId);
+  });
+  unlinkSync(path);
+  assert.deepEqual(retractNote(app, policy, actor, noteId, request), {
+    noteId,
+    version: 1,
+    state: "RETRACTED",
+  });
+  assert.throws(
+    () =>
+      retractNote(app, policy, actor, noteId, {
+        ...request,
+        expectedState: "DELETED",
+      }),
+    { code: "REQUEST_CONFLICT" },
+  );
+  policy.revoke(actor.actorId, actor.workspaceId, "RETRACT_MEMORY");
+  assert.throws(() => retractNote(app, policy, actor, noteId, request), {
+    code: "FORBIDDEN",
+  });
+  assert.equal(
+    app.db.prepare("SELECT count(*) AS n FROM memory_retract_requests").get()!
+      .n,
+    1,
+  );
 });

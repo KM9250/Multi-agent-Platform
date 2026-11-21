@@ -219,6 +219,76 @@ try {
       exact: true,
     })
     .waitFor();
+  // Make the edit after the human saw V1 and before the HTTP handler reads the file.
+  // The watcher is stopped so only the current-bound mutation can observe drift.
+  await stopWatcher();
+  stopWatcher = undefined;
+  await manual.getByRole("button", { name: "Retract publication" }).click();
+  const manualRetract = "**/memory/notes/manual_fixture/retract";
+  const manualV2 = manualFile.replace(
+    "Handwritten fixture.",
+    "Edited handwritten fixture.",
+  );
+  await page.route(
+    manualRetract,
+    async (route) => {
+      writeFileSync(join(vault, manualPath), manualV2);
+      await route.continue();
+    },
+    { times: 1 },
+  );
+  const staleResponse = page.waitForResponse((r) =>
+    r.url().endsWith("/memory/notes/manual_fixture/retract"),
+  );
+  await manual.getByRole("button", { name: "Confirm retraction" }).click();
+  const stale = await staleResponse;
+  assert.equal(
+    stale.status(),
+    409,
+    "Retracting after a V1-to-V2 disk edit must conflict",
+  );
+  assert.equal((await stale.json()).error.code, "REVISION_CONFLICT");
+  assert.equal(stale.request().postDataJSON().expectedState, "PUBLISHED");
+  assert.equal(stale.request().postDataJSON().expectedVersion, 1);
+  assert.equal(
+    app.db
+      .prepare(
+        "SELECT COUNT(*) n FROM memory_retract_requests WHERE note_id='manual_fixture'",
+      )
+      .get()!.n,
+    0,
+  );
+  await panel
+    .getByText(
+      "The saved state changed. Refresh and review the current version.",
+    )
+    .waitFor();
+  await manual.getByText("Current text unavailable · File changed").waitFor();
+  assert.equal(
+    await manual.getByRole("button", { name: "Confirm retraction" }).count(),
+    0,
+  );
+  assert.equal(readFileSync(join(vault, manualPath), "utf8"), manualV2);
+  stopWatcher = startVaultWatcher(app);
+  await manual.getByRole("heading", { name: "Current version 2" }).waitFor();
+  await manual
+    .getByText("Edited handwritten fixture.", { exact: true })
+    .waitFor();
+  await manual.getByRole("button", { name: "Retract publication" }).click();
+  const currentResponse = page.waitForResponse((r) =>
+    r.url().endsWith("/memory/notes/manual_fixture/retract"),
+  );
+  await manual.getByRole("button", { name: "Confirm retraction" }).click();
+  const accepted = await currentResponse;
+  assert.equal(accepted.status(), 200);
+  assert.equal(accepted.request().postDataJSON().expectedState, "PUBLISHED");
+  assert.equal(accepted.request().postDataJSON().expectedVersion, 2);
+  assert.notEqual(
+    accepted.request().postDataJSON().requestId,
+    stale.request().postDataJSON().requestId,
+  );
+  await manual.getByText(/Retracted · Version 2/).waitFor();
+  assert.equal(readFileSync(join(vault, manualPath), "utf8"), manualV2);
   const published = app.db
     .prepare(
       "SELECT relative_path FROM memory_documents WHERE candidate_id IN (SELECT candidate_id FROM memory_candidate_revisions WHERE body=?)",
@@ -264,13 +334,31 @@ try {
   assert.ok(readFileSync(join(vault, moved), "utf8").includes(foreign));
   await panel.getByRole("button", { name: "Vault notes" }).click();
   const movedNote = panel.locator("article").filter({ hasText: moved });
+  await movedNote.getByRole("button", { name: "Retract publication" }).click();
   unlinkSync(join(vault, moved));
   await movedNote
     .getByText("Current text unavailable · File missing", { exact: true })
     .waitFor();
-
+  assert.equal(
+    await movedNote
+      .getByRole("button", { name: "Confirm retraction" })
+      .isDisabled(),
+    true,
+  );
+  await movedNote.getByRole("button", { name: "Cancel retraction" }).click();
   await movedNote.getByRole("button", { name: "Retract publication" }).click();
+  await movedNote
+    .getByText(
+      "This withdraws the registered publication. The Vault file is preserved.",
+    )
+    .waitFor();
+  const missingResponse = page.waitForResponse(
+    (r) => r.url().includes("/memory/notes/") && r.url().endsWith("/retract"),
+  );
   await movedNote.getByRole("button", { name: "Confirm retraction" }).click();
+  const missing = await missingResponse;
+  assert.equal(missing.status(), 200);
+  assert.equal(missing.request().postDataJSON().expectedState, "DELETED");
   await movedNote.getByText(/Retracted · Version 2/).waitFor();
   assert.equal(await movedNote.getByText(foreign, { exact: true }).count(), 0);
   const storage = await page.evaluate(async () => ({
@@ -301,7 +389,8 @@ try {
         "handwritten registrar and original version",
         "protected original source",
         "existing-note proposal preserved as reviewed text",
-        "retraction after external deletion",
+        "stale V1 retraction conflicts, V2 preserved and explicitly retracted",
+        "retraction after known external deletion",
         "browser storage empty",
         "escaped Markdown",
       ],

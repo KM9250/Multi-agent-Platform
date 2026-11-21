@@ -13,12 +13,7 @@ import {
   assertSourcesCurrent,
 } from "./sources.ts";
 import { parseMemoryMarkdown } from "./markdown.ts";
-import {
-  prepareFrozen,
-  publishFrozen,
-  readVaultFile,
-  saveVersion,
-} from "./vault.ts";
+import { prepareFrozen, publishFrozen, saveVersion } from "./vault.ts";
 
 type Job = {
   operation_id: string;
@@ -39,6 +34,7 @@ type Job = {
 type Hooks = {
   afterSelection?: () => void;
   afterPrepared?: () => void;
+  beforeLink?: () => void;
   afterLink?: () => void;
   beforeReceipt?: () => void;
 };
@@ -137,9 +133,7 @@ export function publishNext(
         return;
       assertPublishable(app, policy, job);
       assertPublicationCapacity(app, job.operation_id);
-      publishFrozen(app, job, hooks);
-      hooks.beforeReceipt?.();
-      const bytes = readVaultFile(app, job.relative_path);
+      const bytes = publishFrozen(app, job, hooks);
       if (digest(bytes) !== job.file_digest)
         throw new AppError("PUBLICATION_CONFLICT", 409);
       assertPublishable(app, policy, job);

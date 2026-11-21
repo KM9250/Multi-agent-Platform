@@ -78,8 +78,18 @@ export function memoryRoutes(app: AppDatabase, policy: AuthorizationPolicy) {
     if (parts.length === 4 && method === "GET") {
       if (resource === "candidates")
         return candidates.list(actor, roomId, query(url, "after"));
-      if (resource === "changes")
-        return listNoteChanges(app, policy, actor, roomId, query(url, "after"));
+      if (resource === "changes") {
+        const keys = [...url.searchParams.keys()];
+        if (keys.length > 1 || (keys.length && keys[0] !== "after"))
+          throw new AuthError("INVALID_INPUT", 400);
+        return listNoteChanges(
+          app,
+          policy,
+          actor,
+          roomId,
+          url.searchParams.get("after") ?? undefined,
+        );
+      }
       if (resource === "notes")
         return listNotes(app, policy, actor, roomId, {
           after: query(url, "after"),

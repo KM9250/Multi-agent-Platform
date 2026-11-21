@@ -94,7 +94,7 @@ test("DATA-1 program, populated v1 backup, and MEM-1 migration interoperate with
       assert.equal(
         app.db.prepare("SELECT schema_version FROM app_metadata").get()!
           .schema_version,
-        2,
+        3,
       );
       assert.equal(
         app.db.prepare("SELECT contract FROM app_feature_contracts").get()!
@@ -171,8 +171,10 @@ test("DATA-1 program, populated v1 backup, and MEM-1 migration interoperate with
 });
 
 for (const mutation of [
-  "UPDATE app_metadata SET schema_version=3",
+  "UPDATE app_metadata SET schema_version=4",
   "DELETE FROM app_migrations WHERE version=2",
+  "DELETE FROM app_migrations WHERE version=3",
+  "DROP INDEX memory_receipt_source",
   "DELETE FROM app_feature_contracts",
   "CREATE TABLE foreign_data(x)",
 ])

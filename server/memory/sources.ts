@@ -1,3 +1,4 @@
+import { generationLineage, storeLineage } from "./lineage.ts";
 import { AppError, type Actor } from "../../shared/app-contracts/index.ts";
 import type { AppDatabasePort, PolicyPort } from "../generation/types.ts";
 import type { ContextManifest } from "../generation/context.ts";
@@ -139,39 +140,7 @@ export function captureExports(
       AND s.owner_persona_id=p.persona_id AND s.channel='memory_export' AND s.visibility='self_only'`,
     )
     .all(actor.workspaceId, roomId, callId, personaId) as Row[];
-  // The compiler has already verified this bounded manifest in the receipt transaction.
-  // Prepare its dependency rows once per call, even when the model produced 16 items.
-  const messageRefs = JSON.stringify(context.messages);
-  const attachmentRefs = JSON.stringify(context.attachments);
-  const messageDependencies = app.db
-    .prepare(`INSERT OR IGNORE INTO memory_dependencies
-    SELECT ?,r.workspace_id,r.room_id,'MESSAGE',r.message_id,r.revision,r.content_digest
-    FROM json_each(?) ref JOIN message_revisions r ON r.revision_id=json_extract(ref.value,'$.revisionId')
-    WHERE r.workspace_id=? AND r.room_id=?`);
-  const attachmentDependencies = app.db
-    .prepare(`INSERT OR IGNORE INTO memory_dependencies
-    SELECT ?,?,?,'ATTACHMENT',json_extract(value,'$.id'),1,json_extract(value,'$.digest') FROM json_each(?)`);
-  const privateGrants = app.db
-    .prepare(
-      `SELECT DISTINCT s.owner_persona_id,s.visibility FROM json_each(?) m
-    JOIN json_each(m.value,'$.segments') part JOIN message_segments s ON s.segment_id=json_extract(part.value,'$.id')
-    WHERE s.workspace_id=? AND s.room_id=? AND s.visibility<>'public'`,
-    )
-    .all(messageRefs, actor.workspaceId, roomId);
-  const hasPersonaAttachment = app.db
-    .prepare(
-      `SELECT 1 FROM json_each(?) ref JOIN persona_attachment_links l
-    ON l.attachment_id=json_extract(ref.value,'$.id') JOIN room_personas rp USING(workspace_id,room_id,persona_id,persona_revision)
-    WHERE l.workspace_id=? AND l.room_id=? AND l.persona_id=? AND l.purpose='CONTEXT' LIMIT 1`,
-    )
-    .get(attachmentRefs, actor.workspaceId, roomId, personaId);
-  const hasMessageAttachment = app.db
-    .prepare(
-      `SELECT 1 FROM json_each(?) ref JOIN attachment_links l
-    ON l.message_id=json_extract(ref.value,'$.id') AND l.revision=json_extract(ref.value,'$.revision')
-    WHERE l.workspace_id=? AND l.room_id=? LIMIT 1`,
-    )
-    .get(messageRefs, actor.workspaceId, roomId);
+  const lineage = generationLineage(app.db, actor.workspaceId, roomId, callId);
   for (const output of outputs) {
     const candidateId = id();
     app.db
@@ -226,34 +195,7 @@ export function captureExports(
     );
     authority(app, policy, actor, candidateId, "READ_CONVERSATION", roomId);
     authority(app, policy, actor, candidateId, "READ_ROOM", roomId);
-    // Context inputs stay distinct from evidence for the generated claim.
-    messageDependencies.run(
-      candidateId,
-      messageRefs,
-      actor.workspaceId,
-      roomId,
-    );
-    attachmentDependencies.run(
-      candidateId,
-      actor.workspaceId,
-      roomId,
-      attachmentRefs,
-    );
-    for (const grant of privateGrants)
-      authority(
-        app,
-        policy,
-        actor,
-        candidateId,
-        "READ_PRIVATE_SEGMENT",
-        roomId,
-        String(grant.owner_persona_id),
-        String(grant.visibility),
-      );
-    if (hasPersonaAttachment)
-      authority(app, policy, actor, candidateId, "GENERATE", roomId, personaId);
-    if (hasMessageAttachment)
-      authority(app, policy, actor, candidateId, "READ_ATTACHMENT", roomId);
+    storeLineage(app.db, actor.workspaceId, roomId, candidateId, lineage);
   }
 }
 
@@ -322,7 +264,7 @@ export function assertSourceAccess(
     LEFT JOIN message_segments s ON s.segment_id=c.source_segment_id WHERE c.workspace_id=? AND c.candidate_id=?`,
     )
     .get(actor.workspaceId, candidateId) as Row;
-  if (!row) unavailable();
+  if (!row || (row.target_version === null && !row.visibility)) unavailable();
   if (row.target_version !== null) {
     if (!row.scope) unavailable();
     policy.assert(

@@ -47,3 +47,20 @@ export interface MemoryCandidateDTO {
   } | null;
   binding: MemoryBinding;
 }
+
+export interface MemoryChangeItem {
+  changeId: string;
+  noteId: string;
+  version: number;
+  digest: string;
+  state: string;
+  action: string;
+}
+
+export interface MemoryChangePage {
+  mode: "baseline" | "delta";
+  items: MemoryChangeItem[];
+  hasMore: boolean;
+  /** Persist with the applied page, including an empty checkpoint. */
+  cursor: string;
+}

@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { AppDatabase } from "../server/app-data/db.ts";
+import { APP_SCHEMA } from "../shared/app-contracts/index.ts";
 import { digest } from "../server/app-data/validation.ts";
 import { AttachmentStore } from "../server/attachments/store.ts";
 import { AuthorizationPolicy } from "../server/auth/authorization.ts";
@@ -130,6 +131,7 @@ test("MEM-1 backup binds immutable note revisions, pending jobs, reviews and att
       .get(second.operation_id)!.status,
     "PUBLISHING",
   );
+  const third = await approve("third");
   const attachment = await new AttachmentStore(f.app, f.policy).upload(
     f.actor,
     f.room.id,
@@ -145,10 +147,11 @@ test("MEM-1 backup binds immutable note revisions, pending jobs, reviews and att
   const liveOnly = edit + "\nAn edit not imported at snapshot time.";
   writeFileSync(path, liveOnly);
   const manifest = await new BackupService(f.app).backup(backup);
-  assert.equal(manifest.appSchema, 2);
-  assert.equal(manifest.memory.versions.length, 2);
-  assert.equal(manifest.memory.current.length, 1);
-  assert.equal(manifest.attachments[0].id, attachment.id);
+  assert.equal(manifest.appSchema, APP_SCHEMA);
+  assert.equal(manifest.schema, "MAP-MEM-1:BACKUP:3");
+  assert.equal(manifest.memory.versions.count, 2);
+  assert.equal(manifest.memory.current.count, 1);
+  assert.equal(manifest.attachments.count, 1);
   await assert.rejects(
     restoreBackup(backup, join(vault, "nested")),
     /BACKUP_DESTINATION_OVERLAP/,
@@ -157,6 +160,12 @@ test("MEM-1 backup binds immutable note revisions, pending jobs, reviews and att
   assert.equal(readFileSync(path, "utf8"), liveOnly);
   const restored = new AppDatabase({ root: destination });
   t.after(() => restored.close());
+  assert.equal(
+    restored.db.prepare("SELECT attachment_id FROM attachments").get()!
+      .attachment_id,
+    attachment.id,
+  );
+  assert.notDeepEqual(restored.cursorKey, f.app.cursorKey);
   const restoredPolicy = new AuthorizationPolicy(restored);
   assert.equal(publishNext(restored, restoredPolicy), false);
   assert.equal(
@@ -169,22 +178,23 @@ test("MEM-1 backup binds immutable note revisions, pending jobs, reviews and att
     String(first.relative_path),
   );
   assert.equal(readFileSync(restoredFile, "utf8"), edit);
-  const history = manifest.memory.versions.map((v) =>
-    join(destination, "memory-versions", v.digest + ".md"),
+  const history = [String(first.file_digest), digest(edit)].map((fileDigest) =>
+    join(destination, "memory-versions", fileDigest + ".md"),
   );
   assert.equal(readFileSync(history[0], "utf8"), first.markdown);
   assert.notEqual(statSync(restoredFile).ino, statSync(history[1]).ino);
   const job = restored.db
     .prepare(
-      "SELECT operation_id,markdown,status FROM memory_jobs WHERE operation_id=?",
+      "SELECT operation_id,markdown,status,error_code FROM memory_jobs WHERE operation_id=?",
     )
     .get(second.operation_id)!;
-  assert.equal(job.status, "PENDING");
+  assert.equal(job.status, "CONFLICT");
+  assert.equal(job.error_code, "RESTORE_PUBLICATION_UNCERTAIN");
   assert.equal(job.markdown, second.markdown);
   assert.equal(job.operation_id, second.operation_id);
   assert.equal(
     restored.db.prepare("SELECT count(*) AS n FROM memory_reviews").get()!.n,
-    2,
+    3,
   );
   assert.equal(
     restored.db.prepare("SELECT count(*) AS n FROM memory_receipts").get()!.n,
@@ -204,17 +214,23 @@ test("MEM-1 backup binds immutable note revisions, pending jobs, reviews and att
   );
   assert.equal(
     readFileSync(
-      join(destination, "restored-vault", String(second.relative_path)),
+      join(destination, "restored-vault", String(third.relative_path)),
       "utf8",
     ),
-    second.markdown,
+    third.markdown,
+  );
+  assert.equal(
+    existsSync(
+      join(destination, "restored-vault", String(second.relative_path)),
+    ),
+    false,
   );
   assert.equal(existsSync(join(vault, String(second.relative_path))), false);
-  assert.equal(f.provider.calls.length, 2);
+  assert.equal(f.provider.calls.length, 3);
 
   const next = join(parent, "tampered-restore");
   writeFileSync(
-    join(backup, "memory-versions", manifest.memory.versions[0].digest + ".md"),
+    join(backup, "memory-versions", String(first.file_digest) + ".md"),
     "altered historical bytes",
   );
   await assert.rejects(

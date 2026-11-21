@@ -432,3 +432,110 @@ test("memory HTTP isolates owner rows, direct ID lookups and original private ma
     !JSON.stringify(conflicts.data).includes(String(hidden.candidate_id)),
   );
 });
+
+test("memory change API resets a still-visible checkpoint on gain and loss of private access", async (t) => {
+  const f = await fixture(t);
+  await f.login();
+  const { actor, policy, app, repository } = f;
+  const room = repository.createRoom(actor, { title: "Synthetic feed" });
+  const persona = repository.createPersona(actor, room.id, {
+    name: "Owner",
+    model: "synthetic",
+  });
+  const secondRoom = repository.createRoom(actor, {
+    title: "Second synthetic feed",
+  });
+  const scope = (visibility: string) => ({
+    roomId: room.id,
+    personaId: persona.id,
+    visibility,
+  });
+  const source = (roomId: string, after?: string) =>
+    f.request(
+      `/rooms/${roomId}/memory/changes` +
+        (after === undefined ? "" : "?after=" + encodeURIComponent(after)),
+    );
+  for (const [noteId, visibility] of [
+    ["earlier-private", "persona_private"],
+    ["later-shared", "room_shared"],
+  ]) {
+    app.transaction(() => {
+      const digest = "e".repeat(64),
+        path = noteId + ".md";
+      app.db
+        .prepare(
+          `INSERT INTO memory_documents(note_id,workspace_id,room_id,owner_persona_id,scope,
+        state,relative_path,version,digest,body_digest,trusted) VALUES(?,?,?,?,?,'PUBLISHED',?,1,?,?,0)`,
+        )
+        .run(
+          noteId,
+          actor.workspaceId,
+          room.id,
+          persona.id,
+          visibility,
+          path,
+          digest,
+          digest,
+        );
+      app.db
+        .prepare("INSERT INTO memory_versions VALUES(?,1,?,?,?,1)")
+        .run(noteId, digest, digest, path);
+    });
+  }
+  policy.grant(
+    actor.actorId,
+    actor.workspaceId,
+    "READ_MEMORY",
+    scope("room_shared"),
+  );
+  const original = (await source(room.id)).data;
+  assert.deepEqual(
+    original.items.map((x: any) => x.noteId),
+    ["later-shared"],
+  );
+  assert.equal(original.mode, "baseline");
+  assert.equal(original.hasMore, false);
+  async function expectReset(roomId: string, cursor: string) {
+    const response = await source(roomId, cursor);
+    assert.equal(response.response.status, 409);
+    assert.deepEqual(response.data, {
+      error: { code: "MEMORY_RESYNC_REQUIRED" },
+    });
+  }
+  await expectReset(room.id, original.items[0].changeId); // pre-audit plain change ID
+  await expectReset(room.id, "m1." + "A".repeat(60));
+  await expectReset(secondRoom.id, original.cursor);
+  policy.grant(
+    actor.actorId,
+    actor.workspaceId,
+    "READ_MEMORY",
+    scope("persona_private"),
+  );
+  await expectReset(room.id, original.cursor);
+  const gained = (await source(room.id)).data;
+  assert.deepEqual(
+    gained.items.map((x: any) => x.noteId),
+    ["earlier-private", "later-shared"],
+  );
+  assert.deepEqual((await source(room.id, gained.cursor)).data.items, []);
+  policy.revoke(actor.actorId, actor.workspaceId, "READ_MEMORY");
+  policy.grant(
+    actor.actorId,
+    actor.workspaceId,
+    "READ_MEMORY",
+    scope("room_shared"),
+  );
+  await expectReset(room.id, gained.cursor);
+  // Simulate replacement of the old projection, including removal of disappeared scopes.
+  const replacement = (await source(room.id)).data;
+  assert.equal(replacement.mode, "baseline");
+  assert.deepEqual(
+    replacement.items.map((x: any) => x.noteId),
+    ["later-shared"],
+  );
+  assert.ok(!JSON.stringify(replacement).includes("earlier-private"));
+  policy.revoke(actor.actorId, actor.workspaceId, "READ_ROOM");
+  assert.deepEqual((await source(room.id, replacement.cursor)).data, {
+    error: { code: "FORBIDDEN" },
+  });
+});

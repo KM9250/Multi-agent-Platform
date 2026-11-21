@@ -1,4 +1,5 @@
 import {
+  type BigIntStats,
   closeSync,
   constants as C,
   existsSync,
@@ -289,14 +290,18 @@ export function readVaultFile(app: AppDatabase, relativePath: string): Buffer {
     return result;
   });
 }
-function withVersions<T>(app: AppDatabase, fn: (fd: number) => T): T {
+function withPrivateDirectory<T>(
+  app: AppDatabase,
+  name: "memory-versions" | "memory-publication-state",
+  fn: (fd: number) => T,
+): T {
   const root = absoluteDir(app.root);
   try {
-    const versions = ensureDirectory(root, "memory-versions");
+    const directory = ensureDirectory(root, name);
     try {
-      return fn(versions);
+      return fn(directory);
     } finally {
-      closeSync(versions);
+      closeSync(directory);
     }
   } finally {
     closeSync(root);
@@ -304,7 +309,7 @@ function withVersions<T>(app: AppDatabase, fn: (fd: number) => T): T {
 }
 export function readVersion(app: AppDatabase, fileDigest: string): Buffer {
   if (!hash.test(fileDigest)) fail("INVALID_VERSION");
-  return withVersions(app, (fd) => {
+  return withPrivateDirectory(app, "memory-versions", (fd) => {
     const bytes = readBounded(join(pinned(fd), fileDigest + ".md"));
     if (digest(bytes) !== fileDigest) fail("VERSION_INTEGRITY");
     return bytes;
@@ -313,7 +318,7 @@ export function readVersion(app: AppDatabase, fileDigest: string): Buffer {
 export function saveVersion(app: AppDatabase, bytes: Buffer): string {
   if (bytes.length > MAX_NOTE_BYTES) fail("NOTE_TOO_LARGE");
   const key = digest(bytes);
-  return withVersions(app, (fd) => {
+  return withPrivateDirectory(app, "memory-versions", (fd) => {
     const path = join(pinned(fd), key + ".md");
     if (!statOrNull(path)) {
       // Private content-addressed area. A complete staged inode is installed before a DB reference exists.
@@ -420,63 +425,140 @@ function stagedFile<T>(
 function statOrNull(path: string) {
   return lstatSync(path, { bigint: true, throwIfNoEntry: false });
 }
-/** Complete and fsync an independent editable inode before marking the job PUBLISHING. */
+// This lineage record lives under the protected app root. It binds a single editable inode
+// to the frozen operation. The ctime changes during link/unlink; birth time stays stable.
+function lineage(job: FrozenJob, st: BigIntStats | undefined): string {
+  if (!st?.isFile() || st.birthtimeNs <= 0n) fail("PUBLICATION_CONFLICT");
+  return JSON.stringify([
+    job.operation_id,
+    job.note_id,
+    job.relative_path,
+    job.file_digest,
+    String(st.dev),
+    String(st.ino),
+    String(st.birthtimeNs),
+  ]);
+}
+function saveEvidence(dir: number, path: string, record: string): void {
+  const temp = join(pinned(dir), randomUUID() + ".tmp");
+  const fd = openSync(temp, "wx", 0o400);
+  try {
+    writeFileSync(fd, record);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  // Serialized by the SQLite writer. Rename only in the private control directory.
+  renameSync(temp, path);
+  fsyncSync(dir);
+}
+function witnessPaths(dir: number, job: FrozenJob) {
+  const file = join(pinned(dir), job.operation_id);
+  return { ready: file + ".ready", attempt: file + ".attempt" };
+}
+function verifyEvidence(
+  path: string,
+  job: FrozenJob,
+  st: BigIntStats | undefined,
+): void {
+  if (readBounded(path).toString("utf8") !== lineage(job, st))
+    fail("PUBLICATION_CONFLICT");
+}
+
+/** Only a PENDING job can mint a ready witness, before its PUBLISHING state commits. */
 export function prepareFrozen(app: AppDatabase, job: FrozenJob): void {
   const expected = verifyFrozen(job);
-  stagedFile(app, job, (_root, dir, stage) => {
-    if (!statOrNull(stage)) {
-      // Serialized private staging. A crash during write leaves a scratch inode, never a partial stage/target.
-      const temp = join(pinned(dir), randomUUID() + ".tmp");
-      const handle = openSync(temp, "wx", 0o600);
-      try {
-        writeFileSync(handle, expected);
-        fsyncSync(handle);
-      } finally {
-        closeSync(handle);
+  stagedFile(app, job, (_root, dir, stage) =>
+    withPrivateDirectory(app, "memory-publication-state", (control) => {
+      const { ready, attempt } = witnessPaths(control, job);
+      if (statOrNull(attempt)) fail("PUBLICATION_CONFLICT");
+      const previous = statOrNull(ready);
+      if (previous) verifyEvidence(ready, job, statOrNull(stage));
+      if (!statOrNull(stage)) {
+        const temp = join(pinned(dir), randomUUID() + ".tmp");
+        const handle = openSync(temp, "wx", 0o600);
+        try {
+          writeFileSync(handle, expected);
+          fsyncSync(handle);
+        } finally {
+          closeSync(handle);
+        }
+        renameSync(temp, stage);
       }
-      renameSync(temp, stage);
       fsyncSync(dir);
-    }
-    if (!readBounded(stage).equals(expected)) fail("PUBLICATION_CONFLICT");
-  });
+      const identity = lineage(job, statOrNull(stage));
+      if (
+        !readBounded(stage).equals(expected) ||
+        identity !== lineage(job, statOrNull(stage))
+      )
+        fail("PUBLICATION_CONFLICT");
+      if (!previous) saveEvidence(control, ready, identity);
+    }),
+  );
 }
-// This is the sole write to an editable note. The destination must not already exist.
+
+/** An attempt may have been operator-visible even when both content and link count look pristine.
+ * Consume the ready witness durably BEFORE link(). Recovery with an attempted witness can only
+ * inspect a surviving target. No retry interprets a missing target as permission to create it. */
 export function publishFrozen(
   app: AppDatabase,
   job: FrozenJob,
-  hooks?: { afterLink?: () => void },
-): void {
+  hooks?: {
+    beforeLink?: () => void;
+    afterLink?: () => void;
+    beforeReceipt?: () => void;
+  },
+): Buffer {
   const expected = verifyFrozen(job);
-  stagedFile(app, job, (root, dir, stage) => {
-    const target = join(pinned(root), job.relative_path);
-    let dest = statOrNull(target);
-    if (!dest) {
-      // A consumed stage is evidence the file was published (then moved/deleted). Never recreate it.
-      if (!statOrNull(stage) || !readBounded(stage).equals(expected))
-        fail("PUBLICATION_CONFLICT");
-      try {
-        linkSync(stage, target);
+  return stagedFile(app, job, (root, dir, stage) =>
+    withPrivateDirectory(app, "memory-publication-state", (control) => {
+      const { ready, attempt } = witnessPaths(control, job);
+      const target = join(pinned(root), job.relative_path);
+      let dest = statOrNull(target);
+      const staged = statOrNull(stage);
+      if (statOrNull(ready)) {
+        if (statOrNull(attempt) || dest || staged?.nlink !== 1n)
+          fail("PUBLICATION_CONFLICT");
+        verifyEvidence(ready, job, staged);
+        if (!readBounded(stage).equals(expected)) fail("PUBLICATION_CONFLICT");
+        renameSync(ready, attempt);
+        fsyncSync(control);
+        hooks?.beforeLink?.();
+        linkSync(stage, target); // EEXIST is terminal; another writer won this name.
         hooks?.afterLink?.();
-      } catch (e) {
-        if (!errorIs(e, "EEXIST")) throw e;
+        dest = statOrNull(target);
+      } else if (!statOrNull(attempt)) {
+        // Legacy PUBLISHING jobs have no pre-link witness. A lone stage (even nlink==1)
+        // cannot distinguish never-linked from linked-then-deleted. Only a surviving
+        // exact stage/destination pair proves the original editable inode.
+        if (
+          !staged?.isFile() ||
+          !dest?.isFile() ||
+          dest.nlink !== 2n ||
+          dest.dev !== staged.dev ||
+          dest.ino !== staged.ino
+        )
+          fail("PUBLICATION_CONFLICT");
+        saveEvidence(control, attempt, lineage(job, staged));
       }
-      dest = statOrNull(target);
-    }
-    // Recover a crash between exclusive link and removal of the staging link.
-    const staged = statOrNull(stage);
-    if (
-      staged &&
-      dest?.isFile() &&
-      dest.nlink === 2n &&
-      staged.ino === dest.ino &&
-      staged.dev === dest.dev
-    ) {
+      verifyEvidence(attempt, job, dest);
+      if (staged) {
+        if (
+          dest.nlink !== 2n ||
+          dest.dev !== staged.dev ||
+          dest.ino !== staged.ino
+        )
+          fail("PUBLICATION_CONFLICT");
+        fsyncSync(root);
+        unlinkSync(stage);
+        fsyncSync(dir);
+      }
+      hooks?.beforeReceipt?.();
+      const bytes = readVaultFile(app, job.relative_path);
+      verifyEvidence(attempt, job, statOrNull(target));
+      if (!bytes.equals(expected)) fail("PUBLICATION_CONFLICT");
       fsyncSync(root);
-      unlinkSync(stage);
-      fsyncSync(dir);
-    }
-    if (!dest || !dest.isFile() || !readBounded(target).equals(expected))
-      fail("PUBLICATION_CONFLICT");
-    fsyncSync(root);
-  });
+      return bytes;
+    }),
+  );
 }

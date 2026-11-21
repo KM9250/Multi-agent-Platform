@@ -69,19 +69,24 @@ async function killAt(root: string, boundary: string, roomId = "", runId = "") {
   }
 }
 
-for (const migration of ["migration", "app_002_memory_vault"])
+for (const migration of [
+  "migration",
+  "app_002_memory_vault",
+  "app_003_memory_integrity",
+])
   for (const when of ["before", "after"])
     test(`C1-08: real SIGKILL ${when} ${migration} COMMIT recovers schema exactly once`, async (t) => {
       const root = mkdtempSync(join(tmpdir(), "map-migration-crash-"));
       chmodSync(root, 0o700);
       t.after(() => rmSync(root, { recursive: true, force: true }));
       await killAt(root, `${migration}:${when}`);
-      if (migration === "app_002_memory_vault") {
+      if (migration !== "migration") {
         const beforeRestart = new DatabaseSync(join(root, "app-data.sqlite"), {
           readOnly: true,
         });
         try {
-          const expectedVersion = when === "before" ? 1 : 2;
+          const target = migration === "app_002_memory_vault" ? 2 : 3;
+          const expectedVersion = when === "before" ? target - 1 : target;
           assert.equal(
             beforeRestart
               .prepare("SELECT schema_version FROM app_metadata")
@@ -100,7 +105,15 @@ for (const migration of ["migration", "app_002_memory_vault"])
                 "SELECT count(*) AS n FROM sqlite_schema WHERE name='memory_candidates'",
               )
               .get()!.n,
-            expectedVersion - 1,
+            Number(expectedVersion >= 2),
+          );
+          assert.equal(
+            beforeRestart
+              .prepare(
+                "SELECT count(*) AS n FROM sqlite_schema WHERE name='memory_receipt_source'",
+              )
+              .get()!.n,
+            Number(expectedVersion >= 3),
           );
         } finally {
           beforeRestart.close();
@@ -113,7 +126,11 @@ for (const migration of ["migration", "app_002_memory_vault"])
           .prepare("SELECT name FROM app_migrations ORDER BY version")
           .all()
           .map((row) => row.name),
-        ["app_001_conversation_persistence", "app_002_memory_vault"],
+        [
+          "app_001_conversation_persistence",
+          "app_002_memory_vault",
+          "app_003_memory_integrity",
+        ],
       );
       assert.deepEqual(app.db.prepare("PRAGMA foreign_key_check").all(), []);
     });
