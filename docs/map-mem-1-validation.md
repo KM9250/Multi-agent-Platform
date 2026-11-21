@@ -2,7 +2,7 @@
 
 対象は `KM9250/Multi-agent-Platform`、基準mainは `2309d5e4b30f3eabb60ead959e16611b2ae50cfb`（PR #38）。開始時のリモートmainと一致し、全履歴を取得した。提出ブランチは `codex/map-mem-1-vault`。対象OSはLinux x86_64、kernel 6.18.57、検証用ファイルシステムはoverlayfs、Node.js 24.22.3、npm 11.19.1、SQLite 3.54.1。試験データは一時Root内の合成会話、アカウント、添付、Vaultに限定した。
 
-今回の再監査対象と結果は [F-01〜F-05の修正と回帰試験](#pr39-reaudit) にまとめた。
+再監査の対象コミットと検証結果は [F-06・F-07](#pr39-f06-f07) および [F-01〜F-05](#pr39-reaudit) に記録した。
 
 ## 初回監査時の結果
 
@@ -106,6 +106,74 @@ node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-
 F-03については、同じ修正コミットの初回リンク直後の強制終了試験に、復旧完了後もう一度新しいWorkerプロセスを起動する操作を加えて別途確認した。削除・改名・内容の異なる置換・同一内容への差し替えの4条件で、2回目の再起動後のVault内全Markdown名が利用者の操作結果と一致し、成功Receiptは0件だった。
 
 Chromium 156のMEM-1試験では合成Providerの送信1回、公開Receipt 2件を観測し、外部保存直後の古い撤回への409、新版・削除確認後の撤回、リロード時の版履歴を実画面で検証した。DATA-1のブラウザー試験は、実セッションCookie、添付・会話の保存と再読込、訂正履歴、権限失効時のキャッシュ破棄、外部通信0件を確認した。
+
+<a id="pr39-f06-f07"></a>
+
+## PR #39 再監査　F-06・F-07
+
+検証日 2026-11-22（日本時間）。監査基準は `3370f59f60a4131676b5324a2ff4abdf714c65e3`。着手時のリモートPRのHEADと一致した。以下の修正前の結果は、このコミットと `b98241429466f1ad6406288c1f0ad724bafe6115` のコードを別チェックアウトで動かした観測である。実装・回帰試験の対象コミットは `f375ac1c53bf20df79c99072ed8bbad0e20e1ee8`。Node.js 24.22.3、SQLite 3.54.1、Linux／overlayfs、一時DB・Vault、合成Providerを使用した。
+
+### F-06　長い履歴の検証と既存の公開版
+
+| 条件 | 修正前 | 修正後 |
+| --- | --- | --- |
+| 既定の履歴窓50件・先頭固定、通常会話180往復の後に初回の `/memory` | 直近50件で生成が確定したが候補は最初から `NEEDS_REVIEW`。承認は `REVISION_CONFLICT` | 181個の生成manifest、延べ16,850参照を検証した。検証中は `LINEAGE_PENDING`、完了後は通常のレビュー・承認を経て `PUBLISHED` となり、現在版の本文を取得できた。 |
+| 履歴窓2件、通常会話260往復の後に初回の `/memory` | 261個の生成Receiptと候補1件を保存したが、同じ状態と承認エラーになった | 261個のmanifest、延べ1,042参照を検証して公開できた。1回の処理の観測最大値は、180往復で4 Call／400参照、260往復で4 Call／16参照だった。 |
+| 旧Schema 2で180往復後に承認・公開 | `3370f59` で開くと、健全な公開版と取込済みの人手編集第2版がともに `NEEDS_REVIEW` となり、通常取得は `MEMORY_UNAVAILABLE` | **Schema 2から直接更新した場合、Schema 3で上限に達した後で更新した場合とも、同じNote ID・版・digestで現在の本文を通常取得できた。** 未承認だった健全な候補は `PENDING_REVIEW` に戻った。 |
+| 出所の訂正・削除・閲覧権の撤回、記憶の撤回、未取込の外部編集 | 合格済みのF-01で検証した元発言の訂正に加え、長い履歴の途中での変更を試験 | 確認済みの親に対する訂正も、まだ到達していない古い資料の訂正・削除・撤回後の再付与も公開を阻止した。公開後、先頭固定にも直近の窓にも含まれない元発言を訂正すると、依存するノートは通常取得不能となり、同じRoomの独立したノートは引き続き読めた。 |
+
+SQLiteに**永続的な作業キュー**を持ち、候補ごとに未検証のCallを一意に登録する。1回の検証で採用した版・認可、検証済みCallと次に読むCallを同じトランザクションで確定する。複数候補が待つ場合は順番を回す。旧上限は旧DBで保留された理由を判別する際に使う。各回の間で停止・再開できるので、Room全体への累積上限は必要ない。再開時は同じ検証を続け、Provider送信・候補登録・公開操作を増やさない。
+
+旧DBの試験では、同じSchema 2の閉じたDBから直接更新とSchema 3経由の更新を分岐させた。さらに検証途中でのApp再起動と別RootへのBackup／Restoreを実施した。どの経路でも187件の生成Callと生成Receipt、6件の公開Receipt、7件の保存版、元の承認と凍結済みJobを照合した。人が取り込んだ第2版を保持し、撤回済みの記憶、訂正に依存する記憶、閲覧権を失って再付与された記憶を通常取得から外した。外部で変更された未取込ファイルは元のVaultに保存され、復元先で旧本文として再作成されなかった。
+
+主な実装は `server/memory/lineage.ts`、`lineage-work-schema.ts`、`lineage-recovery.ts`、`server/app-data/db.ts`、`server/operations/backup.ts`。実データで回復の証拠が揃わない場合の確認と再提案の手順を運用文書に記載した。[依存検証・旧DBの回復条件](map-mem-1.md#旧dbの保留と回復)
+
+### F-07　生成に使用した権限と撤回範囲
+
+各条件でprivate原文を実際に使う1件目の候補を公開し、2件目のmanifestに1件目の出力が含まれることを確認した。
+
+| 2回の生成間の操作 | 修正前の2件目 | 修正後の1件目／2件目 |
+| --- | --- | --- |
+| 変更なし | 承認・公開成功 | 公開維持／承認・公開成功 |
+| `MANAGE_VAULT` だけを撤回 | `NEEDS_REVIEW`、公開Job 0件 | 公開維持／承認・公開成功 |
+| 使用した `READ_PRIVATE_SEGMENT` を撤回後に再付与 | 保留 | 旧版は要再確認のまま／2件目も要再確認、公開Job 0件 |
+| 全権限を撤回し、操作に必要な権限を再付与 | 保留 | 旧承認は失効したまま／2件目も要再確認、公開Job 0件 |
+
+新しい撤回は**トランザクション内の監査記録**として残す。付与されていた各grantから操作・Room・Persona・Provider・可視範囲を記録し、生成CallのACL revision以降に該当する撤回を照合する。1つの操作に複数のScopeが付いていた例、該当0件、全件撤回、途中失敗時のロールバックを確認した。無関係なActor・Room・Personaの公開ノートは読み続けられた。範囲を確定できない旧Schema 3の撤回記録は移行後・再付与後も保留となり、古い生成出力からの再公開も成立しなかった。F-05の差分カーソルはWorkspaceのACL版変更時に再同期を要求する。
+
+主な実装は `server/auth/authorization.ts`、`revocations.ts`、`sessions.ts` と各Callの検証処理。権限名の一致に加え、付与範囲と、その資料を読むための権限を照合する理由は運用文書に記載した。[撤回された権限の照合](map-mem-1.md#撤回された権限の照合)
+
+### 再実行する試験
+
+| 指摘 | 試験ファイルとケース名 |
+| --- | --- |
+| F-06 長いRoom・停止再開 | `test/app-memory-long-room.test.ts` の `PR39 F-06 first live /memory after default 50-message history with first-message pinning` と `… after two-message history with over 256 producer calls`。1回分をコミットした実子プロセスをSIGKILLし、同じDBで再開する。検証中の訂正・削除・権限撤回を含む。 |
+| F-06 既存DB・通常起動 | `test/memory-long-lineage-migration.test.ts` の `F-06: real schema 2 approvals survive direct upgrade and recover after schema 3 false holds, restart and detached restore`。 `test/app-memory-lineage-host.test.ts` の `PR39 F-06 normal Host advances persisted source checks, stops cleanly and resumes queued work`。 |
+| F-06 競合と順序 | `test/memory-lineage-vault-ambiguity.test.ts` で検証途中に走査・Backupが検出した重複IDの保留を確認。 `test/app-memory-lineage.test.ts` で、後から到着した候補が処理待ちの候補を追い越し続けないことと、検証済みの資料の訂正を確認。 |
+| F-07 撤回・移行 | `test/app-memory-revocation.test.ts` の `PR39 F-07 real generation and approval with …` 4条件と `PR39 F-07 an operation revoke records each affected grant atomically with memory invalidation and preserves scope boundaries`。 `test/memory-revocation-migration.test.ts` の `PR39 F-07 schema 3 revocation with no exact grant evidence remains held across migration, regrant and new generation`。 |
+
+### 修正コミットの検証結果
+
+| 条件 | 成功 / 失敗 / Skip | 経過時間 |
+| --- | ---: | ---: |
+| 追加試験と直接関連する回帰（下記8ファイル、並列度1） | 31 / 0 / 0 | 128秒 |
+| `npm run test:memory`（並列度2、F-01〜F-07を含む） | 83 / 0 / 0 | 113秒 |
+| `npm test`（既定の並列度2で単独実行） | 2,219 / 0 / 0 | 523秒 |
+| `npm run typecheck` | 成功 | 9秒 |
+| `npm run build` | 成功 | 3秒 |
+| `npm run test:memory-browser` | 成功 | 22秒 |
+| `npm run test:app-data-browser` | 成功 | 17秒 |
+| `git diff --check 3370f59 HEAD` | 成功 | 0秒 |
+| `git diff --check` | 成功 | 0秒 |
+
+対象の直列実行コマンドは以下のとおり。スイート間で重複する試験がある。MEM-1のブラウザー試験では合成Provider 1回・公開Receipt 2件、DATA-1のブラウザー試験ではセッション失効、リロード後の永続化、外部通信0件を確認した。
+
+```bash
+node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=1 \
+  test/app-memory-long-room.test.ts test/app-memory-lineage.test.ts test/app-memory-lineage-host.test.ts \
+  test/memory-long-lineage-migration.test.ts test/memory-lineage-vault-ambiguity.test.ts \
+  test/app-memory-revocation.test.ts test/memory-revocation-migration.test.ts test/app-data-auth.test.ts
+```
 
 ## 最終確認へ引き継ぐ項目
 
