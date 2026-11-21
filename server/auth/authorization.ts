@@ -13,10 +13,10 @@ export interface ResourceScope {
   provider?: string;
   visibility?: string;
 }
-export const APP_OPERATIONS = [
+// Account creation and DATA-1 migrations must never implicitly grant future capabilities.
+export const PUBLIC_USER_OPERATIONS = [
   "READ_ROOM",
   "READ_CONVERSATION",
-  "READ_PRIVATE_SEGMENT",
   "WRITE_MESSAGE",
   "EDIT_ROOM",
   "EDIT_PERSONA",
@@ -27,13 +27,36 @@ export const APP_OPERATIONS = [
   "READ_ATTACHMENT",
   "IMPORT_DATA",
   "EXPORT_DATA",
+] as const;
+const SCOPED_MEMORY_OPERATIONS: ReadonlySet<string> = new Set([
+  "READ_MEMORY",
+  "PROPOSE_MEMORY",
+  "EDIT_MEMORY",
+  "REVIEW_MEMORY",
+  "PUBLISH_MEMORY",
+  "CHANGE_MEMORY_SCOPE",
+  "RETRACT_MEMORY",
+]);
+export const APP_OPERATIONS = [
+  ...PUBLIC_USER_OPERATIONS,
+  "READ_PRIVATE_SEGMENT",
   "BACKUP_DATA",
   "RESTORE_BACKUP",
-] as const;
-export const PUBLIC_USER_OPERATIONS = APP_OPERATIONS.filter(
-  (op) =>
-    !["READ_PRIVATE_SEGMENT", "BACKUP_DATA", "RESTORE_BACKUP"].includes(op),
-);
+  ...SCOPED_MEMORY_OPERATIONS,
+  "MANAGE_VAULT",
+];
+function hasMemoryScope(scope: ResourceScope): boolean {
+  return (
+    typeof scope.roomId === "string" &&
+    !!scope.roomId &&
+    scope.roomId !== "*" &&
+    typeof scope.personaId === "string" &&
+    !!scope.personaId &&
+    scope.personaId !== "*" &&
+    (scope.visibility === "persona_private" ||
+      scope.visibility === "room_shared")
+  );
+}
 export class AuthError extends Error {
   readonly code: string;
   readonly status: number;
@@ -133,10 +156,13 @@ export class AuthorizationPolicy {
     const privateRead = operation === "READ_PRIVATE_SEGMENT";
     if (privateRead && (!scope.personaId || !scope.visibility || !scope.roomId))
       throw new AuthError();
+    const memoryOperation = SCOPED_MEMORY_OPERATIONS.has(operation);
+    if (memoryOperation && !hasMemoryScope(scope)) throw new AuthError();
+    const exactScope = privateRead || memoryOperation;
     const row = this.app.db
       .prepare(
         `SELECT 1 FROM access_grants WHERE workspace_id=? AND actor_id=? AND operation=? AND revoked_at IS NULL
-      AND ${privateRead ? "room_id=? AND persona_id=? AND visibility=?" : "(room_id='*' OR room_id=?) AND (persona_id='*' OR persona_id=?) AND (visibility='*' OR visibility=?)"}
+      AND ${exactScope ? "room_id=? AND persona_id=? AND visibility=?" : "(room_id='*' OR room_id=?) AND (persona_id='*' OR persona_id=?) AND (visibility='*' OR visibility=?)"}
       AND (provider='*' OR provider=?) LIMIT 1`,
       )
       .get(
@@ -197,6 +223,13 @@ export class AuthorizationPolicy {
     if (
       !APP_OPERATIONS.includes(operation as any) ||
       (scope.workspaceId && scope.workspaceId !== workspaceId)
+    )
+      throw new AuthError("INVALID_INPUT", 400);
+    if (SCOPED_MEMORY_OPERATIONS.has(operation) && !hasMemoryScope(scope))
+      throw new AuthError("MEMORY_GRANT_SCOPE_REQUIRED", 400);
+    if (
+      operation === "MANAGE_VAULT" &&
+      (scope.roomId || scope.personaId || scope.visibility || scope.provider)
     )
       throw new AuthError("INVALID_INPUT", 400);
     if (

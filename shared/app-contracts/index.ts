@@ -1,6 +1,7 @@
 /** Browser-safe DATA-1 wire contracts. No server dependencies or credentials. */
 export const APP_CONTRACT = "MAP-DATA-1:SERVER_CONVERSATION:1" as const;
-export const APP_SCHEMA = 1;
+export const APP_SCHEMA = 2;
+export const MEMORY_CONTRACT = "MAP-MEM-1:MEMORY_VAULT:1" as const;
 export const APP_LIMITS = Object.freeze({
   messageChars: 32768,
   configChars: 65536,

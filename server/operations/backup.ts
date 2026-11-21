@@ -5,20 +5,26 @@ import {
   lstatSync,
   mkdirSync,
   readdirSync,
-  readFileSync,
-  writeFileSync,
 } from "node:fs";
-import { copyFile, open, rename, unlink } from "node:fs/promises";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { open, unlink } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomBytes } from "node:crypto";
-import { AppDatabase, assertSafePath } from "../app-data/db.ts";
+import {
+  AppDatabase,
+  assertSafePath,
+  identifyAppSchema,
+} from "../app-data/db.ts";
 import { canonical } from "../app-data/validation.ts";
-import { APP_CONTRACT } from "../../shared/app-contracts/index.ts";
+import {
+  APP_CONTRACT,
+  MEMORY_CONTRACT,
+} from "../../shared/app-contracts/index.ts";
 import { hash, json, OperationError } from "./legacy.ts";
 import { acquireHostLock } from "./locks.ts";
+import { MAX_NOTE_BYTES, validVaultPath } from "../memory/vault.ts";
+import { parseMemoryMarkdown } from "../memory/markdown.ts";
 
-type Row = Record<string, any>;
 type BackupAttachment = {
   workspaceId: string;
   roomId: string;
@@ -28,10 +34,23 @@ type BackupAttachment = {
   size: number;
   state: string;
 };
-export type BackupManifest = {
-  schema: "MAP-DATA-1:BACKUP:1";
+type MemorySnapshot = {
+  contract: typeof MEMORY_CONTRACT;
+  recordsDigest: string;
+  versions: {
+    noteId: string;
+    revision: number;
+    digest: string;
+    bodyDigest: string;
+  }[];
+  current: { noteId: string; revision: number; digest: string; path: string }[];
+  registered: boolean;
+};
+export type BackupManifest = (
+  | { schema: "MAP-DATA-1:BACKUP:1"; appSchema: 1 }
+  | { schema: "MAP-MEM-1:BACKUP:2"; appSchema: 2; memory: MemorySnapshot }
+) & {
   contract: string;
-  appSchema: 1;
   createdAt: number;
   database: { file: "app-data.sqlite"; digest: string; size: number };
   attachments: BackupAttachment[];
@@ -43,6 +62,17 @@ export type BackupManifest = {
   restoreTested: false;
 };
 const pause = () => new Promise<void>((resolve) => setImmediate(resolve));
+async function syncDirectory(path: string): Promise<void> {
+  const directory = await open(
+    path,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
 function safeEmptyRoot(path: string): string {
   if (!isAbsolute(path))
     throw new OperationError("ABSOLUTE_DESTINATION_REQUIRED");
@@ -132,7 +162,7 @@ async function safeCopy(
     await output?.close();
   }
 }
-function integrity(db: DatabaseSync): void {
+function integrity(db: DatabaseSync): 1 | 2 {
   const result = db.prepare("PRAGMA integrity_check").all();
   if (
     result.length !== 1 ||
@@ -140,22 +170,11 @@ function integrity(db: DatabaseSync): void {
     db.prepare("PRAGMA foreign_key_check").all().length
   )
     throw new OperationError("BACKUP_INTEGRITY_FAILED", 409);
-  const metadata = db
-    .prepare(
-      "SELECT contract,schema_version FROM app_metadata WHERE singleton=1",
-    )
-    .get();
-  if (metadata?.contract !== APP_CONTRACT || metadata.schema_version !== 1)
+  try {
+    return identifyAppSchema(db);
+  } catch {
     throw new OperationError("BACKUP_SCHEMA_INVALID", 409);
-  const migrations = db
-    .prepare("SELECT version,name FROM app_migrations ORDER BY version")
-    .all();
-  if (
-    migrations.length !== 1 ||
-    migrations[0].version !== 1 ||
-    migrations[0].name !== "app_001_conversation_persistence"
-  )
-    throw new OperationError("BACKUP_SCHEMA_INVALID", 409);
+  }
 }
 async function semanticIntegrity(db: DatabaseSync): Promise<void> {
   let checked = 0;
@@ -274,6 +293,203 @@ async function orderedDigest(db: DatabaseSync, sql: string): Promise<string> {
   digest.update("]");
   return digest.digest("hex");
 }
+function versionPath(root: string, digest: string): string {
+  if (!/^[a-f0-9]{64}$/.test(digest))
+    throw new OperationError("BACKUP_MEMORY_VERSION_INVALID", 409);
+  return join(root, "memory-versions", digest + ".md");
+}
+// Paths are untrusted even inside a correctly hashed backup. Restore writes
+// exclusively into a fresh private tree and never opens the source Vault.
+function restoredNotePath(vault: string, relative: string): string {
+  if (!validVaultPath(relative) || !relative.toLowerCase().endsWith(".md"))
+    throw new OperationError("BACKUP_MEMORY_PATH_INVALID", 409);
+  return join(vault, ...relative.split("/"));
+}
+async function memorySnapshot(db: DatabaseSync): Promise<MemorySnapshot> {
+  const versions = db
+    .prepare(
+      "SELECT note_id,version,digest,body_digest FROM memory_versions ORDER BY note_id,version",
+    )
+    .all()
+    .map((row) => ({
+      noteId: String(row.note_id),
+      revision: Number(row.version),
+      digest: String(row.digest),
+      bodyDigest: String(row.body_digest),
+    }));
+  let inspected = 0;
+  for (const r of db
+    .prepare(
+      "SELECT body,body_digest,sources_json,sources_digest FROM memory_candidate_revisions",
+    )
+    .iterate()) {
+    if (
+      hash(String(r.body)) !== r.body_digest ||
+      hash(String(r.sources_json)) !== r.sources_digest
+    )
+      throw new OperationError("BACKUP_CONTENT_DIGEST_MISMATCH", 409);
+    if (++inspected % 64 === 0) await pause();
+  }
+  for (const job of db
+    .prepare("SELECT markdown,file_digest FROM memory_jobs")
+    .iterate()) {
+    if (hash(String(job.markdown)) !== job.file_digest)
+      throw new OperationError("BACKUP_CONTENT_DIGEST_MISMATCH", 409);
+    if (++inspected % 64 === 0) await pause();
+  }
+  const mismatch = db
+    .prepare(
+      `SELECT 1 FROM memory_documents d
+    LEFT JOIN memory_versions v ON v.note_id=d.note_id AND v.version=d.version
+    WHERE v.note_id IS NULL OR d.digest<>v.digest OR d.body_digest<>v.body_digest LIMIT 1`,
+    )
+    .get();
+  if (mismatch) throw new OperationError("BACKUP_MEMORY_VERSION_INVALID", 409);
+  const current = db
+    .prepare(
+      "SELECT note_id,version,digest,relative_path FROM memory_documents WHERE state='PUBLISHED' ORDER BY note_id",
+    )
+    .all()
+    .map((row) => ({
+      noteId: String(row.note_id),
+      revision: Number(row.version),
+      digest: String(row.digest),
+      path: String(row.relative_path),
+    }));
+  const registered = !!db
+    .prepare("SELECT 1 FROM memory_vault WHERE singleton=1")
+    .get();
+  const paths = new Set<string>();
+  for (const item of current) {
+    if (!registered || paths.has(item.path))
+      throw new OperationError("BACKUP_MEMORY_VERSION_INVALID", 409);
+    restoredNotePath("restored-vault", item.path);
+    paths.add(item.path);
+  }
+  // Bind the complete memory ledger (including approvals and frozen jobs) to
+  // the manifest. Operational root/worker settings change on restore.
+  const parts: Record<string, string> = {
+    vaultTrust: await orderedDigest(
+      db,
+      "SELECT singleton,trust_new FROM memory_vault ORDER BY singleton",
+    ),
+  };
+  for (const row of db
+    .prepare(
+      "SELECT name FROM sqlite_schema WHERE type='table' AND name GLOB 'memory_*' AND name<>'memory_vault' ORDER BY name",
+    )
+    .all()) {
+    const name = String(row.name);
+    if (!/^memory_[a-z_]+$/.test(name))
+      throw new OperationError("BACKUP_SCHEMA_INVALID", 409);
+    const keys = db
+      .prepare("SELECT name FROM pragma_table_info(?) WHERE pk>0 ORDER BY pk")
+      .all(name);
+    const order = keys
+      .map((key) => '"' + String(key.name).replaceAll('"', '""') + '"')
+      .join(",");
+    parts[name] = await orderedDigest(
+      db,
+      `SELECT * FROM ${name} ORDER BY ${order || "rowid"}`,
+    );
+  }
+  return {
+    contract: MEMORY_CONTRACT,
+    registered,
+    versions,
+    current,
+    recordsDigest: hash(json(parts)),
+  };
+}
+async function verifyVersions(
+  root: string,
+  memory: MemorySnapshot,
+): Promise<void> {
+  for (const version of memory.versions) {
+    const path = versionPath(root, version.digest);
+    assertSafePath(path, "file");
+    const file = await open(
+      path,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    try {
+      const before = await file.stat();
+      if (
+        !before.isFile() ||
+        before.nlink !== 1 ||
+        before.size > MAX_NOTE_BYTES
+      )
+        throw new OperationError("BACKUP_MEMORY_VERSION_INVALID", 409);
+      const bytes = Buffer.alloc(before.size);
+      let offset = 0;
+      while (offset < bytes.length) {
+        const { bytesRead } = await file.read(
+          bytes,
+          offset,
+          bytes.length - offset,
+          null,
+        );
+        if (!bytesRead)
+          throw new OperationError("BACKUP_MEMORY_DIGEST_MISMATCH", 409);
+        offset += bytesRead;
+      }
+      if (
+        (await file.stat()).size !== bytes.length ||
+        hash(bytes) !== version.digest
+      )
+        throw new OperationError("BACKUP_MEMORY_DIGEST_MISMATCH", 409);
+      const parsed = parseMemoryMarkdown(bytes);
+      if (
+        parsed.noteId !== version.noteId ||
+        hash(parsed.body) !== version.bodyDigest
+      )
+        throw new OperationError("BACKUP_MEMORY_VERSION_INVALID", 409);
+    } finally {
+      await file.close();
+    }
+  }
+}
+async function copyVersions(
+  source: string,
+  target: string,
+  memory: MemorySnapshot,
+): Promise<void> {
+  mkdirSync(join(target, "memory-versions"), { mode: 0o700 });
+  for (const digest of new Set(memory.versions.map((entry) => entry.digest))) {
+    if (
+      (await safeCopy(versionPath(source, digest), versionPath(target, digest)))
+        .digest !== digest
+    )
+      throw new OperationError("BACKUP_MEMORY_DIGEST_MISMATCH", 409);
+  }
+  await syncDirectory(join(target, "memory-versions"));
+}
+async function restoreVault(
+  destination: string,
+  memory: MemorySnapshot,
+): Promise<void> {
+  // Only finalized snapshot references can create a live file in the new Vault.
+  if (!memory.registered) return;
+  const vault = join(destination, "restored-vault");
+  mkdirSync(vault, { mode: 0o700 });
+  const directories = new Set([vault]);
+  for (const note of memory.current) {
+    const path = restoredNotePath(vault, note.path);
+    assertSafePath(dirname(path), "directory");
+    for (let parent = dirname(path); parent !== vault; parent = dirname(parent))
+      directories.add(parent);
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    if (
+      (await safeCopy(versionPath(destination, note.digest), path)).digest !==
+      note.digest
+    )
+      throw new OperationError("BACKUP_MEMORY_DIGEST_MISMATCH", 409);
+  }
+  for (const directory of Array.from(directories).sort(
+    (a, b) => b.length - a.length,
+  ))
+    await syncDirectory(directory);
+}
 async function describe(db: DatabaseSync) {
   const referencesDigest = await orderedDigest(
     db,
@@ -352,6 +568,10 @@ export class BackupService {
     const release = acquireHostLock(this.app.root);
     let maintenance = false;
     try {
+      const binding = this.app.db
+        .prepare("SELECT root FROM memory_vault WHERE singleton=1")
+        .get();
+      if (binding) assertDetached(String(binding.root), root);
       safeEmptyRoot(destination);
       mkdirSync(join(root, "attachments"), { mode: 0o700 });
       this.app.maintenanceTransaction(() => {
@@ -403,10 +623,15 @@ export class BackupService {
           )
             throw new OperationError("BACKUP_ATTACHMENT_MISMATCH", 409);
         }
+        await syncDirectory(join(root, "attachments"));
+        const memory = await memorySnapshot(snapshot);
+        await copyVersions(this.app.root, root, memory);
+        await verifyVersions(root, memory);
         manifest = {
-          schema: "MAP-DATA-1:BACKUP:1",
+          schema: "MAP-MEM-1:BACKUP:2",
           contract: APP_CONTRACT,
-          appSchema: 1,
+          appSchema: 2,
+          memory,
           createdAt: Date.now(),
           database: {
             file: "app-data.sqlite",
@@ -420,6 +645,8 @@ export class BackupService {
       } finally {
         snapshot.close();
       }
+      if (Buffer.byteLength(json(manifest)) > 16 * 1024 * 1024)
+        throw new OperationError("BACKUP_MANIFEST_LIMIT", 409);
       const path = join(root, "manifest.json");
       const file = await open(path, "wx", 0o600);
       try {
@@ -428,12 +655,7 @@ export class BackupService {
       } finally {
         await file.close();
       }
-      const directory = await open(root, constants.O_RDONLY);
-      try {
-        await directory.sync();
-      } finally {
-        await directory.close();
-      }
+      await syncDirectory(root);
       return manifest;
     } finally {
       if (maintenance)
@@ -448,7 +670,10 @@ export class BackupService {
     }
   }
 }
-async function verifyBackup(source: string): Promise<BackupManifest> {
+async function verifyBackup(
+  source: string,
+  destination: string,
+): Promise<BackupManifest> {
   assertSafePath(source, "directory");
   const manifestPath = join(source, "manifest.json");
   assertSafePath(manifestPath, "file");
@@ -457,9 +682,13 @@ async function verifyBackup(source: string): Promise<BackupManifest> {
   const manifest: BackupManifest = await readProtectedJson(manifestPath);
   if (
     !manifest ||
-    manifest.schema !== "MAP-DATA-1:BACKUP:1" ||
+    !(
+      (manifest.schema === "MAP-DATA-1:BACKUP:1" && manifest.appSchema === 1) ||
+      (manifest.schema === "MAP-MEM-1:BACKUP:2" &&
+        manifest.appSchema === 2 &&
+        manifest.memory?.contract === MEMORY_CONTRACT)
+    ) ||
     manifest.contract !== APP_CONTRACT ||
-    manifest.appSchema !== 1 ||
     manifest.database?.file !== "app-data.sqlite" ||
     !Array.isArray(manifest.attachments)
   )
@@ -473,7 +702,17 @@ async function verifyBackup(source: string): Promise<BackupManifest> {
     throw new OperationError("BACKUP_DATABASE_MISMATCH", 409);
   const db = new DatabaseSync(databasePath, { readOnly: true });
   try {
-    integrity(db);
+    if (integrity(db) !== manifest.appSchema)
+      throw new OperationError("BACKUP_SCHEMA_INVALID", 409);
+    if (manifest.appSchema === 2) {
+      const binding = db
+        .prepare("SELECT root FROM memory_vault WHERE singleton=1")
+        .get();
+      if (binding) assertDetached(String(binding.root), destination);
+      if (json(await memorySnapshot(db)) !== json(manifest.memory))
+        throw new OperationError("BACKUP_MANIFEST_MISMATCH", 409);
+      await verifyVersions(source, manifest.memory);
+    }
     await semanticIntegrity(db);
     const summary = await describe(db);
     if (
@@ -503,7 +742,7 @@ export async function restoreBackup(
   source = resolve(source);
   destination = resolve(destination);
   assertDetached(source, destination);
-  const manifest = await verifyBackup(source);
+  const manifest = await verifyBackup(source, destination);
   safeEmptyRoot(destination);
   const release = acquireHostLock(destination);
   try {
@@ -513,6 +752,7 @@ export async function restoreBackup(
       { state: "COPYING", sourceManifestDigest: hash(json(manifest)) },
       true,
     );
+    await syncDirectory(destination);
     mkdirSync(join(destination, "attachments"), { mode: 0o700 });
     for (const directory of ["staging", "exports", "backups"])
       mkdirSync(join(destination, directory), { mode: 0o700 });
@@ -533,9 +773,36 @@ export async function restoreBackup(
       )
         throw new OperationError("BACKUP_ATTACHMENT_MISMATCH", 409);
     }
+    await syncDirectory(join(destination, "attachments"));
+    if (manifest.appSchema === 2) {
+      await copyVersions(source, destination, manifest.memory);
+      await restoreVault(destination, manifest.memory);
+    }
     const app = new AppDatabase({ root: destination });
     try {
+      if (
+        manifest.appSchema === 2 &&
+        json(await memorySnapshot(app.db)) !== json(manifest.memory)
+      )
+        throw new OperationError("RESTORE_REFERENCE_MISMATCH", 409);
       app.maintenanceTransaction(() => {
+        // The detached Vault has no staging inode. On explicit restart the worker
+        // prepares the same operation from its frozen bytes, only for jobs that
+        // were between prepare and receipt at the snapshot.
+        app.db.exec(`UPDATE memory_candidates SET state='APPROVED'
+          WHERE state='PUBLISHING' AND candidate_id IN
+          (SELECT candidate_id FROM memory_jobs WHERE status='PUBLISHING');
+          UPDATE memory_jobs SET status='PENDING' WHERE status='PUBLISHING';
+          UPDATE memory_jobs SET prepared=0 WHERE status IN ('PENDING','FAILED','CONFLICT');`);
+        if (manifest.appSchema === 2 && manifest.memory.registered) {
+          const root = join(destination, "restored-vault");
+          const stat = lstatSync(root, { bigint: true });
+          app.db
+            .prepare(
+              "UPDATE memory_vault SET root=?,dev=?,ino=?,paused=1 WHERE singleton=1",
+            )
+            .run(root, String(stat.dev), String(stat.ino));
+        }
         app.db.exec("DELETE FROM auth_sessions");
         app.db
           .prepare(
@@ -564,6 +831,7 @@ export async function restoreBackup(
       integrity(app.db);
       await semanticIntegrity(app.db);
       const summary = await describe(app.db);
+      const memory = await memorySnapshot(app.db);
       if (
         summary.referencesDigest !== manifest.referencesDigest ||
         summary.deletionsDigest !== manifest.deletionsDigest ||
@@ -573,7 +841,10 @@ export async function restoreBackup(
       await writeDurableJson(
         join(destination, "restore-report.json"),
         {
-          schema: "MAP-DATA-1:RESTORE:1",
+          schema: "MAP-MEM-1:RESTORE:2",
+          memoryRecordsDigest: memory.recordsDigest,
+          vaultVersionsVerified: memory.versions.length,
+          vaultDocumentsRestored: memory.current.length,
           verifiedAt: Date.now(),
           sourceManifestDigest: hash(json(manifest)),
           referencesDigest: summary.referencesDigest,
@@ -594,12 +865,7 @@ export async function restoreBackup(
           .prepare("SELECT actor_id,credential_revision FROM auth_accounts")
           .all(),
       });
-      const directory = await open(destination, constants.O_RDONLY);
-      try {
-        await directory.sync();
-      } finally {
-        await directory.close();
-      }
+      await syncDirectory(destination);
     } finally {
       app.close();
     }
@@ -631,6 +897,38 @@ export async function resumeRestore(root: string): Promise<void> {
         summary.importsDigest !== report.importsDigest
       )
         throw new OperationError("RESTORE_REFERENCE_MISMATCH", 409);
+      const memory = await memorySnapshot(app.db);
+      if (
+        memory.recordsDigest !== report.memoryRecordsDigest &&
+        !(
+          report.schema === "MAP-DATA-1:RESTORE:1" &&
+          !memory.registered &&
+          memory.versions.length === 0
+        )
+      )
+        throw new OperationError("RESTORE_REFERENCE_MISMATCH", 409);
+      await verifyVersions(root, memory);
+      if (memory.registered) {
+        const vault = join(root, "restored-vault");
+        assertSafePath(vault, "directory");
+        const stat = lstatSync(vault, { bigint: true });
+        const binding = app.db
+          .prepare("SELECT * FROM memory_vault WHERE singleton=1")
+          .get()!;
+        if (
+          binding.root !== vault ||
+          binding.dev !== String(stat.dev) ||
+          binding.ino !== String(stat.ino) ||
+          binding.paused !== 1
+        )
+          throw new OperationError("RESTORE_VAULT_BINDING_MISMATCH", 409);
+        for (const note of memory.current)
+          if (
+            (await fileDigest(restoredNotePath(vault, note.path))).digest !==
+            note.digest
+          )
+            throw new OperationError("BACKUP_MEMORY_DIGEST_MISMATCH", 409);
+      }
       const account = app.db
         .prepare(
           "SELECT a.actor_id,a.credential_revision FROM auth_accounts a JOIN principals p ON p.actor_id=a.actor_id WHERE p.active=1 AND a.password_hash<>'RESTORE_RESET_REQUIRED'",
@@ -663,12 +961,7 @@ export async function resumeRestore(root: string): Promise<void> {
           .run();
       }, "restore-resume");
       await unlink(marker);
-      const directory = await open(root, constants.O_RDONLY);
-      try {
-        await directory.sync();
-      } finally {
-        await directory.close();
-      }
+      await syncDirectory(root);
     } finally {
       app.close();
     }

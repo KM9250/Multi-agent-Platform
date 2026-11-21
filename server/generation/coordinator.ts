@@ -1,3 +1,4 @@
+import { captureExports } from "../memory/sources.ts";
 import { randomUUID } from "node:crypto";
 import { securePolicy } from "../app-data/validation";
 import { performance } from "node:perf_hooks";
@@ -1435,6 +1436,7 @@ export class GenerationCoordinator {
           )
         : null;
     let privateSource: PrivateReportRef | undefined;
+    let collectionError: string | undefined;
     this.app.transaction(() => {
       const call = this.app.db
         .prepare(
@@ -1544,23 +1546,26 @@ export class GenerationCoordinator {
           failure ?? "COMPLETED",
           this.wall(),
         );
+      const totals = this.app.db
+        .prepare(
+          `SELECT COALESCE(SUM(COALESCE(actual_cost_micros,reserved_cost_micros)),0) AS cost,COALESCE(SUM(CASE WHEN usage_state='COMPLETE' THEN COALESCE(json_extract(usage_json,'$.totalTokens'),reserved_input_tokens+reserved_output_tokens) ELSE reserved_input_tokens+reserved_output_tokens END),0) AS tokens FROM app_provider_calls WHERE run_id=?`,
+        )
+        .get(run.run_id) as any;
+      if (
+        Number(totals.cost) > this.limits.maxCostMicros ||
+        Number(totals.tokens) > this.limits.maxTotalTokens
+      )
+        collectionError = "ACTUAL_BUDGET_EXCEEDED";
+      else if (result.usage.completeness !== "COMPLETE")
+        collectionError = "USAGE_INCOMPLETE";
+      if (message && !failure && !collectionError && purpose === "memory")
+        captureExports(this.app, this.policy, actor, callId, context.manifest);
       this.audit(actor, run.room_id, "PROVIDER_RESULT_RECORDED", callId);
       this.options.hooks?.beforeResultCommit?.();
     });
     this.options.hooks?.afterResultCommit?.();
     if (failure) throw new GenerationError(failure);
-    const totals = this.app.db
-      .prepare(
-        `SELECT COALESCE(SUM(COALESCE(actual_cost_micros,reserved_cost_micros)),0) AS cost,COALESCE(SUM(CASE WHEN usage_state='COMPLETE' THEN COALESCE(json_extract(usage_json,'$.totalTokens'),reserved_input_tokens+reserved_output_tokens) ELSE reserved_input_tokens+reserved_output_tokens END),0) AS tokens FROM app_provider_calls WHERE run_id=?`,
-      )
-      .get(run.run_id) as any;
-    if (
-      Number(totals.cost) > this.limits.maxCostMicros ||
-      Number(totals.tokens) > this.limits.maxTotalTokens
-    )
-      throw new GenerationError("ACTUAL_BUDGET_EXCEEDED");
-    if (result.usage.completeness !== "COMPLETE")
-      throw new GenerationError("USAGE_INCOMPLETE");
+    if (collectionError) throw new GenerationError(collectionError);
     return { ...result, callId, ...(privateSource ? { privateSource } : {}) };
   }
 }

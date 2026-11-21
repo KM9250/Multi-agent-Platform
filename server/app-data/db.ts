@@ -9,16 +9,94 @@ import {
   readFileSync,
   writeFileSync,
   unlinkSync,
-  realpathSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { randomBytes } from "node:crypto";
-import { APP_CONTRACT, AppError } from "../../shared/app-contracts/index.ts";
+import {
+  APP_CONTRACT,
+  MEMORY_CONTRACT,
+  AppError,
+} from "../../shared/app-contracts/index.ts";
 import { id } from "./validation.ts";
 import { STORAGE_SCHEMA } from "./schema.ts";
 import { AUTH_SCHEMA } from "../auth/schema.ts";
 import { GENERATION_SCHEMA } from "../generation/schema.ts";
 import { OPERATIONS_SCHEMA } from "../operations/schema.ts";
+import { MEMORY_SCHEMA_SQL } from "../memory/schema.ts";
+
+const METADATA_SCHEMA = `CREATE TABLE app_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),contract TEXT NOT NULL,schema_version INTEGER NOT NULL,cursor_key TEXT NOT NULL) STRICT; CREATE TABLE app_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at INTEGER NOT NULL) STRICT;`;
+const FEATURE_SCHEMA = `CREATE TABLE app_feature_contracts(contract TEXT PRIMARY KEY) STRICT;`;
+const migrations = ["app_001_conversation_persistence", "app_002_memory_vault"];
+const definitions = [
+  [
+    METADATA_SCHEMA,
+    AUTH_SCHEMA,
+    STORAGE_SCHEMA,
+    GENERATION_SCHEMA,
+    OPERATIONS_SCHEMA,
+  ].join("\n"),
+  [FEATURE_SCHEMA, MEMORY_SCHEMA_SQL].join("\n"),
+];
+function schemaObjects(db: DatabaseSync): string {
+  return JSON.stringify(
+    db
+      .prepare(
+        "SELECT type,name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type,name",
+      )
+      .all(),
+  );
+}
+// Build the canonical catalogue using the same SQLite version as the database
+// reader. Only released migration SQL participates in identification.
+const knownCatalogues = new Map<number, string>();
+function expectedCatalogue(version: number): string {
+  let catalogue = knownCatalogues.get(version);
+  if (!catalogue) {
+    const reference = new DatabaseSync(":memory:");
+    try {
+      for (const sql of definitions.slice(0, version)) reference.exec(sql);
+      catalogue = schemaObjects(reference);
+      knownCatalogues.set(version, catalogue);
+    } finally {
+      reference.close();
+    }
+  }
+  return catalogue;
+}
+export function identifyAppSchema(db: DatabaseSync): 1 | 2 {
+  try {
+    const meta = db
+      .prepare(
+        "SELECT contract,schema_version FROM app_metadata WHERE singleton=1",
+      )
+      .get();
+    const version = meta?.schema_version;
+    if (meta?.contract !== APP_CONTRACT || (version !== 1 && version !== 2))
+      throw new AppError("WRONG_DATABASE");
+    const ledger = db
+      .prepare("SELECT version,name FROM app_migrations ORDER BY version")
+      .all();
+    if (
+      ledger.length !== version ||
+      ledger.some(
+        (row, i) => row.version !== i + 1 || row.name !== migrations[i],
+      ) ||
+      schemaObjects(db) !== expectedCatalogue(version)
+    )
+      throw new AppError("WRONG_DATABASE");
+    if (version === 2) {
+      const contracts = db
+        .prepare("SELECT contract FROM app_feature_contracts")
+        .all();
+      if (contracts.length !== 1 || contracts[0].contract !== MEMORY_CONTRACT)
+        throw new AppError("WRONG_DATABASE");
+    }
+    return version;
+  } catch {
+    throw new AppError("WRONG_DATABASE");
+  }
+}
+
 export interface AppDatabaseOptions {
   root: string;
   path?: string;
@@ -34,8 +112,8 @@ export function assertSafePath(path: string, kind: "directory" | "file"): void {
   let current: string = sep;
   for (const part of absolute.split(sep).filter(Boolean)) {
     current = join(current, part);
-    if (existsSync(current)) {
-      const st = lstatSync(current);
+    const st = lstatSync(current, { throwIfNoEntry: false });
+    if (st) {
       if (st.isSymbolicLink()) throw new AppError("UNSAFE_PATH");
       if (
         current === absolute &&
@@ -90,11 +168,14 @@ export class AppDatabase {
         return false;
       }
     };
+    if (existing && lstatSync(this.path).size === 0 && !recoverBootstrap())
+      throw new AppError("WRONG_DATABASE");
     // Identification runs read-only before chmod, journal_mode or migration. Foreign DBs stay byte-identical.
     if (existsSync(this.path) && lstatSync(this.path).size > 0) {
       let probe: DatabaseSync | undefined;
       try {
         probe = new DatabaseSync(this.path, { readOnly: true });
+        probe.exec("BEGIN");
         const tables = probe
           .prepare(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -104,17 +185,7 @@ export class AppDatabase {
           if (tables.length || !recoverBootstrap())
             throw new AppError("WRONG_DATABASE");
         } else {
-          const meta = probe
-            .prepare(
-              "SELECT contract,schema_version FROM app_metadata WHERE singleton=1",
-            )
-            .get();
-          if (
-            !meta ||
-            meta.contract !== APP_CONTRACT ||
-            meta.schema_version !== 1
-          )
-            throw new AppError("WRONG_DATABASE");
+          identifyAppSchema(probe);
         }
       } catch (e) {
         if (e instanceof AppError) throw e;
@@ -133,8 +204,6 @@ export class AppDatabase {
       if (process.platform !== "win32" && lstatSync(path).mode & 0o077)
         throw new AppError("DATA_ROOT_NOT_PRIVATE");
     }
-    if (existing && lstatSync(this.path).size === 0 && !recoverBootstrap())
-      throw new AppError("WRONG_DATABASE");
     if (!existsSync(this.path)) {
       closeSync(openSync(this.path, "wx", 0o600));
       const stat = lstatSync(this.path);
@@ -160,32 +229,46 @@ export class AppDatabase {
       this.db.exec(
         `PRAGMA busy_timeout=${timeout}; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;`,
       );
-      const exists = this.db
-        .prepare("SELECT 1 FROM sqlite_master WHERE name='app_metadata'")
-        .get();
-      if (!exists) {
-        this.db.exec("BEGIN IMMEDIATE");
-        try {
-          this.db.exec(
-            `CREATE TABLE app_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),contract TEXT NOT NULL,schema_version INTEGER NOT NULL,cursor_key TEXT NOT NULL) STRICT; CREATE TABLE app_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at INTEGER NOT NULL) STRICT;`,
-          );
-          this.db.exec(AUTH_SCHEMA);
-          this.db.exec(STORAGE_SCHEMA);
-          this.db.exec(GENERATION_SCHEMA);
-          this.db.exec(OPERATIONS_SCHEMA);
+      // Re-read the version after acquiring the SQLite write lock. Independent
+      // startup processes may have finished either migration since the probe.
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        const exists = this.db
+          .prepare("SELECT 1 FROM sqlite_schema WHERE name='app_metadata'")
+          .get();
+        if (!exists) {
+          this.db.exec(definitions[0]);
           this.db
             .prepare("INSERT INTO app_metadata VALUES(1,?,1,?)")
             .run(APP_CONTRACT, randomBytes(32).toString("hex"));
           this.db
             .prepare("INSERT INTO app_migrations VALUES(1,?,?)")
-            .run("app_001_conversation_persistence", Date.now());
+            .run(migrations[0], Date.now());
           this.hooks?.beforeCommit?.("migration");
-          this.db.exec("COMMIT");
-          this.hooks?.afterCommit?.("migration");
-        } catch (e) {
-          if (this.db.isTransaction) this.db.exec("ROLLBACK");
-          throw e;
         }
+        this.db.exec("COMMIT");
+        if (!exists) this.hooks?.afterCommit?.("migration");
+        this.db.exec("BEGIN IMMEDIATE");
+        if (identifyAppSchema(this.db) === 1) {
+          this.db.exec(definitions[1]);
+          this.db
+            .prepare("INSERT INTO app_feature_contracts VALUES(?)")
+            .run(MEMORY_CONTRACT);
+          this.db
+            .prepare("INSERT INTO app_migrations VALUES(2,?,?)")
+            .run(migrations[1], Date.now());
+          this.db.exec(
+            "UPDATE app_metadata SET schema_version=2 WHERE singleton=1",
+          );
+          this.hooks?.beforeCommit?.(migrations[1]);
+          this.db.exec("COMMIT");
+          this.hooks?.afterCommit?.(migrations[1]);
+        } else {
+          this.db.exec("COMMIT");
+        }
+      } catch (e) {
+        if (this.db.isTransaction) this.db.exec("ROLLBACK");
+        throw e;
       }
       if (existsSync(marker) && recoverBootstrap()) unlinkSync(marker);
       const violations = this.db.prepare("PRAGMA foreign_key_check").all();

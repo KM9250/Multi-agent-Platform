@@ -34,6 +34,8 @@
     "test:app-data-import": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/app-data-import.test.ts",
     "test:app-data-backup": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test test/app-data-backup.test.ts",
     "test:app-data-browser": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/integration/app-data-browser.integration.ts",
+    "test:memory": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/*memory*.test.ts",
+    "test:memory-browser": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/integration/memory-browser.integration.ts",
     "test:app-data-provider": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/integration/app-data-provider.integration.ts",
     "bench:app-data": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/bench/app-data.bench.ts",
     "test:app-data-audit": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/app-data-audit-pr38.test.ts"

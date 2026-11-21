@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { DatabaseSync } from "node:sqlite";
 import {
   chmodSync,
   mkdtempSync,
@@ -68,24 +69,54 @@ async function killAt(root: string, boundary: string, roomId = "", runId = "") {
   }
 }
 
-for (const when of ["before", "after"])
-  test(`C1-08: real SIGKILL ${when} app migration COMMIT recovers schema exactly once`, async (t) => {
-    const root = mkdtempSync(join(tmpdir(), "map-migration-crash-"));
-    chmodSync(root, 0o700);
-    t.after(() => rmSync(root, { recursive: true, force: true }));
-    await killAt(root, `migration:${when}`);
-    const app = new AppDatabase({ root });
-    t.after(() => app.close());
-    assert.equal(
-      app.db.prepare("SELECT count(*) AS n FROM app_migrations").get()!.n,
-      1,
-    );
-    assert.equal(
-      app.db.prepare("SELECT name FROM app_migrations").get()!.name,
-      "app_001_conversation_persistence",
-    );
-    assert.deepEqual(app.db.prepare("PRAGMA foreign_key_check").all(), []);
-  });
+for (const migration of ["migration", "app_002_memory_vault"])
+  for (const when of ["before", "after"])
+    test(`C1-08: real SIGKILL ${when} ${migration} COMMIT recovers schema exactly once`, async (t) => {
+      const root = mkdtempSync(join(tmpdir(), "map-migration-crash-"));
+      chmodSync(root, 0o700);
+      t.after(() => rmSync(root, { recursive: true, force: true }));
+      await killAt(root, `${migration}:${when}`);
+      if (migration === "app_002_memory_vault") {
+        const beforeRestart = new DatabaseSync(join(root, "app-data.sqlite"), {
+          readOnly: true,
+        });
+        try {
+          const expectedVersion = when === "before" ? 1 : 2;
+          assert.equal(
+            beforeRestart
+              .prepare("SELECT schema_version FROM app_metadata")
+              .get()!.schema_version,
+            expectedVersion,
+          );
+          assert.equal(
+            beforeRestart
+              .prepare("SELECT count(*) AS n FROM app_migrations")
+              .get()!.n,
+            expectedVersion,
+          );
+          assert.equal(
+            beforeRestart
+              .prepare(
+                "SELECT count(*) AS n FROM sqlite_schema WHERE name='memory_candidates'",
+              )
+              .get()!.n,
+            expectedVersion - 1,
+          );
+        } finally {
+          beforeRestart.close();
+        }
+      }
+      const app = new AppDatabase({ root });
+      t.after(() => app.close());
+      assert.deepEqual(
+        app.db
+          .prepare("SELECT name FROM app_migrations ORDER BY version")
+          .all()
+          .map((row) => row.name),
+        ["app_001_conversation_persistence", "app_002_memory_vault"],
+      );
+      assert.deepEqual(app.db.prepare("PRAGMA foreign_key_check").all(), []);
+    });
 
 for (const boundary of ["beforeAcceptCommit", "afterAcceptCommit"])
   test(`C1-01: SIGKILL ${boundary} converges same input request without execution`, async (t) => {

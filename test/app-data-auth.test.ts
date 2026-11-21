@@ -289,3 +289,63 @@ test("login rate limits persist in the DB and oversized inputs never invoke pass
     0,
   );
 });
+
+test("memory grants are opt-in and bind operation, workspace, room, owner and disclosure scope", async (t) => {
+  const f = fixture(t);
+  const policy = new AuthorizationPolicy(f.app);
+  const actor = await new SessionService(f.app).createAccount({
+    username: "memory-reader",
+    workspaceId: "workspace",
+    password,
+  });
+  const scope = {
+    roomId: "r",
+    personaId: "alice",
+    visibility: "persona_private",
+  };
+  for (const operation of [
+    "READ_MEMORY",
+    "PROPOSE_MEMORY",
+    "EDIT_MEMORY",
+    "REVIEW_MEMORY",
+    "PUBLISH_MEMORY",
+    "CHANGE_MEMORY_SCOPE",
+    "RETRACT_MEMORY",
+    "MANAGE_VAULT",
+  ])
+    assert.equal(policy.can(actor, operation, scope), false);
+  assert.equal(policy.can(actor, "READ_CONVERSATION", scope), true);
+  for (const invalid of [
+    {},
+    { ...scope, personaId: "*" },
+    { ...scope, roomId: "*" },
+    { ...scope, visibility: "*" },
+  ])
+    assert.throws(
+      () =>
+        policy.grant(actor.actorId, actor.workspaceId, "READ_MEMORY", invalid),
+      { code: "MEMORY_GRANT_SCOPE_REQUIRED" },
+    );
+  policy.grant(actor.actorId, actor.workspaceId, "READ_MEMORY", scope);
+  assert.equal(policy.can(actor, "READ_MEMORY", scope), true);
+  for (const other of [
+    { ...scope, roomId: "r2" },
+    { ...scope, personaId: "bob" },
+    { ...scope, visibility: "room_shared" },
+    { ...scope, workspaceId: "other" },
+  ])
+    assert.equal(policy.can(actor, "READ_MEMORY", other), false);
+  assert.equal(
+    policy.can(actor, "READ_PRIVATE_SEGMENT", {
+      ...scope,
+      visibility: "self_only",
+    }),
+    false,
+  );
+  policy.grant(actor.actorId, actor.workspaceId, "MANAGE_VAULT");
+  assert.equal(policy.can(actor, "MANAGE_VAULT"), true);
+  assert.equal(policy.can(actor, "PUBLISH_MEMORY", scope), false);
+  assert.equal(policy.can(actor, "REVIEW_MEMORY", scope), false);
+  policy.revoke(actor.actorId, actor.workspaceId, "READ_MEMORY");
+  assert.equal(policy.can(actor, "READ_MEMORY", scope), false);
+});

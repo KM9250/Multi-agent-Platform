@@ -9,9 +9,13 @@ import {
   restoreBackup,
   resumeRestore,
 } from "./operations/backup.ts";
-import { acquireHostLock } from "./operations/locks.ts";
+import { acquireHostLock, assertOperationalRoot } from "./operations/locks.ts";
 import { inspectDataHealth } from "./operations/health.ts";
 import { protectedDataRoot } from "./http/config.ts";
+import { registerVault, setVaultPaused, vaultStatus } from "./memory/vault.ts";
+import { registerHandwrittenNote, scanVault } from "./memory/importer.ts";
+import { setNoteTrust } from "./memory/notes.ts";
+import { listVaultConflicts } from "./memory/conflicts.ts";
 
 function flags(argv: string[]): Record<string, string> {
   const output: Record<string, string> = {};
@@ -62,6 +66,33 @@ export async function runCli(argv = process.argv.slice(2)) {
     backup: ["root", "destination"],
     restore: ["source", "destination"],
     resume: ["root"],
+    "vault-register": ["root", "path", "trust-new"],
+    "vault-register-note": [
+      "root",
+      "workspace",
+      "actor",
+      "room",
+      "persona",
+      "visibility",
+      "note",
+      "path",
+      "digest",
+      "request",
+      "trusted",
+    ],
+    "vault-status": ["root"],
+    "vault-pause": ["root"],
+    "vault-resume": ["root"],
+    "vault-rescan": ["root"],
+    "vault-conflicts": [
+      "root",
+      "workspace",
+      "room",
+      "actor",
+      "after-note",
+      "after-candidate",
+    ],
+    "vault-trust": ["root", "workspace", "actor", "note", "trusted"],
     "attachment-check": ["root", "remove-orphans"],
     status: ["root", "warning-bytes"],
   };
@@ -84,6 +115,8 @@ export async function runCli(argv = process.argv.slice(2)) {
     await resumeRestore(protectedRoot);
     return { resumed: true };
   }
+  if (command.startsWith("vault-") && command !== "vault-status")
+    assertOperationalRoot(protectedRoot);
   const app = new AppDatabase({ root: protectedRoot });
   try {
     const sessions = new SessionService(app),
@@ -125,6 +158,98 @@ export async function runCli(argv = process.argv.slice(2)) {
         return await new BackupService(app).backup(
           protectedDataRoot(args.destination),
         );
+      case "vault-status":
+        return vaultStatus(app);
+      case "vault-conflicts": {
+        if (!args.workspace || !args.actor || !args.room)
+          throw new AuthError("INVALID_ARGUMENTS", 400);
+        const actor = { workspaceId: args.workspace, actorId: args.actor };
+        return listVaultConflicts(
+          app,
+          policy,
+          actor,
+          args.room,
+          args["after-note"],
+          args["after-candidate"],
+        );
+      }
+      case "vault-register":
+      case "vault-register-note":
+      case "vault-pause":
+      case "vault-resume":
+      case "vault-rescan":
+      case "vault-trust": {
+        const release = acquireHostLock(app.root);
+        try {
+          assertOperationalRoot(app.root);
+          if (command === "vault-register") {
+            if (
+              !args.path ||
+              (args["trust-new"] !== undefined &&
+                !["true", "false"].includes(args["trust-new"]))
+            )
+              throw new AuthError("INVALID_ARGUMENTS", 400);
+            return registerVault(app, args.path, {
+              trustNew:
+                args["trust-new"] === undefined
+                  ? undefined
+                  : args["trust-new"] === "true",
+              staticRoot: process.env.MAP_STATIC_ROOT,
+            });
+          }
+          if (command === "vault-rescan") return await scanVault(app);
+          if (command === "vault-register-note") {
+            if (
+              !args.workspace ||
+              !args.actor ||
+              !args.room ||
+              !args.persona ||
+              !args.visibility ||
+              !args.note ||
+              !args.path ||
+              !args.digest ||
+              !args.request ||
+              (args.trusted !== undefined &&
+                !["true", "false"].includes(args.trusted))
+            )
+              throw new AuthError("INVALID_ARGUMENTS", 400);
+            const actor = { workspaceId: args.workspace, actorId: args.actor };
+            policy.assert(actor, "MANAGE_VAULT");
+            return await registerHandwrittenNote(app, policy, actor, {
+              roomId: args.room,
+              personaId: args.persona,
+              scope: args.visibility,
+              noteId: args.note,
+              relativePath: args.path,
+              expectedDigest: args.digest,
+              requestId: args.request,
+              trusted: args.trusted === "true",
+            });
+          }
+          if (command === "vault-trust") {
+            if (
+              !args.workspace ||
+              !args.actor ||
+              !args.note ||
+              !["true", "false"].includes(args.trusted)
+            )
+              throw new AuthError("INVALID_ARGUMENTS", 400);
+            const actor = { workspaceId: args.workspace, actorId: args.actor };
+            policy.assert(actor, "MANAGE_VAULT");
+            await setNoteTrust(
+              app,
+              policy,
+              actor,
+              args.note,
+              args.trusted === "true",
+            );
+            return { updated: true };
+          }
+          return setVaultPaused(app, command === "vault-pause");
+        } finally {
+          release();
+        }
+      }
       case "attachment-check": {
         if (
           args["remove-orphans"] !== undefined &&

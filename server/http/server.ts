@@ -13,6 +13,9 @@ import {
 } from "../auth/authorization.ts";
 import type { SessionService } from "../auth/sessions.ts";
 
+import { memoryRoutes } from "./memory.ts";
+import { assertVaultOutsideStatic } from "../memory/vault.ts";
+
 export interface AppServerOptions {
   app: AppDatabase;
   sessions: SessionService;
@@ -62,6 +65,13 @@ const SAFE_ERRORS = new Set([
   "TOO_LARGE",
   "INVALID_CURSOR",
   "CURSOR_EXPIRED",
+  "MEMORY_INTEGRITY",
+  "MEMORY_UNAVAILABLE",
+  "VAULT_UNREGISTERED",
+  "VAULT_IDENTITY_CHANGED",
+  "VAULT_ADAPTER_UNAVAILABLE",
+  "INVALID_MEMORY_MARKDOWN",
+  "PUBLICATION_CONFLICT",
   "ATTACHMENT_MISSING",
   "ATTACHMENT_INTEGRITY",
   "INTEGRITY_ERROR",
@@ -231,6 +241,8 @@ function requireService<T>(service: T | undefined): T {
 }
 
 export function createAppHandler(options: AppServerOptions) {
+  if (options.staticRoot)
+    assertVaultOutsideStatic(options.app, options.staticRoot);
   const origin = new URL(options.origin);
   if (
     origin.origin !== options.origin ||
@@ -251,6 +263,12 @@ export function createAppHandler(options: AppServerOptions) {
     sessions,
     policy,
   } = options;
+  const handleMemory = memoryRoutes(options.app, policy);
+  const memoryLimits = generation?.limits && {
+    maxHistory: generation.limits.maxHistory,
+    maxCalls: generation.limits.maxCalls,
+    maxTotalTokens: generation.limits.maxTotalTokens,
+  };
   const enqueue = (receipt: any) => {
     if (receipt.status === "QUEUED" && generation)
       setImmediate(() => {
@@ -346,7 +364,12 @@ export function createAppHandler(options: AppServerOptions) {
         .slice(PREFIX.length + 1)
         .split("/")
         .map(routeId);
-      route = parts.map((x, i) => (i % 2 === 1 ? ":id" : x)).join("/");
+      const memoryRoute =
+        parts[0] === "memory" ||
+        (parts[0] === "rooms" && parts[2] === "memory");
+      route = memoryRoute
+        ? "memory"
+        : parts.map((x, i) => (i % 2 === 1 ? ":id" : x)).join("/");
       if (MUTATIONS.has(method) && request.headers.origin !== origin.origin)
         throw new AuthError("CSRF_REJECTED", 403);
       if (parts.join("/") === "session/login" && method === "POST") {
@@ -373,6 +396,7 @@ export function createAppHandler(options: AppServerOptions) {
           csrfToken: result.csrfToken,
           expiresAt: result.expiresAt,
           models: options.allowedModels ?? [],
+          memoryLimits,
         });
         return;
       }
@@ -393,6 +417,7 @@ export function createAppHandler(options: AppServerOptions) {
             csrfToken: session.csrfToken,
             expiresAt: session.expiresAt,
             models: options.allowedModels ?? [],
+            memoryLimits,
           });
           return;
         }
@@ -403,6 +428,13 @@ export function createAppHandler(options: AppServerOptions) {
           json(response, 200, { loggedOut: true });
           return;
         }
+      }
+      if (memoryRoute) {
+        const result = await handleMemory(actor, method, parts, url, () =>
+          body(request),
+        );
+        json(response, 200, result);
+        return;
       }
       if (parts[0] === "migrations") {
         policy.assert(actor, "IMPORT_DATA");
