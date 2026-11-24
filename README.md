@@ -61,6 +61,8 @@ CDN/service-worker caches. This change does not rotate keys automatically.
 
 - [MEM-1 design, rollout sequence and Host operations](docs/map-mem-1.md)
 - [MEM-1 verification and production handoff](docs/map-mem-1-validation.md)
+- [MEM-2 room search, citations and Host operations](docs/map-mem-2.md)
+- [MEM-2 acceptance tests and search benchmarks](docs/map-mem-2-validation.md)
 - [Architecture and limits](docs/map-data-1-architecture.md)
 - [Design decisions and compatibility changes](docs/map-data-1-adr.md)
 - [Validation results and production gates](docs/map-data-1-validation.md)

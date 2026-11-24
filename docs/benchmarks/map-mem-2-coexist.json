@@ -1,0 +1,161 @@
+{
+  "schema": "MAP-MEM-2:COEXIST-BENCH:1",
+  "environment": {
+    "node": "v24.22.3",
+    "sqlite": "3.54.1",
+    "platform": "linux",
+    "kernel": "6.18.57",
+    "cpu": "AMD EPYC 9V74 80-Core Processor",
+    "parallelism": 4,
+    "hostRamBytes": 18882662400
+  },
+  "corpus": {
+    "messages": 100000,
+    "deltaMessages": 1,
+    "furtherPublicMessagesDuringQueryTrials": 113,
+    "historyRevisions": 5000,
+    "meanInitialBodyUtf16": 35.88877,
+    "sourceScope": "public_message/public",
+    "denseProfiles": 0,
+    "queryTrialsPerMode": 10,
+    "heartbeatIntervalMs": 50,
+    "saveIntervalMs": 80
+  },
+  "seedMs": 85053.019761,
+  "baseline": {
+    "ms": 1200.7857650000078,
+    "save": {
+      "count": 14,
+      "p50Ms": 2.4569659999979194,
+      "p95Ms": 15.950140000000829,
+      "maxMs": 15.950140000000829
+    },
+    "heartbeatGap": {
+      "count": 23,
+      "p50Ms": 50.120132000010926,
+      "p95Ms": 57.18859200000588,
+      "maxMs": 57.35161599999992
+    },
+    "renewalErrors": 0,
+    "writeErrors": 0,
+    "eventLoopP95Ms": 13.484031,
+    "eventLoopMaxMs": 45.973503,
+    "peakQueue": 0
+  },
+  "build": {
+    "ms": 94762.607081,
+    "save": {
+      "count": 1169,
+      "p50Ms": 2.177646999974968,
+      "p95Ms": 8.172647999992478,
+      "maxMs": 149.85847099999955
+    },
+    "heartbeatGap": {
+      "count": 1860,
+      "p50Ms": 50.22633099999803,
+      "p95Ms": 53.34129700000631,
+      "maxMs": 260.0698449999909
+    },
+    "renewalErrors": 0,
+    "writeErrors": 0,
+    "eventLoopP95Ms": 13.565951,
+    "eventLoopMaxMs": 263.979007,
+    "peakQueue": 1
+  },
+  "buildPrimaryMs": 93150.682771,
+  "delta": {
+    "ms": 1020.1295899999968,
+    "save": {
+      "count": 12,
+      "p50Ms": 2.2169059999869205,
+      "p95Ms": 12.15620100000524,
+      "maxMs": 12.15620100000524
+    },
+    "heartbeatGap": {
+      "count": 20,
+      "p50Ms": 50.331411999999546,
+      "p95Ms": 52.09839900000952,
+      "maxMs": 61.33061999999336
+    },
+    "renewalErrors": 0,
+    "writeErrors": 0,
+    "eventLoopP95Ms": 13.606911,
+    "eventLoopMaxMs": 22.265855,
+    "peakQueue": 0
+  },
+  "deltaVerificationHttpMs": 343.2340360000089,
+  "queries": {
+    "ms": 9289.192358,
+    "save": {
+      "count": 113,
+      "p50Ms": 2.8694740000064485,
+      "p95Ms": 12.074267000018153,
+      "maxMs": 21.300282000011066
+    },
+    "heartbeatGap": {
+      "count": 180,
+      "p50Ms": 50.39272199998959,
+      "p95Ms": 58.04185000000871,
+      "maxMs": 68.78409299999475
+    },
+    "renewalErrors": 0,
+    "writeErrors": 0,
+    "eventLoopP95Ms": 19.660799,
+    "eventLoopMaxMs": 45.285375,
+    "peakQueue": 0
+  },
+  "lexicalHttp": {
+    "count": 10,
+    "p50Ms": 431.2461290000065,
+    "p95Ms": 718.3323420000088,
+    "maxMs": 718.3323420000088
+  },
+  "approxDateHttp": {
+    "count": 10,
+    "p50Ms": 473.07299800001783,
+    "p95Ms": 715.4276309999987,
+    "maxMs": 715.4276309999987
+  },
+  "responses": {
+    "externalCalls": 0,
+    "verified": 21,
+    "excluded": 0
+  },
+  "statusCounts": {
+    "ready": 2,
+    "partial": 19
+  },
+  "reasonCounts": {
+    "INDEX_LAGGING": 19,
+    "INDEX_REFRESHING": 12
+  },
+  "queryWorkload": {
+    "text": "牡丹観測記録",
+    "transport": "HTTP over loopback; session reused; lexical worker startup and final source checks included",
+    "date": "approx 2026-11-11 Asia/Tokyo; reference recorded November 9",
+    "cache": "no OS cache flush; timed trials follow build, delta and an initial HTTP probe"
+  },
+  "external": {
+    "calls": 0,
+    "recordedUsage": 0,
+    "estimatedCosts": 0
+  },
+  "indexWorkers": {
+    "started": 12,
+    "completed": 11,
+    "cancelled": 1,
+    "failed": 0,
+    "queueWaitTotalMs": 93138,
+    "maxConcurrent": 1,
+    "cancelAndExitMs": 267.1830889999983,
+    "limits": {
+      "concurrent": 1,
+      "queued": 4,
+      "deadlineMs": 1800000,
+      "refreshIntervalMs": 5000
+    }
+  },
+  "derivedBytesAllPartitions": 361426944,
+  "serverAndThreadsSampledPeakRssBytes": 346857472,
+  "rssScope": "node parent including worker threads, excluding forked lexical processes"
+}

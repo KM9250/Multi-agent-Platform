@@ -1,0 +1,67 @@
+{
+  "benchmark": "isolated-derived-sqlite",
+  "environment": {
+    "platform": "linux",
+    "kernel": "6.18.57",
+    "cpu": "AMD EPYC 9V74 80-Core Processor",
+    "logicalCpus": 5,
+    "totalRAMBytes": 18882662400,
+    "node": "v24.22.3",
+    "sqliteVersion": "3.54.1"
+  },
+  "messages": 100000,
+  "corpus": {
+    "historical": 5000,
+    "private": 15000,
+    "public": 90000,
+    "utf16Units": 2811360,
+    "segments": 105000,
+    "meanUtf16Units": 26.774857142857144
+  },
+  "trials": 30,
+  "buildMs": 76731,
+  "validationMs": 4411,
+  "deltaMs": 5.33,
+  "derivedDBBytes": 260468736,
+  "maxRSSBytes": 257376256,
+  "lexical": {
+    "allDatesMixed": {
+      "samples": 30,
+      "p50Ms": 353.65,
+      "p95Ms": 480.51
+    },
+    "strict": {
+      "samples": 30,
+      "p50Ms": 16.5,
+      "p95Ms": 22
+    },
+    "approx": {
+      "samples": 30,
+      "p50Ms": 432.27,
+      "p95Ms": 691.45
+    },
+    "exactId": {
+      "samples": 30,
+      "p50Ms": 0.22,
+      "p95Ms": 0.33
+    }
+  },
+  "syntheticLexicalQuality": [
+    {
+      "query": "月面 基地 予備電源",
+      "recallAt10": 1
+    },
+    {
+      "query": "白猫の避難所",
+      "recallAt10": 1
+    },
+    {
+      "query": "ＰＲ３９レビュー",
+      "recallAt10": 1
+    }
+  ],
+  "externalCalls": 0,
+  "usage": "no external operations",
+  "originFileReads": "outside isolated benchmark",
+  "workerWaitAndSave": "measured separately by search-coexist"
+}
