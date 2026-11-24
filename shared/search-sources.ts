@@ -27,6 +27,7 @@ export type SearchCitation = SourceRef & { start: number; end: number };
 export type Citation = SearchCitation;
 
 export interface SourceMetadata {
+  revisionKind?: "original" | "correction" | "regeneration" | "revision";
   personaId: string | null;
   speakerId: string | null;
   visibility: string;

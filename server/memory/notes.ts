@@ -446,6 +446,36 @@ export function setNoteTrust(
     );
   });
 }
+export function memoryChangeContext(
+  app: AppDatabase,
+  policy: AuthorizationPolicy,
+  actor: Actor,
+  roomId: string,
+): Buffer {
+  policy.assert(actor, "READ_ROOM", { roomId });
+  // Persona/Room deletion can remove visible notes without changing the workspace ACL revision.
+  const grants = app.db
+    .prepare(
+      `
+      SELECT DISTINCT g.persona_id, g.visibility FROM access_grants g
+      JOIN rooms r USING(workspace_id,room_id) JOIN personas p USING(workspace_id,persona_id)
+      WHERE g.workspace_id=? AND g.actor_id=? AND g.room_id=? AND g.operation='READ_MEMORY'
+      AND g.revoked_at IS NULL AND g.provider='*' AND p.deleted_at IS NULL AND r.deleted_at IS NULL
+      ORDER BY g.persona_id,g.visibility`,
+    )
+    .all(actor.workspaceId, actor.actorId, roomId);
+  return Buffer.from(
+    JSON.stringify([
+      "MAP:MEMORY:CHANGES:1",
+      actor.workspaceId,
+      actor.actorId,
+      roomId,
+      policy.revision(actor),
+      grants,
+    ]),
+  );
+}
+
 export function listNoteChanges(
   app: AppDatabase,
   policy: AuthorizationPolicy,
@@ -456,28 +486,7 @@ export function listNoteChanges(
 ): MemoryChangePage {
   integer(pageSize, 1, 200);
   return app.transaction(() => {
-    policy.assert(actor, "READ_ROOM", { roomId });
-    // Persona/Room deletion can remove visible notes without changing the workspace ACL revision.
-    const grants = app.db
-      .prepare(
-        `
-      SELECT DISTINCT g.persona_id, g.visibility FROM access_grants g
-      JOIN rooms r USING(workspace_id,room_id) JOIN personas p USING(workspace_id,persona_id)
-      WHERE g.workspace_id=? AND g.actor_id=? AND g.room_id=? AND g.operation='READ_MEMORY'
-      AND g.revoked_at IS NULL AND g.provider='*' AND p.deleted_at IS NULL AND r.deleted_at IS NULL
-      ORDER BY g.persona_id,g.visibility`,
-      )
-      .all(actor.workspaceId, actor.actorId, roomId);
-    const context = Buffer.from(
-      JSON.stringify([
-        "MAP:MEMORY:CHANGES:1",
-        actor.workspaceId,
-        actor.actorId,
-        roomId,
-        policy.revision(actor),
-        grants,
-      ]),
-    );
+    const context = memoryChangeContext(app, policy, actor, roomId);
     const latest = Number(
       app.db
         .prepare("SELECT COALESCE(MAX(seq),0) AS n FROM memory_changes")
@@ -520,9 +529,12 @@ export function listNoteChanges(
         SELECT ${fields},c.action FROM memory_changes c ${versionJoin}
         WHERE c.seq>? AND c.seq<=? AND c.note_id IN (${permitted}) ORDER BY c.seq LIMIT ?`,
           )
-          .all(page.position, cutoff, ...args, pageSize + 1)) as unknown as Array<
-      MemoryChangeItem & { seq: number }
-    >;
+          .all(
+            page.position,
+            cutoff,
+            ...args,
+            pageSize + 1,
+          )) as unknown as Array<MemoryChangeItem & { seq: number }>;
     const hasMore = rows.length > pageSize;
     const items = rows.slice(0, pageSize).map(({ seq, ...item }) => {
       if (typeof item.digest !== "string")

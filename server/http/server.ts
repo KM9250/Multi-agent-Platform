@@ -13,6 +13,9 @@ import {
 } from "../auth/authorization.ts";
 import type { SessionService } from "../auth/sessions.ts";
 
+import { searchRoom } from "../search/service.ts";
+import { searchInput, citationInput } from "../search/input.ts";
+import { SearchSources } from "../search/sources.ts";
 import { memoryRoutes } from "./memory.ts";
 import { assertVaultOutsideStatic } from "../memory/vault.ts";
 
@@ -68,6 +71,8 @@ const SAFE_ERRORS = new Set([
   "MEMORY_INTEGRITY",
   "MEMORY_UNAVAILABLE",
   "MEMORY_RESYNC_REQUIRED",
+  "SEARCH_RESYNC_REQUIRED",
+  "INVALID_CITATION_RANGE",
   "VAULT_UNREGISTERED",
   "VAULT_IDENTITY_CHANGED",
   "VAULT_ADAPTER_UNAVAILABLE",
@@ -429,6 +434,44 @@ export function createAppHandler(options: AppServerOptions) {
           json(response, 200, { loggedOut: true });
           return;
         }
+      }
+      if (parts[0] === "rooms" && parts[2] === "search") {
+        route = "room_search";
+        if (method !== "POST" || url.search || parts.length > 4)
+          throw new AuthError("INVALID_INPUT", 400);
+        const roomId = parts[1];
+        const input = await body(request, 8192);
+        if (parts.length === 4) {
+          if (parts[3] !== "citation") throw new AuthError("NOT_FOUND", 404);
+          const { citation, includeHistory, surrounding } =
+            citationInput(input);
+          const sources = new SearchSources(options.app, policy, actor, roomId);
+          json(
+            response,
+            200,
+            sources.resolve(citation, { includeHistory, surrounding }),
+          );
+        } else {
+          const req = searchInput(input);
+          const controller = new AbortController();
+          const abort = () => controller.abort();
+          response.once("close", abort);
+          try {
+            const result = await searchRoom(
+              options.app,
+              policy,
+              actor,
+              roomId,
+              req,
+              { purpose: "human", roomId, scope: req.target },
+              controller.signal,
+            );
+            if (!response.destroyed) json(response, 200, result);
+          } finally {
+            response.off("close", abort);
+          }
+        }
+        return;
       }
       if (memoryRoute) {
         const result = await handleMemory(actor, method, parts, url, () =>

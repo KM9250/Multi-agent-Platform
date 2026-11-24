@@ -52,6 +52,7 @@ test("MEM-2 S-09/S-11 R-01/R-02/R-05 history and neighbors reauthorize individua
   const opened = sources.resolve(quote, { surrounding: 2 });
   assert.equal(opened.text, "😀\r\ne\u0301");
   assert.equal(opened.recordedAt, 8);
+  assert.equal(opened.revisionKind, "original");
   assert.deepEqual(
     opened.surrounding.map((e) => e.text),
     ["周辺"],
@@ -227,7 +228,8 @@ test("MEM-2 R-03/R-06/R-07 shared Memory uses live published bytes without grant
     roomId: room.id,
   });
   const sources = new SearchSources(app, policy, viewer, room.id);
-  const { upserts } = sources.memoryPage();
+  const { upserts, cursor } = sources.memoryPage();
+  assert.equal(sources.hasUnindexedChanges("memory", cursor), false);
   assert.equal(upserts.length, 1);
   const publishedQuote = { ...upserts[0].ref, start: 0, end: 5 };
   assert.equal(sources.resolve(publishedQuote).text, "共通の判断");
@@ -251,6 +253,7 @@ test("MEM-2 R-03/R-06/R-07 shared Memory uses live published bytes without grant
   );
   writeFileSync(join(f.vault, path), "edited outside the app");
   assert.throws(() => sources.resolve(publishedQuote), /MEMORY_UNAVAILABLE/);
+  assert.equal(sources.hasUnindexedChanges("memory", cursor), true);
   assert.equal(sources.eligible(publishedQuote), false);
   assert.throws(
     () => sources.resolve(publishedQuote, { includeHistory: true }),
@@ -287,4 +290,52 @@ test("MEM-2 candidate snapshot does not cache grant decisions across revocation"
     () => sources.resolve({ ...ref, start: 0, end: 1 }),
     /NOT_FOUND/,
   );
+});
+
+test("MEM-2 lag probe reports only actor-visible local changes, including a deletion", (t) => {
+  const f = appFixture();
+  t.after(f.dispose);
+  const { repository, room, persona, actor, app, policy } = f;
+  const other = repository.createRoom(actor, { title: "Other" });
+  const sources = new SearchSources(app, policy, actor, room.id);
+  const before = sources.archivePage().cursor;
+  app.transaction(() => {
+    for (let i = 0; i < 80; i++) {
+      repository.appendMessage(actor, other.id, {
+        role: "user",
+        content: "other room",
+      });
+      repository.appendMessage(actor, room.id, {
+        role: "model",
+        personaId: persona.id,
+        segments: [
+          {
+            visibility: "self_only",
+            channel: "private_state",
+            content: "not visible",
+          },
+        ],
+      });
+    }
+  });
+  assert.equal(sources.hasUnindexedChanges("archive", before), false);
+  const added = repository.appendMessage(actor, room.id, {
+    role: "user",
+    content: "in this room",
+  });
+  assert.equal(sources.hasUnindexedChanges("archive", before), true);
+  const active = sources.archivePage().cursor;
+  assert.equal(sources.hasUnindexedChanges("archive", active), false);
+  repository.correctMessage(actor, room.id, added.id, {
+    expectedRevision: 1,
+    content: "fixed",
+  });
+  const revised = sources.archivePage(active);
+  const current = revised.upserts.find((s) => s.current)!;
+  assert.equal(
+    sources.resolve({ ...current.ref, start: 0, end: 1 }).revisionKind,
+    "correction",
+  );
+  repository.deleteMessage(actor, room.id, added.id, { expectedRevision: 2 });
+  assert.equal(sources.hasUnindexedChanges("archive", revised.cursor), true);
 });

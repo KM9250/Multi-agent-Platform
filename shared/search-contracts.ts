@@ -49,6 +49,7 @@ export interface SearchResult {
   channel: string;
   visibility: string;
   current: boolean;
+  revisionKind?: "original" | "correction" | "regeneration" | "revision";
   dateLayer?: "anchor" | "near3" | "near7";
 }
 export interface SearchResponse {

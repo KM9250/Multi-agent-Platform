@@ -1,0 +1,324 @@
+import { AppError } from "../../shared/app-contracts/index.ts";
+import type {
+  SearchAudience,
+  SearchResponse,
+} from "../../shared/search-contracts.ts";
+import type { SearchCitation } from "../../shared/search-sources.ts";
+import type { AppDatabase } from "../app-data/db.ts";
+import type { Actor, AuthorizationPolicy } from "../auth/authorization.ts";
+import type { SearchCandidate } from "./backend.ts";
+import { dateLayer } from "./date.ts";
+import { searchDense, fuseRanks } from "./dense.ts";
+import { acquireActiveIndex, requestIndexUpdate } from "./index.ts";
+import { searchInput } from "./input.ts";
+import { lexicalQuery } from "./query-process.ts";
+import { SearchSources } from "./sources.ts";
+
+const DEADLINE_MS = 10_000;
+const MAX_CONCURRENT = 4;
+let running = 0;
+function overlaps(a: SearchCitation, b: SearchCitation) {
+  const same =
+    a.target === "memory" && b.target === "memory"
+      ? a.noteId === b.noteId
+      : a.target === "archive" &&
+        b.target === "archive" &&
+        a.segmentId === b.segmentId;
+  return same && a.version === b.version && a.start < b.end && b.start < a.end;
+}
+function isAccessError(e: unknown) {
+  const status = (e as { status?: number })?.status;
+  return status === 401 || status === 403 || status === 404;
+}
+
+/** HTTP sets a human audience. Context delivery needs an explicit MEM-3 authorization policy. */
+export async function searchRoom(
+  app: AppDatabase,
+  policy: AuthorizationPolicy,
+  actor: Actor,
+  roomId: string,
+  req: ReturnType<typeof searchInput>,
+  audience: SearchAudience,
+  clientSignal?: AbortSignal,
+): Promise<SearchResponse> {
+  if (
+    audience.purpose !== "human" ||
+    audience.roomId !== roomId ||
+    audience.scope !== req.target
+  )
+    throw new AppError("FORBIDDEN", 403);
+  const start = performance.now();
+  const sources = new SearchSources(app, policy, actor, roomId);
+  sources.assertRoom(req.target);
+  const acl = policy.revision(actor);
+  const response: SearchResponse = {
+    results: [],
+    methods: [],
+    reasons: [],
+    status: "ready",
+    elapsedMs: 0,
+    scope: {
+      roomId,
+      target: req.target,
+      revisionMode: req.revisionMode,
+      ...(req.personaId ? { personaId: req.personaId } : {}),
+      ...(req.date ? { date: req.date } : {}),
+    },
+    coverage: {
+      indexState: "UNBUILT",
+      revisionMode: req.revisionMode,
+      planned: [
+        req.target === "archive" ? "authorized_segments" : "published_notes",
+      ],
+    },
+    external: { status: "none", calls: 0 },
+    verification: { checked: 0, excluded: 0 },
+  };
+  const finish = () => {
+    if (policy.revision(actor) !== acl)
+      throw new AppError("SEARCH_RESYNC_REQUIRED", 409);
+    sources.assertRoom(req.target);
+    response.elapsedMs = Math.round(performance.now() - start);
+    return response;
+  };
+  const active = acquireActiveIndex(app, policy, actor, roomId);
+  response.coverage.indexState = active.state;
+  let lagging = false;
+  if (active.state === "ACTIVE") {
+    try {
+      lagging = sources.hasUnindexedChanges(
+        req.target,
+        active.manifest.positions?.[req.target],
+      );
+    } catch (error) {
+      if (isAccessError(error)) throw error;
+      const reset = [
+        "SEARCH_RESYNC_REQUIRED",
+        "MEMORY_RESYNC_REQUIRED",
+      ].includes((error as { code?: string }).code);
+      response.status = reset ? "resync_required" : "unavailable";
+      response.coverage.indexState = reset ? "RESYNC_REQUIRED" : "FAILED";
+      response.reasons.push(
+        reset ? "SEARCH_RESYNC_REQUIRED" : "INDEX_UNAVAILABLE",
+      );
+      if (reset)
+        void requestIndexUpdate(app, policy, actor, roomId, {
+          rebuild: true,
+        }).catch(() => {});
+      return finish();
+    }
+  }
+  if (active.state !== "STOPPED") {
+    void requestIndexUpdate(app, policy, actor, roomId, {
+      force: lagging,
+    }).catch(() => {
+      /* Persisted by the worker. */
+    });
+  }
+  if (active.state !== "ACTIVE") {
+    response.status =
+      active.state === "UNBUILT"
+        ? "unbuilt"
+        : active.state === "BUILDING"
+          ? "building"
+          : active.state === "RESYNC_REQUIRED"
+            ? "resync_required"
+            : active.state === "STOPPED"
+              ? "stopped"
+              : "unavailable";
+    response.reasons.push(
+      active.reason === "SEARCH_FILE_MISSING"
+        ? "SEARCH_FILE_MISSING"
+        : active.state,
+    );
+    return finish();
+  }
+  response.coverage.syncedAt = active.syncedAt;
+  response.coverage.updating = active.updating;
+  if (lagging) {
+    response.reasons.push("INDEX_LAGGING");
+    response.status = "partial";
+  }
+  if (active.updating || active.reason) {
+    response.status = "partial";
+    response.reasons.push(
+      active.reason ? "INDEX_REFRESH_FAILED" : "INDEX_REFRESHING",
+    );
+  }
+  if (running >= MAX_CONCURRENT) {
+    response.status = "partial";
+    response.reasons.push("QUEUE_FULL");
+    return finish();
+  }
+  running++;
+  const timeout = AbortSignal.timeout(DEADLINE_MS);
+  const signal = clientSignal
+    ? AbortSignal.any([timeout, clientSignal])
+    : timeout;
+  try {
+    const includeHistory = req.revisionMode === "include_history";
+    const lexical = await lexicalQuery(
+      {
+        root: app.root,
+        appPath: app.path,
+        indexPath: active.path,
+        roomId,
+        actor,
+        idleTimeoutMs: policy.idleTimeoutMs,
+        target: req.target,
+        query: req.query,
+        includeHistory,
+        personaId: req.personaId,
+        from: req.date?.startInclusive,
+        until: req.date?.endExclusive,
+      },
+      signal,
+    );
+    response.methods.push("lexical");
+    let ranked = lexical.hits;
+    if (req.target === "memory" && req.retrievalMode !== "lexical") {
+      if (policy.revision(actor) !== acl)
+        throw new AppError("SEARCH_RESYNC_REQUIRED", 409);
+      // Keep part of the request deadline for resolving lexical citations after a slow provider.
+      const remaining = Math.max(
+        0,
+        Math.floor(DEADLINE_MS - 1000 - (performance.now() - start)),
+      );
+      const denseSignal = AbortSignal.any([
+        signal,
+        AbortSignal.timeout(remaining),
+      ]);
+      const dense = await searchDense(
+        app,
+        policy,
+        actor,
+        roomId,
+        active.path,
+        req.query,
+        req.requestId,
+        {
+          personaId: req.personaId,
+          signal: denseSignal,
+        },
+      ).catch((error) => {
+        if (isAccessError(error)) throw error;
+        return {
+          state: "dense_unavailable",
+          candidates: [],
+          external: { calls: undefined, usage: "UNKNOWN" },
+        };
+      });
+      response.external = {
+        status:
+          dense.external.calls === undefined
+            ? "unknown"
+            : dense.external.calls
+              ? "dispatched"
+              : "none",
+        ...dense.external,
+      };
+      response.coverage.denseState = dense.state;
+      if (dense.state === "ready") {
+        response.methods.push("dense");
+        ranked = fuseRanks<SearchCandidate>(
+          [ranked, dense.candidates],
+          (hit) => hit.id,
+        );
+      } else {
+        response.reasons.push(dense.state);
+        response.status = "degraded";
+      }
+    }
+    if (policy.revision(actor) !== acl)
+      throw new AppError("SEARCH_RESYNC_REQUIRED", 409);
+    // The lexical and optional dense workers have finished. Only verified original text is serialized.
+    for (const hit of ranked) {
+      if (
+        response.results.length >= req.limit ||
+        response.verification.checked >= 200
+      )
+        break;
+      if (signal.aborted || performance.now() - start >= DEADLINE_MS) {
+        response.status = "partial";
+        response.reasons.push("DEADLINE_EXCEEDED");
+        break;
+      }
+      if (
+        response.results.some((result) =>
+          overlaps(result.citation, hit.citation),
+        )
+      )
+        continue;
+      response.verification.checked++;
+      try {
+        const {
+          text,
+          citation,
+          current,
+          recordedAt,
+          personaId,
+          speakerId,
+          role,
+          channel,
+          visibility,
+          revisionKind,
+        } = sources.resolve(hit.citation, { includeHistory });
+        if (
+          (req.personaId && req.personaId !== personaId) ||
+          (req.date &&
+            (recordedAt < req.date.startInclusive ||
+              recordedAt >= req.date.endExclusive))
+        )
+          continue;
+        response.results.push({
+          snippet: text,
+          citation,
+          current,
+          recordedAt,
+          personaId,
+          speakerId,
+          role,
+          channel,
+          visibility,
+          ...(revisionKind ? { revisionKind } : {}),
+          ...(req.date?.mode === "approx"
+            ? { dateLayer: dateLayer(req.date, recordedAt) }
+            : {}),
+        });
+      } catch (e) {
+        const code = (e as { code?: string }).code;
+        if (code === "UNAUTHENTICATED") throw e;
+        response.verification.excluded++;
+        const reason = [
+          "FORBIDDEN",
+          "NOT_FOUND",
+          "MEMORY_UNAVAILABLE",
+          "SOURCE_CHANGED",
+        ].includes(code)
+          ? "SOURCE_CHANGED"
+          : "SOURCE_VERIFICATION_UNAVAILABLE";
+        if (!response.reasons.includes(reason)) response.reasons.push(reason);
+      }
+    }
+    if (lexical.limited || response.verification.checked >= 200) {
+      response.reasons.push("CANDIDATE_LIMIT");
+      if (response.results.length < req.limit) response.status = "partial";
+    }
+    if (response.verification.excluded) {
+      response.status = "partial";
+    }
+  } catch (e) {
+    if (
+      isAccessError(e) ||
+      (e as { code?: string }).code === "SEARCH_RESYNC_REQUIRED"
+    )
+      throw e;
+    response.status = response.methods.length ? "partial" : "unavailable";
+    response.reasons.push(
+      signal.aborted ? "DEADLINE_EXCEEDED" : "INDEX_UNAVAILABLE",
+    );
+  } finally {
+    running--;
+  }
+  return finish();
+}

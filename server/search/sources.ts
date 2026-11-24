@@ -19,9 +19,12 @@ import { digest, integer, object, string } from "../app-data/validation.ts";
 import type { Actor, AuthorizationPolicy } from "../auth/authorization.ts";
 import {
   listNoteChanges,
+  memoryChangeContext,
   readNote,
   visibleMemoryDocuments,
 } from "../memory/notes.ts";
+
+import { openChangeCursor } from "../memory/change-cursor.ts";
 
 const PAGE = 32;
 // Rowid windows bound a page's original-store work even in a sparse actor/room partition.
@@ -38,6 +41,7 @@ interface SegmentRow {
   revision: number;
   revision_id: string;
   current_revision: number;
+  reason: string;
   segment_id: string;
   owner_persona_id: string | null;
   persona_id: string | null;
@@ -50,19 +54,23 @@ interface SegmentRow {
 }
 
 const segmentColumns = `s.rowid AS rid,s.message_id,s.segment_id,s.revision,s.owner_persona_id,
-  s.visibility,s.channel,s.digest,v.revision_id,m.seq,m.current_revision,m.role,m.persona_id,m.occurred_at`;
+  s.visibility,s.channel,s.digest,v.revision_id,v.reason,m.seq,m.current_revision,m.role,m.persona_id,m.occurred_at`;
 const liveSegments = (
   rowidWindow: boolean,
+  includeDeletedMessage: boolean,
 ) => `FROM message_segments s ${rowidWindow ? "NOT INDEXED CROSS JOIN" : "JOIN"} messages m USING(workspace_id,room_id,message_id)
   JOIN message_revisions v USING(workspace_id,room_id,message_id,revision)
-  WHERE s.workspace_id=? AND s.room_id=? AND m.deleted_at IS NULL
+  WHERE s.workspace_id=? AND s.room_id=? ${includeDeletedMessage ? "" : "AND m.deleted_at IS NULL"}
   AND (m.persona_id IS NULL OR EXISTS(SELECT 1 FROM personas p WHERE p.workspace_id=m.workspace_id
     AND p.persona_id=m.persona_id AND p.deleted_at IS NULL))
   AND (s.owner_persona_id IS NULL OR EXISTS(SELECT 1 FROM personas p WHERE p.workspace_id=s.workspace_id
     AND p.persona_id=s.owner_persona_id AND p.deleted_at IS NULL))`;
 // READ_ROOM and room-wide READ_CONVERSATION are asserted independently. Private grants are
 // exact (including their owner and visibility). Apply this predicate before page and context LIMITs.
-const permittedSegments = (rowidWindow = false) => `${liveSegments(rowidWindow)}
+const permittedSegments = (
+  rowidWindow = false,
+  includeDeletedMessage = false,
+) => `${liveSegments(rowidWindow, includeDeletedMessage)}
   AND ((s.visibility='public' AND s.channel IN ('public_message','shared_summary')) OR
   EXISTS(SELECT 1 FROM access_grants g WHERE g.workspace_id=s.workspace_id AND g.actor_id=?
     AND g.operation='READ_PRIVATE_SEGMENT' AND g.revoked_at IS NULL AND g.room_id=s.room_id
@@ -123,6 +131,7 @@ function excerpt(
     speakerId,
   } = source;
   return {
+    ...(source.revisionKind ? { revisionKind: source.revisionKind } : {}),
     citation: { ...source.ref, start, end },
     text: source.text.slice(start, end),
     recordedAt,
@@ -344,6 +353,12 @@ export class SearchSources
       role: row.role,
       recordedAt: row.occurred_at,
       current: row.current_revision === row.revision,
+      revisionKind:
+        row.revision === 1
+          ? "original"
+          : row.reason === "correction" || row.reason === "regeneration"
+            ? row.reason
+            : "revision",
     };
   }
 
@@ -547,6 +562,101 @@ export class SearchSources
       Buffer.from(data, "base64url").toString(),
     ) as ArchivePosition;
     return pos;
+  }
+
+  /**
+   * Positive evidence that this actor has a change beyond the generation's checkpoint.
+   * A negative probe is neutral: the caller still displays the index's as-of time.
+   * Both ends of a large backlog are examined within a fixed budget. Other actors'
+   * activity never causes a positive status merely because the global counter advanced.
+   */
+  hasUnindexedChanges(target: SearchTarget, cursor: string): boolean {
+    return this.withReadSnapshot(() => {
+      this.assertRoom(target);
+      let position: number;
+      let latest: number;
+      if (target === "memory") {
+        const context = memoryChangeContext(
+          this.app,
+          this.policy,
+          this.actor,
+          this.roomId,
+        );
+        const page = openChangeCursor(this.app.cursorKey, context, cursor);
+        if (page.mode === "baseline") return true;
+        position = page.position;
+        latest = Number(
+          this.statement(
+            "SELECT COALESCE(MAX(seq),0) AS n FROM memory_changes",
+          ).get()!.n,
+        );
+      } else {
+        const page = this.unpack(cursor, this.policy.revision(this.actor));
+        if (page.mode === "baseline" || page.afterSegment !== undefined)
+          return true;
+        position = page.change;
+        latest = Number(
+          this.statement(
+            "SELECT COALESCE(MAX(change_id),0) AS n FROM app_changes",
+          ).get()!.n,
+        );
+      }
+      if (position > latest) throw resync();
+      const firstEnd = Math.min(position + PAGE, latest);
+      const ranges = [
+        [position, firstEnd],
+        [Math.max(firstEnd, latest - PAGE), latest],
+      ];
+      for (const [start, end] of ranges) {
+        if (start >= end) continue;
+        if (target === "memory") {
+          // Point-check the scope of at most PAGE note events, including retractions.
+          const noteIds = this.statement(
+            "SELECT note_id FROM memory_changes WHERE seq>? AND seq<=?",
+          ).all(start, end);
+          const visible = this.statement(
+            "SELECT 1 " +
+              visibleMemoryDocuments +
+              " AND d.room_id=? AND d.note_id=?",
+          );
+          if (
+            noteIds.some((note) =>
+              visible.get(
+                this.actor.workspaceId,
+                this.actor.actorId,
+                this.roomId,
+                note.note_id,
+              ),
+            )
+          )
+            return true;
+        } else {
+          const events = this.statement(
+            `SELECT target_id,revision FROM app_changes WHERE change_id>? AND change_id<=?
+            AND workspace_id=? AND room_id=? AND target_type='MESSAGE'`,
+          ).all(start, end, this.actor.workspaceId, this.roomId);
+          // Soft-deleted messages retain the classification of the affected version. Probe
+          // only that revision and its predecessor (bounded segments), without reading text.
+          const visible = this
+            .statement(`SELECT 1 ${permittedSegments(false, true)}
+            AND s.message_id=? AND s.revision IN (?,?) LIMIT 1`);
+          if (
+            events.some((event) =>
+              visible.get(
+                this.actor.workspaceId,
+                this.roomId,
+                this.actor.actorId,
+                event.target_id,
+                event.revision,
+                Number(event.revision) - 1,
+              ),
+            )
+          )
+            return true;
+        }
+      }
+      return false;
+    });
   }
 
   /** An internal bounded read on one SQLite snapshot. Cursors never cross the browser/API boundary. */

@@ -9,6 +9,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import MemoryPanel from "./components/MemoryPanel";
+import SearchPanel from "./components/SearchPanel";
 import AgentSidebar from "./components/AgentSidebar";
 import AgentModal from "./components/AgentModal";
 import RoomModal from "./components/RoomModal";
@@ -142,6 +143,7 @@ export default function App() {
     complete: boolean;
   }>();
   const [memoryOpen, setMemoryOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
   const [migration, setMigration] = useState(false);
   const [graph, setGraph] = useState(false);
   const [reader, setReader] = useState<{ title: string; data: unknown }>();
@@ -152,6 +154,7 @@ export default function App() {
   const epoch = useRef(0);
   const selected = useRef("");
   const sessionRef = useRef<SessionDTO | null>(null);
+  const sessionChanges = useRef<BroadcastChannel>();
   const pendingTurn = useRef<{ roomId: string; path: string; body: unknown }>();
   const fileInput = useRef<HTMLInputElement>(null);
   const agents =
@@ -195,6 +198,7 @@ export default function App() {
     setFiles([]);
     setReader(undefined);
     setMemoryOpen(false);
+    setSearchOpen(false);
     setCorrection(undefined);
     pendingTurn.current = undefined;
     setPending(false);
@@ -221,6 +225,7 @@ export default function App() {
       setRuns([]);
       setReader(undefined);
       setMemoryOpen(false);
+      setSearchOpen(false);
       setCorrection(undefined);
     }
     setError(code);
@@ -293,6 +298,7 @@ export default function App() {
     setFiles([]);
     setReader(undefined);
     setMemoryOpen(false);
+    setSearchOpen(false);
     setCorrection(undefined);
     setExportState(undefined);
     setRoomEditSnapshot(undefined);
@@ -309,19 +315,46 @@ export default function App() {
     setSending(false);
   }
   useEffect(() => {
-    const controller = new AbortController();
-    appRequest<SessionDTO>("/session", "GET", undefined, controller.signal)
-      .then((value) => {
-        if (!controller.signal.aborted) signIn(value);
-      })
-      .catch((cause) => {
-        if (!controller.signal.aborted) {
+    let controller: AbortController;
+    function readSession() {
+      controller?.abort();
+      controller = new AbortController();
+      const { signal } = controller;
+      const ticket = epoch.current;
+      appRequest<SessionDTO>("/session", "GET", undefined, signal)
+        .then((value) => {
+          if (!signal.aborted && epoch.current === ticket) signIn(value);
+        })
+        .catch((cause) => {
+          if (signal.aborted || epoch.current !== ticket) return;
           clearIdentity();
           if (!(cause instanceof AppAPIError && cause.status === 401))
             fail(cause);
-        }
-      });
-    return () => controller.abort();
+        });
+    }
+    function identityChanged() {
+      clearIdentity();
+      readSession();
+    }
+    // All tabs on this origin share the session cookie. Send only the change
+    // notification; each tab obtains its new identity directly from the BFF.
+    const channel =
+      typeof BroadcastChannel === "undefined"
+        ? undefined
+        : new BroadcastChannel("map-session");
+    if (channel) channel.onmessage = identityChanged;
+    sessionChanges.current = channel;
+    const restoredPage = (event: PageTransitionEvent) => {
+      if (event.persisted) identityChanged();
+    };
+    window.addEventListener("pageshow", restoredPage);
+    readSession();
+    return () => {
+      controller.abort();
+      window.removeEventListener("pageshow", restoredPage);
+      channel?.close();
+      sessionChanges.current = undefined;
+    };
   }, []);
   useEffect(() => {
     if (session) void loadRooms().catch(fail);
@@ -348,8 +381,10 @@ export default function App() {
   }, [session?.actorId, roomId, pageAfter, scopeVersion]);
 
   async function logout() {
+    setSearchOpen(false);
     try {
       await appRequest("/session/logout", "POST", {});
+      sessionChanges.current?.postMessage("changed");
       clearIdentity();
       setError("");
     } catch (cause) {
@@ -753,7 +788,12 @@ export default function App() {
   if (!session)
     return (
       <>
-        <LoginPanel onLogin={signIn} />
+        <LoginPanel
+          onLogin={(value) => {
+            signIn(value);
+            sessionChanges.current?.postMessage("changed");
+          }}
+        />
         {error && (
           <div
             role="alert"
@@ -816,6 +856,12 @@ export default function App() {
             </button>
             {room && (
               <>
+                <button
+                  className="map-button"
+                  onClick={() => setSearchOpen(true)}
+                >
+                  Search room
+                </button>
                 <button
                   className="map-button"
                   onClick={() => setMemoryOpen(true)}
@@ -1252,6 +1298,17 @@ export default function App() {
           setSavedContexts((items) => items.filter((item) => item.id !== id))
         }
       />
+      {searchOpen && room && room.id === roomId && (
+        <React.Fragment
+          key={JSON.stringify([session.workspaceId, session.actorId, room.id])}
+        >
+          <SearchPanel
+            room={room}
+            close={() => setSearchOpen(false)}
+            onSessionExpired={clearIdentity}
+          />
+        </React.Fragment>
+      )}
       {memoryOpen && room && (
         <React.Fragment key={session.actorId + "/" + room.id}>
           <MemoryPanel
