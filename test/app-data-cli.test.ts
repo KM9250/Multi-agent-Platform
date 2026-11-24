@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { AppDatabase } from "../server/app-data/db.ts";
@@ -10,6 +11,7 @@ import { SessionService } from "../server/auth/sessions.ts";
 import { ConversationRepository } from "../server/app-data/repository.ts";
 import { AuthorizationPolicy } from "../server/auth/authorization.ts";
 import { hostConfiguration, startServer } from "../server/main.ts";
+import { runCli } from "../server/cli.ts";
 
 test("production fails closed without TLS/provider/account config; synthetic and unavailable modes require loopback development", () => {
   const common = {
@@ -108,6 +110,25 @@ test("host CLI backup, separate restore, credential reset and explicit resume pr
   );
   assert.equal(created.status, 0, created.stderr);
   const actor = created.value;
+  const vault = join(directory, "dedicated-vault");
+  const vaultCommand = (command: string, dataRoot = root, ...flags: string[]) =>
+    runCli([command, "--root", dataRoot, ...flags]);
+  assert.deepEqual(
+    await vaultCommand(
+      "vault-register",
+      root,
+      "--path",
+      vault,
+      "--trust-new",
+      "true",
+    ),
+    { registered: true, paused: true, trustNew: true },
+  );
+  assert.deepEqual(await vaultCommand("vault-resume"), {
+    registered: true,
+    paused: false,
+    trustNew: true,
+  });
   const app = new AppDatabase({ root }),
     sessions = new SessionService(app),
     policy = new AuthorizationPolicy(app),
@@ -117,24 +138,85 @@ test("host CLI backup, separate restore, credential reset and explicit resume pr
     role: "user",
     content: "saved original",
   });
+  const persona = repo.createPersona(actor, room.id, {
+    name: "Registrar",
+    model: "synthetic",
+  });
+  const scope = {
+    roomId: room.id,
+    personaId: persona.id,
+    visibility: "persona_private",
+  };
+  policy.grant(actor.actorId, actor.workspaceId, "MANAGE_VAULT");
+  for (const op of ["READ_MEMORY", "REVIEW_MEMORY", "PUBLISH_MEMORY"])
+    policy.grant(actor.actorId, actor.workspaceId, op, scope);
+  const noteId = "mem_host_note";
+  const handwritten =
+    "---\nmap_id: mem_host_note\n---\nA synthetic standalone note.\n";
+  const expectedDigest = createHash("sha256").update(handwritten).digest("hex");
+  writeFileSync(join(vault, "manual.md"), handwritten, { mode: 0o600 });
+  const registerNote = () =>
+    vaultCommand(
+      "vault-register-note",
+      root,
+      "--workspace",
+      actor.workspaceId,
+      "--actor",
+      actor.actorId,
+      "--room",
+      room.id,
+      "--persona",
+      persona.id,
+      "--visibility",
+      scope.visibility,
+      "--note",
+      noteId,
+      "--path",
+      "manual.md",
+      "--digest",
+      expectedDigest,
+      "--request",
+      "host-manual-001",
+      "--trusted",
+      "true",
+    );
   const old = await sessions.login(
     "restore-user",
     "synthetic-account-password",
   );
   app.close();
+  assert.deepEqual(await registerNote(), {
+    noteId,
+    version: 1,
+    digest: expectedDigest,
+    state: "PUBLISHED",
+  });
+  assert.deepEqual(await registerNote(), {
+    noteId,
+    version: 1,
+    digest: expectedDigest,
+    state: "PUBLISHED",
+  });
   const reserved = createServer();
   await new Promise<void>((r) => reserved.listen(0, "127.0.0.1", r));
   const port = (reserved.address() as any).port;
   await new Promise<void>((r) => reserved.close(() => r()));
-  const origin = `http://127.0.0.1:${port}`,
-    live = await startServer({
-      MAP_DATA_ROOT: root,
-      MAP_ORIGIN: origin,
-      MAP_PORT: String(port),
-      MAP_DEV_HTTP: "1",
-      MAP_PROVIDER: "fake",
-    });
+  const origin = `http://127.0.0.1:${port}`;
+  const config = {
+    MAP_DATA_ROOT: root,
+    MAP_ORIGIN: origin,
+    MAP_PORT: String(port),
+    MAP_DEV_HTTP: "1",
+    MAP_PROVIDER: "fake",
+  };
+  await assert.rejects(startServer({ ...config, MAP_STATIC_ROOT: vault }), {
+    code: "VAULT_OVERLAPS_STATIC",
+  });
+  const live = await startServer(config);
   try {
+    await assert.rejects(vaultCommand("vault-pause"), {
+      code: "HOST_IN_USE_OR_STALE_LOCK",
+    });
     const response = await fetch(origin + "/api/app/v1/rooms", {
       headers: { cookie: `map_session=${old.token}` },
     });
@@ -143,6 +225,12 @@ test("host CLI backup, separate restore, credential reset and explicit resume pr
   } finally {
     await live.close();
   }
+  assert.deepEqual(await vaultCommand("vault-rescan"), { status: "COMPLETE" });
+  assert.deepEqual(await vaultCommand("vault-pause"), {
+    registered: true,
+    paused: true,
+    trustNew: true,
+  });
   const health = cli(["status", "--root", root]);
   assert.equal(health.status, 0, health.stderr);
   const orphans = cli(["attachment-check", "--root", root]);
@@ -154,6 +242,9 @@ test("host CLI backup, separate restore, credential reset and explicit resume pr
   const copy = cli(["restore", "--source", backup, "--destination", restored]);
   assert.equal(copy.status, 0, copy.stderr);
   assert.equal(existsSync(join(restored, "RESTORED_DISABLED")), true);
+  await assert.rejects(vaultCommand("vault-resume", restored), {
+    code: "RESTORE_RESUME_REQUIRED",
+  });
   const denied = cli(["resume", "--root", restored]);
   assert.equal(denied.status, 1);
   assert.match(denied.stderr, /RESTORE_CREDENTIAL_RESET_REQUIRED/);
@@ -165,6 +256,11 @@ test("host CLI backup, separate restore, credential reset and explicit resume pr
   const resumed = cli(["resume", "--root", restored]);
   assert.equal(resumed.status, 0, resumed.stderr);
   assert.equal(existsSync(join(restored, "RESTORED_DISABLED")), false);
+  assert.deepEqual(await vaultCommand("vault-status", restored), {
+    registered: true,
+    paused: true,
+    trustNew: true,
+  });
   const restoredApp = new AppDatabase({ root: restored });
   try {
     const restoredSessions = new SessionService(restoredApp);

@@ -8,6 +8,7 @@ import {
   LogOut,
   RefreshCw,
 } from "lucide-react";
+import MemoryPanel from "./components/MemoryPanel";
 import AgentSidebar from "./components/AgentSidebar";
 import AgentModal from "./components/AgentModal";
 import RoomModal from "./components/RoomModal";
@@ -140,6 +141,7 @@ export default function App() {
     part: number;
     complete: boolean;
   }>();
+  const [memoryOpen, setMemoryOpen] = useState(false);
   const [migration, setMigration] = useState(false);
   const [graph, setGraph] = useState(false);
   const [reader, setReader] = useState<{ title: string; data: unknown }>();
@@ -154,6 +156,9 @@ export default function App() {
   const fileInput = useRef<HTMLInputElement>(null);
   const agents =
     room?.agents.map((persona) => displayAgent(persona, room.id)) ?? [];
+  const enabledPersonas = agents.filter((agent) => agent.isEnabled);
+  const memoryCommand =
+    room?.internalStateSettings.enabled && input.trim() === "/memory";
   const speakerName = (personaId?: string) => {
     const current = agents.find((agent) => agent.id === personaId);
     const historical = room?.historicalPersonas?.find(
@@ -189,6 +194,7 @@ export default function App() {
     setInput("");
     setFiles([]);
     setReader(undefined);
+    setMemoryOpen(false);
     setCorrection(undefined);
     pendingTurn.current = undefined;
     setPending(false);
@@ -214,6 +220,7 @@ export default function App() {
       setMessages([]);
       setRuns([]);
       setReader(undefined);
+      setMemoryOpen(false);
       setCorrection(undefined);
     }
     setError(code);
@@ -285,6 +292,7 @@ export default function App() {
     setInput("");
     setFiles([]);
     setReader(undefined);
+    setMemoryOpen(false);
     setCorrection(undefined);
     setExportState(undefined);
     setRoomEditSnapshot(undefined);
@@ -534,8 +542,8 @@ export default function App() {
             content: input,
             attachmentIds,
             recipient: createRecipientSnapshot(
-              recipient,
-              agents.filter((agent) => agent.isEnabled),
+              memoryCommand ? "all" : recipient,
+              enabledPersonas,
             ),
           },
         };
@@ -810,6 +818,12 @@ export default function App() {
               <>
                 <button
                   className="map-button"
+                  onClick={() => setMemoryOpen(true)}
+                >
+                  Memory
+                </button>
+                <button
+                  className="map-button"
                   onClick={() =>
                     setExportState({
                       roomId: room.id,
@@ -1076,11 +1090,11 @@ export default function App() {
                   Recipient{" "}
                   <select
                     aria-label="Recipient"
-                    value={recipient}
+                    value={memoryCommand ? "all" : recipient}
                     onChange={(event) =>
                       setRecipient(event.target.value as RecipientSelection)
                     }
-                    disabled={pending || sending}
+                    disabled={memoryCommand || pending || sending}
                     className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 ml-2"
                   >
                     <option value="auto">Auto</option>
@@ -1105,9 +1119,40 @@ export default function App() {
                   </span>
                 )}
                 <span className="text-xs text-zinc-500">
-                  /memory: internal memo only · Vault unpublished
+                  {room.internalStateSettings.enabled
+                    ? "/memory creates private review candidates for Personas with proposal permission."
+                    : "Enable internal state separation in Room settings to use /memory."}
                 </span>
               </div>
+              {memoryCommand && (
+                <div
+                  className="rounded-lg border border-blue-900 bg-blue-950/30 px-3 py-2 text-sm"
+                  role="status"
+                >
+                  <p className="font-medium">
+                    Generate private memory candidates
+                  </p>
+                  <p className="mt-1">
+                    All enabled Personas ·{" "}
+                    {enabledPersonas.map((agent) => agent.name).join(", ") ||
+                      "None"}
+                  </p>
+                  {session.memoryLimits && (
+                    <p className="mt-1 text-xs text-zinc-300">
+                      Up to{" "}
+                      {Math.min(
+                        enabledPersonas.length,
+                        session.memoryLimits.maxCalls,
+                      )}{" "}
+                      provider calls. Each Persona uses its configured history
+                      window, up to {session.memoryLimits.maxHistory} messages
+                      through this turn. Run budget · up to{" "}
+                      {session.memoryLimits.maxTotalTokens.toLocaleString()}{" "}
+                      tokens.
+                    </p>
+                  )}
+                </div>
+              )}
               {files.length > 0 && (
                 <div className="flex flex-wrap gap-2">
                   {files.map((file, index) => (
@@ -1207,6 +1252,15 @@ export default function App() {
           setSavedContexts((items) => items.filter((item) => item.id !== id))
         }
       />
+      {memoryOpen && room && (
+        <React.Fragment key={session.actorId + "/" + room.id}>
+          <MemoryPanel
+            room={room}
+            close={() => setMemoryOpen(false)}
+            onSessionExpired={clearIdentity}
+          />
+        </React.Fragment>
+      )}
       {migration && (
         <MigrationPanel
           close={() => setMigration(false)}
@@ -1239,8 +1293,8 @@ export default function App() {
       {reader && (
         <DataDialog title={reader.title} close={() => setReader(undefined)}>
           <p className="text-xs text-zinc-400 mb-3">
-            Current server authorization applies. Internal memory is not
-            published to a Vault.
+            Access follows your current permissions. Review memory candidates in
+            the Room’s Memory panel.
           </p>
           <pre className="text-sm whitespace-pre-wrap break-words max-h-[60vh] overflow-auto">
             {JSON.stringify(reader.data, null, 2)}

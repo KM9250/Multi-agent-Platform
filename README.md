@@ -33,7 +33,8 @@ It is a prototype environment for testing how a network of AI agents can functio
 ## Getting started
 
 Requirements: Node.js 22.13+ and local, protected storage for the application DB
-and attachments. DATA-1 uses server sessions and server-side provider calls.
+and attachments. The MEM-1 Vault adapter uses Linux with procfs and a local filesystem.
+DATA-1 uses server sessions and server-side provider calls.
 A real Gemini key is needed only for explicitly enabled real-provider use.
 
 ```bash
@@ -58,6 +59,8 @@ keys. For a deployment previously built with a client-side key, rotate that key
 through the provider's account controls and remove old bundles, source maps and
 CDN/service-worker caches. This change does not rotate keys automatically.
 
+- [MEM-1 design, rollout sequence and Host operations](docs/map-mem-1.md)
+- [MEM-1 verification and production handoff](docs/map-mem-1-validation.md)
 - [Architecture and limits](docs/map-data-1-architecture.md)
 - [Design decisions and compatibility changes](docs/map-data-1-adr.md)
 - [Validation results and production gates](docs/map-data-1-validation.md)
@@ -79,9 +82,8 @@ npm run bench:app-data
 
 The browser suite uses installed Chromium (set `CHROMIUM_PATH` when necessary).
 Real-provider testing is a separately gated command, `npm run test:app-data-provider`;
-it is never part of ordinary tests or an automatic startup probe. DATA-1 does not
-implement MEM-1–4 or publish `/memory` to an Obsidian Vault. Production readiness
-requires the separately documented live-provider and target-host restore gates.
+run it only during an authorized live-provider check. Initial production acceptance
+follows MEM-3 and includes verification on the chosen deployment.
 
 ## Related repository
 
@@ -105,8 +107,8 @@ Normal message readers return authorized public content; the explicit internal
 reader checks the current session and exact Room, Persona and visibility grants.
 Room display/separation settings do not grant access or reclassify saved private
 content. Public generation excludes private history, private worker reports and
-private memory. `/memory` produces a classified internal memo and does not publish
-to a Vault. Debug summaries are application-requested concise summaries, not
+private memory. With explicit memory grants, `/memory` also creates private
+candidates. Reviewers can edit and approve them for publication to the registered Vault. Debug summaries are application-requested concise summaries, not
 provider-hidden chain of thought.
 
 The earlier client-side separation helpers remain covered by historical isolated

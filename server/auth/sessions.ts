@@ -76,14 +76,12 @@ export class SessionService {
     this.absoluteTimeoutMs = options.absoluteTimeoutMs ?? 12 * 60 * 60_000;
     this.idleTimeoutMs = options.idleTimeoutMs ?? 30 * 60_000;
     this.now = options.now ?? (() => Date.now());
-    if (
-      !(
-        this.absoluteTimeoutMs > 0 &&
-        this.absoluteTimeoutMs <= 7 * 86400_000 &&
-        this.idleTimeoutMs > 0 &&
-        this.idleTimeoutMs <= this.absoluteTimeoutMs
-      )
-    )
+    if (!(
+      this.absoluteTimeoutMs > 0 &&
+      this.absoluteTimeoutMs <= 7 * 86400_000 &&
+      this.idleTimeoutMs > 0 &&
+      this.idleTimeoutMs <= this.absoluteTimeoutMs
+    ))
       throw new AuthError("INVALID_CONFIGURATION", 500);
   }
 
@@ -341,11 +339,18 @@ export class SessionService {
       this.app.db
         .prepare("UPDATE auth_sessions SET revoked_at=? WHERE actor_id=?")
         .run(this.now(), actorId);
+      const epoch = this.app.db
+        .prepare(
+          "UPDATE workspaces SET acl_revision=acl_revision+1 WHERE workspace_id=? RETURNING acl_revision",
+        )
+        .get(p.workspace_id)!;
+      const revision = Number(epoch.acl_revision);
       this.app.db
         .prepare(
-          "UPDATE workspaces SET acl_revision=acl_revision+1 WHERE workspace_id=?",
+          `INSERT INTO auth_revocations
+        (workspace_id,actor_id,revision,action,requested_operation,grant_count) VALUES(?,?,?,'ACCOUNT_REVOKE',NULL,0)`,
         )
-        .run(p.workspace_id);
+        .run(p.workspace_id, actorId, revision);
       this.app.audit(
         actorId,
         String(p.workspace_id),
@@ -357,11 +362,7 @@ export class SessionService {
         null,
         "ACL",
         actorId,
-        Number(
-          this.app.db
-            .prepare("SELECT acl_revision FROM workspaces WHERE workspace_id=?")
-            .get(p.workspace_id)!.acl_revision,
-        ),
+        revision,
         "ACCOUNT_REVOKE",
       );
     });
