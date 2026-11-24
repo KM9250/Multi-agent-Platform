@@ -15,6 +15,9 @@ import { SQLiteSearchBackend, BACKEND_CONTRACT } from "./backend.ts";
 import { ANALYZER_VERSION, NORMALIZER_VERSION } from "./lexical.ts";
 import { CHUNKER_VERSION, CHUNK_LENGTH, CHUNK_OVERLAP } from "./chunk.ts";
 import { SearchSources } from "./sources.ts";
+import { getSearchProfile } from "./profile.ts";
+import { buildDenseIndex } from "./dense.ts";
+import { EMBEDDING_SPACE } from "./embedding.ts";
 import {
   assertAvailable,
   errorCode,
@@ -59,6 +62,7 @@ export async function updateGeneration(
         ?.requester !== JSON.stringify(binding)
     )
       throw new AppError("SEARCH_JOB_BINDING_MISMATCH");
+    const profile = getSearchProfile(app, actor, binding.roomId);
     const config = {
       backend: "sqlite-fts5",
       backendContract: BACKEND_CONTRACT,
@@ -70,6 +74,12 @@ export async function updateGeneration(
       chunkLength: CHUNK_LENGTH,
       overlap: CHUNK_OVERLAP,
       targets: ["current-memory", "current-and-historical-archive"],
+      embeddingSpace: profile ? EMBEDDING_SPACE : null,
+      profileVersion: profile?.version ?? null,
+      denseScopes: profile?.scopes ?? [],
+      densePersona: profile?.personaId ?? null,
+      profileDigest: profile?.configDigest ?? null,
+      denseSpaceId: profile?.spaceId ?? null,
     };
     const configDigest = hash(JSON.stringify(config));
     const epoch = hash(app.cursorKey);
@@ -165,8 +175,36 @@ export async function updateGeneration(
       await refresh("memory");
       await refresh("archive");
     }
+    let dense = create ? null : old?.dense;
+    if (profile && job.external) {
+      check();
+      dense = await buildDenseIndex(
+        app,
+        policy,
+        actor,
+        binding.roomId,
+        path,
+        signal,
+      );
+      // External calls may have taken minutes. Reconcile committed edits/deletions before marking coverage.
+      memoryChanged = false;
+      await refresh("memory");
+      await refresh("archive");
+    }
+    if (dense && memoryChanged) {
+      dense = {
+        state: "source_changed",
+        indexed: null,
+        planned: null,
+        spaceId: config.denseSpaceId,
+        profileVersion: config.profileVersion,
+      };
+    }
     if (switching) backend.validate();
     check();
+    const nowProfile = getSearchProfile(app, actor, binding.roomId);
+    if ((nowProfile?.version ?? null) !== config.profileVersion)
+      throw new AppError("SEARCH_PROFILE_CHANGED", 409);
     const manifest = {
       ...base,
       generationId,
@@ -176,6 +214,7 @@ export async function updateGeneration(
         memory: backend.getCursor("memory"),
         archive: backend.getCursor("archive"),
       },
+      dense,
     };
     if (switching) {
       changeState(reg, generationId, "VALIDATING", "READY");

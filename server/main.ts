@@ -22,6 +22,7 @@ import { inspectDataHealth } from "./operations/health.ts";
 import { startLineageWorker, startPublicationWorker } from "./memory/worker.ts";
 import { startVaultWatcher } from "./memory/importer.ts";
 
+import { recoverSearchDispatches } from "./search/profile.ts";
 import { shutdownIndexWorkers } from "./search/index.ts";
 
 function numberSetting(
@@ -186,6 +187,7 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
           )
         : createAppServer(options);
     generation.recoverInterrupted();
+    recoverSearchDispatches(app);
     server.requestTimeout = 30_000;
     server.headersTimeout = 10_000;
     server.maxHeadersCount = 64;
