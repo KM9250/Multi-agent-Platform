@@ -22,6 +22,8 @@ import { inspectDataHealth } from "./operations/health.ts";
 import { startLineageWorker, startPublicationWorker } from "./memory/worker.ts";
 import { startVaultWatcher } from "./memory/importer.ts";
 
+import { shutdownIndexWorkers } from "./search/index.ts";
+
 function numberSetting(
   value: string | undefined,
   fallback: number,
@@ -202,6 +204,7 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
       stopLineage();
       stopPublisher();
       await stopWatching();
+      await shutdownIndexWorkers(app!);
       await generation.shutdown();
       app!.close();
       release();
