@@ -452,7 +452,9 @@ export function listNoteChanges(
   actor: Actor,
   roomId: string,
   after?: string,
+  pageSize = 200,
 ): MemoryChangePage {
+  integer(pageSize, 1, 200);
   return app.transaction(() => {
     policy.assert(actor, "READ_ROOM", { roomId });
     // Persona/Room deletion can remove visible notes without changing the workspace ACL revision.
@@ -509,27 +511,27 @@ export function listNoteChanges(
         WITH allowed AS (${permitted} AND d.note_id>COALESCE((SELECT note_id FROM memory_changes WHERE seq=?),''))
         SELECT ${fields},'BASELINE' AS action FROM allowed a
         JOIN memory_changes c ON c.seq=(SELECT MAX(h.seq) FROM memory_changes h WHERE h.note_id=a.note_id AND h.seq<=?)
-        ${versionJoin} ORDER BY a.note_id LIMIT 201`,
+        ${versionJoin} ORDER BY a.note_id LIMIT ?`,
           )
-          .all(...args, page.position, cutoff)
+          .all(...args, page.position, cutoff, pageSize + 1)
       : app.db
           .prepare(
             `
         SELECT ${fields},c.action FROM memory_changes c ${versionJoin}
-        WHERE c.seq>? AND c.seq<=? AND c.note_id IN (${permitted}) ORDER BY c.seq LIMIT 201`,
+        WHERE c.seq>? AND c.seq<=? AND c.note_id IN (${permitted}) ORDER BY c.seq LIMIT ?`,
           )
-          .all(page.position, cutoff, ...args)) as unknown as Array<
+          .all(page.position, cutoff, ...args, pageSize + 1)) as unknown as Array<
       MemoryChangeItem & { seq: number }
     >;
-    const hasMore = rows.length > 200;
-    const items = rows.slice(0, 200).map(({ seq, ...item }) => {
+    const hasMore = rows.length > pageSize;
+    const items = rows.slice(0, pageSize).map(({ seq, ...item }) => {
       if (typeof item.digest !== "string")
         throw new AppError("MEMORY_INTEGRITY", 409);
       return item;
     });
     const next = {
       mode: hasMore ? page.mode : ("delta" as const),
-      position: hasMore ? Number(rows[199].seq) : cutoff,
+      position: hasMore ? Number(rows[pageSize - 1].seq) : cutoff,
       cutoff,
     };
     return {
@@ -541,4 +543,4 @@ export function listNoteChanges(
   }, "memory_change_feed");
 }
 
-export { lookup as lookupNote };
+export { lookup as lookupNote, visibleDocuments as visibleMemoryDocuments };
