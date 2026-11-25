@@ -17,6 +17,8 @@ import { registerHandwrittenNote, scanVault } from "./memory/importer.ts";
 import { setNoteTrust } from "./memory/notes.ts";
 import { listVaultConflicts } from "./memory/conflicts.ts";
 
+import { runSearchCommand, searchFlags } from "./search/index-cli.ts";
+
 function flags(argv: string[]): Record<string, string> {
   const output: Record<string, string> = {};
   for (let i = 0; i < argv.length; i += 2) {
@@ -49,6 +51,7 @@ export async function runCli(argv = process.argv.slice(2)) {
     args = flags(argv.slice(1)),
     root = args.root ?? process.env.MAP_DATA_ROOT;
   const allowed: Record<string, string[]> = {
+    ...searchFlags,
     "account-create": ["root", "username", "workspace", "no-public-grants"],
     "account-revoke": ["root", "actor"],
     "password-reset": ["root", "actor"],
@@ -121,6 +124,8 @@ export async function runCli(argv = process.argv.slice(2)) {
   try {
     const sessions = new SessionService(app),
       policy = new AuthorizationPolicy(app);
+    if (Object.hasOwn(searchFlags, command))
+      return await runSearchCommand(app, policy, command, args);
     switch (command) {
       case "account-create":
         if (!args.username) throw new AuthError("INVALID_ARGUMENTS", 400);

@@ -1,0 +1,160 @@
+{
+  "schema": "MAP-MEM-2:COEXIST-BENCH:1",
+  "environment": {
+    "node": "v24.22.3",
+    "sqlite": "3.54.1",
+    "platform": "linux",
+    "kernel": "6.18.57",
+    "cpu": "AMD EPYC 9V74 80-Core Processor",
+    "parallelism": 4,
+    "hostRamBytes": 18882662400
+  },
+  "corpus": {
+    "messages": 100000,
+    "deltaMessages": 1,
+    "furtherPublicMessagesDuringQueryTrials": 73,
+    "historyRevisions": 5000,
+    "meanInitialBodyUtf16": 35.88877,
+    "sourceScope": "public_message/public",
+    "denseProfiles": 0,
+    "queryTrialsPerMode": 10,
+    "heartbeatIntervalMs": 50,
+    "saveIntervalMs": 80
+  },
+  "seedMs": 77908.984207,
+  "baseline": {
+    "ms": 1200.4005159999942,
+    "save": {
+      "count": 14,
+      "p50Ms": 1.684454000002006,
+      "p95Ms": 2.2998289999959525,
+      "maxMs": 2.2998289999959525
+    },
+    "heartbeatGap": {
+      "count": 23,
+      "p50Ms": 50.14777799999865,
+      "p95Ms": 50.87331899999117,
+      "maxMs": 52.98412500000268
+    },
+    "renewalErrors": 0,
+    "writeErrors": 0,
+    "eventLoopP95Ms": 10.772479,
+    "eventLoopMaxMs": 12.304383,
+    "peakQueue": 0
+  },
+  "build": {
+    "ms": 72626.124223,
+    "save": {
+      "count": 905,
+      "p50Ms": 1.644877999991877,
+      "p95Ms": 4.338019000002532,
+      "maxMs": 28.197320000006584
+    },
+    "heartbeatGap": {
+      "count": 1447,
+      "p50Ms": 50.08870300000126,
+      "p95Ms": 50.90211599999748,
+      "maxMs": 94.86609399999725
+    },
+    "renewalErrors": 0,
+    "writeErrors": 0,
+    "eventLoopP95Ms": 11.452415,
+    "eventLoopMaxMs": 91.029503,
+    "peakQueue": 1
+  },
+  "buildPrimaryMs": 71644.13035099999,
+  "delta": {
+    "ms": 655.7461559999792,
+    "save": {
+      "count": 8,
+      "p50Ms": 1.7305120000091847,
+      "p95Ms": 2.019518999994034,
+      "maxMs": 2.019518999994034
+    },
+    "heartbeatGap": {
+      "count": 13,
+      "p50Ms": 50.14187999998103,
+      "p95Ms": 51.97923299999093,
+      "maxMs": 51.97923299999093
+    },
+    "renewalErrors": 0,
+    "writeErrors": 0,
+    "eventLoopP95Ms": 10.944511,
+    "eventLoopMaxMs": 11.927551,
+    "peakQueue": 0
+  },
+  "deltaVerificationHttpMs": 296.9314970000123,
+  "queries": {
+    "ms": 5923.734971000027,
+    "save": {
+      "count": 73,
+      "p50Ms": 2.0387749999936204,
+      "p95Ms": 5.209140999999363,
+      "maxMs": 12.592571999994107
+    },
+    "heartbeatGap": {
+      "count": 116,
+      "p50Ms": 50.24704400001792,
+      "p95Ms": 54.38269900000887,
+      "maxMs": 69.78440400000545
+    },
+    "renewalErrors": 0,
+    "writeErrors": 0,
+    "eventLoopP95Ms": 13.492223,
+    "eventLoopMaxMs": 26.230783,
+    "peakQueue": 0
+  },
+  "lexicalHttp": {
+    "count": 10,
+    "p50Ms": 256.9528740000096,
+    "p95Ms": 316.3582279999973,
+    "maxMs": 316.3582279999973
+  },
+  "approxDateHttp": {
+    "count": 10,
+    "p50Ms": 313.8613539999933,
+    "p95Ms": 405.2494230000011,
+    "maxMs": 405.2494230000011
+  },
+  "responses": {
+    "externalCalls": 0,
+    "verified": 21,
+    "excluded": 0
+  },
+  "statusCounts": {
+    "ready": 1,
+    "partial": 20
+  },
+  "reasonCounts": {
+    "INDEX_LAGGING": 20
+  },
+  "queryWorkload": {
+    "text": "牡丹観測記録",
+    "transport": "HTTP over loopback; session reused; lexical worker startup and final source checks included",
+    "date": "approx 2026-11-11 Asia/Tokyo; reference recorded November 9",
+    "cache": "no OS cache flush; timed trials follow build, delta and an initial HTTP probe"
+  },
+  "external": {
+    "calls": 0,
+    "recordedUsage": 0,
+    "estimatedCosts": 0
+  },
+  "indexWorkers": {
+    "started": 11,
+    "completed": 10,
+    "cancelled": 1,
+    "failed": 0,
+    "queueWaitTotalMs": 71631,
+    "maxConcurrent": 1,
+    "cancelAndExitMs": 595.9464140000055,
+    "limits": {
+      "concurrent": 1,
+      "queued": 4,
+      "deadlineMs": 1800000,
+      "refreshIntervalMs": 5000
+    }
+  },
+  "derivedBytesAllPartitions": 360763392,
+  "serverAndThreadsSampledPeakRssBytes": 335319040,
+  "rssScope": "node parent including worker threads, excluding forked lexical processes"
+}

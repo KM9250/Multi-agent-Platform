@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   mkdtempSync,
+  mkdirSync,
   rmSync,
   readFileSync,
   writeFileSync,
@@ -10,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { APP_SCHEMA } from "../shared/app-contracts/index.ts";
 import { AppDatabase } from "../server/app-data/db.ts";
 import { ConversationRepository } from "../server/app-data/repository.ts";
 import {
@@ -330,6 +332,114 @@ test("Restore destination may not overwrite an existing store and resume rejects
       /RESTORE_RESUME_REQUIRED/,
     );
   } finally {
+    f.close();
+  }
+});
+
+test("C-07: backup fences search dispatch and restore preserves costs with external profiles paused", async () => {
+  const f = fixture();
+  let restored: AppDatabase | undefined;
+  try {
+    // Even a damaged derived generation is disposable and cannot veto a source backup.
+    mkdirSync(join(f.root, "search-index"), { mode: 0o700 });
+    writeFileSync(
+      join(f.root, "search-index", "broken.sqlite"),
+      "partial derived bytes",
+    );
+    const db = f.app.db;
+    db.prepare(
+      `INSERT INTO search_profiles(workspace_id,actor_id,room_id,version,active,
+      provider,model,space_id,config_json,config_digest,created_at) VALUES(?,?,?,1,1,?,?,?,?,?,1)`,
+    ).run(
+      "w",
+      "a",
+      f.room.id,
+      "synthetic",
+      "embedding-test",
+      "fixture",
+      "{}",
+      "fixture-digest",
+    );
+    const record =
+      db.prepare(`INSERT INTO search_operations(operation_id,workspace_id,actor_id,room_id,
+      profile_version,purpose,payload_digest,state,reserved_tokens,reserved_cost_micros,
+      estimated_cost_micros,usage_json,created_at) VALUES(?,'w','a',?,1,'QUERY_EMBEDDING','digest',?,10,20,?,?,1)`);
+    record.run("pending", f.room.id, "RESERVED", null, null);
+    record.run("uncertain", f.room.id, "DISPATCH_INTENT", null, null);
+    record.run("done", f.room.id, "SUCCEEDED", 12, '{"inputTokens":6}');
+    const backup = new BackupService(f.app);
+    await assert.rejects(
+      backup.backup(join(f.parent, "busy-backup")),
+      /BACKUP_ACTIVE_SEARCH_DISPATCH/,
+    );
+    assert.equal(
+      db.prepare("SELECT maintenance FROM app_operational_state").get()!
+        .maintenance,
+      0,
+    );
+    db.prepare(
+      "UPDATE search_operations SET state='OUTCOME_UNKNOWN' WHERE operation_id='uncertain'",
+    ).run();
+
+    const manifest = await backup.backup(f.backup);
+    assert.equal(manifest.schema, "MAP-MEM-1:BACKUP:3");
+    assert.equal(manifest.appSchema, APP_SCHEMA);
+    assert.equal(existsSync(join(f.backup, "search-index")), false);
+    await restoreBackup(f.backup, f.restored);
+    assert.equal(existsSync(join(f.restored, "search-index")), false);
+    restored = new AppDatabase({ root: f.restored });
+    assert.notDeepEqual(restored.cursorKey, f.app.cursorKey);
+    assert.equal(
+      restored.db.prepare("SELECT active FROM search_profiles").get()!.active,
+      0,
+    );
+    assert.equal(
+      db.prepare("SELECT active FROM search_profiles").get()!.active,
+      1,
+    );
+    assert.deepEqual(
+      restored.db
+        .prepare(
+          `SELECT operation_id,state,reserved_cost_micros,
+      estimated_cost_micros,usage_json FROM search_operations ORDER BY operation_id`,
+        )
+        .all()
+        .map((row) => Object.values(row)),
+      [
+        ["done", "SUCCEEDED", 20, 12, '{"inputTokens":6}'],
+        ["pending", "REJECTED", 20, null, null],
+        ["uncertain", "OUTCOME_UNKNOWN", 20, null, null],
+      ],
+    );
+    await new SessionService(restored).resetPassword(
+      "a",
+      "synthetic-reset-password-2026",
+    );
+    restored.db.exec(
+      "UPDATE search_operations SET reserved_cost_micros=1 WHERE operation_id='uncertain'",
+    );
+    await assert.rejects(
+      resumeRestore(f.restored),
+      /RESTORE_REFERENCE_MISMATCH/,
+    );
+    restored.db.exec(
+      "UPDATE search_operations SET reserved_cost_micros=20 WHERE operation_id='uncertain'",
+    );
+    await resumeRestore(f.restored);
+    assert.equal(
+      restored.db.prepare("SELECT active FROM search_profiles").get()!.active,
+      0,
+    );
+    assert.equal(
+      restored.db
+        .prepare(
+          "SELECT count(*) n FROM search_operations WHERE state IN ('RESERVED','DISPATCH_INTENT')",
+        )
+        .get()!.n,
+      0,
+    );
+  } finally {
+    restored?.close();
     f.close();
   }
 });

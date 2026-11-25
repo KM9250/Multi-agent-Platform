@@ -38,7 +38,11 @@
     "test:memory-browser": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/integration/memory-browser.integration.ts",
     "test:app-data-provider": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/integration/app-data-provider.integration.ts",
     "bench:app-data": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/bench/app-data.bench.ts",
-    "test:app-data-audit": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/app-data-audit-pr38.test.ts"
+    "test:app-data-audit": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/app-data-audit-pr38.test.ts",
+    "test:search": "node --experimental-transform-types --loader ./test/ts-loader.mjs --test --test-concurrency=2 test/search*.test.ts",
+    "test:search-browser": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/integration/search-browser.integration.ts",
+    "bench:search": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/bench/search.bench.ts",
+    "bench:search-coexist": "node --experimental-transform-types --loader ./test/ts-loader.mjs test/bench/search-coexist.bench.ts"
   },
   "dependencies": {
     "@google/genai": "^1.30.0",

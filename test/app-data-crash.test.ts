@@ -74,6 +74,8 @@ for (const migration of [
   "app_002_memory_vault",
   "app_003_memory_integrity",
   "app_004_resumable_memory_lineage",
+  "app_005_search_control",
+  "app_006_scoped_archive_changes",
 ])
   for (const when of ["before", "after"])
     test(`C1-08: real SIGKILL ${when} ${migration} COMMIT recovers schema exactly once`, async (t) => {
@@ -86,15 +88,16 @@ for (const migration of [
           readOnly: true,
         });
         try {
-          const schema2 = migration === "app_002_memory_vault";
-          // Migration 003 and 004 share a commit for a direct upgrade from schema 2.
-          const expectedVersion = schema2
-            ? when === "before"
-              ? 1
-              : 2
-            : when === "before"
-              ? 2
-              : 4;
+          // Migrations 003 and 004 share a commit for direct upgrades from schema 2.
+          const versions: Record<string, [number, number]> = {
+            app_002_memory_vault: [1, 2],
+            app_003_memory_integrity: [2, 4],
+            app_004_resumable_memory_lineage: [2, 4],
+            app_005_search_control: [4, 5],
+            app_006_scoped_archive_changes: [5, 6],
+          };
+          const expectedVersion =
+            versions[migration][when === "before" ? 0 : 1];
           assert.equal(
             beforeRestart
               .prepare("SELECT schema_version FROM app_metadata")
@@ -131,6 +134,22 @@ for (const migration of [
               .get()!.n,
             Number(expectedVersion >= 4),
           );
+          assert.equal(
+            beforeRestart
+              .prepare(
+                "SELECT count(*) AS n FROM sqlite_schema WHERE name='search_operations'",
+              )
+              .get()!.n,
+            Number(expectedVersion >= 5),
+          );
+          assert.equal(
+            beforeRestart
+              .prepare(
+                "SELECT count(*) AS n FROM sqlite_schema WHERE type='index' AND name IN ('search_message_changes','search_persona_deletions')",
+              )
+              .get()!.n,
+            expectedVersion >= 6 ? 2 : 0,
+          );
         } finally {
           beforeRestart.close();
         }
@@ -147,6 +166,8 @@ for (const migration of [
           "app_002_memory_vault",
           "app_003_memory_integrity",
           "app_004_resumable_memory_lineage",
+          "app_005_search_control",
+          "app_006_scoped_archive_changes",
         ],
       );
       assert.deepEqual(app.db.prepare("PRAGMA foreign_key_check").all(), []);

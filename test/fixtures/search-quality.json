@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "description": "Synthetic Japanese lexical relevance judgments. References are stable across generations and backends.",
+  "workspaceId": "synthetic-workspace",
+  "roomId": "synthetic-room",
+  "cases": [
+    {
+      "query": "月面 基地 予備電源",
+      "relevant": [
+        {
+          "target": "archive",
+          "messageId": "msg-7",
+          "revisionId": "revision-7-2",
+          "segmentId": "segment-7-2",
+          "version": 2,
+          "workspaceId": "synthetic-workspace",
+          "roomId": "synthetic-room",
+          "segmentDigest": "cf20a45daf2f9c08026de053ccd39929125b07545957cde25d4c34b9e2826d5a"
+        }
+      ]
+    },
+    {
+      "query": "白猫の避難所",
+      "relevant": [
+        {
+          "target": "archive",
+          "messageId": "msg-8",
+          "revisionId": "revision-8-2",
+          "segmentId": "segment-8-2",
+          "version": 2,
+          "workspaceId": "synthetic-workspace",
+          "roomId": "synthetic-room",
+          "segmentDigest": "512c5a5da2cd6aaaf00f182da1d58d5a875180dec8b57f888226f00f904dc497"
+        }
+      ]
+    },
+    {
+      "query": "ＰＲ３９レビュー",
+      "relevant": [
+        {
+          "target": "archive",
+          "messageId": "msg-9",
+          "revisionId": "revision-9-2",
+          "segmentId": "segment-9-2",
+          "version": 2,
+          "workspaceId": "synthetic-workspace",
+          "roomId": "synthetic-room",
+          "segmentDigest": "c6793a4024a07b9c4295e8a4b69107dad3a09e1ce8a02facbdc8134b7a41a63e"
+        }
+      ]
+    }
+  ]
+}

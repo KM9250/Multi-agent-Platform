@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { basename, join, resolve } from "node:path";
+import { APP_SCHEMA } from "../shared/app-contracts/index.ts";
 import { AppDatabase } from "../server/app-data/db.ts";
 import { ConversationRepository } from "../server/app-data/repository.ts";
 import { AuthorizationPolicy } from "../server/auth/authorization.ts";
@@ -291,7 +292,7 @@ test("F-06: real schema 2 approvals survive direct upgrade and recover after sch
       assert.equal(
         app.db.prepare("SELECT schema_version FROM app_metadata").get()!
           .schema_version,
-        4,
+        APP_SCHEMA,
       );
       const policy = new AuthorizationPolicy(app),
         candidates = new MemoryCandidates(app, policy);

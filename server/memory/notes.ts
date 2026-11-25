@@ -446,36 +446,47 @@ export function setNoteTrust(
     );
   });
 }
+export function memoryChangeContext(
+  app: AppDatabase,
+  policy: AuthorizationPolicy,
+  actor: Actor,
+  roomId: string,
+): Buffer {
+  policy.assert(actor, "READ_ROOM", { roomId });
+  // Persona/Room deletion can remove visible notes without changing the workspace ACL revision.
+  const grants = app.db
+    .prepare(
+      `
+      SELECT DISTINCT g.persona_id, g.visibility FROM access_grants g
+      JOIN rooms r USING(workspace_id,room_id) JOIN personas p USING(workspace_id,persona_id)
+      WHERE g.workspace_id=? AND g.actor_id=? AND g.room_id=? AND g.operation='READ_MEMORY'
+      AND g.revoked_at IS NULL AND g.provider='*' AND p.deleted_at IS NULL AND r.deleted_at IS NULL
+      ORDER BY g.persona_id,g.visibility`,
+    )
+    .all(actor.workspaceId, actor.actorId, roomId);
+  return Buffer.from(
+    JSON.stringify([
+      "MAP:MEMORY:CHANGES:1",
+      actor.workspaceId,
+      actor.actorId,
+      roomId,
+      policy.revision(actor),
+      grants,
+    ]),
+  );
+}
+
 export function listNoteChanges(
   app: AppDatabase,
   policy: AuthorizationPolicy,
   actor: Actor,
   roomId: string,
   after?: string,
+  pageSize = 200,
 ): MemoryChangePage {
+  integer(pageSize, 1, 200);
   return app.transaction(() => {
-    policy.assert(actor, "READ_ROOM", { roomId });
-    // Persona/Room deletion can remove visible notes without changing the workspace ACL revision.
-    const grants = app.db
-      .prepare(
-        `
-      SELECT DISTINCT g.persona_id, g.visibility FROM access_grants g
-      JOIN rooms r USING(workspace_id,room_id) JOIN personas p USING(workspace_id,persona_id)
-      WHERE g.workspace_id=? AND g.actor_id=? AND g.room_id=? AND g.operation='READ_MEMORY'
-      AND g.revoked_at IS NULL AND g.provider='*' AND p.deleted_at IS NULL AND r.deleted_at IS NULL
-      ORDER BY g.persona_id,g.visibility`,
-      )
-      .all(actor.workspaceId, actor.actorId, roomId);
-    const context = Buffer.from(
-      JSON.stringify([
-        "MAP:MEMORY:CHANGES:1",
-        actor.workspaceId,
-        actor.actorId,
-        roomId,
-        policy.revision(actor),
-        grants,
-      ]),
-    );
+    const context = memoryChangeContext(app, policy, actor, roomId);
     const latest = Number(
       app.db
         .prepare("SELECT COALESCE(MAX(seq),0) AS n FROM memory_changes")
@@ -509,27 +520,30 @@ export function listNoteChanges(
         WITH allowed AS (${permitted} AND d.note_id>COALESCE((SELECT note_id FROM memory_changes WHERE seq=?),''))
         SELECT ${fields},'BASELINE' AS action FROM allowed a
         JOIN memory_changes c ON c.seq=(SELECT MAX(h.seq) FROM memory_changes h WHERE h.note_id=a.note_id AND h.seq<=?)
-        ${versionJoin} ORDER BY a.note_id LIMIT 201`,
+        ${versionJoin} ORDER BY a.note_id LIMIT ?`,
           )
-          .all(...args, page.position, cutoff)
+          .all(...args, page.position, cutoff, pageSize + 1)
       : app.db
           .prepare(
             `
         SELECT ${fields},c.action FROM memory_changes c ${versionJoin}
-        WHERE c.seq>? AND c.seq<=? AND c.note_id IN (${permitted}) ORDER BY c.seq LIMIT 201`,
+        WHERE c.seq>? AND c.seq<=? AND c.note_id IN (${permitted}) ORDER BY c.seq LIMIT ?`,
           )
-          .all(page.position, cutoff, ...args)) as unknown as Array<
-      MemoryChangeItem & { seq: number }
-    >;
-    const hasMore = rows.length > 200;
-    const items = rows.slice(0, 200).map(({ seq, ...item }) => {
+          .all(
+            page.position,
+            cutoff,
+            ...args,
+            pageSize + 1,
+          )) as unknown as Array<MemoryChangeItem & { seq: number }>;
+    const hasMore = rows.length > pageSize;
+    const items = rows.slice(0, pageSize).map(({ seq, ...item }) => {
       if (typeof item.digest !== "string")
         throw new AppError("MEMORY_INTEGRITY", 409);
       return item;
     });
     const next = {
       mode: hasMore ? page.mode : ("delta" as const),
-      position: hasMore ? Number(rows[199].seq) : cutoff,
+      position: hasMore ? Number(rows[pageSize - 1].seq) : cutoff,
       cutoff,
     };
     return {
@@ -541,4 +555,4 @@ export function listNoteChanges(
   }, "memory_change_feed");
 }
 
-export { lookup as lookupNote };
+export { lookup as lookupNote, visibleDocuments as visibleMemoryDocuments };

@@ -14,6 +14,8 @@ import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
   APP_CONTRACT,
+  APP_SCHEMA,
+  SEARCH_CONTRACT,
   MEMORY_CONTRACT,
   AppError,
 } from "../../shared/app-contracts/index.ts";
@@ -28,6 +30,8 @@ import { enqueueLegacyLineage } from "../memory/lineage-recovery.ts";
 import { REVOCATION_SCHEMA } from "../auth/revocations.ts";
 import { memoryRecordsDigest } from "../operations/memory-ledger.ts";
 
+import { SEARCH_PROFILE_SCHEMA } from "../search/profile-schema.ts";
+
 const METADATA_SCHEMA = `CREATE TABLE app_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),contract TEXT NOT NULL,schema_version INTEGER NOT NULL,cursor_key TEXT NOT NULL) STRICT; CREATE TABLE app_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at INTEGER NOT NULL) STRICT;`;
 const FEATURE_SCHEMA = `CREATE TABLE app_feature_contracts(contract TEXT PRIMARY KEY) STRICT;`;
 const migrations = [
@@ -35,6 +39,8 @@ const migrations = [
   "app_002_memory_vault",
   "app_003_memory_integrity",
   "app_004_resumable_memory_lineage",
+  "app_005_search_control",
+  "app_006_scoped_archive_changes",
 ] as const;
 const definitions = [
   [
@@ -65,6 +71,11 @@ const definitions = [
       version INTEGER NOT NULL, digest TEXT NOT NULL, relative_path TEXT NOT NULL
     ) STRICT;`,
   ].join("\n"),
+  SEARCH_PROFILE_SCHEMA,
+  `CREATE INDEX search_message_changes ON app_changes(workspace_id,room_id,change_id)
+     WHERE target_type='MESSAGE';
+   CREATE INDEX search_persona_deletions ON app_changes(workspace_id,target_id,change_id)
+     WHERE target_type='PERSONA' AND action='DELETE';`,
 ];
 function schemaObjects(db: DatabaseSync): string {
   return JSON.stringify(
@@ -92,7 +103,7 @@ function expectedCatalogue(version: number): string {
   }
   return catalogue;
 }
-export function identifyAppSchema(db: DatabaseSync): 1 | 2 | 3 | 4 {
+export function identifyAppSchema(db: DatabaseSync): 1 | 2 | 3 | 4 | 5 | 6 {
   try {
     const meta = db
       .prepare(
@@ -102,7 +113,12 @@ export function identifyAppSchema(db: DatabaseSync): 1 | 2 | 3 | 4 {
     const version = meta?.schema_version;
     if (
       meta?.contract !== APP_CONTRACT ||
-      (version !== 1 && version !== 2 && version !== 3 && version !== 4)
+      (version !== 1 &&
+        version !== 2 &&
+        version !== 3 &&
+        version !== 4 &&
+        version !== 5 &&
+        version !== 6)
     )
       throw new AppError("WRONG_DATABASE");
     const ledger = db
@@ -120,7 +136,14 @@ export function identifyAppSchema(db: DatabaseSync): 1 | 2 | 3 | 4 {
       const contracts = db
         .prepare("SELECT contract FROM app_feature_contracts")
         .all();
-      if (contracts.length !== 1 || contracts[0].contract !== MEMORY_CONTRACT)
+      const expected =
+        version >= 5 ? [MEMORY_CONTRACT, SEARCH_CONTRACT] : [MEMORY_CONTRACT];
+      if (
+        contracts.length !== expected.length ||
+        !expected.every((contract) =>
+          contracts.some((row) => row.contract === contract),
+        )
+      )
         throw new AppError("WRONG_DATABASE");
     }
     return version;
@@ -141,6 +164,7 @@ function fenceOldRestoredJobs(db: DatabaseSync): void {
 export interface AppDatabaseOptions {
   root: string;
   path?: string;
+  readOnly?: boolean;
   busyTimeoutMs?: number;
   hooks?: {
     beforeCommit?: (phase: string) => void;
@@ -165,11 +189,19 @@ export function assertSafePath(path: string, kind: "directory" | "file"): void {
     }
   }
 }
+function readCursorKey(db: DatabaseSync): Buffer {
+  const key = db
+    .prepare("SELECT cursor_key FROM app_metadata WHERE singleton=1")
+    .get()!.cursor_key;
+  return Buffer.from(String(key), "hex");
+}
+
 export class AppDatabase {
   readonly db: DatabaseSync;
   readonly root: string;
   readonly path: string;
   readonly cursorKey: Buffer;
+  readonly #readOnly: boolean;
   readonly hooks: AppDatabaseOptions["hooks"];
   #depth = 0;
   #poisoned = false;
@@ -183,6 +215,7 @@ export class AppDatabase {
     this.root = resolve(options.root);
     this.path = options.path ?? join(this.root, "app-data.sqlite");
     this.hooks = options.hooks;
+    this.#readOnly = options.readOnly === true;
     if (
       !isAbsolute(options.root) ||
       !isAbsolute(this.path) ||
@@ -192,6 +225,34 @@ export class AppDatabase {
       throw new AppError("INVALID_DATA_ROOT");
     assertSafePath(this.root, "directory");
     assertSafePath(this.path, "file");
+    const timeout = options.busyTimeoutMs ?? 2000;
+    if (!Number.isInteger(timeout) || timeout < 0 || timeout > 60000)
+      throw new AppError("INVALID_CONFIGURATION");
+    if (options.readOnly) {
+      // Search workers can inspect an existing installation, never bootstrap or upgrade it.
+      if (!existsSync(this.path)) throw new AppError("WRONG_DATABASE");
+      if (
+        process.platform !== "win32" &&
+        (lstatSync(this.root).mode & 0o077 || lstatSync(this.path).mode & 0o077)
+      )
+        throw new AppError("DATA_ROOT_NOT_PRIVATE");
+      for (const suffix of ["-wal", "-shm", "-journal"])
+        assertSafePath(this.path + suffix, "file");
+      this.db = new DatabaseSync(this.path, { readOnly: true });
+      try {
+        this.db.exec(
+          `PRAGMA query_only=ON; PRAGMA busy_timeout=${timeout}; BEGIN`,
+        );
+        if (identifyAppSchema(this.db) !== APP_SCHEMA)
+          throw new AppError("WRONG_DATABASE");
+        this.cursorKey = readCursorKey(this.db);
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.close();
+        throw error;
+      }
+      return;
+    }
     const marker = join(this.root, ".app-bootstrap");
     const existing = existsSync(this.path);
     const recoverBootstrap = () => {
@@ -261,11 +322,6 @@ export class AppDatabase {
     }
     chmodSync(this.path, 0o600);
     this.db = new DatabaseSync(this.path);
-    const timeout = options.busyTimeoutMs ?? 2000;
-    if (!Number.isInteger(timeout) || timeout < 0 || timeout > 60000) {
-      this.db.close();
-      throw new AppError("INVALID_CONFIGURATION");
-    }
     try {
       this.db.exec(
         `PRAGMA busy_timeout=${timeout}; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;`,
@@ -292,11 +348,11 @@ export class AppDatabase {
         for (;;) {
           this.db.exec("BEGIN IMMEDIATE");
           const version = identifyAppSchema(this.db);
-          if (version === 4) {
+          if (version === APP_SCHEMA) {
             this.db.exec("COMMIT");
             break;
           }
-          const record = (next: 2 | 3 | 4) => {
+          const record = (next: 2 | 3 | 4 | 5 | 6) => {
             this.db
               .prepare("INSERT INTO app_migrations VALUES(?,?,?)")
               .run(next, migrations[next - 1], Date.now());
@@ -315,6 +371,23 @@ export class AppDatabase {
             record(2);
             this.db.exec("COMMIT");
             this.hooks?.afterCommit?.(migrations[1]);
+            continue;
+          }
+          if (version === 4) {
+            this.db.exec(definitions[4]);
+            this.db
+              .prepare("INSERT INTO app_feature_contracts VALUES(?)")
+              .run(SEARCH_CONTRACT);
+            record(5);
+            this.db.exec("COMMIT");
+            this.hooks?.afterCommit?.(migrations[4]);
+            continue;
+          }
+          if (version === 5) {
+            this.db.exec(definitions[5]);
+            record(6);
+            this.db.exec("COMMIT");
+            this.hooks?.afterCommit?.(migrations[5]);
             continue;
           }
           // A direct upgrade retains the original schema-2 state and never exposes an
@@ -351,7 +424,6 @@ export class AppDatabase {
           this.db.exec("COMMIT");
           if (version === 2) this.hooks?.afterCommit?.(migrations[2]);
           this.hooks?.afterCommit?.(migrations[3]);
-          break;
         }
       } catch (e) {
         if (this.db.isTransaction) this.db.exec("ROLLBACK");
@@ -360,14 +432,7 @@ export class AppDatabase {
       if (existsSync(marker) && recoverBootstrap()) unlinkSync(marker);
       const violations = this.db.prepare("PRAGMA foreign_key_check").all();
       if (violations.length) throw new AppError("DATABASE_INTEGRITY");
-      this.cursorKey = Buffer.from(
-        String(
-          this.db
-            .prepare("SELECT cursor_key FROM app_metadata WHERE singleton=1")
-            .get()!.cursor_key,
-        ),
-        "hex",
-      );
+      this.cursorKey = readCursorKey(this.db);
     } catch (e) {
       this.db.close();
       throw e;
@@ -398,7 +463,9 @@ export class AppDatabase {
     let committed = false;
     this.#metrics.transactionCount++;
     try {
-      this.db.exec("BEGIN IMMEDIATE");
+      // A read-only worker uses the canonical readNote transaction. SQLite query_only
+      // still rejects writes, including any live-file change that would mark a note dirty.
+      this.db.exec(this.#readOnly ? "BEGIN DEFERRED" : "BEGIN IMMEDIATE");
     } catch (error) {
       this.#metrics.transactionFailures++;
       this.#metrics.transactionMs += performance.now() - started;

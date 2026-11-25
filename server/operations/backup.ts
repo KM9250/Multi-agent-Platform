@@ -80,7 +80,7 @@ type ManifestHeader = {
 };
 type SnapshotManifest = ManifestHeader & {
   schema: "MAP-MEM-1:BACKUP:3";
-  appSchema: 2 | 3 | 4;
+  appSchema: 2 | 3 | 4 | 5 | 6;
   attachments: Inventory;
   memory: MemoryInventory;
 };
@@ -352,6 +352,18 @@ async function orderedDigest(db: DatabaseSync, sql: string): Promise<string> {
   }
   digest.update("]");
   return digest.digest("hex");
+}
+// Verify the post-fence control records again before resuming a detached restore.
+async function searchControlDigest(db: DatabaseSync): Promise<string> {
+  const profiles = await orderedDigest(
+    db,
+    "SELECT * FROM search_profiles ORDER BY workspace_id,actor_id,room_id,version",
+  );
+  const operations = await orderedDigest(
+    db,
+    "SELECT * FROM search_operations ORDER BY operation_id",
+  );
+  return hash(json([profiles, operations]));
 }
 function versionPath(root: string, digest: string): string {
   if (!/^[a-f0-9]{64}$/.test(digest))
@@ -726,6 +738,14 @@ export class BackupService {
             "SELECT 1 FROM app_provider_calls WHERE state='DISPATCH_INTENT' LIMIT 1",
           )
           .get();
+        if (
+          this.app.db
+            .prepare(
+              "SELECT 1 FROM search_operations WHERE state='DISPATCH_INTENT' LIMIT 1",
+            )
+            .get()
+        )
+          throw new OperationError("BACKUP_ACTIVE_SEARCH_DISPATCH", 409);
         if (running || dispatched)
           throw new OperationError("BACKUP_ACTIVE_GENERATION", 409);
         this.app.db
@@ -861,7 +881,7 @@ async function verifyBackup(
       break;
     case "MAP-MEM-1:BACKUP:3":
       if (
-        ![2, 3, 4].includes(manifest.appSchema) ||
+        ![2, 3, 4, 5, 6].includes(manifest.appSchema) ||
         manifest.memory?.contract !== MEMORY_CONTRACT ||
         !validInventory(manifest.attachments) ||
         !validInventory(manifest.memory.versions) ||
@@ -1024,6 +1044,16 @@ export async function restoreBackup(
             )
             .run(root, String(stat.dev), String(stat.ino));
         }
+        // A restore copies authority and cost history, never an instruction to send again.
+        app.db.exec("UPDATE search_profiles SET active=0 WHERE active=1");
+        app.db
+          .prepare(
+            `UPDATE search_operations
+          SET state=CASE state WHEN 'RESERVED' THEN 'REJECTED' ELSE 'OUTCOME_UNKNOWN' END,
+              finished_at=?
+          WHERE state IN ('RESERVED','DISPATCH_INTENT')`,
+          )
+          .run(Date.now());
         app.db.exec("DELETE FROM auth_sessions");
         app.db
           .prepare(
@@ -1062,7 +1092,10 @@ export async function restoreBackup(
       await writeDurableJson(
         join(destination, "restore-report.json"),
         {
-          schema: "MAP-MEM-1:RESTORE:4",
+          schema: "MAP-MEM-2:RESTORE:5",
+          searchControlDigest: await searchControlDigest(app.db),
+          externalSearchPaused: true,
+          derivedSearchIndex: "REBUILD_REQUIRED",
           memoryRecordsDigest: memory.recordsDigest,
           vaultVersionsVerified: memory.versions.count,
           vaultDocumentsRestored: memory.current.count,
@@ -1128,7 +1161,20 @@ export async function resumeRestore(root: string): Promise<void> {
         )
         .get();
       let verifiedDigest = memory.recordsDigest;
-      if (migration && report.schema !== "MAP-MEM-1:RESTORE:4") {
+      if (report.schema === "MAP-MEM-2:RESTORE:5") {
+        if (report.searchControlDigest !== (await searchControlDigest(app.db)))
+          throw new OperationError("RESTORE_REFERENCE_MISMATCH", 409);
+      } else if (
+        app.db.prepare("SELECT 1 FROM search_profiles LIMIT 1").get()
+      ) {
+        // Older restore reports can only witness installations migrated with empty search controls.
+        throw new OperationError("RESTORE_REFERENCE_MISMATCH", 409);
+      }
+      if (
+        migration &&
+        report.schema !== "MAP-MEM-1:RESTORE:4" &&
+        report.schema !== "MAP-MEM-2:RESTORE:5"
+      ) {
         if (verifiedDigest !== migration.after_digest)
           throw new OperationError("RESTORE_REFERENCE_MISMATCH", 409);
         verifiedDigest = String(migration.before_digest);
