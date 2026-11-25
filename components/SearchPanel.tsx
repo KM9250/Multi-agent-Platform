@@ -21,6 +21,40 @@ const stateLabels: Record<SearchResponse["status"], string> = {
   stopped: "Room indexing is paused.",
   unavailable: "The room index is unavailable.",
 };
+const methodLabels = {
+  lexical: "Local text search",
+  dense: "Dense search",
+  rerank: "Reranking",
+};
+const denseReasons: Record<string, string> = {
+  profile_unconfigured_or_stopped: "the search profile is missing or stopped",
+  profile_scope: "the Persona is outside the search profile",
+  query_disabled: "the profile does not permit sending queries",
+  incomplete_dense_coverage: "the vector index is incomplete",
+  no_dense_coverage: "the vector index has no eligible records",
+  unconfigured_provider: "the embedding provider is unconfigured",
+  outcome_unknown: "the provider did not confirm the outcome",
+  provider_rejected: "the provider rejected the request",
+  budget_exhausted: "the search budget has been reached",
+  dense_limit: "the searchable vectors exceed the processing limit",
+  dense_unavailable: "the dense search service is unavailable",
+};
+function reasonText(reason: string, denseState?: string) {
+  if (reason === "INDEX_LAGGING")
+    return "Recent changes may be missing from these results. Run the search again after the index synchronizes.";
+  if (reason === "INDEX_FRESHNESS_UNAVAILABLE")
+    return "Index freshness could not be verified. Retry the search or ask the Host to check synchronization.";
+  if (reason === "DEADLINE_EXCEEDED")
+    return "Search reached its time limit. Retry or narrow the search.";
+  if (reason === "INDEX_REFRESH_FAILED")
+    return "The last index update failed. The Host can check the index and retry synchronization.";
+  if (reason === "INDEX_REFRESHING")
+    return "The index is updating. Run the search again after synchronization.";
+  const label = reason.replaceAll("_", " ").toLowerCase();
+  return reason === denseState
+    ? `Dense search unavailable (${denseReasons[reason] ?? label}).`
+    : label;
+}
 const revisionLabels: Record<string, string> = {
   original: "Original",
   correction: "Correction",
@@ -379,9 +413,12 @@ export default function SearchPanel({
           <p className={metaClass}>
             Index {response.coverage.indexState} ·{" "}
             {response.methods.length
-              ? response.methods.join(" + ")
+              ? response.methods
+                  .map((method) => methodLabels[method])
+                  .join(" + ")
               : "No retrieval executed"}{" "}
             · {Math.round(response.elapsedMs)} ms
+            {response.external.calls === 0 && " · No external calls"}
           </p>
           {response.coverage.syncedAt !== undefined && (
             <p className={metaClass}>
@@ -398,9 +435,7 @@ export default function SearchPanel({
             <ul className="list-disc pl-5 text-sm text-amber-300">
               {response.reasons.map((reason) => (
                 <li key={reason}>
-                  {reason === "INDEX_LAGGING"
-                    ? "Recent changes are still being indexed. Search again after synchronization."
-                    : reason.replaceAll("_", " ").toLowerCase()}
+                  {reasonText(reason, response.coverage.denseState)}
                 </li>
               ))}
             </ul>
@@ -411,6 +446,15 @@ export default function SearchPanel({
               access in this search.
             </p>
           )}
+          {response.results.length === 0 && response.status === "partial" && (
+            <p>No verified matches are available in these partial results.</p>
+          )}
+          {response.results.length === 0 &&
+            response.status === "degraded" &&
+            response.methods.length === 1 &&
+            response.methods[0] === "lexical" && (
+              <p>Local text search returned no matches.</p>
+            )}
           {response.results.map((hit, index) => (
             <article
               className="space-y-2 rounded-lg border border-zinc-700 p-3"

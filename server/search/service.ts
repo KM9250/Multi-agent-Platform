@@ -14,6 +14,7 @@ import {
   isIndexUpdatePending,
   requestIndexUpdate,
 } from "./index.ts";
+import { getSearchProfile, type SearchProfile } from "./profile.ts";
 import { searchInput } from "./input.ts";
 import { lexicalQuery } from "./query-process.ts";
 import { SearchSources } from "./sources.ts";
@@ -125,6 +126,25 @@ export async function searchRoom(
     ? AbortSignal.any([timeout, clientSignal])
     : timeout;
   try {
+    // Pin the requested policy before starting either method. Dispatch rechecks it after lexical work.
+    let profile: SearchProfile | null = null;
+    let includeDense = false;
+    if (req.target === "memory" && req.retrievalMode !== "lexical") {
+      try {
+        profile = getSearchProfile(app, actor, roomId);
+        includeDense =
+          req.retrievalMode === "hybrid" ||
+          !!(
+            profile?.purposes.includes("QUERY_EMBEDDING") &&
+            (!req.personaId || profile.personaId === req.personaId)
+          );
+      } catch (error) {
+        if (isAccessError(error)) throw error;
+        response.coverage.denseState = "dense_unavailable";
+        response.reasons.push("dense_unavailable");
+        if (response.status === "ready") response.status = "degraded";
+      }
+    }
     const includeHistory = req.revisionMode === "include_history";
     const lexical = await lexicalQuery(
       {
@@ -156,7 +176,7 @@ export async function searchRoom(
     });
 
     let ranked = lexical.hits;
-    if (req.target === "memory" && req.retrievalMode !== "lexical") {
+    if (includeDense) {
       if (policy.revision(actor) !== acl)
         throw new AppError("SEARCH_RESYNC_REQUIRED", 409);
       // Keep part of the request deadline for resolving lexical citations after a slow provider.
@@ -178,6 +198,7 @@ export async function searchRoom(
         req.requestId,
         {
           personaId: req.personaId,
+          profile,
           signal: denseSignal,
         },
       ).catch((error) => {
@@ -206,7 +227,7 @@ export async function searchRoom(
         );
       } else {
         response.reasons.push(dense.state);
-        response.status = "degraded";
+        if (response.status === "ready") response.status = "degraded";
       }
     }
     if (policy.revision(actor) !== acl)

@@ -399,7 +399,7 @@ test("P-02 cancellation waits for the compute child to exit", async (t) => {
   assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
 });
 
-test("HTTP hybrid Memory search uses a single mock Google query and resolves a published original", async (t) => {
+test("HTTP Memory search verifies hybrid hits and reports failed planned Dense calls with lexical fallback", async (t) => {
   const { httpFixture } = await import("./http-fixture.ts");
   const { registerVault, setVaultPaused } =
     await import("../server/memory/vault.ts");
@@ -450,6 +450,7 @@ test("HTTP hybrid Memory search uses a single mock Google query and resolves a p
   const pinned = acquireActiveIndex(app, policy, actor, room.id);
   assert.equal(pinned.state, "ACTIVE");
   const requests: string[] = [];
+  let providerDown = false;
   const network: typeof fetch = async (url, options) => {
     if (String(url).startsWith(f.origin + "/"))
       return originalFetch(url, options);
@@ -458,6 +459,7 @@ test("HTTP hybrid Memory search uses a single mock Google query and resolves a p
       "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent",
     );
     requests.push(JSON.parse(String(options.body)).content.parts[0].text);
+    if (providerDown) return new Response(null, { status: 503 });
     return Response.json({
       embedding: { values },
       usageMetadata: { promptTokenCount: 5 },
@@ -492,6 +494,43 @@ test("HTTP hybrid Memory search uses a single mock Google query and resolves a p
       `title: none | text: ${body}`,
       "task: search result | query: ミーティングの曜日",
     ]);
+
+    providerDown = true;
+    const post = async (retrievalMode: "lexical" | "auto") => {
+      const reply = await f.request(`/rooms/${room.id}/search`, "POST", {
+        requestId: randomUUID(),
+        target: "memory",
+        query: body,
+        retrievalMode,
+      });
+      assert.equal(reply.response.status, 200);
+      return reply.data;
+    };
+    const local = await post("lexical");
+    assert.equal(local.status, "ready");
+    assert.equal(local.external.calls, 0);
+    assert.deepEqual(local.methods, ["lexical"]);
+    assert.equal(requests.length, 2);
+
+    const fallback = await post("auto");
+    assert.equal(fallback.status, "degraded");
+    assert.deepEqual(fallback.reasons, ["outcome_unknown"]);
+    assert.equal(fallback.coverage.denseState, "outcome_unknown");
+    assert.deepEqual(fallback.methods, ["lexical"]);
+    assert.deepEqual(fallback.external, {
+      status: "dispatched",
+      calls: 1,
+      usage: "UNKNOWN",
+    });
+    assert.equal(fallback.results[0].citation.noteId, noteId);
+    assert.equal(requests.length, 3);
+    const charge = app.db
+      .prepare(
+        "SELECT state,reserved_tokens FROM search_operations ORDER BY rowid DESC LIMIT 1",
+      )
+      .get()!;
+    assert.equal(charge.state, "OUTCOME_UNKNOWN");
+    assert.ok(Number(charge.reserved_tokens) > 0);
   } finally {
     globalThis.fetch = originalFetch;
     if (saved === undefined) delete process.env.GEMINI_API_KEY;

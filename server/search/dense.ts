@@ -20,6 +20,7 @@ import {
   getSearchProfile,
   operationId,
   type MemoryScope,
+  type SearchProfile,
 } from "./profile.ts";
 import { SearchSources } from "./sources.ts";
 
@@ -165,6 +166,7 @@ export async function searchDense(
   requestId: string,
   options: {
     personaId?: string;
+    profile?: SearchProfile | null;
     signal?: AbortSignal;
     provider?: EmbeddingProvider;
   } = {},
@@ -175,7 +177,10 @@ export async function searchDense(
     candidates: [],
     external,
   });
-  const profile = getSearchProfile(app, actor, roomId);
+  const profile =
+    options.profile === undefined
+      ? getSearchProfile(app, actor, roomId)
+      : options.profile;
   if (!profile) return empty("profile_unconfigured_or_stopped");
   if (
     options.personaId !== undefined &&

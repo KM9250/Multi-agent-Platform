@@ -15,7 +15,13 @@ import { GenerationCoordinator } from "../../server/generation/coordinator.ts";
 import { FakeProvider } from "../../server/generation/provider.ts";
 import { createAppHandler } from "../../server/http/server.ts";
 import { requestIndexUpdate } from "../../server/search/index.ts";
+import {
+  configureSearchProfile,
+  stopSearchProfile,
+} from "../../server/search/profile.ts";
 
+// This standalone suite exercises the missing-provider path on synthetic data.
+delete process.env.GEMINI_API_KEY;
 const root = mkdtempSync(join(tmpdir(), "map-search-browser-"));
 const app = new AppDatabase({ root });
 const policy = new AuthorizationPolicy(app);
@@ -69,6 +75,16 @@ try {
     roomId: room.id,
     personaId: persona.id,
     visibility: "self_only",
+  });
+  const embeddingScope = {
+    roomId: room.id,
+    personaId: persona.id,
+    visibility: "room_shared",
+  };
+  policy.grant(actor.actorId, actor.workspaceId, "READ_MEMORY", embeddingScope);
+  policy.grant(actor.actorId, actor.workspaceId, "SEND_TO_PROVIDER", {
+    ...embeddingScope,
+    provider: "google",
   });
   repository.appendMessage(actor, room.id, {
     role: "user",
@@ -138,14 +154,103 @@ try {
   const search = panel.getByRole("button", { name: "Search", exact: true });
   assert.equal(await target.inputValue(), "memory");
   assert.equal(await panel.getByLabel("Conversation revisions").count(), 0);
+  const emptyMessage = panel.getByText(
+    /No matching record was found within the saved records/,
+  );
+  const absentTerm = `absent${randomUUID().replaceAll("-", "")}`;
+  await terms.fill(absentTerm);
+  assert.ok(
+    !requests.some((url) => url.endsWith("/search")),
+    "Typing must not dispatch a query",
+  );
+  const memoryReply = page.waitForResponse((r) => r.url().endsWith("/search"));
+  await search.click();
+  const memoryResponse = await memoryReply;
+  const local = await memoryResponse.json();
+  assert.equal(local.status, "ready", JSON.stringify(local));
+  assert.deepEqual(local.methods, ["lexical"]);
+  assert.equal(local.external.calls, 0);
+  assert.equal(memoryResponse.request().postDataJSON().retrievalMode, "auto");
+  await panel.getByText("Search complete", { exact: true }).waitFor();
+  await emptyMessage.waitFor();
+  await panel.getByText(/Local text search.*No external calls/).waitFor();
+  assert.equal(await panel.getByText("Reduced search coverage").count(), 0);
+
+  // This time a real Host profile requests Dense search, but this process has no provider key.
+  configureSearchProfile(app, actor, room.id, {
+    personaId: persona.id,
+    scopes: ["room_shared"],
+    purposes: ["QUERY_EMBEDDING"],
+    maxCalls: 1,
+    maxTokens: 8192,
+    maxCostMicros: 1000,
+    priceMicrosPerThousandTokens: 1,
+  });
+  await requestIndexUpdate(app, policy, actor, room.id, { force: true });
+  await search.click();
+  await panel.getByText("Reduced search coverage").waitFor();
+  await panel
+    .getByText(/Dense search unavailable.*embedding provider is unconfigured/)
+    .waitFor();
+  await panel.getByText("Local text search returned no matches.").waitFor();
+  await panel.getByText(/Local text search.*No external calls/).waitFor();
+  assert.equal(await emptyMessage.count(), 0);
+  stopSearchProfile(app, actor, room.id);
+
+  // Place the changed Room between two unrelated runs longer than the old 32-event sample.
+  // The intercepted lookup still uses the real HTTP handler, auth policy and index.
+  function writeOtherRoomChanges() {
+    for (let i = 0; i < 40; i++) {
+      repository.appendMessage(actor, otherRoom.id, {
+        role: "user",
+        content: "Separate room update",
+      });
+    }
+  }
   await target.selectOption("archive");
+  await page.route(
+    "**/rooms/*/search",
+    async (route) => {
+      await requestIndexUpdate(app, policy, actor, room.id, { force: true });
+      writeOtherRoomChanges();
+      repository.appendMessage(actor, room.id, {
+        role: "user",
+        content: "A recent schedule update.",
+      });
+      writeOtherRoomChanges();
+      await route.continue();
+    },
+    { times: 1 },
+  );
+  const archiveReply = page.waitForResponse((r) => r.url().endsWith("/search"));
+  await search.click();
+  const stale = await (await archiveReply).json();
+  assert.equal(stale.status, "partial", JSON.stringify(stale));
+  assert.ok(stale.reasons.includes("INDEX_LAGGING"));
+  await panel.getByText("Partial results", { exact: true }).waitFor();
+  await panel
+    .getByText(/Run the search again after the index synchronizes/)
+    .waitFor();
+  await panel
+    .getByText("No verified matches are available in these partial results.")
+    .waitFor();
+  assert.equal(await emptyMessage.count(), 0);
+  assert.equal(
+    await panel.getByText("Search complete", { exact: true }).count(),
+    0,
+  );
+  await requestIndexUpdate(app, policy, actor, room.id, { force: true });
+  const submittedSearches = requests.filter((url) =>
+    url.endsWith("/search"),
+  ).length;
   await terms.fill(privateTerm);
   await panel.getByLabel("Conversation date (optional)").fill("2026-11-11");
   await panel.getByLabel("Time zone").fill("Asia/Tokyo");
   await panel.getByLabel("Persona", { exact: true }).selectOption(persona.id);
-  assert.ok(
-    !requests.some((url) => url.endsWith("/search")),
-    "Typing must not dispatch a query",
+  assert.equal(
+    requests.filter((url) => url.endsWith("/search")).length,
+    submittedSearches,
+    "Changing filters must not dispatch a query",
   );
   const dispatch = page.waitForResponse((r) => r.url().endsWith("/search"));
   await search.click();
@@ -296,6 +401,9 @@ try {
       providerCalls: 0,
       checks: [
         "explicit search",
+        "default local Memory empty search",
+        "planned dense failure with no external provider",
+        "partial result and retry guidance before archive synchronization",
         "authorized private excerpt",
         "date range",
         "resolved original",
