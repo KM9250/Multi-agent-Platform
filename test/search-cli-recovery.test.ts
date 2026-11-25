@@ -17,8 +17,15 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   configureSearchProfile,
+  dispatchEmbedding,
+  operationId,
   OP_TOKEN_RESERVATION,
 } from "../server/search/profile.ts";
+import { documentOperationKey } from "../server/search/dense-corpus.ts";
+import {
+  generationPath,
+  indexDirectory,
+} from "../server/search/index-registry.ts";
 import { lineageFixture } from "./memory-lineage-fixture.ts";
 
 test("F-01 CLI recovers abandoned document dispatch before a new generation and preserves unknown costs in backup", async (t) => {
@@ -29,7 +36,7 @@ test("F-01 CLI recovers abandoned document dispatch before a new generation and 
   f.publish(memory.candidate.id);
   const price = 100;
   const reservation = Math.ceil((OP_TOKEN_RESERVATION * price) / 1000);
-  configureSearchProfile(f.app, f.actor, f.room.id, {
+  const profile = configureSearchProfile(f.app, f.actor, f.room.id, {
     personaId: f.persona.id,
     scopes: ["persona_private"],
     purposes: ["DOCUMENT_EMBEDDING"],
@@ -88,7 +95,7 @@ test("F-01 CLI recovers abandoned document dispatch before a new generation and 
   const ledger = (db: DatabaseSync) =>
     db
       .prepare(
-        `SELECT operation_id,purpose,state,
+        `SELECT operation_id,profile_version,purpose,state,source_ref,payload_digest,
     reserved_tokens,reserved_cost_micros,estimated_cost_micros,usage_json,dispatched_at FROM search_operations ORDER BY rowid`,
       )
       .all();
@@ -171,6 +178,56 @@ test("F-01 CLI recovers abandoned document dispatch before a new generation and 
       tokens: OP_TOKEN_RESERVATION + 3,
       costMicros: reservation + Number(recorded.estimated_cost_micros),
     });
+    const old = status.generations.find(
+      (g: { id: string }) => g.id !== retried.generationId,
+    );
+    assert.ok(old);
+    const dir = indexDirectory(f.root, { ...f.actor, roomId: f.room.id });
+    const oldPath = generationPath(dir, old.id);
+    const oldIndex = new DatabaseSync(oldPath, { readOnly: true });
+    try {
+      const chunk = oldIndex
+        .prepare(
+          "SELECT id,text FROM chunks WHERE target='memory' AND source_id=?",
+        )
+        .get(memory.noteId)!;
+      const purpose = "DOCUMENT_EMBEDDING";
+      const operationKey = documentOperationKey(
+        oldPath,
+        profile.version,
+        String(chunk.id),
+      );
+      assert.equal(
+        operationId(f.actor, f.room.id, purpose, operationKey),
+        unknown.operation_id,
+      );
+      await assert.rejects(
+        dispatchEmbedding(
+          f.app,
+          f.policy,
+          {
+            spaceId: profile.spaceId,
+            async embed() {
+              throw Error("replayed the recovered dispatch");
+            },
+          },
+          {
+            actor: f.actor,
+            roomId: f.room.id,
+            profile,
+            scopes: profile.scopes,
+            purpose,
+            operationKey,
+            sourceRef: String(unknown.source_ref),
+            readText: () => String(chunk.text),
+            signal: new AbortController().signal,
+          },
+        ),
+        /operation_already_recorded/,
+      );
+    } finally {
+      oldIndex.close();
+    }
     // A repeat on the same generation reuses its vector. A fresh generation needs room in the budget.
     assert.equal(
       success("search-sync", ...scope).generationId,

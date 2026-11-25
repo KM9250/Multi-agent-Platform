@@ -17,7 +17,7 @@ const stateLabels: Record<SearchResponse["status"], string> = {
   unbuilt: "The room index has not been built.",
   building: "Index synchronization is in progress.",
   resync_required:
-    "Permissions changed. The room index needs resynchronization.",
+    "The room index needs resynchronization. Run the search again after it is rebuilt.",
   stopped: "Room indexing is paused.",
   unavailable: "The room index is unavailable.",
 };
