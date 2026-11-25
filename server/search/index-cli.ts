@@ -14,6 +14,7 @@ import { manageIndex, requestIndexUpdate } from "./index.ts";
 import {
   configureSearchProfile,
   getSearchProfile,
+  recoverSearchDispatches,
   stopSearchProfile,
   budgetStatus,
 } from "./profile.ts";
@@ -62,6 +63,8 @@ export async function runSearchCommand(
   const release = acquireHostLock(app.root);
   try {
     assertOperationalRoot(app.root);
+    // This lock excludes live server and CLI dispatchers for the entire data root.
+    recoverSearchDispatches(app);
     if (command === "search-status") {
       const profile = getSearchProfile(app, actor, args.room);
       return {
