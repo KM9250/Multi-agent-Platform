@@ -37,10 +37,22 @@ MEM-2は1回の検索を、ログインした人の1つのRoomに限定する。
 | フィールド | 利用側の判断 |
 | --- | --- |
 | `scope` | 対象Room・資料・版・Persona、指定日、タイムゾーン、実際の暦日範囲、UTCミリ秒の半開区間。 |
-| `coverage`・`status`・`reasons` | 計画対象、索引状態、最終同期完了時刻、および更新中かどうかを確認する。現在のActorから読める未反映の変更を検知したときは部分結果として表示する。遅延の即時判定では変更台帳の先頭側と末尾側を各32件まで調べる。大量の変更があるときは最終同期完了時刻を反映時点の目安にする。未構築・構築中・再同期要求・停止・利用不能・部分結果・縮退を、完了した検索の無一致と区別する。 |
+| `coverage`・`status`・`reasons` | `syncedAt` は選択した索引世代の同期完了時刻。`updating` は応答時、そのActor・Roomで更新ジョブが待機中または実行中かを示す。読める変更が未反映なら `partial / INDEX_LAGGING`。原本を確認できた結果だけを表示する。 |
 | `results` | 原文のSnippet、引用、版の現在性、表示できる話者・所有者等。Archiveのapproxでは該当日の層も含む。 |
 | `methods`・`external`・`elapsedMs` | 実際に利用した方式と当該要求の外部利用、検索時間。ArchiveはLexical。Scoreを正答確率に変換しない。 |
 | `verification` | この要求で再検証した候補数と除外数。グローバルな変更連番や他Actorの索引件数を表示しない。 |
+
+### 方式と状態の読み方
+
+| Memoryの指定 | 実行する方式と状態 |
+| --- | --- |
+| `lexical` | ローカル全文検索。索引の鮮度と原本確認に問題がなければ `ready`。 |
+| `auto` | 現行ProfileがQuery送信を許し、指定Personaがその範囲に入る場合にLexicalとDenseを計画する。Profileの未設定・停止、文書用だけの許可ではローカル全文検索が通常動作になる。 |
+| `hybrid` | LexicalとDenseを明示的に要求する。未設定・停止・用途不許可、Coverage不足、予算不足、Provider障害では、利用できた方式とDenseが使えなかった理由を返す。 |
+
+Lexicalが完了し、計画したDenseが使えなければ `degraded`。未反映や原本の除外、結果を検証している間の期限超過もあれば `partial` を優先し、検出した各理由を残す。取得開始前の障害や検索子プロセスの期限超過では、利用不能とその理由を返す。通常の0件は、この検索条件で一致がなかったことを表す。部分結果の0件は、今回確認できた範囲で表示できる原本が0件という意味になる。更新の完了後に再検索する。同期失敗が続く場合はHostがジョブの理由を確認する。
+
+増分索引の鮮度は、選択した世代のチェックポイント（Watermark）と正本を照合する。Lexical検索子プロセスが1つの正本読取り時点で鮮度と候補の認可を評価する。Archiveは対象Roomの変更をチェックポイント以降に絞り、現行の権限で読める対象版・直前版のSegmentを調べる。Message削除では全ての該当版を考慮する。Persona削除は、削除操作が行われたRoomによらず、検索Roomに所属するPersonaに限って再同期の対象にする。Memoryは対象Roomで読取りを許可されたノートごとに、チェックポイントより後の変更があるかを調べる。対象範囲の照合が終わって初めて「未反映なし」と判定する。Cursorが無効なら再同期を要求し、照合不能・期限超過なら理由と再試行の案内を返す。グローバル連番はAPIへ出さない。
 
 `POST /api/app/v1/rooms/:roomId/search/citation` に `{citation, includeHistory, surrounding}` を送る。Archiveの版が変わったら、現行表示の引用取得は失敗する。過去版を開くには、明示した履歴モードと、その時点での閲覧権限が必要になる。
 
@@ -63,6 +75,8 @@ MEM-3の接続先は `shared/search-contracts.ts` と `shared/search-sources.ts`
 | 転置索引・文字n-gram・BM25 | FTS5 trigramに1～2 Unicode文字の転置索引とID一致を追加し、日本語短語・識別子を扱う。日時、ID、検索Scopeの制限を上位候補の決定前に適用する。 |
 | Hybrid Retrieval／Reciprocal Rank Fusion | 許可・設定・Coverageが揃ったDenseとLexicalの順位を各1位から数え、`sum(1 / (60 + rank))` で統合する。方式内の重複を除き、同点を安定IDで解決する。 |
 | 版付き引用と原本再検証 | ノートの `readNote` はlive-file検証を含む。現行版を読めない場合は通常検索から外す。Archiveは現在のMessage・Revision・Segment・所有Personaと引用を照合する。 |
+| クラッシュリカバリと冪等処理 | 排他Hostの起動時に、正本に残った予約・送信Intentを終端化する。送信が始まった操作IDと費用予約が再起動をまたいで残る。 |
+| 派生データの互換性と無効化 | 文書Vectorの元の成功Receipt・原本・Embedding空間を検証する。MAPでは再利用を同じActor・Room・Persona・Scopeの索引世代に限定し、新規送信を現行Profile版へ計上する。 |
 | 世代の構築・切替・Rollback | 同期と整合性検査を完了した世代をACTIVEにし、旧世代をRETIREDにする。途中で停止したBUILDING／VALIDATING／READY世代は検索対象外。検索要求は1つの世代を参照する。 |
 
 MAP固有の判断には、Actorごとの読取り領域、人とconsumer Personaの区別、公開状態とprivate会話の独立した認可、MEM-1の失効契約がある。日付許容検索は、暦日の範囲フィルタ・内容比較・順位付けを組み合わせた運用ポリシー。特定日の事実の有無や利用者の記憶の正誤を判定する機能ではない。正本と索引は別のCOMMITを持つ。規模に合わせて単一Host上のSQLiteを採用した。
@@ -84,7 +98,7 @@ MAP固有の判断には、Actorごとの読取り領域、人とconsumer Person
 
 ## Hostの操作
 
-App Schema 5は `search_profiles` と `search_operations` を正本DBに追加する。Schema 1～4から所定のMigrationを通す。検索契約は `MAP-MEM-2:SEARCH:1`。COORD Schema 11と既存MACP契約を維持する。派生領域は保護されたApp Rootの `search-index/` 配下に置き、Workspace・Actor・Roomを束縛する。ManifestにAnalyzer・Chunker・正本契約、設定Digest、ACL、復元世代、同期位置、検証結果とCoverageを記録する。
+App Schema 5で `search_profiles` と `search_operations` を正本DBに追加した。Schema 6は変更台帳のスコープ照合を高速化する索引を追加する。既存のSchema 1～5は所定のMigrationを通る。5からの通常更新は既存の検索世代、Cursor、Vector、費用台帳を保持する。検索契約は `MAP-MEM-2:SEARCH:1`。COORD Schema 11と既存MACP契約を維持する。派生領域は保護されたApp Rootの `search-index/` 配下に置き、Workspace・Actor・Roomを束縛する。ManifestにAnalyzer・Chunker・正本契約、設定Digest、ACL、復元世代、同期位置、検証結果とCoverageを記録する。
 
 以下はBashの例。Host CLIは排他ロックを取得するため、稼働中のサーバーを停止してから実行する。各変数にはHostの保護Rootと既存Workspace、依頼元Actor、RoomのIDを指定する。
 
@@ -94,6 +108,10 @@ npm run app:admin -- search-status "${scope[@]}"
 npm run app:admin -- search-rebuild "${scope[@]}"
 npm run app:admin -- search-sync "${scope[@]}"
 ```
+
+全ての `search-*` コマンドは独占Host lockを取得し、Restore後の停止を確認してから、Root内の孤立操作を整理する。`search-status` もこの復旧を行う。`RESERVED` は送信前の `REJECTED`、`DISPATCH_INTENT` は `OUTCOME_UNKNOWN` になる。元の操作ID、Profile版、送信記録、結果不明のToken・費用予約は残り、結果不明分は元の版の予算に含まれる。復旧による送信は0件。明示的に再実行した `search-sync` は、別の操作に対して現在の認可と残予算が揃えば送信できる。
+
+異常終了で `.server.lock` が残った場合は、運用者が記録されたPIDの停止と対象Rootを確認した後、その残存lockを取り除く。稼働中Hostのlockは保持される。未復旧IntentがあればBackupは引き続き拒否される。検索CLIで復旧して正常終了した後にBackupを行う。[Hostの異常終了とlockの手順](map-data-1-runbook.md)
 
 `search-status` の世代一覧でACTIVEのManifestと最終同期時刻、ジョブ状態・失敗理由を確認する。再構築・差分同期は指定した実在Actorの現在の権限で動く。ACL変更後の再同期は、新しいbaselineから行う。MEM-1の候補・ノートの承認には既存の失効判定が適用される。
 
@@ -135,6 +153,10 @@ npm run app:admin -- search-profile-stop "${scope[@]}"
 ```
 
 構成版を設定すると新しい予算が有効になる。上例は1つのPersonaが所有するroom_sharedの公開済みノートと、その検索語の外部送信を個別に許可している。privateを含める場合は `persona_private` をHostが明示する。文書だけをEmbedする場合は `QUERY_EMBEDDING` を外す。Profile設定後のCLI `search-sync`／`search-rebuild` は、許可・設定・予算が揃った文書について実際に外部送信し得る。Roomでの検索に付随する自動同期は文書を外部送信しない。
+
+文書Vectorを構築した後、同じPersona・Scopeで `QUERY_EMBEDDING` だけを許可する運用ができる。通常同期と検索時の自動同期は、用途・予算だけの変更なら互換な世代を引き継ぐ。Manifestの `indexConfigDigest` はAnalyzer、Chunker、Embedding空間、Persona・Scopeなどの索引構成を表す。Profile版と全設定のDigestは別に保存し、送信・実行中の世代切替・Rollbackでは現在の版と設定を照合する。Schema 5時代のManifestは元の全設定Digestを検証してから互換性を判定する。検索時にも、同じWorkspace・Actor・Roomの文書成功Receipt、元のProfileと操作ID、索引世代・Chunk、現在の公開状態・読取り権限、版・Digest・本文範囲・送信本文のDigest、Provider・モデル・前処理・次元を含む空間IDを照合する。過去のReceipt、Usage、費用は作成時の版に残る。
+
+変更後の原本・空間に合わないVectorは使用できない。Query-onlyのとき、欠けた文書の再送は行わず、対象全体のCoverageが不足すればQuery送信前にDenseを止める。応答には `no_dense_coverage` または `incomplete_dense_coverage` などの理由を付ける。新しい文書・Query送信は、その時点のProfile版、用途、読取り権限、`SEND_TO_PROVIDER`、予算を照合する。明示的な再構築は新しい世代を作るので、文書Embeddingを有効にした場合は新規送信の予算が必要になる。Profile全体を停止してから同期すると、Lexical専用世代に切り替わる。作成済みVectorで検索を続ける運用では、現在のPersona・Scopeを保ち、文書用途だけを外したProfileを設定する。
 
 Google REST Adapterは `gemini-embedding-2:embedContent` に1要求1Chunkまたは1Queryを送る。入力量を制限し、Document／Queryのテンプレート、768次元、cosine、unit-f32と空間IDを固定する。透過的再試行と別Providerへの切替は行わない。Qdrantへの交換やCohereのEmbedding／実Reranker採用は将来の評価対象。
 

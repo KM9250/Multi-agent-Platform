@@ -1,6 +1,44 @@
 # MEM-2 検証記録
 
-検証日 2026-11-24。基準は `cd1ffca5474902b7b90381e598f0741737e482f7`。一時Rootに作った合成データを使い、Linux上のNode.js 24.22.3、SQLite 3.54.1、Chromiumで確認した。実Providerへの送信は0件。
+初回実装の検証日 2026-11-24。基準は `cd1ffca5474902b7b90381e598f0741737e482f7`。一時Rootに作った合成データを使い、Linux上のNode.js 24.22.3、SQLite 3.54.1、Chromiumで確認した。実Providerへの送信は0件。
+
+## PR #40 監査修正の再検証　2026-11-25
+
+監査基準は `c154e404318d5033483d20da88e42e905af23af8`。着手時のPR先端も同じだった。添付監査証跡の17ファイルを同梱のSHA-256一覧と照合し、そこで報告された現象を回帰fixtureで再現した。Linux、Node.js 24.22.3、SQLite 3.54.1、Chromium 156を使った。資料、アカウント、Vault、費用枠は合成したものを用いた。模擬送信の試験ではGoogle向けの通信をfetch境界で置換し、実Provider呼出しは0件だった。
+
+| 指摘 | 監査時の再現と修正後の確認 |
+| --- | --- |
+| F-01 | 正式な `server/cli.ts search-sync` を模擬文書送信中にSIGKILLし、Intentを残した。別CLIは生存中のlockで拒否され、台帳はそのまま。終了とPIDを確認してfixtureのlockを片付け、CLIだけで再起動したところ、旧操作は同一IDの `OUTCOME_UNKNOWN` に変わった。8,192 Tokenと820費用単位（micros）の予約を予算に含め、新しい明示操作の成功後にBackupが成立した。元の世代とChunkから旧文書操作IDを再現して再実行を試みると、送信前に `operation_already_recorded` で拒否された。再度の通常同期は再送0件。未送信予約、重複拒否、未復旧IntentのBackup拒否は既存試験でも確認した。 |
+| F-02 | 両用途で作成したVectorが、監査版ではQuery-onlyへの切替と通常同期で消えることを再現した。修正後は正式CLIの通常同期、HTTP検索による自動同期、Denseだけが見つける原本の取得まで同じVectorとReceiptを維持した。新しい `maxCalls=1` は最初のQueryだけに使い、別requestIdの次のQueryは送信前に拒否。新旧の費用とUsageを個別に照合した。 |
+| F-02の失効・移行 | 元操作の状態・用途、SourceRef、送信本文Digest、数値・空間、別世代への転記、対象Scopeの拡大を検査した。長さが変わらないVault編集でも検証に失敗し、Queryを送信しなかった。構築途中の権限・Profile変更、Rollback不適合、Coverage件数・容量上限も検証した。監査コミットの実装で作ったSchema 5のDBを6へ移行し、同じCursor・Vectorを利用できた。旧BackupのRestoreでは費用台帳を保持し、Profile停止と旧Cursor無効化を確認した。 |
+| F-03 | ArchiveとMemoryのHTTP検索で、別Room 80件→対象Room 1件→別Room 80件を再現した。HTTP側の時計を同期時点に固定した。別Roomだけなら通常の0件、対象変更が中間に入ると同期前は0件でも `partial / INDEX_LAGGING`、同期後は原本が1件で `ready`。同じRoomの権限外資料、古い公開版を含むMessageの削除、別Roomだけに属するPersonaの削除も検査した。無効Cursorは再同期、鮮度索引の読取り障害は確認不能、認証・閲覧拒否は元のステータスを保持することを子プロセス経由で確認した。 |
+| F-04と状態の組合せ | Profileなしの一致・0件、停止中、文書用途のみ、明示Lexicalを検査した。通常時は `ready`・外部呼出し0件。明示Hybridの用途不許可、現在予算の超過、模擬Providerの503では理由を返した。503時は `degraded` でLexicalの原本を表示し、実行済みの模擬呼出し1件とUsage不明を記録。未反映とDense不可の併発時は `partial` と両方の理由を保持した。Chromiumでは通常の0件、縮退時の利用方式、部分結果0件の再検索案内、別タブのログアウトとブラウザへの非永続化を確認した。 |
+
+`EXPLAIN QUERY PLAN` は、ArchiveのMessageで `search_message_changes`（Workspace・Room・チェックポイント）、SegmentでMessage・版の複合索引を利用した。Persona削除はRoom所属を起点に `search_persona_deletions` を照合する。Memoryは `memory_documents_room` から読取り可能なノートを調べ、`memory_change_note` でノートID・連番を範囲検索する。両経路の回帰試験は全表走査のない実行計画を検査する。同じRoomに大量の未処理履歴がある場合はその分の照合時間がかかるため、鮮度確認を取消・期限付きLexical子プロセスで実行する。
+
+| 修正後に実行したコマンド | 結果 |
+| --- | --- |
+| `npm test` | 2,279件成功、失敗・Skip各0件。535.13秒。 |
+| `npm run test:search` | 49件成功、失敗・Skip各0件。75.92秒。全体試験と重複する。 |
+| `npm run typecheck`、`npm run build` | いずれも終了コード0。 |
+| `npm run test:search-browser` | ビルド済みアプリとChromiumで成功。記録した外部Provider呼出し0件。 |
+| `git diff --check` | 空白・パッチ形式の指摘0件。 |
+
+今回の追加・変更試験は `test/search-cli-recovery.test.ts`、`test/search-dense.test.ts`、`test/search-vector-reuse.test.ts`、`test/search-index.test.ts`、`test/search-sources.test.ts`、`test/search-persona-delete.test.ts`、`test/search-freshness-{http,worker}.test.ts`、`test/search-migration.test.ts`、`test/integration/search-browser.integration.ts` と既存のMigration・Backup試験で再現できる。実Provider・実データ移行・実機のBackup／Restore・TLSは今回未実施。初回の実施記録にあるMACP単独・DATA-1／MEM-1の専用Browser試験も今回の再実行範囲外とした。
+
+### 監査修正後のHTTP共存測定
+
+同じ実装で `npm run --silent bench:search-coexist -- 100000 10` を2回実行した。10万Message、過去5千版、Denseなしの合成データで、通常保存・COORD heartbeatと同時に、認証済みloopback HTTPから各方式を10回検索した。初回構築後のキャッシュは保持した。10回の分位であるため、ここでのp95は各方式で最も遅い1回である。
+
+| 条件 | 日付なしHTTP p50／p95 | 前後7日HTTP p50／p95 | 通常保存 p95 | heartbeat間隔 p95 |
+| --- | ---: | ---: | ---: | ---: |
+| 監査前の初回提出時 | 431／718 ms | 473／715 ms | 12.07 ms | 58.04 ms |
+| 修正後、全体試験と並行 | 656／1,227 ms | 958／1,349 ms | 25.38 ms | 72.51 ms |
+| 修正後、全体試験の終了後 | 257／316 ms | 314／405 ms | 5.21 ms | 54.38 ms |
+
+両方の修正後測定で、21応答すべてが意図した引用を検証し、原本の除外・外部呼出し・保存失敗・heartbeat失敗は各0件だった。保存が並行した20応答は `partial / INDEX_LAGGING`、1応答が `ready`。単独測定では主世代の構築71.64秒、1件差分0.66秒、検索中の保存73件、索引容量360,763,392 bytes、サーバー・Workerスレッドのサンプル最大RSSは335,319,040 bytesだった。暫定目標の1秒を下回ったのは単独測定で、全体試験と同居した測定では超過した。環境負荷と試行数が異なるため、この差をコード変更だけには帰属できない。[試験と並行した測定](benchmarks/map-mem-2-audit-coexist-shared.json) · [単独測定](benchmarks/map-mem-2-audit-coexist-isolated.json)
+
+追加の負荷確認では、同じRoomの閲覧できない変更10万件に対して未反映なし、末尾に読める1件を入れると未反映ありを各10回検出した。前者の検索子プロセス起動を含むp95は1.68秒、並行して計った親プロセスの20 msタイマー間隔はp95 34.8 msだった。これは大きな滞留を処理するコストを調べた合成試験であり、上表の通常のHTTP検索とは測定範囲が異なる。
 
 ## 再現コマンド
 
@@ -19,7 +57,7 @@ MAP_SEARCH_BENCH_MESSAGES=100000 MAP_SEARCH_BENCH_TRIALS=30 npm run bench:search
 npm run bench:search-coexist -- 100000 10
 ```
 
-## 受入試験
+## 初回実装の受入試験
 
 | 対象 | 確認した境界・条件 |
 | --- | --- |
@@ -45,7 +83,7 @@ npm run bench:search-coexist -- 100000 10
 
 MACPの検証は既存手順の固定コミット `e88937d0c8132ae7d18098a24d01ee28bffda655` と一時SQLiteを使い、認証付きloopback FastAPIおよびSSEを経由した。Python 3.12.14、FastAPI 0.141.1、uvicorn 0.52.1。[MACP試験環境の手順](coordination-macp-integration.md)
 
-## 性能測定
+## 初回実装の性能測定
 
 **索引単体**は10万Message・5千の過去版、計10万5千Segment（平均26.77 UTF-16単位）を使用した。SQLite内の合成認可条件で各30回実行した。構築76.73秒、検証4.41秒、1件の差分5.33 ms、DBは260,468,736 bytes、プロセスの最大RSSは257,376,256 bytesだった。HTTP・実セッション・原本再読取りを含む値は次の共存測定を参照。[索引単体の生データ](benchmarks/map-mem-2-lexical.json)
 
