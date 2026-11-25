@@ -1,13 +1,15 @@
 import { runSearchProcess } from "./query-process.ts";
-import { basename } from "node:path";
 import type { AppDatabase } from "../app-data/db.ts";
 import type { Actor, AuthorizationPolicy } from "../auth/authorization.ts";
 import { SQLiteSearchBackend, type SearchCandidate } from "./backend.ts";
-import { DENSE_LIMITS, plannedFilter } from "./dense-corpus.ts";
+import {
+  DENSE_LIMITS,
+  scanCorpus,
+  documentOperationKey,
+} from "./dense-corpus.ts";
 import type { DenseScanJob } from "./dense-worker.ts";
 import {
   DenseError,
-  EMBEDDING_SPACE,
   GoogleEmbeddingProvider,
   type EmbeddingProvider,
   type SearchUsage,
@@ -48,6 +50,7 @@ export async function buildDenseIndex(
   indexPath: string,
   signal?: AbortSignal,
   provider?: EmbeddingProvider,
+  options: { dispatchDocuments?: boolean } = {},
 ) {
   const profile = getSearchProfile(app, actor, roomId);
   const coverage = {
@@ -58,95 +61,77 @@ export async function buildDenseIndex(
     profileVersion: profile?.version ?? null,
   };
   if (!profile) return coverage;
-  if (!profile.purposes.includes("DOCUMENT_EMBEDDING"))
-    return { ...coverage, state: "documents_disabled" };
-  const adapter = providerOrEnv(provider);
-  if (!adapter) return { ...coverage, state: "unconfigured_provider" };
   const until = deadline(DENSE_LIMITS.documentJobMs, signal);
   const index = new SQLiteSearchBackend(indexPath);
   try {
     const sources = new SearchSources(app, policy, actor, roomId);
     sources.assertRoom("memory");
-    const filter = plannedFilter(index, sources, profile);
-    const rows = sources.withCandidateSnapshot("memory", () =>
-      index.db
-        .prepare(
-          `SELECT c.id,c.ref,c.visibility,c.start,c.end FROM chunks c WHERE ${filter.sql}
-      ORDER BY c.id LIMIT ?`,
-        )
-        .all(...filter.params, DENSE_LIMITS.chunks + 1),
+    const inspected = scanCorpus(
+      app,
+      policy,
+      actor,
+      roomId,
+      index,
+      indexPath,
+      profile,
     );
-    coverage.planned = rows.length;
+    coverage.planned = inspected.planned;
+    coverage.indexed = inspected.indexed;
     if (
-      rows.length > DENSE_LIMITS.chunks ||
-      rows.length * EMBEDDING_SPACE.dimensions * 4 > DENSE_LIMITS.bytes
+      inspected.state !== "incomplete_dense_coverage" ||
+      options.dispatchDocuments === false ||
+      !profile.purposes.includes("DOCUMENT_EMBEDDING")
     )
-      return { ...coverage, state: "dense_limit" };
-    const present = index.db.prepare(
-      "SELECT 1 FROM search_vectors WHERE chunk_id=? AND operation_id=? AND space_id=? AND length(vector)=?",
-    );
+      return { ...coverage, state: inspected.state };
+    const adapter = providerOrEnv(provider);
+    if (!adapter) return { ...coverage, state: "unconfigured_provider" };
     const save = index.db.prepare(
       "INSERT OR REPLACE INTO search_vectors(chunk_id,space_id,operation_id,vector) VALUES(?,?,?,?)",
     );
-    for (const row of rows) {
+    for (const row of inspected.missing) {
       until.throwIfAborted();
-      const ref = JSON.parse(String(row.ref));
-      const citation = {
-        ...ref,
-        start: Number(row.start),
-        end: Number(row.end),
-      };
-      const operationKey = JSON.stringify([
-        basename(indexPath),
+      const citation = { ...row.ref, start: row.start, end: row.end };
+      const operationKey = documentOperationKey(
+        indexPath,
         profile.version,
         row.id,
-      ]);
-      const id = operationId(actor, roomId, "DOCUMENT_EMBEDDING", operationKey);
-      if (
-        !present.get(
-          row.id,
-          id,
-          profile.spaceId,
-          EMBEDDING_SPACE.dimensions * 4,
+      );
+      const readText = () => {
+        const source = sources.resolve(citation);
+        if (
+          source.personaId !== profile.personaId ||
+          source.visibility !== row.visibility ||
+          !profile.scopes.includes(source.visibility as MemoryScope)
         )
-      ) {
-        const readText = () => {
-          const source = sources.resolve(citation);
-          if (
-            source.personaId !== profile.personaId ||
-            source.visibility !== row.visibility ||
-            !profile.scopes.includes(source.visibility as MemoryScope)
-          )
-            throw new DenseError("scope_unavailable");
-          return source.text;
-        };
-        const result = await dispatchEmbedding(app, policy, adapter, {
+          throw new DenseError("scope_unavailable");
+        return source.text;
+      };
+      const result = await dispatchEmbedding(app, policy, adapter, {
+        actor,
+        roomId,
+        profile,
+        scopes: [row.visibility as MemoryScope],
+        purpose: "DOCUMENT_EMBEDDING",
+        operationKey,
+        sourceRef: JSON.stringify(citation),
+        signal: deadline(DENSE_LIMITS.dispatchMs, until),
+        readText,
+      });
+      const blob = Buffer.alloc(result.vector.length * 4);
+      result.vector.forEach((n, i) => blob.writeFloatLE(n, 4 * i));
+      app.transaction(() => {
+        assertDispatchScope(
+          app,
+          policy,
           actor,
           roomId,
           profile,
-          scopes: [row.visibility as MemoryScope],
-          purpose: "DOCUMENT_EMBEDDING",
-          operationKey,
-          sourceRef: JSON.stringify(citation),
-          signal: deadline(DENSE_LIMITS.dispatchMs, until),
-          readText,
-        });
-        const blob = Buffer.alloc(result.vector.length * 4);
-        result.vector.forEach((n, i) => blob.writeFloatLE(n, 4 * i));
-        app.transaction(() => {
-          assertDispatchScope(
-            app,
-            policy,
-            actor,
-            roomId,
-            profile,
-            "DOCUMENT_EMBEDDING",
-            [row.visibility as MemoryScope],
-          );
-          readText();
-          save.run(row.id, profile.spaceId, result.operationId, blob);
-        }, "search-adopt-vector");
-      }
+          "DOCUMENT_EMBEDDING",
+          [row.visibility as MemoryScope],
+        );
+        readText();
+        save.run(row.id, profile.spaceId, result.operationId, blob);
+      }, "search-adopt-vector");
       coverage.indexed++;
     }
     return { ...coverage, state: "ready" };

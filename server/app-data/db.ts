@@ -195,6 +195,7 @@ export class AppDatabase {
   readonly root: string;
   readonly path: string;
   readonly cursorKey: Buffer;
+  readonly #readOnly: boolean;
   readonly hooks: AppDatabaseOptions["hooks"];
   #depth = 0;
   #poisoned = false;
@@ -208,6 +209,7 @@ export class AppDatabase {
     this.root = resolve(options.root);
     this.path = options.path ?? join(this.root, "app-data.sqlite");
     this.hooks = options.hooks;
+    this.#readOnly = options.readOnly === true;
     if (
       !isAbsolute(options.root) ||
       !isAbsolute(this.path) ||
@@ -448,7 +450,9 @@ export class AppDatabase {
     let committed = false;
     this.#metrics.transactionCount++;
     try {
-      this.db.exec("BEGIN IMMEDIATE");
+      // A read-only worker uses the canonical readNote transaction. SQLite query_only
+      // still rejects writes, including any live-file change that would mark a note dirty.
+      this.db.exec(this.#readOnly ? "BEGIN DEFERRED" : "BEGIN IMMEDIATE");
     } catch (error) {
       this.#metrics.transactionFailures++;
       this.#metrics.transactionMs += performance.now() - started;

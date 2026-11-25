@@ -264,9 +264,10 @@ test("published Memory flows through document dispatch, independent query receip
     ...config(persona.id),
     maxCalls: 1,
   });
-  assert.equal(
-    (await query("stale-profile")).state,
-    "incomplete_dense_coverage",
+  assert.equal((await query("new-budget")).state, "ready");
+  assert.deepEqual(
+    log.slice(before).map((call) => call.purpose),
+    ["QUERY_EMBEDDING"],
   );
   assert.equal((await build()).state, "ready");
   assert.equal((await query("budget")).state, "budget_exhausted");
@@ -372,12 +373,10 @@ test("P-01 count and byte bounds independently skip the whole eligible corpus be
 });
 
 test("P-02 cancellation waits for the compute child to exit", async (t) => {
-  const { runSearchProcess } = await import(
-    "../server/search/query-process.ts"
-  );
-  const { existsSync, mkdtempSync, readFileSync, rmSync } = await import(
-    "node:fs"
-  );
+  const { runSearchProcess } =
+    await import("../server/search/query-process.ts");
+  const { existsSync, mkdtempSync, readFileSync, rmSync } =
+    await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { setTimeout: delay } = await import("node:timers/promises");
   const directory = mkdtempSync(join(tmpdir(), "map-search-cancel-"));
@@ -402,15 +401,12 @@ test("P-02 cancellation waits for the compute child to exit", async (t) => {
 
 test("HTTP hybrid Memory search uses a single mock Google query and resolves a published original", async (t) => {
   const { httpFixture } = await import("./http-fixture.ts");
-  const { registerVault, setVaultPaused } = await import(
-    "../server/memory/vault.ts"
-  );
-  const { registerHandwrittenNote } = await import(
-    "../server/memory/importer.ts"
-  );
-  const { acquireActiveIndex, requestIndexUpdate } = await import(
-    "../server/search/index.ts"
-  );
+  const { registerVault, setVaultPaused } =
+    await import("../server/memory/vault.ts");
+  const { registerHandwrittenNote } =
+    await import("../server/memory/importer.ts");
+  const { acquireActiveIndex, requestIndexUpdate } =
+    await import("../server/search/index.ts");
   const { digest } = await import("../server/app-data/validation.ts");
   const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -505,9 +501,8 @@ test("HTTP hybrid Memory search uses a single mock Google query and resolves a p
 
 test("R-05 source, ACL or profile changes at committed intent prevent transport and release a known unsent reservation", async (t) => {
   const { AppDatabase } = await import("../server/app-data/db.ts");
-  const { AuthorizationPolicy } = await import(
-    "../server/auth/authorization.ts"
-  );
+  const { AuthorizationPolicy } =
+    await import("../server/auth/authorization.ts");
   const f = appFixture();
   t.after(() => f.dispose());
   const { actor, room, persona } = f;
@@ -578,4 +573,173 @@ test("R-05 source, ACL or profile changes at committed intent prevent transport 
       { state: "REJECTED", dispatched_at: null, estimated_cost_micros: 0 },
     );
   }
+});
+
+test("F-02 reuses only generation-bound successes for the same authorized chunk and space", async (t) => {
+  const { hash } = await import("../server/search/embedding.ts");
+  const f = lineageFixture();
+  t.after(() => f.close());
+  f.original();
+  const note = await f.memory();
+  f.publish(note.candidate.id);
+  const { app, policy, actor, room, persona } = f;
+  const path = join(f.root, "verified.sqlite"),
+    index = new SQLiteSearchBackend(path, { create: true });
+  t.after(() => index.close());
+  index.applyPage({
+    deletes: [],
+    upserts: new SearchSources(app, policy, actor, room.id).memoryPage()
+      .upserts,
+  });
+  const initial = configureSearchProfile(
+    app,
+    actor,
+    room.id,
+    config(persona.id),
+  );
+  let calls = 0;
+  const provider: EmbeddingProvider = {
+    spaceId,
+    async embed() {
+      calls++;
+      return {
+        vector: Float32Array.from(values),
+        usage: { unit: "input_token", completeness: "COMPLETE", quantity: 3 },
+      };
+    },
+  };
+  const inspect = (p = path) =>
+    buildDenseIndex(app, policy, actor, room.id, p, signal, provider);
+  assert.equal((await inspect()).state, "ready");
+  const queryOnly = configureSearchProfile(app, actor, room.id, {
+    ...config(persona.id),
+    purposes: ["QUERY_EMBEDDING"],
+  });
+  const oldBudget = budgetStatus(app, actor, room.id, initial.version);
+  const sealed = app.db
+    .prepare(
+      "SELECT * FROM search_operations WHERE purpose='DOCUMENT_EMBEDDING'",
+    )
+    .get()!;
+  const successfulVector = index.db
+    .prepare("SELECT * FROM search_vectors")
+    .get()!;
+  const requireMissing = async (label: string) => {
+    const coverage = await inspect();
+    assert.equal(coverage.state, "incomplete_dense_coverage", label);
+    assert.equal(coverage.indexed, 0, label);
+    assert.equal(calls, 1, label);
+  };
+
+  // Representative persisted MEM-2 operation. Reuse never rewrites the old receipt, charge, or vector.
+  assert.equal((await inspect()).state, "ready");
+  assert.equal(initial.version + 1, queryOnly.version);
+  for (const [column, bad] of [
+    ["payload_digest", hash("different content")],
+    [
+      "source_ref",
+      JSON.stringify({ ...JSON.parse(String(sealed.source_ref)), start: 999 }),
+    ],
+    ["state", "OUTCOME_UNKNOWN"],
+    ["purpose", "QUERY_EMBEDDING"],
+  ] as const) {
+    const write = app.db.prepare(
+      `UPDATE search_operations SET ${column}=? WHERE operation_id=?`,
+    );
+    write.run(bad, sealed.operation_id);
+    await requireMissing(column);
+    write.run(sealed[column], sealed.operation_id);
+  }
+  const historical = app.db
+    .prepare("SELECT * FROM search_profiles WHERE version=?")
+    .get(initial.version)!;
+  const alterConfig = app.db.prepare(
+    "UPDATE search_profiles SET config_json=?,config_digest=? WHERE version=?",
+  );
+  for (const change of [
+    { purposes: ["QUERY_EMBEDDING"] },
+    { scopes: ["room_shared"] },
+    { personaId: "unrelated" },
+  ]) {
+    const configJson = JSON.stringify({
+      ...JSON.parse(String(historical.config_json)),
+      ...change,
+    });
+    alterConfig.run(configJson, hash(configJson), initial.version);
+    await requireMissing(JSON.stringify(change));
+  }
+  alterConfig.run(
+    historical.config_json,
+    historical.config_digest,
+    initial.version,
+  );
+  const setSpace = app.db.prepare(
+    "UPDATE search_profiles SET space_id=? WHERE version=?",
+  );
+  setSpace.run("incompatible-space", initial.version);
+  await requireMissing("old space");
+  setSpace.run(historical.space_id, initial.version);
+  const blob = Buffer.alloc(768 * 4);
+  blob.writeFloatLE(NaN, 0);
+  const setVector = index.db.prepare(
+    "UPDATE search_vectors SET vector=? WHERE chunk_id=?",
+  );
+  setVector.run(blob, successfulVector.chunk_id);
+  await requireMissing("invalid vector");
+  const search = await searchDense(
+    app,
+    policy,
+    actor,
+    room.id,
+    path,
+    "語義",
+    "invalid-floats",
+    { provider },
+  );
+  assert.equal(search.state, "incomplete_dense_coverage");
+  assert.equal(search.external.calls, 0);
+  setVector.run(successfulVector.vector, successfulVector.chunk_id);
+  const otherGeneration = join(f.root, "different-generation.sqlite");
+  // Transplant just the valid old receipt/vector into a correctly formed second generation.
+  const second = new SQLiteSearchBackend(otherGeneration, { create: true });
+  try {
+    second.applyPage({
+      deletes: [],
+      upserts: new SearchSources(app, policy, actor, room.id).memoryPage()
+        .upserts,
+    });
+    second.db
+      .prepare("INSERT INTO search_vectors VALUES(?,?,?,?)")
+      .run(
+        successfulVector.chunk_id,
+        successfulVector.space_id,
+        successfulVector.operation_id,
+        successfulVector.vector,
+      );
+  } finally {
+    second.close();
+  }
+  assert.equal(
+    (await inspect(otherGeneration)).state,
+    "incomplete_dense_coverage",
+  );
+  assert.equal((await inspect()).state, "ready");
+  assert.equal(calls, 1);
+  assert.deepEqual(
+    budgetStatus(app, actor, room.id, initial.version),
+    oldBudget,
+  );
+  assert.deepEqual(budgetStatus(app, actor, room.id, queryOnly.version), {
+    calls: 0,
+    costMicros: 0,
+    tokens: 0,
+  });
+  assert.deepEqual(
+    app.db.prepare("SELECT * FROM search_operations").get(),
+    sealed,
+  );
+  assert.deepEqual(
+    index.db.prepare("SELECT * FROM search_vectors").get(),
+    successfulVector,
+  );
 });

@@ -26,12 +26,14 @@ import {
   manageIndex,
   shutdownIndexWorkers,
   indexWorkerStatus,
+  isIndexUpdatePending,
 } from "../server/search/index.ts";
 import {
   indexDirectory,
   openRegistry,
   type IndexJob,
 } from "../server/search/index-registry.ts";
+import { configureSearchProfile } from "../server/search/profile.ts";
 import { updateGeneration } from "../server/search/index-worker.ts";
 import { SearchSources } from "../server/search/sources.ts";
 import { runCli } from "../server/cli.ts";
@@ -393,6 +395,115 @@ test("Host CLI persists index/profile controls and honors the exclusive host loc
       f.app.db.prepare("SELECT COUNT(*) AS n FROM search_profiles").get()!.n,
       1,
     );
+  } finally {
+    await f.close();
+  }
+});
+
+test("F-02 policy rotation fences activation and rollback while a compatible ordinary refresh preserves the active generation", async () => {
+  const f = fixture();
+  try {
+    const persona = f.repo.createPersona(f.actor, f.roomId, {
+      name: "owner",
+      model: "synthetic",
+    });
+    const cfg = {
+      personaId: persona.id,
+      scopes: ["room_shared"],
+      purposes: ["QUERY_EMBEDDING"],
+      maxCalls: 1,
+      maxCostMicros: 10000,
+      maxTokens: 8192,
+      priceMicrosPerThousandTokens: 200,
+    };
+    configureSearchProfile(f.app, f.actor, f.roomId, cfg);
+    const first = await f.update();
+    const before = f.active();
+    assert(before.state === "ACTIVE");
+    await assert.rejects(
+      updateGeneration(
+        f.app,
+        f.prepareJob(true),
+        new AbortController().signal,
+        (stage) => {
+          if (stage === "READY")
+            configureSearchProfile(f.app, f.actor, f.roomId, {
+              ...cfg,
+              maxCalls: 2,
+            });
+        },
+      ),
+      /SEARCH_PROFILE_CHANGED/,
+    );
+    const preserved = f.active();
+    assert(preserved.state === "ACTIVE");
+    assert.equal(preserved.generationId, first);
+    assert.equal(preserved.manifest.profileVersion, 1);
+    assert.equal(preserved.reason, "SEARCH_PROFILE_CHANGED");
+    const otherRoom = f.repo.createRoom(f.actor, { title: "Other" });
+    await requestIndexUpdate(f.app, f.policy, f.actor, otherRoom.id);
+    const other = acquireActiveIndex(f.app, f.policy, f.actor, otherRoom.id);
+    assert(other.state === "ACTIVE");
+    // A failed job from the old policy must not force a fresh generation on ordinary retry.
+    const refreshing = f.update();
+    assert(!isIndexUpdatePending(other));
+    assert(isIndexUpdatePending(preserved));
+    assert.equal(await refreshing, first);
+    assert(!isIndexUpdatePending(preserved));
+    const refreshed = f.active();
+    assert(refreshed.state === "ACTIVE");
+    assert.equal(refreshed.manifest.profileVersion, 2);
+    assert.equal(
+      refreshed.manifest.indexConfigDigest,
+      before.manifest.indexConfigDigest,
+    );
+    assert.notEqual(
+      refreshed.manifest.configDigest,
+      before.manifest.configDigest,
+    );
+    const second = await f.update({ rebuild: true });
+    configureSearchProfile(f.app, f.actor, f.roomId, { ...cfg, maxCalls: 3 });
+    await assert.rejects(
+      f.update({ rollback: first }),
+      /SEARCH_ROLLBACK_INCOMPATIBLE/,
+    );
+    assert.equal(await f.update(), second);
+    configureSearchProfile(f.app, f.actor, f.roomId, {
+      ...cfg,
+      scopes: ["persona_private"],
+    });
+    assert.notEqual(await f.update(), second);
+  } finally {
+    await f.close();
+  }
+});
+
+test("F-02 legacy manifest checksums are verified before upgrading their index compatibility metadata", async () => {
+  const f = fixture();
+  try {
+    const first = await f.update();
+    const old = f.active();
+    assert(old.state === "ACTIVE");
+    const reg = openRegistry(f.dir, true)!;
+    try {
+      const put = reg.prepare("UPDATE generations SET manifest=? WHERE id=?");
+      const { indexConfigDigest, ...legacy } = old.manifest;
+      put.run(JSON.stringify(legacy), first);
+      assert.equal(await f.update(), first);
+      // A legacy manifest whose persisted representation differs from its checksum fails closed.
+      put.run(JSON.stringify({ ...legacy, chunkLength: 64 }), first);
+      const replacement = await f.update();
+      assert.notEqual(replacement, first);
+      const current = f.active();
+      assert(current.state === "ACTIVE");
+      put.run(
+        JSON.stringify({ ...current.manifest, generationId: first }),
+        replacement,
+      );
+      assert.notEqual(await f.update(), replacement);
+    } finally {
+      reg.close();
+    }
   } finally {
     await f.close();
   }

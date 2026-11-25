@@ -33,6 +33,13 @@ import {
 
 type Stage = "PAGE_READ" | "PAGE_COMMITTED" | "VALIDATING" | "READY" | "ACTIVE";
 
+// Budgets and allowed external operations govern each dispatch. They do not change
+// the representation of a chunk or the set of notes planned for this vector space.
+function indexConfigDigest(config: Record<string, unknown>) {
+  const { profileVersion, profileDigest, ...representation } = config;
+  return hash(JSON.stringify(representation));
+}
+
 function changeState(db: DatabaseSync, id: string, from: string, to: string) {
   if (
     !db
@@ -83,7 +90,23 @@ export async function updateGeneration(
     };
     const configDigest = hash(JSON.stringify(config));
     const epoch = hash(app.cursorKey);
-    const base = { ...config, configDigest, binding, acl, epoch };
+    const shapeDigest = indexConfigDigest(config);
+    const base = {
+      ...config,
+      configDigest,
+      indexConfigDigest: shapeDigest,
+      binding,
+      acl,
+      epoch,
+    };
+    const checkProfile = () => {
+      const current = getSearchProfile(app, actor, binding.roomId);
+      if (
+        (current?.version ?? null) !== config.profileVersion ||
+        (current?.configDigest ?? null) !== config.profileDigest
+      )
+        throw new AppError("SEARCH_PROFILE_CHANGED", 409);
+    };
     const check = () => {
       signal.throwIfAborted();
       if (reg.prepare("SELECT paused FROM control").get()?.paused)
@@ -105,13 +128,23 @@ export async function updateGeneration(
     if (job.rollback && !chosen)
       throw new AppError("SEARCH_GENERATION_UNAVAILABLE", 409);
     const old = chosen ? JSON.parse(String(chosen.manifest)) : null;
+    // Existing MEM-2 manifests stored just the full configuration checksum. Verify
+    // the original checksum before deriving their compatible index representation.
+    const previousConfig =
+      old &&
+      Object.fromEntries(Object.keys(config).map((key) => [key, old[key]]));
     const reusable =
-      old?.acl === acl &&
+      old?.validated === true &&
+      old.generationId === chosen.id &&
+      old.acl === acl &&
       old.epoch === epoch &&
-      old.configDigest === configDigest &&
+      old.configDigest === hash(JSON.stringify(previousConfig)) &&
+      indexConfigDigest(previousConfig) === shapeDigest &&
+      (!Object.hasOwn(old, "indexConfigDigest") ||
+        old.indexConfigDigest === shapeDigest) &&
       JSON.stringify(old.binding) === JSON.stringify(binding) &&
       existsSync(generationPath(dir, String(chosen!.id)));
-    if (job.rollback && !reusable)
+    if (job.rollback && (!reusable || old.configDigest !== configDigest))
       throw new AppError("SEARCH_ROLLBACK_INCOMPATIBLE", 409);
     const create = !job.rollback && (job.rebuild || !reusable);
     const generationId = create ? randomUUID() : String(chosen!.id);
@@ -176,8 +209,12 @@ export async function updateGeneration(
       await refresh("archive");
     }
     let dense = create ? null : old?.dense;
-    if (profile && job.external) {
+    // Recheck cached coverage locally when a new policy is applied to existing
+    // vectors. Only an explicit external job may dispatch a missing document.
+    const policyChanged = !create && old.configDigest !== configDigest;
+    if (profile && (job.external || policyChanged)) {
       check();
+      checkProfile();
       dense = await buildDenseIndex(
         app,
         policy,
@@ -185,8 +222,10 @@ export async function updateGeneration(
         binding.roomId,
         path,
         signal,
+        undefined,
+        { dispatchDocuments: job.external },
       );
-      // External calls may have taken minutes. Reconcile committed edits/deletions before marking coverage.
+      // Coverage validation or external calls can outlast the prior source cutoffs.
       memoryChanged = false;
       await refresh("memory");
       await refresh("archive");
@@ -202,9 +241,6 @@ export async function updateGeneration(
     }
     if (switching) backend.validate();
     check();
-    const nowProfile = getSearchProfile(app, actor, binding.roomId);
-    if ((nowProfile?.version ?? null) !== config.profileVersion)
-      throw new AppError("SEARCH_PROFILE_CHANGED", 409);
     const manifest = {
       ...base,
       generationId,
@@ -221,6 +257,7 @@ export async function updateGeneration(
       observe?.("READY");
     }
     check();
+    checkProfile();
     inRegistryTransaction(reg, () => {
       if (switching) {
         reg.exec("UPDATE generations SET state='RETIRED' WHERE state='ACTIVE'");

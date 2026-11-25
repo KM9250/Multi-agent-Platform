@@ -6,7 +6,7 @@ import {
   rmdirSync,
   unlinkSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { AppError } from "../../shared/app-contracts/index.ts";
 import { type AppDatabase, assertSafePath } from "../app-data/db.ts";
@@ -139,6 +139,12 @@ interface Task {
   waitStart: number;
 }
 const pending = new Map<string, Task>();
+/** Host-wide scheduling is exclusive; only report a live job for this pinned actor/room partition. */
+export function isIndexUpdatePending(
+  active: Extract<ActiveIndex, { state: "ACTIVE" }>,
+): boolean {
+  return pending.has(dirname(active.path));
+}
 const queue: Task[] = [];
 let running = 0;
 const metrics = {
@@ -295,7 +301,12 @@ export async function requestIndexUpdate(
     rebuild:
       options.rebuild === true ||
       active.state === "FAILED" ||
-      Boolean(active.reason),
+      // A change to policy during the previous job can leave a valid index and its paid vectors.
+      Boolean(
+        active.reason &&
+        active.reason !== "SEARCH_PROFILE_CHANGED" &&
+        active.reason !== "SEARCH_ROLLBACK_INCOMPATIBLE",
+      ),
     external: options.external === true,
     ...(options.rollback ? { rollback: options.rollback } : {}),
   };

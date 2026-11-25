@@ -42,10 +42,13 @@ process.once("message", (job: DenseScanJob) => {
       job.actor,
       job.roomId,
       index,
+      job.indexPath,
       profile,
       job.query,
     );
-    process.send!({ result });
+    process.send!({
+      result: { state: result.state, candidates: result.candidates },
+    });
   } catch {
     process.send!({ error: "dense_unavailable" });
   } finally {

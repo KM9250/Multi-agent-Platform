@@ -190,7 +190,11 @@ export function getSearchProfile(
   const row = app.db
     .prepare(`SELECT * FROM search_profiles WHERE ${match} AND active=1`)
     .get(...binding(actor, roomId));
-  if (!row) return null;
+  return row ? decodeProfile(row) : null;
+}
+
+/** Decode the immutable historical config using the same contract as today's dispatch profile. */
+export function decodeProfile(row: Record<string, unknown>): SearchProfile {
   const json = String(row.config_json);
   if (
     row.space_id !== spaceId ||
