@@ -1,3 +1,4 @@
+import { APP_SCHEMA } from "../shared/app-contracts/index.ts";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
@@ -155,7 +156,7 @@ test("F-01 CLI recovers abandoned document dispatch before a new generation and 
       "--destination",
       backup,
     );
-    assert.equal(backupManifest.appSchema, 5);
+    assert.equal(backupManifest.appSchema, APP_SCHEMA);
     const backupDb = new DatabaseSync(join(backup, "app-data.sqlite"), {
       readOnly: true,
     });

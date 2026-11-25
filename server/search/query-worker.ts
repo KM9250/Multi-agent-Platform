@@ -1,3 +1,4 @@
+import { AppError } from "../../shared/app-contracts/index.ts";
 import { AppDatabase } from "../app-data/db.ts";
 import { AuthorizationPolicy, type Actor } from "../auth/authorization.ts";
 import { SQLiteSearchBackend } from "./backend.ts";
@@ -12,12 +13,27 @@ export interface LexicalJob {
   idleTimeoutMs: number;
   roomId: string;
   query: string;
+  cursor: string;
   target: SearchTarget;
   includeHistory: boolean;
   personaId?: string;
   from?: number;
   until?: number;
 }
+const accessCodes = new Set(["FORBIDDEN", "UNAUTHENTICATED", "NOT_FOUND"]);
+
+function freshness(sources: SearchSources, job: LexicalJob) {
+  try {
+    return sources.hasUnindexedChanges(job.target, job.cursor);
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    if (accessCodes.has(code)) throw error;
+    if (code === "SEARCH_RESYNC_REQUIRED" || code === "MEMORY_RESYNC_REQUIRED")
+      throw new AppError("SEARCH_CURSOR_INVALID", 409);
+    throw new AppError("SEARCH_FRESHNESS_UNAVAILABLE", 503);
+  }
+}
+
 process.once("message", (job: LexicalJob) => {
   let app: AppDatabase | undefined, index: SQLiteSearchBackend | undefined;
   try {
@@ -29,8 +45,9 @@ process.once("message", (job: LexicalJob) => {
     const policy = new AuthorizationPolicy(app, job.idleTimeoutMs);
     const sources = new SearchSources(app, policy, job.actor, job.roomId);
     index = new SQLiteSearchBackend(job.indexPath, { readOnly: true });
-    const result = sources.withCandidateSnapshot(job.target, () =>
-      index!.query({
+    const result = sources.withCandidateSnapshot(job.target, () => {
+      const lagging = freshness(sources, job);
+      const candidates = index!.query({
         query: job.query,
         target: job.target,
         includeHistory: job.includeHistory,
@@ -40,15 +57,19 @@ process.once("message", (job: LexicalJob) => {
         limit: 100,
         allowsScope: sources.allowsScope.bind(sources),
         eligible: sources.eligible.bind(sources),
-      }),
-    );
+      });
+      return { ...candidates, lagging };
+    });
     process.send!({ result });
   } catch (e) {
     const code = (e as { code?: string }).code;
     process.send!({
-      error: ["FORBIDDEN", "UNAUTHENTICATED", "NOT_FOUND"].includes(code)
-        ? code
-        : "INDEX_UNAVAILABLE",
+      error:
+        accessCodes.has(code) ||
+        code === "SEARCH_CURSOR_INVALID" ||
+        code === "SEARCH_FRESHNESS_UNAVAILABLE"
+          ? code
+          : "INDEX_UNAVAILABLE",
     });
   } finally {
     index?.close();

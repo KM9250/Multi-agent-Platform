@@ -80,7 +80,7 @@ type ManifestHeader = {
 };
 type SnapshotManifest = ManifestHeader & {
   schema: "MAP-MEM-1:BACKUP:3";
-  appSchema: 2 | 3 | 4 | 5;
+  appSchema: 2 | 3 | 4 | 5 | 6;
   attachments: Inventory;
   memory: MemoryInventory;
 };
@@ -881,7 +881,7 @@ async function verifyBackup(
       break;
     case "MAP-MEM-1:BACKUP:3":
       if (
-        ![2, 3, 4, 5].includes(manifest.appSchema) ||
+        ![2, 3, 4, 5, 6].includes(manifest.appSchema) ||
         manifest.memory?.contract !== MEMORY_CONTRACT ||
         !validInventory(manifest.attachments) ||
         !validInventory(manifest.memory.versions) ||

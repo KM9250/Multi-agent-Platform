@@ -14,7 +14,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { AppDatabase } from "../server/app-data/db.ts";
 import { restoreBackup } from "../server/operations/backup.ts";
-import { MEMORY_CONTRACT } from "../shared/app-contracts/index.ts";
+import { APP_SCHEMA, MEMORY_CONTRACT } from "../shared/app-contracts/index.ts";
 
 // Use the released program both to produce the backup and attempt the downgrade.
 // Recreating a schema-1 manifest with the new writer would miss wire incompatibilities.
@@ -94,7 +94,7 @@ test("DATA-1 program, populated v1 backup, and MEM-1 migration interoperate with
       assert.equal(
         app.db.prepare("SELECT schema_version FROM app_metadata").get()!
           .schema_version,
-        5,
+        APP_SCHEMA,
       );
       assert.equal(
         app.db.prepare("SELECT contract FROM app_feature_contracts").get()!
@@ -171,13 +171,16 @@ test("DATA-1 program, populated v1 backup, and MEM-1 migration interoperate with
 });
 
 for (const mutation of [
-  "UPDATE app_metadata SET schema_version=6",
+  `UPDATE app_metadata SET schema_version=${APP_SCHEMA + 1}`,
   "DELETE FROM app_migrations WHERE version=2",
   "DELETE FROM app_migrations WHERE version=3",
   "DELETE FROM app_migrations WHERE version=4",
   "DELETE FROM app_migrations WHERE version=5",
   "DELETE FROM app_feature_contracts WHERE contract='MAP-MEM-2:SEARCH:1'",
   "DROP TABLE search_operations",
+  "DELETE FROM app_migrations WHERE version=6",
+  "DROP INDEX search_message_changes",
+  "DROP INDEX search_persona_deletions",
   "DROP INDEX memory_receipt_source",
   "DELETE FROM app_feature_contracts",
   "CREATE TABLE foreign_data(x)",

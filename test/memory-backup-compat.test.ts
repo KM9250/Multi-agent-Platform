@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { APP_SCHEMA } from "../shared/app-contracts/index.ts";
 import { AppDatabase } from "../server/app-data/db.ts";
 import { SessionService } from "../server/auth/sessions.ts";
 import { AuthorizationPolicy } from "../server/auth/authorization.ts";
@@ -79,7 +80,7 @@ test("F-03/F-04: previous MEM-1 binary backups and paused restore reports stay r
       assert.equal(
         app.db.prepare("SELECT schema_version FROM app_metadata").get()!
           .schema_version,
-        5,
+        APP_SCHEMA,
       );
       assert.deepEqual(
         app.db

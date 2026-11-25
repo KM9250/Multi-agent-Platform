@@ -3,7 +3,7 @@ import { AppError } from "../../shared/app-contracts/index.ts";
 import type { SQLiteSearchBackend } from "./backend.ts";
 import type { LexicalJob } from "./query-worker.ts";
 
-type Result = ReturnType<SQLiteSearchBackend["query"]>;
+type Result = ReturnType<SQLiteSearchBackend["query"]> & { lagging: boolean };
 /** The child owns its SQLite connections. SIGKILL also interrupts a native FTS query. */
 export function runSearchProcess<T>(
   moduleUrl: URL,
@@ -32,7 +32,9 @@ export function runSearchProcess<T>(
               ? 403
               : message.error === "NOT_FOUND"
                 ? 404
-                : 503,
+                : message.error === "SEARCH_CURSOR_INVALID"
+                  ? 409
+                  : 503,
         );
     });
     child.once("error", (e) => {

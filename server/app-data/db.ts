@@ -40,6 +40,7 @@ const migrations = [
   "app_003_memory_integrity",
   "app_004_resumable_memory_lineage",
   "app_005_search_control",
+  "app_006_scoped_archive_changes",
 ] as const;
 const definitions = [
   [
@@ -71,6 +72,10 @@ const definitions = [
     ) STRICT;`,
   ].join("\n"),
   SEARCH_PROFILE_SCHEMA,
+  `CREATE INDEX search_message_changes ON app_changes(workspace_id,room_id,change_id)
+     WHERE target_type='MESSAGE';
+   CREATE INDEX search_persona_deletions ON app_changes(workspace_id,target_id,change_id)
+     WHERE target_type='PERSONA' AND action='DELETE';`,
 ];
 function schemaObjects(db: DatabaseSync): string {
   return JSON.stringify(
@@ -98,7 +103,7 @@ function expectedCatalogue(version: number): string {
   }
   return catalogue;
 }
-export function identifyAppSchema(db: DatabaseSync): 1 | 2 | 3 | 4 | 5 {
+export function identifyAppSchema(db: DatabaseSync): 1 | 2 | 3 | 4 | 5 | 6 {
   try {
     const meta = db
       .prepare(
@@ -112,7 +117,8 @@ export function identifyAppSchema(db: DatabaseSync): 1 | 2 | 3 | 4 | 5 {
         version !== 2 &&
         version !== 3 &&
         version !== 4 &&
-        version !== 5)
+        version !== 5 &&
+        version !== 6)
     )
       throw new AppError("WRONG_DATABASE");
     const ledger = db
@@ -346,7 +352,7 @@ export class AppDatabase {
             this.db.exec("COMMIT");
             break;
           }
-          const record = (next: 2 | 3 | 4 | 5) => {
+          const record = (next: 2 | 3 | 4 | 5 | 6) => {
             this.db
               .prepare("INSERT INTO app_migrations VALUES(?,?,?)")
               .run(next, migrations[next - 1], Date.now());
@@ -375,6 +381,13 @@ export class AppDatabase {
             record(5);
             this.db.exec("COMMIT");
             this.hooks?.afterCommit?.(migrations[4]);
+            continue;
+          }
+          if (version === 5) {
+            this.db.exec(definitions[5]);
+            record(6);
+            this.db.exec("COMMIT");
+            this.hooks?.afterCommit?.(migrations[5]);
             continue;
           }
           // A direct upgrade retains the original schema-2 state and never exposes an

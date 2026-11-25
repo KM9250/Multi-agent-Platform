@@ -4,7 +4,11 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { appFixture } from "./app-data-fixture.ts";
 import { lineageFixture } from "./memory-lineage-fixture.ts";
-import { SearchSources } from "../server/search/sources.ts";
+import {
+  ARCHIVE_FRESHNESS_SQL,
+  MEMORY_FRESHNESS_SQL,
+  SearchSources,
+} from "../server/search/sources.ts";
 import type { SourcePage, SearchSource } from "../shared/search-sources.ts";
 
 function applyPage(index: Map<string, SearchSource>, page: SourcePage) {
@@ -338,4 +342,161 @@ test("MEM-2 lag probe reports only actor-visible local changes, including a dele
   );
   repository.deleteMessage(actor, room.id, added.id, { expectedRevision: 2 });
   assert.equal(sources.hasUnindexedChanges("archive", revised.cursor), true);
+});
+
+test("PR40 F-03 Archive finds an authorized change in the middle of a scoped backlog", (t) => {
+  const f = appFixture();
+  t.after(f.dispose);
+  const { repository, room, actor, app, policy, persona } = f;
+  const other = repository.createRoom(actor, { title: "Elsewhere" });
+  const reader = new SearchSources(app, policy, actor, room.id);
+  const cursor = reader.archivePage().cursor;
+  const noise = () => {
+    for (let i = 0; i < 80; i++) {
+      repository.appendMessage(actor, other.id, {
+        role: "user",
+        content: "another room",
+      });
+      repository.appendMessage(actor, room.id, {
+        role: "model",
+        personaId: persona.id,
+        segments: [
+          {
+            visibility: "self_only",
+            channel: "private_state",
+            content: "private only",
+          },
+        ],
+      });
+    }
+  };
+  app.transaction(noise);
+  assert.equal(reader.hasUnindexedChanges("archive", cursor), false);
+  repository.appendMessage(actor, room.id, {
+    role: "user",
+    content: "ALPHA927",
+  });
+  app.transaction(noise);
+  assert.equal(reader.hasUnindexedChanges("archive", cursor), true);
+});
+
+test("PR40 F-03 Memory finds only granted documents past the cursor, including the middle", (t) => {
+  const f = appFixture();
+  t.after(f.dispose);
+  const { room, actor, app, policy, persona } = f;
+  policy.grant(actor.actorId, actor.workspaceId, "READ_MEMORY", {
+    roomId: room.id,
+    personaId: persona.id,
+    visibility: "room_shared",
+  });
+  const reader = new SearchSources(app, policy, actor, room.id);
+  const cursor = reader.memoryPage().cursor;
+  const publish = app.db.prepare(`INSERT INTO memory_documents(
+    note_id,workspace_id,room_id,owner_persona_id,scope,state,relative_path,version,digest,body_digest,trusted)
+    VALUES(?,?,?,?,?,'PUBLISHED',?,1,?,?,0)`);
+  const version = app.db.prepare(
+    "INSERT INTO memory_versions VALUES(?,1,?,?,?,1)",
+  );
+  let serial = 0;
+  function register(scope: string) {
+    const n = ++serial,
+      id = "lag_" + n,
+      path = id + ".md",
+      sha = n.toString(16).padStart(64, "0");
+    publish.run(
+      id,
+      actor.workspaceId,
+      room.id,
+      persona.id,
+      scope,
+      path,
+      sha,
+      sha,
+    );
+    version.run(id, sha, sha, path);
+  }
+  const noise = () => {
+    for (let n = 0; n < 80; n++) register("persona_private");
+  };
+  app.transaction(noise);
+  assert.equal(reader.hasUnindexedChanges("memory", cursor), false);
+  app.transaction(() => {
+    register("room_shared");
+    noise();
+  });
+  assert.equal(reader.hasUnindexedChanges("memory", cursor), true);
+});
+
+test("PR40 F-03 deleting a message invalidates an earlier readable revision when recent revisions were private", (t) => {
+  const f = appFixture();
+  t.after(f.dispose);
+  const { repository, app, actor, room, policy, persona } = f;
+  const reader = new SearchSources(app, policy, actor, room.id);
+  const msg = repository.appendMessage(actor, room.id, {
+    role: "model",
+    personaId: persona.id,
+    content: "old public",
+  });
+  const privateRevision = {
+    reason: "regeneration" as const,
+    segments: [
+      {
+        channel: "private_state" as const,
+        visibility: "self_only" as const,
+        content: "private",
+      },
+    ],
+  };
+  repository.appendRevision(actor, room.id, msg.id, {
+    ...privateRevision,
+    expectedRevision: 1,
+  });
+  repository.appendRevision(actor, room.id, msg.id, {
+    ...privateRevision,
+    expectedRevision: 2,
+  });
+  const baseline = reader.archivePage();
+  assert.deepEqual(
+    baseline.upserts.map((x) => [x.current, x.text]),
+    [[false, "old public"]],
+  );
+  assert.equal(reader.hasUnindexedChanges("archive", baseline.cursor), false);
+  repository.deleteMessage(actor, room.id, msg.id, { expectedRevision: 3 });
+  assert.equal(reader.hasUnindexedChanges("archive", baseline.cursor), true);
+  const after = reader.archivePage(baseline.cursor);
+  assert.deepEqual(after.deletes, [msg.id]);
+  assert.equal(reader.hasUnindexedChanges("archive", after.cursor), false);
+});
+
+test("PR40 F-03 freshness plans seek room changes and per-note change positions", (t) => {
+  const f = appFixture();
+  t.after(f.dispose);
+  const details = (sql: string, params: (string | number)[]) =>
+    f.app.db
+      .prepare("EXPLAIN QUERY PLAN " + sql)
+      .all(...params)
+      .map((row) => String(row.detail))
+      .join("\n");
+  const archive = details(ARCHIVE_FRESHNESS_SQL, [
+    f.actor.workspaceId,
+    f.room.id,
+    f.actor.actorId,
+    20,
+  ]);
+  const memory = details(MEMORY_FRESHNESS_SQL, [
+    f.actor.workspaceId,
+    f.actor.actorId,
+    f.room.id,
+    20,
+  ]);
+  assert.match(
+    archive,
+    /search_message_changes \(workspace_id=\? AND room_id=\? AND change_id>\?\)/,
+  );
+  assert.match(
+    memory,
+    /memory_documents_room \(workspace_id=\? AND room_id=\?\)/,
+  );
+  assert.match(memory, /memory_change_note \(note_id=\? AND seq>\?\)/);
+  assert.doesNotMatch(archive + "\n" + memory, /\bSCAN\b/);
 });

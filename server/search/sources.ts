@@ -60,7 +60,7 @@ const liveSegments = (
   includeDeletedMessage: boolean,
 ) => `FROM message_segments s ${rowidWindow ? "NOT INDEXED CROSS JOIN" : "JOIN"} messages m USING(workspace_id,room_id,message_id)
   JOIN message_revisions v USING(workspace_id,room_id,message_id,revision)
-  WHERE s.workspace_id=? AND s.room_id=? ${includeDeletedMessage ? "" : "AND m.deleted_at IS NULL"}
+  WHERE s.workspace_id=?1 AND s.room_id=?2 ${includeDeletedMessage ? "" : "AND m.deleted_at IS NULL"}
   AND (m.persona_id IS NULL OR EXISTS(SELECT 1 FROM personas p WHERE p.workspace_id=m.workspace_id
     AND p.persona_id=m.persona_id AND p.deleted_at IS NULL))
   AND (s.owner_persona_id IS NULL OR EXISTS(SELECT 1 FROM personas p WHERE p.workspace_id=s.workspace_id
@@ -72,13 +72,31 @@ const permittedSegments = (
   includeDeletedMessage = false,
 ) => `${liveSegments(rowidWindow, includeDeletedMessage)}
   AND ((s.visibility='public' AND s.channel IN ('public_message','shared_summary')) OR
-  EXISTS(SELECT 1 FROM access_grants g WHERE g.workspace_id=s.workspace_id AND g.actor_id=?
+  EXISTS(SELECT 1 FROM access_grants g WHERE g.workspace_id=s.workspace_id AND g.actor_id=?3
     AND g.operation='READ_PRIVATE_SEGMENT' AND g.revoked_at IS NULL AND g.room_id=s.room_id
     AND g.persona_id=s.owner_persona_id AND g.visibility=s.visibility AND g.provider IN ('*','')))
   AND EXISTS(SELECT 1 FROM access_grants g WHERE g.workspace_id=s.workspace_id AND g.actor_id=?3
     AND g.operation='READ_CONVERSATION' AND g.revoked_at IS NULL AND g.provider IN ('*','')
     AND g.room_id IN ('*',s.room_id) AND g.persona_id IN ('*',COALESCE(s.owner_persona_id,m.persona_id,''))
     AND g.visibility IN ('*',s.visibility))`;
+
+// These read the actor's current permissions on the same App DB snapshot as the cursor.
+export const MEMORY_FRESHNESS_SQL = `SELECT 1 ${visibleMemoryDocuments} AND d.room_id=?
+  AND EXISTS (SELECT 1 FROM memory_changes h WHERE h.note_id=d.note_id AND h.seq>?)
+  LIMIT 1`;
+// A correction can remove a previously visible segment. A deletion removes every revision.
+// Separate lookups preserve the revision index for the ordinary creation/correction case.
+const affectedSegment = `SELECT 1 ${permittedSegments(false, true)} AND s.message_id=e.target_id`;
+export const ARCHIVE_FRESHNESS_SQL = `SELECT 1 FROM app_changes e INDEXED BY search_message_changes
+  WHERE e.workspace_id=?1 AND e.room_id=?2 AND e.target_type='MESSAGE' AND e.change_id>?4
+  AND CASE WHEN e.action='DELETE' THEN EXISTS (${affectedSegment})
+    ELSE EXISTS (${affectedSegment} AND s.revision IN (e.revision,e.revision-1)) END
+  UNION ALL
+  SELECT 1 FROM room_personas rp WHERE rp.workspace_id=?1 AND rp.room_id=?2
+  AND EXISTS (SELECT 1 FROM app_changes e INDEXED BY search_persona_deletions
+    WHERE e.workspace_id=rp.workspace_id AND e.target_id=rp.persona_id
+    AND e.target_type='PERSONA' AND e.action='DELETE' AND e.change_id>?4)
+  LIMIT 1`;
 
 interface ArchivePosition {
   mode: "baseline" | "delta";
@@ -564,17 +582,10 @@ export class SearchSources
     return pos;
   }
 
-  /**
-   * Positive evidence that this actor has a change beyond the generation's checkpoint.
-   * A negative probe is neutral: the caller still displays the index's as-of time.
-   * Both ends of a large backlog are examined within a fixed budget. Other actors'
-   * activity never causes a positive status merely because the global counter advanced.
-   */
+  /** An exact room/actor metadata probe. No bodies, change IDs or unrelated activity leave the reader. */
   hasUnindexedChanges(target: SearchTarget, cursor: string): boolean {
     return this.withReadSnapshot(() => {
       this.assertRoom(target);
-      let position: number;
-      let latest: number;
       if (target === "memory") {
         const context = memoryChangeContext(
           this.app,
@@ -584,78 +595,36 @@ export class SearchSources
         );
         const page = openChangeCursor(this.app.cursorKey, context, cursor);
         if (page.mode === "baseline") return true;
-        position = page.position;
-        latest = Number(
+        const latest = Number(
           this.statement(
             "SELECT COALESCE(MAX(seq),0) AS n FROM memory_changes",
           ).get()!.n,
         );
-      } else {
-        const page = this.unpack(cursor, this.policy.revision(this.actor));
-        if (page.mode === "baseline" || page.afterSegment !== undefined)
-          return true;
-        position = page.change;
-        latest = Number(
-          this.statement(
-            "SELECT COALESCE(MAX(change_id),0) AS n FROM app_changes",
-          ).get()!.n,
+        if (page.position > latest) throw resync();
+        if (page.position === latest) return false;
+        return !!this.statement(MEMORY_FRESHNESS_SQL).get(
+          this.actor.workspaceId,
+          this.actor.actorId,
+          this.roomId,
+          page.position,
         );
       }
-      if (position > latest) throw resync();
-      const firstEnd = Math.min(position + PAGE, latest);
-      const ranges = [
-        [position, firstEnd],
-        [Math.max(firstEnd, latest - PAGE), latest],
-      ];
-      for (const [start, end] of ranges) {
-        if (start >= end) continue;
-        if (target === "memory") {
-          // Point-check the scope of at most PAGE note events, including retractions.
-          const noteIds = this.statement(
-            "SELECT note_id FROM memory_changes WHERE seq>? AND seq<=?",
-          ).all(start, end);
-          const visible = this.statement(
-            "SELECT 1 " +
-              visibleMemoryDocuments +
-              " AND d.room_id=? AND d.note_id=?",
-          );
-          if (
-            noteIds.some((note) =>
-              visible.get(
-                this.actor.workspaceId,
-                this.actor.actorId,
-                this.roomId,
-                note.note_id,
-              ),
-            )
-          )
-            return true;
-        } else {
-          const events = this.statement(
-            `SELECT target_id,revision FROM app_changes WHERE change_id>? AND change_id<=?
-            AND workspace_id=? AND room_id=? AND target_type='MESSAGE'`,
-          ).all(start, end, this.actor.workspaceId, this.roomId);
-          // Soft-deleted messages retain the classification of the affected version. Probe
-          // only that revision and its predecessor (bounded segments), without reading text.
-          const visible = this
-            .statement(`SELECT 1 ${permittedSegments(false, true)}
-            AND s.message_id=? AND s.revision IN (?,?) LIMIT 1`);
-          if (
-            events.some((event) =>
-              visible.get(
-                this.actor.workspaceId,
-                this.roomId,
-                this.actor.actorId,
-                event.target_id,
-                event.revision,
-                Number(event.revision) - 1,
-              ),
-            )
-          )
-            return true;
-        }
-      }
-      return false;
+      const page = this.unpack(cursor, this.policy.revision(this.actor));
+      if (page.mode === "baseline" || page.afterSegment !== undefined)
+        return true;
+      const latest = Number(
+        this.statement(
+          "SELECT COALESCE(MAX(change_id),0) AS n FROM app_changes",
+        ).get()!.n,
+      );
+      if (page.change > latest) throw resync();
+      if (page.change === latest) return false;
+      return !!this.statement(ARCHIVE_FRESHNESS_SQL).get(
+        this.actor.workspaceId,
+        this.roomId,
+        this.actor.actorId,
+        page.change,
+      );
     });
   }
 
@@ -727,12 +696,15 @@ export class SearchSources
         const events = this.statement(
           `SELECT change_id,target_id,target_type,action FROM app_changes
           WHERE change_id>? AND change_id<=? AND workspace_id=? AND
-          ((room_id=? AND target_type='MESSAGE') OR (target_type='PERSONA' AND action='DELETE'))
+          ((room_id=? AND target_type='MESSAGE') OR (target_type='PERSONA' AND action='DELETE'
+            AND EXISTS (SELECT 1 FROM room_personas rp WHERE rp.workspace_id=app_changes.workspace_id
+              AND rp.room_id=? AND rp.persona_id=app_changes.target_id)))
           ORDER BY change_id LIMIT ?`,
         ).all(
           pos.change,
           eventEnd,
           this.actor.workspaceId,
+          this.roomId,
           this.roomId,
           PAGE + 1,
         );
@@ -741,7 +713,8 @@ export class SearchSources
             hasMore = true;
             break;
           }
-          // Persona soft deletion is workspace-wide. Existing sources may be owned/spoken by it.
+          // A persona is soft-deleted workspace-wide. Its retained room membership
+          // is visible to READ_ROOM, even when none of its private segments were readable.
           if (event.target_type === "PERSONA") throw resync();
           const messageId = String(event.target_id);
           const remaining = PAGE - upserts.length;

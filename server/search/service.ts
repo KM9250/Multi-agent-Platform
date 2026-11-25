@@ -9,7 +9,11 @@ import type { Actor, AuthorizationPolicy } from "../auth/authorization.ts";
 import type { SearchCandidate } from "./backend.ts";
 import { dateLayer } from "./date.ts";
 import { searchDense, fuseRanks } from "./dense.ts";
-import { acquireActiveIndex, requestIndexUpdate } from "./index.ts";
+import {
+  acquireActiveIndex,
+  isIndexUpdatePending,
+  requestIndexUpdate,
+} from "./index.ts";
 import { searchInput } from "./input.ts";
 import { lexicalQuery } from "./query-process.ts";
 import { SearchSources } from "./sources.ts";
@@ -74,48 +78,20 @@ export async function searchRoom(
     external: { status: "none", calls: 0 },
     verification: { checked: 0, excluded: 0 },
   };
+  const active = acquireActiveIndex(app, policy, actor, roomId);
   const finish = () => {
     if (policy.revision(actor) !== acl)
       throw new AppError("SEARCH_RESYNC_REQUIRED", 409);
     sources.assertRoom(req.target);
+    if (active.state === "ACTIVE")
+      response.coverage.updating = isIndexUpdatePending(active);
     response.elapsedMs = Math.round(performance.now() - start);
     return response;
   };
-  const active = acquireActiveIndex(app, policy, actor, roomId);
   response.coverage.indexState = active.state;
-  let lagging = false;
-  if (active.state === "ACTIVE") {
-    try {
-      lagging = sources.hasUnindexedChanges(
-        req.target,
-        active.manifest.positions?.[req.target],
-      );
-    } catch (error) {
-      if (isAccessError(error)) throw error;
-      const reset = [
-        "SEARCH_RESYNC_REQUIRED",
-        "MEMORY_RESYNC_REQUIRED",
-      ].includes((error as { code?: string }).code);
-      response.status = reset ? "resync_required" : "unavailable";
-      response.coverage.indexState = reset ? "RESYNC_REQUIRED" : "FAILED";
-      response.reasons.push(
-        reset ? "SEARCH_RESYNC_REQUIRED" : "INDEX_UNAVAILABLE",
-      );
-      if (reset)
-        void requestIndexUpdate(app, policy, actor, roomId, {
-          rebuild: true,
-        }).catch(() => {});
-      return finish();
-    }
-  }
-  if (active.state !== "STOPPED") {
-    void requestIndexUpdate(app, policy, actor, roomId, {
-      force: lagging,
-    }).catch(() => {
-      /* Persisted by the worker. */
-    });
-  }
   if (active.state !== "ACTIVE") {
+    if (active.state !== "STOPPED")
+      void requestIndexUpdate(app, policy, actor, roomId).catch(() => {});
     response.status =
       active.state === "UNBUILT"
         ? "unbuilt"
@@ -134,16 +110,9 @@ export async function searchRoom(
     return finish();
   }
   response.coverage.syncedAt = active.syncedAt;
-  response.coverage.updating = active.updating;
-  if (lagging) {
-    response.reasons.push("INDEX_LAGGING");
+  if (active.reason) {
     response.status = "partial";
-  }
-  if (active.updating || active.reason) {
-    response.status = "partial";
-    response.reasons.push(
-      active.reason ? "INDEX_REFRESH_FAILED" : "INDEX_REFRESHING",
-    );
+    response.reasons.push("INDEX_REFRESH_FAILED");
   }
   if (running >= MAX_CONCURRENT) {
     response.status = "partial";
@@ -162,6 +131,7 @@ export async function searchRoom(
         root: app.root,
         appPath: app.path,
         indexPath: active.path,
+        cursor: active.manifest.positions?.[req.target],
         roomId,
         actor,
         idleTimeoutMs: policy.idleTimeoutMs,
@@ -175,6 +145,16 @@ export async function searchRoom(
       signal,
     );
     response.methods.push("lexical");
+    if (lexical.lagging) {
+      response.reasons.push("INDEX_LAGGING");
+      response.status = "partial";
+    }
+    void requestIndexUpdate(app, policy, actor, roomId, {
+      force: lexical.lagging,
+    }).catch(() => {
+      /* The worker records job failures. */
+    });
+
     let ranked = lexical.hits;
     if (req.target === "memory" && req.retrievalMode !== "lexical") {
       if (policy.revision(actor) !== acl)
@@ -313,10 +293,24 @@ export async function searchRoom(
       (e as { code?: string }).code === "SEARCH_RESYNC_REQUIRED"
     )
       throw e;
-    response.status = response.methods.length ? "partial" : "unavailable";
-    response.reasons.push(
-      signal.aborted ? "DEADLINE_EXCEEDED" : "INDEX_UNAVAILABLE",
-    );
+    const code = (e as { code?: string }).code;
+    if (code === "SEARCH_CURSOR_INVALID") {
+      response.status = "resync_required";
+      response.coverage.indexState = "RESYNC_REQUIRED";
+      response.reasons.push("SEARCH_RESYNC_REQUIRED");
+      void requestIndexUpdate(app, policy, actor, roomId, {
+        rebuild: true,
+      }).catch(() => {});
+    } else {
+      response.status = response.methods.length ? "partial" : "unavailable";
+      response.reasons.push(
+        signal.aborted
+          ? "DEADLINE_EXCEEDED"
+          : code === "SEARCH_FRESHNESS_UNAVAILABLE"
+            ? "INDEX_FRESHNESS_UNAVAILABLE"
+            : "INDEX_UNAVAILABLE",
+      );
+    }
   } finally {
     running--;
   }

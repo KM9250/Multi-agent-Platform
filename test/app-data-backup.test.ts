@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { APP_SCHEMA } from "../shared/app-contracts/index.ts";
 import { AppDatabase } from "../server/app-data/db.ts";
 import { ConversationRepository } from "../server/app-data/repository.ts";
 import {
@@ -382,7 +383,7 @@ test("C-07: backup fences search dispatch and restore preserves costs with exter
 
     const manifest = await backup.backup(f.backup);
     assert.equal(manifest.schema, "MAP-MEM-1:BACKUP:3");
-    assert.equal(manifest.appSchema, 5);
+    assert.equal(manifest.appSchema, APP_SCHEMA);
     assert.equal(existsSync(join(f.backup, "search-index")), false);
     await restoreBackup(f.backup, f.restored);
     assert.equal(existsSync(join(f.restored, "search-index")), false);
