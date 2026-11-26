@@ -148,6 +148,7 @@ export async function prepareContextPlan(
   };
   const reader = new SearchSources(app, policy, actor, options.roomId, binding);
   const resolved: ResolvedExcerpt[] = [];
+  const requiredAliases = new Set<string>();
   const selectedTokens = { memory: 32, archive: 32 };
   const limits = { memory: 2048, archive: 4096 };
   const ordinarySegments = new Set(options.baseline.manifest.messages.flatMap(message => message.segments.map(segment => segment.id)));
@@ -173,16 +174,28 @@ export async function prepareContextPlan(
       if (plan.sources.some(source => sameResource(source.citation, candidate.citation) &&
         (source.citation.version !== candidate.citation.version || (source.citation.start < candidate.citation.end && candidate.citation.start < source.citation.end)))) continue;
       let verified: ResolvedExcerpt;
+      const primary = !plan.sources.some(source => source.citation.target === target);
+      const fullSource = primary && route.requiresFullSource;
       try {
         verified = await withVerifiedNoteAncestors(app,
           candidate.citation.target === "memory" ? [candidate.citation.noteId] : [], () => {
-            if (route.requiresExactExcerpt) {
+            if (fullSource) {
               const original = reader.read(candidate.citation);
-              // An explicitly requested original must not silently inherit an index
-              // chunk's omitted beginning/end. The existing citation API is bounded
-              // to 4,096 UTF-16 units; larger originals require a narrower request.
+              // Only explicit whole-Source requests expand the primary hit. Faithful
+              // partial quotes and supporting hits retain their verified offsets.
               if (original.text.length > 4096) throw new GenerationError("CONTEXT_LIMIT", 413);
               return reader.resolve({ ...candidate.citation, start: 0, end: original.text.length });
+            }
+            if (route.requiresExactExcerpt) {
+              // A hit can end inside the requested sentence. Include bounded local
+              // context on both sides, from the same verified original/revision.
+              const original = reader.read(candidate.citation);
+              const margin = Math.min(128, Math.max(0, Math.floor((4096 - (candidate.citation.end - candidate.citation.start)) / 2)));
+              let start = Math.max(0, candidate.citation.start - margin);
+              let end = Math.min(original.text.length, candidate.citation.end + margin);
+              if (!isSourceBoundary(original.text, start) || (original.text[start - 1] === "\r" && original.text[start] === "\n")) start++;
+              if (!isSourceBoundary(original.text, end) || (original.text[end - 1] === "\r" && original.text[end] === "\n")) end--;
+              return reader.resolve({ ...candidate.citation, start, end });
             }
             let current = reader.resolve(candidate.citation);
             // Chunk offsets may end next to a line break. Keep each CRLF pair whole.
@@ -222,7 +235,7 @@ export async function prepareContextPlan(
         const payload = applyContextEnvelope(options.baseline, text);
         return estimate(payload.systemInstruction + stable(payload.contents)) <= options.limits.maxInputTokens;
       };
-      if (route.requiresExactExcerpt && !fits(verified.text.length))
+      if (primary && route.requiresExactExcerpt && !fits(verified.text.length))
         throw new GenerationError("CONTEXT_LIMIT", 413);
       let low = 0, high = verified.text.length;
       while (low < high) { const mid = low + Math.ceil((high - low) / 2); if (fits(safeEnd(verified.text, mid))) low = mid; else high = mid - 1; }
@@ -239,6 +252,7 @@ export async function prepareContextPlan(
       }
       selectedTokens[target] += estimate(stable(reference(source, verified.text)));
       plan.sources.push(source);
+      if (primary && route.requiresExactExcerpt) requiredAliases.add(source.alias);
       resolved.push(verified);
       const permission = contextPermission(source);
       if (!plan.permissions.some(item => stable(item) === stable(permission))) plan.permissions.push(permission);
@@ -253,7 +267,7 @@ export async function prepareContextPlan(
   // A later search status can add envelope metadata. Repack before freezing,
   // without changing normal history, the accepted input, or the selected originals.
   while (!totalFits() && plan.sources.length) {
-    if (route.requiresExactExcerpt) throw new GenerationError("CONTEXT_LIMIT", 413);
+    if (requiredAliases.has(plan.sources.at(-1)!.alias)) throw new GenerationError("CONTEXT_LIMIT", 413);
     const removed = plan.sources.pop()!;
     resolved.pop();
     const search = plan.searches.find(item => item.target === removed.citation.target)!;

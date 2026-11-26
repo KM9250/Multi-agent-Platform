@@ -7,6 +7,7 @@ import {
 import { canonical, digest, object, string } from "../app-data/validation.ts";
 import { assertPublicationCapacity } from "./limits.ts";
 import { advanceLineage } from "./lineage.ts";
+import { NoteVerificationPending } from "./verification-state.ts";
 import { assertPublishable } from "./candidates.ts";
 import {
   memoryScope,
@@ -65,6 +66,7 @@ function setStatus(
     .run(status, job.candidate_id, job.revision);
 }
 function terminal(app: AppDatabase, job: Job, error: unknown): void {
+  if (error instanceof NoteVerificationPending) return;
   const code = (error as { code?: string })?.code ?? "PUBLICATION_FAILURE";
   const conflict = [
     "PUBLICATION_CONFLICT",

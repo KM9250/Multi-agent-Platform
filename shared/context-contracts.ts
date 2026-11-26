@@ -21,7 +21,7 @@ export interface ContextDateInterpretation {
   range?: SearchDateRange;
 }
 export interface ContextRoute {
-  version: "map-context-router-v1";
+  version: "map-context-router-v1" | "map-context-router-v2";
   requestedMode: ContextMode;
   mode: Exclude<ContextMode, "auto">;
   reason: string;
@@ -29,6 +29,8 @@ export interface ContextRoute {
   dateInterpretation: ContextDateInterpretation;
   requiresEvidence: boolean;
   requiresExactExcerpt: boolean;
+  /** v2 separates faithful excerpts from an explicit request for the whole Source. */
+  requiresFullSource?: boolean;
 }
 export interface ContextSource {
   alias: string;

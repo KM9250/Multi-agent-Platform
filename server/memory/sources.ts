@@ -1,6 +1,7 @@
 import { checkNewLineage, verifyCurrentNoteFile } from "./lineage.ts";
 import type { AppDatabase } from "../app-data/db.ts";
 import { hasVerifiedNoteAncestors } from "./source-validation.ts";
+import { NoteVerificationPending } from "./verification-state.ts";
 import { AppError, type Actor } from "../../shared/app-contracts/index.ts";
 import type { AppDatabasePort, PolicyPort } from "../generation/types.ts";
 import type { ContextManifest } from "../generation/context.ts";
@@ -269,7 +270,10 @@ export function assertSourcesCurrent(
             WHERE s.note_id=h.note_id AND g.revoked_at IS NOT NULL)`).get(note.note_id);
         if (!origin) stale();
       }
-    } catch { stale(); }
+    } catch (error) {
+      if (error instanceof NoteVerificationPending) throw error;
+      stale();
+    }
   }
   for (const grant of app.db
     .prepare("SELECT * FROM memory_authorities WHERE candidate_id=?")

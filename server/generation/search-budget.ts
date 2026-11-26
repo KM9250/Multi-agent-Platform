@@ -44,17 +44,24 @@ export function runBudgetStatus(
   };
 }
 
-function runLimits(app: AppDatabasePort, actor: Actor, binding: AiSearchBinding, now: number) {
+/** Dispatch-only gate. Never apply the start deadline to receipt/Usage collection. */
+export function assertSearchRunDispatch(app: AppDatabasePort, actor: Actor, binding: AiSearchBinding, at?: number) {
   const run = app.db.prepare(`SELECT * FROM app_generation_runs
     WHERE run_id=? AND workspace_id=? AND room_id=? AND actor_id=?`).get(
       binding.runId, actor.workspaceId, binding.roomId, actor.actorId,
     );
-  if (!run || run.state !== "RUNNING" || run.cancelled_at !== null ||
-      now > Number(run.deadline_at) || now > Number(run.dispatch_before))
-    throw new DenseError("run_unavailable");
   if (binding.workspaceId !== actor.workspaceId || binding.actorId !== actor.actorId ||
       binding.purpose !== "answer" || binding.audience !== "room")
     throw new DenseError("invalid_run_binding");
+  if (!run || run.state !== "RUNNING" || run.cancelled_at !== null)
+    throw new GenerationError("CANCELLED", 409);
+  const now = at ?? Date.now();
+  if (now > Number(run.deadline_at)) throw new GenerationError("DEADLINE_EXCEEDED", 409);
+  if (now > Number(run.dispatch_before)) throw new GenerationError("DISPATCH_EXPIRED", 409);
+  return run;
+}
+function runLimits(app: AppDatabasePort, actor: Actor, binding: AiSearchBinding, now: number) {
+  const run = assertSearchRunDispatch(app, actor, binding, now);
   return JSON.parse(String(run.limits_json));
 }
 function fits(used: RunBudget, limits: any, tokens: number, cost: number) {

@@ -86,7 +86,7 @@ test("MEM-3A an explicit original quotation cannot silently shrink to fit the op
   f.repository.appendMessage(f.actor, f.room.id, { role: "user", content: originalText });
   const run = f.generation.accept(f.actor, f.room.id, {
     requestId: randomUUID(), expectedRoomRevision: f.room.revision,
-    content: "cedar 原文をそのまま引用して", recipient: { type: "all" }, context: { mode: "archive" },
+    content: "cedar 全文を省略せず引用して", recipient: { type: "all" }, context: { mode: "archive" },
   });
   await requestIndexUpdate(f.app, f.policy, f.actor, f.room.id, { force: true });
   f.app.db.prepare("UPDATE app_generation_runs SET state='RUNNING' WHERE run_id=?").run(run.runId);

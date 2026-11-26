@@ -20,6 +20,7 @@ import {
 } from "./change-cursor.ts";
 import { parseMemoryMarkdown } from "./markdown.ts";
 import { readVaultFile, readVersion } from "./vault.ts";
+import { NoteVerificationPending } from "./verification-state.ts";
 
 export interface NoteSummary {
   noteId: string;
@@ -208,7 +209,8 @@ function currentDocument(
     return;
   try {
     assertDocumentSources(app, policy, actor, row);
-  } catch {
+  } catch (error) {
+    if (error instanceof NoteVerificationPending) return;
     setDocumentState(app, row, "NEEDS_REVIEW");
     return;
   }

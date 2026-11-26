@@ -26,6 +26,7 @@ import {
 
 import { openChangeCursor } from "../memory/change-cursor.ts";
 import { withVerifiedNoteAncestors } from "../memory/source-validation.ts";
+import { NoteVerificationPending } from "../memory/verification-state.ts";
 import { parseCitation } from "./citation.ts";
 export { parseCitation } from "./citation.ts";
 import { assertAiSearchBinding, type AiSearchBinding } from "./ai-binding.ts";
@@ -102,11 +103,34 @@ export const ARCHIVE_FRESHNESS_SQL = `SELECT 1 FROM app_changes e INDEXED BY sea
     AND e.target_type='PERSONA' AND e.action='DELETE' AND e.change_id>?4)
   LIMIT 1`;
 
-// Bound to the accepted user seq, with public-only predicates before event/neighbor limits.
-// The previous revision is examined only to notice a public source removed by a correction.
+// Match allowsScope's current owner/SEND rules on metadata, without requiring a
+// current live Source: previous public revisions and withdrawn Notes need removal too.
+function aiSendScope(owner: string, visibility: string, workspace: string, room: string,
+  actor: string, provider: string, deletedOwner = false) {
+  return `EXISTS (SELECT 1 FROM access_grants send WHERE send.workspace_id=${workspace} AND send.actor_id=${actor}
+    AND send.operation='SEND_TO_PROVIDER' AND send.revoked_at IS NULL
+    AND send.room_id IN ('*',${room}) AND send.persona_id IN ('*',COALESCE(${owner},''))
+    AND send.visibility IN ('*',${visibility}) AND send.provider IN ('*',${provider}))
+    AND (${owner} IS NULL OR EXISTS (SELECT 1 FROM room_personas owner
+      JOIN personas p USING(workspace_id,persona_id) JOIN persona_revisions config
+      ON config.workspace_id=owner.workspace_id AND config.persona_id=owner.persona_id AND config.revision=owner.persona_revision
+      WHERE owner.workspace_id=${workspace} AND owner.room_id=${room} AND owner.persona_id=${owner}
+      ${deletedOwner ? "" : "AND p.deleted_at IS NULL"}
+      AND json_type(config.config_json,'$.isEnabled') IS NOT 'false'
+      AND coalesce(json_extract(config.config_json,'$.historicalIdentity'),0)=0))`;
+}
+export const AI_MEMORY_FRESHNESS_SQL = `SELECT 1 ${visibleMemoryDocuments}
+  AND d.room_id=?3 AND d.scope='room_shared'
+  AND ${aiSendScope("d.owner_persona_id", "d.scope", "d.workspace_id", "d.room_id", "?2", "?5")}
+  AND EXISTS (SELECT 1 FROM memory_changes h WHERE h.note_id=d.note_id AND h.seq>?4) LIMIT 1`;
+
+// Before event LIMITs, apply current READ/SEND scope and accepted input bounds.
+// Examine the previous revision to detect public -> private corrections.
+const archiveOwner = "COALESCE(s.owner_persona_id,m.persona_id)";
 const aiAffectedSegment = `SELECT 1 ${permittedSegments(false, true)}
   AND s.message_id=e.target_id AND s.visibility='public'
-  AND s.channel IN ('public_message','shared_summary') AND m.seq<=?5 AND m.message_id<>?6`;
+  AND s.channel IN ('public_message','shared_summary') AND m.seq<=?5 AND m.message_id<>?6
+  AND ${aiSendScope(archiveOwner, "s.visibility", "s.workspace_id", "s.room_id", "?3", "?7")}`;
 export const AI_ARCHIVE_FRESHNESS_SQL = `SELECT 1 FROM app_changes e INDEXED BY search_message_changes
   WHERE e.workspace_id=?1 AND e.room_id=?2 AND e.target_type='MESSAGE' AND e.change_id>?4
   AND CASE WHEN e.action='DELETE' THEN EXISTS (${aiAffectedSegment})
@@ -118,7 +142,12 @@ export const AI_ARCHIVE_FRESHNESS_SQL = `SELECT 1 FROM app_changes e INDEXED BY 
   AND EXISTS (SELECT 1 FROM messages m JOIN message_segments s USING(workspace_id,room_id,message_id)
     WHERE m.workspace_id=rp.workspace_id AND m.room_id=rp.room_id AND m.persona_id=rp.persona_id
     AND m.seq<=?5 AND m.message_id<>?6 AND s.revision=m.current_revision
-    AND s.visibility='public' AND s.channel IN ('public_message','shared_summary')) LIMIT 1`;
+    AND s.visibility='public' AND s.channel IN ('public_message','shared_summary')
+    AND ${aiSendScope(archiveOwner, "s.visibility", "s.workspace_id", "s.room_id", "?3", "?7", true)}
+    AND EXISTS(SELECT 1 FROM access_grants g WHERE g.workspace_id=s.workspace_id AND g.actor_id=?3
+      AND g.operation='READ_CONVERSATION' AND g.revoked_at IS NULL AND g.provider IN ('*','')
+      AND g.room_id IN ('*',s.room_id) AND g.persona_id IN ('*',COALESCE(s.owner_persona_id,m.persona_id,''))
+      AND g.visibility IN ('*',s.visibility))) LIMIT 1`;
 
 interface ArchivePosition {
   mode: "baseline" | "delta";
@@ -326,6 +355,8 @@ export class SearchSources
   }
 
   private readMemory(noteId: string): SearchSource {
+    if (this.app.db.prepare("SELECT incomplete FROM memory_scan_state WHERE singleton=1").get()?.incomplete)
+      throw new NoteVerificationPending();
     const meta = this.noteMeta(noteId);
     if (!meta) throw missing();
     if (!this.allowsScope("memory", String(meta.owner_persona_id), String(meta.scope), "note"))
@@ -557,6 +588,8 @@ export class SearchSources
   private memorySelection(after?: string) {
     if (this.aiBinding) throw new AppError("AI_INDEX_SCOPE_FORBIDDEN", 403);
     this.assertRoom("memory");
+    if (this.app.db.prepare("SELECT incomplete FROM memory_scan_state WHERE singleton=1").get()?.incomplete)
+      throw new NoteVerificationPending();
     return listNoteChanges(
       this.app,
       this.policy,
@@ -666,12 +699,13 @@ export class SearchSources
         if (page.position > latest) throw resync();
         if (page.position === latest) return false;
         return !!this.statement(this.aiBinding
-          ? MEMORY_FRESHNESS_SQL.replace("LIMIT 1", "AND d.scope='room_shared' LIMIT 1")
+          ? AI_MEMORY_FRESHNESS_SQL
           : MEMORY_FRESHNESS_SQL).get(
           this.actor.workspaceId,
           this.actor.actorId,
           this.roomId,
           page.position,
+          ...(this.aiBinding ? [this.aiBinding.provider] : []),
         );
       }
       const page = this.unpack(cursor, this.policy.revision(this.actor));
@@ -690,6 +724,7 @@ export class SearchSources
         this.actor.actorId,
         page.change,
         ...this.aiSegmentParams(),
+        ...(this.aiBinding ? [this.aiBinding.provider] : []),
       );
     });
   }

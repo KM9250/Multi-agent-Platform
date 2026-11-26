@@ -4,6 +4,7 @@ import { setImmediate as yieldTurn } from "node:timers/promises";
 import { AppError } from "../../shared/app-contracts/index.ts";
 import type { AppDatabase } from "../app-data/db.ts";
 import { verifyCurrentNoteFile } from "./lineage.ts";
+import { NoteVerificationPending } from "./verification-state.ts";
 import { validVaultPath, withVaultDirectory } from "./vault.ts";
 
 export const NOTE_VALIDATION_PAGE = 32;
@@ -51,6 +52,8 @@ export async function withVerifiedNoteAncestors<T>(
   signal?: AbortSignal,
 ): Promise<T> {
   signal?.throwIfAborted();
+  if (noteIds.length && app.db.prepare("SELECT incomplete FROM memory_scan_state WHERE singleton=1").get()?.incomplete)
+    throw new NoteVerificationPending();
   if (app.db.isTransaction && noteIds.length) throw new AppError("ASYNC_SOURCE_TRANSACTION", 409);
   const candidates = new Map<string, string>(), observed = new Map<string, string>();
   for (const noteId of new Set(noteIds)) {
@@ -72,6 +75,7 @@ export async function withVerifiedNoteAncestors<T>(
         if (row.state !== "PUBLISHED" || row.version !== row.required_version || row.digest !== row.required_digest) changed();
         const path = String(row.relative_path), before = stamp(app, path);
         try { verifyCurrentNoteFile(app, row); } catch (error) {
+          if (error instanceof NoteVerificationPending) throw error;
           if (error instanceof Error && "code" in error && String(error.code).startsWith("ERR_SQLITE")) throw error;
           changed();
         }

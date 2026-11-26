@@ -12,6 +12,11 @@ const dateVersion = "map-context-date-v1" as const;
 const historyIntent = /前に|以前|過去|話した|発言|会話|履歴|last time|previous|earlier|\bsaid\b|talked|discussed|conversation/i;
 const memoryIntent = /決め|決定|確定|合意|方針|共有記憶|メモリ|\bmemory\b|\bpolicy\b|agreed|decided/i;
 const strictIntent = /厳密|正確な日|その日だけ|当日だけ|exact date|strict|only on/i;
+function requestsFullSource(content: string): boolean {
+  // A selection from a whole document still asks for a part, not every character.
+  if (/一文(?:だけ|のみ)?|該当(?:箇所|部分)|冒頭(?:の文|の一文)|一節|one sentence|relevant (?:part|passage)|opening sentence/i.test(content)) return false;
+  return /全文|メッセージ全体|発言全体|省略せず(?:に)?全部|full (?:text|message)|entire (?:text|message)|without omissions/i.test(content);
+}
 
 /** Closed HTTP input. MEM-2 remains the single civil-date/timezone validator. */
 export function normalizeTurnContext(value: unknown): TurnContext | undefined {
@@ -100,8 +105,10 @@ export function routeContext(input: {
 }): ContextRoute {
   const requestedMode = input.context?.mode ?? (input.context?.date ? "auto" : undefined) ?? input.personaMode ?? input.roomMode ?? "auto";
   const query = extractContextQuery(input.content);
-  const base = { version: "map-context-router-v1" as const, requestedMode, query, dateInterpretation: input.dateInterpretation,
-    requiresExactExcerpt: /原文|そのまま|一字一句|引用|verbatim|\bquot(?:e|ation)\b|exact wording/i.test(input.content) };
+  const requiresFullSource = requestsFullSource(input.content);
+  const base = { version: "map-context-router-v2" as const, requestedMode, query, dateInterpretation: input.dateInterpretation,
+    requiresFullSource,
+    requiresExactExcerpt: requiresFullSource || /原文|そのまま|一字一句|引用|verbatim|\bquot(?:e|ation)\b|exact wording/i.test(input.content) };
   const result = (mode: ContextRoute["mode"], reason: string, requiresEvidence = false): ContextRoute => ({ ...base, mode, reason, requiresEvidence });
   if (input.purpose !== "answer" || input.memoryCommand) return result("none", "purpose_excluded");
   if (requestedMode === "none") return result("none", "explicit_none");
@@ -113,6 +120,7 @@ export function routeContext(input: {
   const history = historyIntent.test(input.content), memory = memoryIntent.test(input.content);
   if (history && memory && /比較|違い|比べ|compare|comparison/i.test(input.content)) return result("both", "compare_history_policy", true);
   if (input.dateInterpretation.source === "explicit") return result("archive", "explicit_date", true);
+  if (history && input.dateInterpretation.status === "resolved") return result("archive", "dated_conversation", true);
   if (memory) return result("memory", "established_memory", true);
   if (history) return result("archive", "past_conversation", true);
   if (!query.text || /^(?:ありがとう(?:ございます|ございました)?|どうも|了解(?:しました)?|わかりました|はい|いいえ|こんにちは|おはよう(?:ございます)?|thanks?(?: you)?|hello|hi|ok(?:ay)?)[\s!！。.?？]*$/i.test(query.text))

@@ -43,6 +43,7 @@ function stopsAiRun(error: unknown) {
   const code = (error as { code?: string; message?: string })?.code ??
     (error as { message?: string })?.message;
   return ["OUTCOME_UNKNOWN", "SEARCH_OUTCOME_UNKNOWN", "RUN_NOT_ACTIVE", "CONTEXT_CHANGED",
+    "DISPATCH_EXPIRED", "DEADLINE_EXCEEDED", "CANCELLED",
     "INVALID_AI_CONTEXT_BINDING", "AUTHORIZATION_CHANGED", "run_unavailable", "invalid_run_binding",
     "profile_changed_or_disabled", "source_changed"].includes(code);
 }

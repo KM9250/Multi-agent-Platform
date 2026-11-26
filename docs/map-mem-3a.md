@@ -26,7 +26,7 @@ timezone未指定時はUTC。相対日付は今日・昨日・一昨日（かな
 
 ## RouterとContextの固定
 
-Routerは決定的なローカル処理で、LLM呼出しを行わない。謝辞等は `none`、確定事項は `memory`、過去の発言は `archive`、過去発言と現在方針の比較は `both` を選ぶ。日付が含まれるだけではArchiveへ分岐しない。曖昧な通常会話では、利用できる少量のMemoryを選ぶ。`decision`、固定 `subagent`、既存仕様でコマンドと判定した `/memory` には追加検索しない。
+Routerは決定的なローカル処理で、LLM呼出しを行わない。謝辞等は `none`、確定事項は `memory`、過去の発言は `archive`、過去発言と現在方針の比較は `both` を選ぶ。解決済み日付と過去発言の確認意図が重なる場合は、「方針」「決定」「合意」も含む要求をArchiveへ送り、現在方針との比較はbothへ送る。日付が含まれるだけではArchiveへ分岐しない。曖昧な通常会話では、利用できる少量のMemoryを選ぶ。`decision`、固定 `subagent`、既存仕様でコマンドと判定した `/memory` には追加検索しない。
 
 検索Queryは受理済みの現在user入力だけから作る。最大512 UTF-16 code unitに決定的に制限し、surrogate pairの途中で切らない。private履歴、添付本文、private NoteをQueryへ暗黙に足さない。Query省略は回答への現在入力省略を意味しない。
 
@@ -48,9 +48,9 @@ private原典から承認された共有Noteは、共有Note本文だけを公�
 
 資料は通常履歴やシステム方針と区別したenvelopeへ格納し、資料内の区切り文字・指示文をシステム構造へ昇格させない。初期上限はMemory 5件／推定2,048 tokens、Archive 5件／推定4,096 tokens、合計推定6,144 tokens。付随メタデータも見積もりに含め、Host・モデル上限の残容量へ収める。現在入力、必須添付、必須設定、先頭固定発言を追加資料のために押し出さない。
 
-原文・引用の明示要求を `requiresExactExcerpt` として識別した場合、検索chunkの範囲をSource原本全体の `0..length` へ拡張する。token枠またはcitation APIの4,096 UTF-16上限に収まらない原本は切断せず `CONTEXT_LIMIT` を返す。任意の追加資料を短縮した場合は `EXCERPT_TRUNCATED / partial` を記録する。抜粋は原文のUTF-16半開区間で、surrogate pairとCRLFの途中を境界にしない。
+Router v2では原文忠実性を `requiresExactExcerpt`、明示的な全文要求を `requiresFullSource` として分離する。部分引用では同じ原本の検索hit前後を各最大128 UTF-16 units含めて検証し、必要な短文がchunk境界をまたぐ場合にも対応する。「全文から一文だけ」などの部分指定は全文要求にしない。明示的な全文要求だけは各検索先の最初の採用Sourceを `0..length` へ拡張し、必須範囲がtoken枠またはcitation APIの4,096 UTF-16上限に収まらなければ `CONTEXT_LIMIT` を返す。補助候補は全文必須にしない。任意の追加資料を短縮した場合は `EXCERPT_TRUNCATED / partial` を記録する。抜粋は原文のUTF-16半開区間で、surrogate pairとCRLFの途中を境界にしない。
 
-Manifestは `MAP-MEM-3:CONTEXT:1`。旧 `MAP-DATA-1:SERVER_CONVERSATION:1` と併存し、旧digestを維持する。実行主体・設定版・入力binding・Provider・Router version・日付解釈・検索状態・Index世代・採用SourceRef・UTF-16半開範囲・実使用権限・費用操作・payload digestを記録する。ACL snapshotは監査証跡であり、将来の許可ではない。未実装Summaryと未知Sourceを「依存なし」として受理しない。
+Manifestは `MAP-MEM-3:CONTEXT:1`。旧 `MAP-DATA-1:SERVER_CONVERSATION:1` と併存し、旧digestを維持する。実行主体・設定版・入力binding・Provider・Router version・日付解釈・検索状態・Index世代・採用SourceRef・UTF-16半開範囲・実使用権限・費用操作・payload digestを記録する。新規routeは `map-context-router-v2` とし、全文要求フラグを必須booleanで保存する。既存v1 routeは元の範囲・digestを読み継ぎ、再読時にRouterを実行しない。ACL snapshotは監査証跡であり、将来の許可ではない。未実装Summaryと未知Sourceを「依存なし」として受理しない。
 
 サーバーがCall内aliasを割り当て、`[[MAP_SOURCE:S1]]` の予約された引用表記だけを固定Planへ照合する。供給したSourceと本文で引用したSourceを別集合として扱う。未知aliasやモデルが作ったURL・HTML・revisionを出典リンクとして信用しない。標準の非構造化回答、既存の構造化回答、引用なし回答を維持する。
 
@@ -99,3 +99,5 @@ Backupは既存の `MAP-MEM-1:BACKUP:3` で `appSchema: 7` を受理する。新
 MEM-3BはRolling Summaryと `summary` 呼出し、MEM-3Cは正解SourceRefを持つ体系的な検索・回答品質評価と初期上限の調整を扱う。Memory自動承認・統合・階層化、Archive新Dense化、新Provider、COORD／MACP契約変更、ブラウザ生成復活、SSE追加は本変更の対象外。
 
 本稼働Gateでは実ProviderのUsage・価格・取消／切断時挙動、実データ移行、対象機器でのBackup／Restore・Index再構築、TLS・鍵配置、長時間稼働・容量不足を確認する。合成試験の成功をこれらの確認済みとは扱わない。[設計判断](map-mem-3a-adr.md)と[検証記録](map-mem-3a-validation.md)を参照。
+
+PR #41監査のF-01〜F-05修正と回帰対応は[監査修正記録](map-mem-3a-pr41-audit-fixes.md)を参照。

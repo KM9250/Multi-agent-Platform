@@ -1,7 +1,7 @@
 import type { AppDatabase } from "../app-data/db.ts";
 import { AuthorizationPolicy, type Actor } from "../auth/authorization.ts";
 import { assertAiSearchBinding, type AiSearchBinding } from "./ai-binding.ts";
-import { markSearchOutcomeUnknown, reserveSearchRunBinding } from "../generation/search-budget.ts";
+import { assertSearchRunDispatch, markSearchOutcomeUnknown, reserveSearchRunBinding } from "../generation/search-budget.ts";
 import {
   DenseError,
   EMBEDDING_SPACE,
@@ -435,6 +435,7 @@ export async function dispatchEmbedding(
       check();
       if (hash(formattedInput(purpose, input.readText())) !== payloadDigest)
         throw new DenseError("source_changed");
+      if (input.aiBinding) assertSearchRunDispatch(app, actor, input.aiBinding);
       const changed = app.db
         .prepare(
           "UPDATE search_operations SET state='DISPATCH_INTENT',dispatched_at=? WHERE operation_id=? AND state='RESERVED'",
@@ -459,6 +460,9 @@ export async function dispatchEmbedding(
     if (hash(formattedInput(purpose, input.readText())) !== payloadDigest)
       throw new DenseError("source_changed");
     check();
+    // Last dispatch-only clock read, after Source/ACL checks and the Intent COMMIT.
+    // No asynchronous work or additional Source reads may intervene before embed().
+    if (input.aiBinding) assertSearchRunDispatch(app, actor, input.aiBinding);
   } catch (error) {
     app.transaction(() => {
       const rejected = app.db

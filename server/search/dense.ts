@@ -273,7 +273,8 @@ export async function searchDense(
       const status = (error as { status?: number })?.status;
       const code = (error as Error)?.message;
       if (status === 401 || status === 403 || status === 404 ||
-          ["run_unavailable", "invalid_run_binding", "profile_changed_or_disabled", "source_changed"].includes(code)) throw error;
+          ["run_unavailable", "invalid_run_binding", "profile_changed_or_disabled", "source_changed",
+            "DISPATCH_EXPIRED", "DEADLINE_EXCEEDED", "CANCELLED"].includes(code)) throw error;
       // Recheck even failures from worker IPC so revocation is never hidden by fallback.
       checkAi();
     }

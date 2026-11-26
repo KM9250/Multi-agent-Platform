@@ -11,6 +11,7 @@ import type { ContextManifest } from "../generation/context.ts";
 import { readContextManifest } from "../generation/context-manifest.ts";
 import { parseMemoryMarkdown } from "./markdown.ts";
 import { readVaultFile } from "./vault.ts";
+import { inventoryNotePath, NoteVerificationPending } from "./verification-state.ts";
 
 interface Dependency {
   type: "MESSAGE" | "ATTACHMENT" | "NOTE";
@@ -422,15 +423,21 @@ function recordManifest(
 /** File access is internal provenance validation; it does not confer private-source access
  * on the actor consuming the published projection. Each NOTE work item opens one file. */
 export function verifyCurrentNoteFile(app: AppDatabase, row: Record<string, any>) {
-  requireFact(!app.db.prepare("SELECT incomplete FROM memory_scan_state WHERE singleton=1").get()?.incomplete);
+  let inventoryPath: string | undefined;
   try {
-    const bytes = readVaultFile(app, row.relative_path), parsed = parseMemoryMarkdown(bytes);
+    inventoryPath = inventoryNotePath(app, row);
+    if (inventoryPath === undefined && app.db.prepare("SELECT incomplete FROM memory_scan_state WHERE singleton=1").get()?.incomplete)
+      throw new NoteVerificationPending();
+    const bytes = readVaultFile(app, inventoryPath ?? row.relative_path), parsed = parseMemoryMarkdown(bytes);
     requireFact(parsed.noteId === row.note_id && digest(bytes) === row.digest && digest(parsed.body) === row.body_digest);
     const version = app.db.prepare("SELECT digest,body_digest FROM memory_versions WHERE note_id=? AND version=?")
       .get(row.note_id, row.version);
     requireFact(version && version.digest === row.digest && version.body_digest === row.body_digest);
   } catch (error) {
+    if (error instanceof NoteVerificationPending) throw error;
+    if (["EIO", "EAGAIN", "EBUSY", "EACCES"].includes((error as any)?.code)) throw new NoteVerificationPending();
     if (error instanceof Error && "code" in error && String(error.code).startsWith("ERR_SQLITE")) throw error;
+    if (inventoryPath !== undefined && !(error instanceof Unverifiable)) throw new NoteVerificationPending();
     throw new Unverifiable();
   }
 }
@@ -582,6 +589,8 @@ function workSlice(
       .get(candidateId)!;
     requireFact(!complete.invalidated && Number(complete.calls_done) > 0);
     if (job.mode === "LEGACY") {
+      if (db.prepare("SELECT incomplete FROM memory_scan_state WHERE singleton=1").get()?.incomplete)
+        throw new NoteVerificationPending();
       if (!recover) throw new Error("LEGACY_RECOVERY_CALLBACK_REQUIRED");
       requireFact(
         recover(
@@ -599,6 +608,13 @@ function workSlice(
       "UPDATE memory_lineage_work SET status='DONE' WHERE candidate_id=?",
     ).run(candidateId);
   } catch (error) {
+    if (error instanceof NoteVerificationPending) {
+      // Keep the exact NOTE cursor and proof counters, but yield this candidate's
+      // place so another verifiable candidate can proceed on the next bounded slice.
+      db.prepare(`UPDATE memory_lineage_work SET last_step=(SELECT coalesce(max(last_step),0)+1
+        FROM memory_lineage_work WHERE status='PENDING') WHERE candidate_id=?`).run(candidateId);
+      return processed + 1;
+    }
     if (!(error instanceof Unverifiable)) throw error;
     db.prepare(
       "UPDATE memory_lineage_work SET status='INVALID' WHERE candidate_id=?",

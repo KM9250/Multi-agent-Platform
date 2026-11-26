@@ -23,10 +23,12 @@ export function validateContextPlan(value: unknown): ContextPlan {
   requireFact(isText(plan.inputBinding.messageId) && integer(plan.inputBinding.revision, 1) && integer(plan.inputBinding.seq, 1) &&
     (plan.inputBinding.excludeMessageId === undefined || isText(plan.inputBinding.excludeMessageId)));
   requireFact(plan.packingVersion === "map-context-pack-v1" && plan.estimatorVersion === "utf8-bytes-div3-v1" && integer(plan.estimatedTokens, 0, 6144) && digest(plan.payloadDigest));
-  object(plan.route, ["version", "requestedMode", "mode", "reason", "query", "dateInterpretation", "requiresEvidence", "requiresExactExcerpt"]);
+  object(plan.route, ["version", "requestedMode", "mode", "reason", "query", "dateInterpretation", "requiresEvidence", "requiresExactExcerpt", "requiresFullSource"]);
   const route = plan.route;
-  requireFact(route.version === "map-context-router-v1" && ["auto", "none", "memory", "archive", "both"].includes(route.requestedMode) &&
+  requireFact(["map-context-router-v1", "map-context-router-v2"].includes(route.version) && ["auto", "none", "memory", "archive", "both"].includes(route.requestedMode) &&
     ["none", "memory", "archive", "both"].includes(route.mode) && isText(route.reason) && typeof route.requiresEvidence === "boolean" && typeof route.requiresExactExcerpt === "boolean");
+  requireFact(route.version === "map-context-router-v1" ? route.requiresFullSource === undefined :
+    typeof route.requiresFullSource === "boolean" && (!route.requiresFullSource || route.requiresExactExcerpt));
   object(route.query, ["version", "text", "truncated"]);
   requireFact(route.query.version === "map-context-query-v1" && typeof route.query.text === "string" && route.query.text.length <= 512 && typeof route.query.truncated === "boolean");
   object(route.dateInterpretation, ["version", "status", "source", "timeZone", "range"]);
