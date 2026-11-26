@@ -18,6 +18,8 @@ import { searchInput, citationInput } from "../search/input.ts";
 import { SearchSources } from "../search/sources.ts";
 import { memoryRoutes } from "./memory.ts";
 import { assertVaultOutsideStatic } from "../memory/vault.ts";
+import { lookupNote } from "../memory/notes.ts";
+import { withVerifiedNoteAncestors } from "../memory/source-validation.ts";
 
 export interface AppServerOptions {
   app: AppDatabase;
@@ -52,6 +54,7 @@ const SAFE_ERRORS = new Set([
   "LOGIN_RATE_LIMIT",
   "AUTH_BUSY",
   "INVALID_INPUT",
+  "INVALID_CONTEXT_DATE_MODE",
   "HISTORICAL_PERSONA_IMMUTABLE",
   "EXPORT_SOURCE_LIMIT",
   "INVALID_USERNAME",
@@ -446,11 +449,20 @@ export function createAppHandler(options: AppServerOptions) {
           const { citation, includeHistory, surrounding } =
             citationInput(input);
           const sources = new SearchSources(options.app, policy, actor, roomId);
-          json(
-            response,
-            200,
-            sources.resolve(citation, { includeHistory, surrounding }),
-          );
+          if (citation.target === "memory") {
+            if (lookupNote(options.app, policy, actor, citation.noteId).room_id !== roomId)
+              throw new AuthError("NOT_FOUND", 404);
+            const controller = new AbortController();
+            const abort = () => controller.abort();
+            response.once("close", abort);
+            try {
+              const resolved = await withVerifiedNoteAncestors(options.app, [citation.noteId],
+                () => sources.resolve(citation, { includeHistory, surrounding }), controller.signal);
+              if (!response.destroyed) json(response, 200, resolved);
+            } finally { response.off("close", abort); }
+          } else {
+            json(response, 200, sources.resolve(citation, { includeHistory, surrounding }));
+          }
         } else {
           const req = searchInput(input);
           const controller = new AbortController();
@@ -537,6 +549,7 @@ export function createAppHandler(options: AppServerOptions) {
                   "type",
                   "systemInstruction",
                   "internalStateSettings",
+                  "contextMode",
                 ],
                 ["title"],
               ),
@@ -568,6 +581,7 @@ export function createAppHandler(options: AppServerOptions) {
                   "type",
                   "systemInstruction",
                   "internalStateSettings",
+                  "contextMode",
                 ],
                 ["expectedRevision"],
               ),
@@ -753,6 +767,7 @@ export function createAppHandler(options: AppServerOptions) {
           [
             "requestId",
             "expectedRoomRevision",
+            "context",
             "content",
             "attachmentIds",
             "recipient",

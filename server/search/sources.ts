@@ -25,6 +25,10 @@ import {
 } from "../memory/notes.ts";
 
 import { openChangeCursor } from "../memory/change-cursor.ts";
+import { withVerifiedNoteAncestors } from "../memory/source-validation.ts";
+import { parseCitation } from "./citation.ts";
+export { parseCitation } from "./citation.ts";
+import { assertAiSearchBinding, type AiSearchBinding } from "./ai-binding.ts";
 
 const PAGE = 32;
 // Rowid windows bound a page's original-store work even in a sparse actor/room partition.
@@ -98,6 +102,24 @@ export const ARCHIVE_FRESHNESS_SQL = `SELECT 1 FROM app_changes e INDEXED BY sea
     AND e.target_type='PERSONA' AND e.action='DELETE' AND e.change_id>?4)
   LIMIT 1`;
 
+// Bound to the accepted user seq, with public-only predicates before event/neighbor limits.
+// The previous revision is examined only to notice a public source removed by a correction.
+const aiAffectedSegment = `SELECT 1 ${permittedSegments(false, true)}
+  AND s.message_id=e.target_id AND s.visibility='public'
+  AND s.channel IN ('public_message','shared_summary') AND m.seq<=?5 AND m.message_id<>?6`;
+export const AI_ARCHIVE_FRESHNESS_SQL = `SELECT 1 FROM app_changes e INDEXED BY search_message_changes
+  WHERE e.workspace_id=?1 AND e.room_id=?2 AND e.target_type='MESSAGE' AND e.change_id>?4
+  AND CASE WHEN e.action='DELETE' THEN EXISTS (${aiAffectedSegment})
+    ELSE EXISTS (${aiAffectedSegment} AND s.revision IN (e.revision,e.revision-1)) END
+  UNION ALL SELECT 1 FROM room_personas rp WHERE rp.workspace_id=?1 AND rp.room_id=?2
+  AND EXISTS (SELECT 1 FROM app_changes e INDEXED BY search_persona_deletions
+    WHERE e.workspace_id=rp.workspace_id AND e.target_id=rp.persona_id
+    AND e.target_type='PERSONA' AND e.action='DELETE' AND e.change_id>?4)
+  AND EXISTS (SELECT 1 FROM messages m JOIN message_segments s USING(workspace_id,room_id,message_id)
+    WHERE m.workspace_id=rp.workspace_id AND m.room_id=rp.room_id AND m.persona_id=rp.persona_id
+    AND m.seq<=?5 AND m.message_id<>?6 AND s.revision=m.current_revision
+    AND s.visibility='public' AND s.channel IN ('public_message','shared_summary')) LIMIT 1`;
+
 interface ArchivePosition {
   mode: "baseline" | "delta";
   change: number; // last fully applied event; never returned to the browser
@@ -162,30 +184,6 @@ function excerpt(
   };
 }
 
-/** Validate the closed external DTO before treating any identifier as a database key. */
-export function parseCitation(value: unknown): SearchCitation {
-  const common = ["workspaceId", "roomId", "target", "version", "start", "end"];
-  const type = (value as Partial<SearchCitation> | null)?.target;
-  const extra =
-    type === "memory"
-      ? ["noteId", "fileDigest", "bodyDigest"]
-      : type === "archive"
-        ? ["messageId", "revisionId", "segmentId", "segmentDigest"]
-        : [];
-  const x = object(value, [...common, ...extra]);
-  if (!extra.length) throw new AppError("INVALID_INPUT");
-  for (const key of ["workspaceId", "roomId", ...extra]) {
-    const v = string(x[key], 128);
-    if (key.endsWith("Digest") && !/^[a-f0-9]{64}$/.test(v))
-      throw new AppError("INVALID_INPUT");
-  }
-  integer(x.version);
-  integer(x.start, 0);
-  integer(x.end, x.start + 1);
-  if (x.end - x.start > 4096) throw new AppError("INVALID_CITATION_RANGE", 400);
-  return x as SearchCitation;
-}
-
 /** Bound exclusively by the server/worker's authenticated actor and single room. */
 export class SearchSources
   implements MemorySourceReader, ArchiveSourceReader, CitationResolver
@@ -201,6 +199,7 @@ export class SearchSources
     readonly policy: AuthorizationPolicy,
     readonly actor: Actor,
     readonly roomId: string,
+    readonly aiBinding?: AiSearchBinding,
   ) {}
 
   private statement(sql: string) {
@@ -213,6 +212,8 @@ export class SearchSources
   }
 
   assertRoom(target: SearchTarget) {
+    if (this.aiBinding)
+      assertAiSearchBinding(this.app, this.policy, this.actor, this.roomId, this.aiBinding);
     this.policy.assert(this.actor, "READ_ROOM", { roomId: this.roomId });
     if (
       !this.statement(
@@ -282,6 +283,29 @@ export class SearchSources
       personaId: personaId ?? "",
       visibility,
     };
+    if (this.aiBinding) {
+      const publicSource = target === "memory"
+        ? visibility === "room_shared" && channel === "note"
+        : visibility === "public" && ["public_message", "shared_summary"].includes(channel);
+      if (!publicSource || !this.policy.can(this.actor, "SEND_TO_PROVIDER", {
+        ...scope, provider: this.aiBinding.provider,
+      })) {
+        cache?.set(key, false);
+        return false;
+      }
+      if (personaId) {
+        const owner = this.statement(`SELECT r.config_json FROM room_personas rp
+          JOIN personas p USING(workspace_id,persona_id) JOIN persona_revisions r ON r.workspace_id=rp.workspace_id
+          AND r.persona_id=rp.persona_id AND r.revision=rp.persona_revision
+          WHERE rp.workspace_id=? AND rp.room_id=? AND rp.persona_id=? AND p.deleted_at IS NULL`)
+          .get(this.actor.workspaceId, this.roomId, personaId);
+        const config = owner && JSON.parse(String(owner.config_json));
+        if (!config || config.isEnabled === false || config.historicalIdentity) {
+          cache?.set(key, false);
+          return false;
+        }
+      }
+    }
     const allowed =
       target === "memory"
         ? this.policy.can(this.actor, "READ_MEMORY", scope)
@@ -293,7 +317,7 @@ export class SearchSources
   private noteMeta(noteId: string) {
     return this.statement(
       `WITH visible AS (SELECT d.* ${visibleMemoryDocuments}
-        AND d.room_id=? AND d.note_id=? AND d.state='PUBLISHED')
+        AND d.room_id=? AND d.note_id=? AND d.state='PUBLISHED' ${this.aiBinding ? "AND d.scope='room_shared'" : ""})
        SELECT d.owner_persona_id,d.scope,d.version,d.digest,v.body_digest,v.created_at
        FROM visible d JOIN memory_versions v ON v.note_id=d.note_id AND v.version=d.version
        WHERE v.digest=d.digest AND v.body_digest=d.body_digest
@@ -304,6 +328,8 @@ export class SearchSources
   private readMemory(noteId: string): SearchSource {
     const meta = this.noteMeta(noteId);
     if (!meta) throw missing();
+    if (!this.allowsScope("memory", String(meta.owner_persona_id), String(meta.scope), "note"))
+      throw missing();
     // Only readNote may accept a live file. The historical readNote overload bypasses the live-file check.
     const note = readNote(this.app, this.policy, this.actor, noteId);
     if (
@@ -383,12 +409,13 @@ export class SearchSources
   private segment(segmentId: string, body: boolean) {
     return this.statement(
       `SELECT ${segmentColumns}${body ? ",s.content" : ""} ${permittedSegments()}
-      AND s.segment_id=?`,
+      AND s.segment_id=? ${this.aiSegmentClause()}`,
     ).get(
       this.actor.workspaceId,
       this.roomId,
       this.actor.actorId,
       segmentId,
+      ...this.aiSegmentParams(),
     ) as unknown as SegmentRow | undefined;
   }
 
@@ -402,8 +429,18 @@ export class SearchSources
       row.revision === ref.version &&
       row.revision_id === ref.revisionId &&
       row.digest === ref.segmentDigest &&
-      (includeHistory || row.revision === row.current_revision)
+      ((!this.aiBinding && includeHistory) || row.revision === row.current_revision) &&
+      (!this.aiBinding || this.allowsScope("archive", row.owner_persona_id ?? row.persona_id, row.visibility, row.channel))
     );
+  }
+
+  private aiSegmentClause() {
+    return this.aiBinding ? `AND s.visibility='public' AND s.channel IN ('public_message','shared_summary')
+      AND s.revision=m.current_revision AND m.seq<=? AND m.message_id<>?` : "";
+  }
+
+  private aiSegmentParams(): (string | number)[] {
+    return this.aiBinding ? [this.aiBinding.maxArchiveMessageSeq, this.aiBinding.excludeMessageId ?? ""] : [];
   }
 
   /** Live authorization & metadata filter for candidate selection, before either backend's top K. */
@@ -494,6 +531,7 @@ export class SearchSources
           AND s.message_id IN (SELECT message_id FROM messages WHERE workspace_id=?1
             AND room_id=?2 AND seq BETWEEN ? AND ?)
           AND s.revision=m.current_revision AND length(s.content)>0
+          ${this.aiSegmentClause()}
           ORDER BY m.seq ${order},s.rowid ${order} LIMIT ?`,
         ).all(
           this.actor.workspaceId,
@@ -501,6 +539,7 @@ export class SearchSources
           this.actor.actorId,
           before ? Math.max(seq - count, 0) : seq + 1,
           before ? seq - 1 : seq + count,
+          ...this.aiSegmentParams(),
           count,
         ) as unknown as SegmentRow[];
         if (before) rows.reverse();
@@ -515,9 +554,10 @@ export class SearchSources
     return { ...excerpt(source, ref.start, ref.end), surrounding };
   }
 
-  memoryPage(after?: string): SourcePage {
+  private memorySelection(after?: string) {
+    if (this.aiBinding) throw new AppError("AI_INDEX_SCOPE_FORBIDDEN", 403);
     this.assertRoom("memory");
-    const { mode, cursor, hasMore, items } = listNoteChanges(
+    return listNoteChanges(
       this.app,
       this.policy,
       this.actor,
@@ -525,30 +565,53 @@ export class SearchSources
       after,
       PAGE,
     );
+  }
+
+  private memoryUpsert(item: ReturnType<typeof listNoteChanges>["items"][number]) {
+    const source = this.readMemory(item.noteId);
+    return source.version === item.version && (source.ref as MemoryRef).fileDigest === item.digest
+      ? source : undefined;
+  }
+
+  private memoryUnavailable(error: unknown) {
+    // Stale/removed after the feed's cutoff. Commit the tombstone; future changes arrive through delta.
+    return error instanceof AppError && ["NOT_FOUND", "SOURCE_CHANGED", "MEMORY_UNAVAILABLE"].includes(error.code);
+  }
+
+  memoryPage(after?: string): SourcePage {
+    const { mode, cursor, hasMore, items } = this.memorySelection(after);
     const notes = new Map(items.map((item) => [item.noteId, item]));
     const upserts: SearchSource[] = [];
     for (const item of notes.values()) {
       if (item.state !== "PUBLISHED") continue;
       try {
-        const source = this.readMemory(item.noteId);
-        if (
-          source.version === item.version &&
-          (source.ref as MemoryRef).fileDigest === item.digest
-        )
-          upserts.push(source);
+        const source = this.memoryUpsert(item);
+        if (source) upserts.push(source);
       } catch (error) {
-        // Stale/removed after the feed's cutoff. Commit the tombstone; future changes arrive through delta.
-        if (
-          !(
-            error instanceof AppError &&
-            ["NOT_FOUND", "SOURCE_CHANGED", "MEMORY_UNAVAILABLE"].includes(
-              error.code,
-            )
-          )
-        )
-          throw error;
+        if (!this.memoryUnavailable(error)) throw error;
       }
     }
+    return { mode, cursor, hasMore, deletes: [...notes.keys()], upserts };
+  }
+
+  /** The index worker shares the exact page/cursor selection, but reads long Note ancestry before a writer. */
+  async memoryPageAsync(after?: string, signal?: AbortSignal): Promise<SourcePage> {
+    signal?.throwIfAborted();
+    const { mode, cursor, hasMore, items } = this.memorySelection(after);
+    const notes = new Map(items.map(item => [item.noteId, item]));
+    const upserts: SearchSource[] = [];
+    for (const item of notes.values()) {
+      if (item.state !== "PUBLISHED") continue;
+      try {
+        const source = await withVerifiedNoteAncestors(this.app, [item.noteId], () => this.memoryUpsert(item), signal);
+        if (source) upserts.push(source);
+      } catch (error) {
+        signal?.throwIfAborted();
+        if (!this.memoryUnavailable(error)) throw error;
+      }
+    }
+    signal?.throwIfAborted();
+    this.assertRoom("memory");
     return { mode, cursor, hasMore, deletes: [...notes.keys()], upserts };
   }
 
@@ -602,7 +665,9 @@ export class SearchSources
         );
         if (page.position > latest) throw resync();
         if (page.position === latest) return false;
-        return !!this.statement(MEMORY_FRESHNESS_SQL).get(
+        return !!this.statement(this.aiBinding
+          ? MEMORY_FRESHNESS_SQL.replace("LIMIT 1", "AND d.scope='room_shared' LIMIT 1")
+          : MEMORY_FRESHNESS_SQL).get(
           this.actor.workspaceId,
           this.actor.actorId,
           this.roomId,
@@ -619,17 +684,19 @@ export class SearchSources
       );
       if (page.change > latest) throw resync();
       if (page.change === latest) return false;
-      return !!this.statement(ARCHIVE_FRESHNESS_SQL).get(
+      return !!this.statement(this.aiBinding ? AI_ARCHIVE_FRESHNESS_SQL : ARCHIVE_FRESHNESS_SQL).get(
         this.actor.workspaceId,
         this.roomId,
         this.actor.actorId,
         page.change,
+        ...this.aiSegmentParams(),
       );
     });
   }
 
   /** An internal bounded read on one SQLite snapshot. Cursors never cross the browser/API boundary. */
   archivePage(after?: string): SourcePage {
+    if (this.aiBinding) throw new AppError("AI_INDEX_SCOPE_FORBIDDEN", 403);
     return this.withReadSnapshot(() => {
       this.assertRoom("memory");
       const acl = this.policy.revision(this.actor);

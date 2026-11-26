@@ -23,6 +23,7 @@ import { canonical } from "../app-data/validation.ts";
 import {
   APP_CONTRACT,
   MEMORY_CONTRACT,
+  CONTEXT_CONTRACT,
 } from "../../shared/app-contracts/index.ts";
 import { hash, json, OperationError } from "./legacy.ts";
 import { acquireHostLock } from "./locks.ts";
@@ -33,6 +34,7 @@ import {
 } from "../memory/vault.ts";
 import { memoryRecordsDigest, summarizeRows } from "./memory-ledger.ts";
 import { parseMemoryMarkdown } from "../memory/markdown.ts";
+import { readContextManifest } from "../generation/context-manifest.ts";
 
 type BackupAttachment = {
   workspaceId: string;
@@ -80,7 +82,7 @@ type ManifestHeader = {
 };
 type SnapshotManifest = ManifestHeader & {
   schema: "MAP-MEM-1:BACKUP:3";
-  appSchema: 2 | 3 | 4 | 5 | 6;
+  appSchema: 2 | 3 | 4 | 5 | 6 | 7;
   attachments: Inventory;
   memory: MemoryInventory;
 };
@@ -268,6 +270,132 @@ async function semanticIntegrity(db: DatabaseSync): Promise<void> {
       throw new OperationError("BACKUP_CONTENT_DIGEST_MISMATCH", 409);
     if (++checked % 256 === 0) await pause();
   }
+  // Verify historical bindings, not current permission: withdrawn sources and
+  // uncertain calls remain valid audit records and must survive a restore.
+  if (db.prepare("SELECT 1 FROM sqlite_schema WHERE name='app_context_answer_holds'").get()) {
+    for (const profile of db.prepare(`SELECT DISTINCT p.config_json,p.config_digest FROM search_operation_bindings b
+      JOIN search_operations o USING(operation_id) JOIN search_profiles p
+      ON p.workspace_id=o.workspace_id AND p.actor_id=o.actor_id AND p.room_id=o.room_id AND p.version=o.profile_version`).iterate()) {
+      try {
+        if (hash(String(profile.config_json)) !== profile.config_digest) throw Error("profile digest");
+        JSON.parse(String(profile.config_json));
+      } catch {
+        throw new OperationError("BACKUP_SEARCH_PROFILE_INVALID", 409);
+      }
+      if (++checked % 256 === 0) await pause();
+    }
+    const inconsistent = db.prepare(`SELECT 1 FROM app_context_answer_holds h
+      LEFT JOIN app_generation_runs r ON r.run_id=h.run_id
+      LEFT JOIN app_provider_calls c ON c.call_id=h.call_id
+      WHERE r.run_id IS NULL OR r.workspace_id<>h.workspace_id OR r.room_id<>h.room_id
+        OR r.actor_id<>h.actor_id
+        OR (h.state='CONSUMED' AND (c.call_id IS NULL OR c.run_id<>h.run_id
+          OR c.workspace_id<>h.workspace_id OR c.room_id<>h.room_id
+          OR c.persona_id<>h.consumer_persona_id OR c.provider<>h.provider
+          OR c.model<>h.model OR c.purpose<>'answer')) LIMIT 1`).get();
+    const wrongSearch = db.prepare(`SELECT 1 FROM search_operation_bindings b
+      LEFT JOIN search_operations o USING(operation_id)
+      LEFT JOIN app_context_answer_holds h USING(plan_id)
+      LEFT JOIN search_profiles p ON p.workspace_id=o.workspace_id AND p.actor_id=o.actor_id
+        AND p.room_id=o.room_id AND p.version=o.profile_version
+      WHERE o.operation_id IS NULL OR h.plan_id IS NULL OR b.purpose<>'answer'
+        OR o.purpose<>'QUERY_EMBEDDING' OR h.workspace_id<>o.workspace_id
+        OR h.room_id<>o.room_id OR h.actor_id<>o.actor_id
+        OR b.binding_digest<>h.binding_digest OR p.version IS NULL OR h.currency IS NULL
+        OR h.search_profile_version IS NOT o.profile_version
+        OR h.currency IS NOT json_extract(p.config_json,'$.aiContext.currency')
+        OR json_extract(p.config_json,'$.aiContext.queryEmbedding') IS NOT 1
+        OR NOT EXISTS(SELECT 1 FROM json_each(p.config_json,'$.aiContext.consumerPersonaIds')
+          WHERE value=h.consumer_persona_id) LIMIT 1`).get();
+    const mixedCurrency = db.prepare(`SELECT 1 FROM app_context_answer_holds
+      GROUP BY run_id HAVING count(DISTINCT coalesce(currency,''))>1 LIMIT 1`).get();
+    const mixedProfile = db.prepare(`SELECT 1 FROM app_context_answer_holds
+      GROUP BY run_id HAVING count(DISTINCT coalesce(search_profile_version,0))>1 LIMIT 1`).get();
+    if (inconsistent || wrongSearch || mixedCurrency || mixedProfile)
+      throw new OperationError("BACKUP_CONTEXT_BINDING_INVALID", 409);
+    for (const row of db.prepare(`SELECT binding_digest FROM app_context_answer_holds`).iterate()) {
+      if (!/^[a-f0-9]{64}$/.test(String(row.binding_digest)))
+        throw new OperationError("BACKUP_CONTEXT_BINDING_INVALID", 409);
+      if (++checked % 256 === 0) await pause();
+    }
+    const searchBindings = db.prepare(`SELECT operation_id FROM search_operation_bindings WHERE plan_id=? ORDER BY operation_id`);
+    const answerHold = db.prepare(`SELECT plan_id,state,call_id FROM app_context_answer_holds WHERE plan_id=?`);
+    const callHold = db.prepare(`SELECT plan_id FROM app_context_answer_holds WHERE call_id=?`);
+    for (const call of db.prepare(`SELECT c.*,r.actor_id,r.request_json,r.target_message_id FROM app_provider_calls c
+      JOIN app_generation_runs r ON r.run_id=c.run_id`).iterate()) {
+      if (hash(String(call.manifest_json)) !== call.manifest_digest)
+        throw new OperationError("BACKUP_CONTENT_DIGEST_MISMATCH", 409);
+      let manifest: ReturnType<typeof readContextManifest>;
+      try { manifest = readContextManifest(String(call.manifest_json)); } catch {
+        throw new OperationError("BACKUP_CONTEXT_MANIFEST_INVALID", 409);
+      }
+      if (manifest.roomId !== call.room_id || manifest.personaId !== call.persona_id
+        || manifest.purpose !== call.purpose || manifest.provider !== call.provider || manifest.model !== call.model)
+        throw new OperationError("BACKUP_CONTEXT_MANIFEST_INVALID", 409);
+      if (manifest.contract === CONTEXT_CONTRACT) {
+        const plan = manifest.retrieval!;
+        let accepted: any;
+        try { accepted = JSON.parse(String(call.request_json)); } catch {
+          throw new OperationError("BACKUP_CONTEXT_BINDING_INVALID", 409);
+        }
+        if (plan.workspaceId !== call.workspace_id || plan.runId !== call.run_id || plan.actorId !== call.actor_id
+          || plan.inputBinding.messageId !== accepted.inputBinding?.messageId
+          || plan.inputBinding.revision !== accepted.inputBinding?.revision
+          || plan.inputBinding.seq !== accepted.inputBinding?.seq
+          || plan.inputBinding.excludeMessageId !== (call.target_message_id ?? undefined))
+          throw new OperationError("BACKUP_CONTEXT_BINDING_INVALID", 409);
+        const hold = answerHold.get(plan.id);
+        const consumed = callHold.get(call.call_id);
+        if (hold && (hold.call_id !== call.call_id || hold.state !== "CONSUMED"))
+          throw new OperationError("BACKUP_CONTEXT_BINDING_INVALID", 409);
+        if (consumed && consumed.plan_id !== plan.id)
+          throw new OperationError("BACKUP_CONTEXT_BINDING_INVALID", 409);
+        const bound = searchBindings.all(plan.id).map(row => String(row.operation_id));
+        const supplied = plan.searches.flatMap(search => search.searchOperationIds).sort();
+        if (json(bound) !== json(supplied))
+          throw new OperationError("BACKUP_CONTEXT_BINDING_INVALID", 409);
+      }
+      if (++checked % 256 === 0) await pause();
+    }
+    const invalidNote = db.prepare(`SELECT 1 FROM memory_lineage_notes n
+      JOIN memory_lineage_work w USING(candidate_id)
+      JOIN memory_candidates c USING(candidate_id)
+      LEFT JOIN memory_dependencies dep ON dep.candidate_id=n.candidate_id
+        AND dep.resource_type='NOTE' AND dep.resource_id=n.note_id
+      LEFT JOIN memory_documents d ON d.note_id=n.note_id
+      LEFT JOIN memory_versions v ON v.note_id=n.note_id AND v.version=n.version
+      LEFT JOIN app_provider_calls consumer ON consumer.call_id=n.consumer_call_id
+      LEFT JOIN app_generation_receipts receipt ON receipt.call_id=n.consumer_call_id
+      WHERE (n.checked=1)<>(n.phase='DONE') OR dep.resource_id IS NULL
+        OR dep.revision<>n.version OR dep.digest<>n.file_digest
+        OR dep.workspace_id<>c.workspace_id OR dep.room_id<>c.room_id
+        OR consumer.call_id IS NULL OR consumer.workspace_id<>c.workspace_id OR consumer.room_id<>c.room_id
+        OR consumer.purpose<>'answer' OR consumer.state<>'COMPLETED'
+        OR receipt.call_id IS NULL OR receipt.status<>'COMPLETED'
+        OR receipt.workspace_id<>c.workspace_id OR receipt.room_id<>c.room_id
+        OR NOT EXISTS(SELECT 1 FROM json_each(consumer.manifest_json,'$.retrieval.sources') source
+          WHERE source.value->>'$.citation.target'='memory' AND source.value->>'$.citation.noteId'=n.note_id
+            AND source.value->>'$.citation.version'=n.version AND source.value->>'$.citation.fileDigest'=n.file_digest
+            AND source.value->>'$.citation.bodyDigest'=n.body_digest
+            AND source.value->>'$.ownerPersonaId'=n.owner_persona_id AND source.value->>'$.scope'=n.scope)
+        OR (w.status='DONE' AND (n.checked<>1 OR n.phase<>'DONE' OR d.note_id IS NULL
+        OR d.workspace_id<>c.workspace_id OR d.room_id<>c.room_id
+        OR d.owner_persona_id<>n.owner_persona_id OR v.note_id IS NULL
+        OR v.digest<>n.file_digest OR v.body_digest<>n.body_digest)) LIMIT 1`).get();
+    if (invalidNote) throw new OperationError("BACKUP_CONTEXT_LINEAGE_INVALID", 409);
+    for (const note of db.prepare(`SELECT n.after_authority_key,d.candidate_id AS origin_candidate
+      FROM memory_lineage_notes n LEFT JOIN memory_documents d ON d.note_id=n.note_id`).iterate()) {
+      try {
+        const key: unknown = JSON.parse(String(note.after_authority_key));
+        if (!Array.isArray(key) || !key.every(item => typeof item === "string")
+          || (key.length !== 0 && key.length !== (note.origin_candidate ? 5 : 1)))
+          throw Error("authority cursor");
+      } catch {
+        throw new OperationError("BACKUP_CONTEXT_LINEAGE_INVALID", 409);
+      }
+      if (++checked % 256 === 0) await pause();
+    }
+  }
 }
 async function readProtectedJson(path: string): Promise<any> {
   assertSafePath(path, "file");
@@ -364,6 +492,19 @@ async function searchControlDigest(db: DatabaseSync): Promise<string> {
     "SELECT * FROM search_operations ORDER BY operation_id",
   );
   return hash(json([profiles, operations]));
+}
+// Separate from the released MEM-2 digest so old restore reports remain valid.
+async function contextControlDigest(db: DatabaseSync): Promise<string> {
+  const parts: string[] = [];
+  for (const [table, order] of [
+    ["app_context_answer_holds", "plan_id"],
+    ["search_operation_bindings", "operation_id"],
+    ["app_generation_runs", "run_id"],
+    ["app_provider_calls", "call_id"],
+    ["app_generation_receipts", "call_id"],
+    ["app_turns", "workspace_id,room_id,turn_id"],
+  ]) parts.push(await orderedDigest(db, `SELECT * FROM ${table} ORDER BY ${order}`));
+  return hash(json(parts));
 }
 function versionPath(root: string, digest: string): string {
   if (!/^[a-f0-9]{64}$/.test(digest))
@@ -881,7 +1022,7 @@ async function verifyBackup(
       break;
     case "MAP-MEM-1:BACKUP:3":
       if (
-        ![2, 3, 4, 5, 6].includes(manifest.appSchema) ||
+        ![2, 3, 4, 5, 6, 7].includes(manifest.appSchema) ||
         manifest.memory?.contract !== MEMORY_CONTRACT ||
         !validInventory(manifest.attachments) ||
         !validInventory(manifest.memory.versions) ||
@@ -1046,6 +1187,8 @@ export async function restoreBackup(
         }
         // A restore copies authority and cost history, never an instruction to send again.
         app.db.exec("UPDATE search_profiles SET active=0 WHERE active=1");
+        app.db.prepare(`UPDATE app_context_answer_holds SET state='RELEASED',finished_at=?
+          WHERE state='HELD'`).run(Date.now());
         app.db
           .prepare(
             `UPDATE search_operations
@@ -1092,8 +1235,9 @@ export async function restoreBackup(
       await writeDurableJson(
         join(destination, "restore-report.json"),
         {
-          schema: "MAP-MEM-2:RESTORE:5",
+          schema: "MAP-MEM-3:RESTORE:7",
           searchControlDigest: await searchControlDigest(app.db),
+          contextControlDigest: await contextControlDigest(app.db),
           externalSearchPaused: true,
           derivedSearchIndex: "REBUILD_REQUIRED",
           memoryRecordsDigest: memory.recordsDigest,
@@ -1161,7 +1305,25 @@ export async function resumeRestore(root: string): Promise<void> {
         )
         .get();
       let verifiedDigest = memory.recordsDigest;
-      if (report.schema === "MAP-MEM-2:RESTORE:5") {
+      if (report.schema === "MAP-MEM-3:RESTORE:7") {
+        if (report.contextControlDigest !== (await contextControlDigest(app.db)))
+          throw new OperationError("RESTORE_REFERENCE_MISMATCH", 409);
+      } else {
+        // The schema-7 frontier adds a column and table to the memory ledger.
+        // Bridge a paused old restore using the migration's committed evidence.
+        const contextMigration = app.db.prepare(
+          "SELECT before_digest,after_digest FROM app_restore_context_migration WHERE singleton=1",
+        ).get();
+        if (contextMigration) {
+          if (verifiedDigest !== contextMigration.after_digest)
+            throw new OperationError("RESTORE_REFERENCE_MISMATCH", 409);
+          verifiedDigest = String(contextMigration.before_digest);
+        }
+        if (app.db.prepare("SELECT 1 FROM app_context_answer_holds LIMIT 1").get()
+          || app.db.prepare("SELECT 1 FROM search_operation_bindings LIMIT 1").get())
+          throw new OperationError("RESTORE_REFERENCE_MISMATCH", 409);
+      }
+      if (report.schema === "MAP-MEM-2:RESTORE:5" || report.schema === "MAP-MEM-3:RESTORE:7") {
         if (report.searchControlDigest !== (await searchControlDigest(app.db)))
           throw new OperationError("RESTORE_REFERENCE_MISMATCH", 409);
       } else if (
@@ -1173,7 +1335,8 @@ export async function resumeRestore(root: string): Promise<void> {
       if (
         migration &&
         report.schema !== "MAP-MEM-1:RESTORE:4" &&
-        report.schema !== "MAP-MEM-2:RESTORE:5"
+        report.schema !== "MAP-MEM-2:RESTORE:5" &&
+        report.schema !== "MAP-MEM-3:RESTORE:7"
       ) {
         if (verifiedDigest !== migration.after_digest)
           throw new OperationError("RESTORE_REFERENCE_MISMATCH", 409);

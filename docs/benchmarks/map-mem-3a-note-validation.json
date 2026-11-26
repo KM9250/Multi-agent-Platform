@@ -1,0 +1,45 @@
+{
+  "kind": "MEM-3A live ancestor revalidation outside writer / authenticated HTTP",
+  "node": "v24.19.0",
+  "ancestorNotes": 1024,
+  "trials": 5,
+  "pageSize": 32,
+  "validation": {
+    "count": 5,
+    "p50Ms": 262.28777500000024,
+    "p95Ms": 360.8688299999999,
+    "maxMs": 360.8688299999999
+  },
+  "writerBoundaries": {
+    "count": 5,
+    "p50Ms": 6.736615999999685,
+    "p95Ms": 7.054345000000012,
+    "maxMs": 7.054345000000012
+  },
+  "httpReads": {
+    "count": 54,
+    "p50Ms": 13.88665600000013,
+    "p95Ms": 45.44918800000005,
+    "maxMs": 87.610502
+  },
+  "eventLoop": {
+    "p95Ms": 34.897919,
+    "maxMs": 79.888383
+  },
+  "realExternalCalls": 0,
+  "queryPlan": [
+    {
+      "id": 7,
+      "parent": 0,
+      "notused": 50,
+      "detail": "SEARCH d USING INDEX sqlite_autoindex_memory_dependencies_1 (candidate_id=? AND resource_type=? AND resource_id>?)"
+    },
+    {
+      "id": 17,
+      "parent": 0,
+      "notused": 60,
+      "detail": "SEARCH n USING INDEX memory_documents_room (workspace_id=? AND room_id=? AND note_id=?)"
+    }
+  ],
+  "scope": "Synthetic flattened NOTE dependencies isolate fresh file/authority gate cost. Every trial rereads every ancestor; final metadata comparison is outside writer. No production latency claim."
+}

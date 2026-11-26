@@ -9,6 +9,8 @@ import {
 } from "lucide-react";
 import { RoomTag, Room, InternalStateSettings } from "../types";
 import { ROOM_TAGS } from "../constants";
+import type { ContextMode } from "../shared/context-contracts";
+import { ContextModeOptions } from "./ContextModeSelect";
 import { DEFAULT_INTERNAL_STATE_SETTINGS } from "../utils/messageVisibility";
 
 interface RoomModalProps {
@@ -20,6 +22,7 @@ interface RoomModalProps {
     type: RoomTag,
     systemInstruction: string,
     internalStateSettings: InternalStateSettings,
+    contextMode: ContextMode,
   ) => void | boolean | Promise<void | boolean>;
   editingRoom?: Room | null;
 }
@@ -30,6 +33,7 @@ const RoomModal: React.FC<RoomModalProps> = ({
   onSave,
   editingRoom,
 }) => {
+  const [contextMode, setContextMode] = useState<ContextMode>("auto");
   const [title, setTitle] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState(false);
@@ -42,6 +46,7 @@ const RoomModal: React.FC<RoomModalProps> = ({
   useEffect(() => {
     if (isOpen) {
       if (editingRoom) {
+        setContextMode(editingRoom.contextMode ?? "auto");
         setTitle(editingRoom.title);
         setDescription(editingRoom.description);
         setSystemInstruction(editingRoom.systemInstruction || "");
@@ -51,6 +56,7 @@ const RoomModal: React.FC<RoomModalProps> = ({
           ...editingRoom.internalStateSettings,
         });
       } else {
+        setContextMode("auto");
         setTitle("");
         setDescription("");
         setSystemInstruction("");
@@ -73,6 +79,7 @@ const RoomModal: React.FC<RoomModalProps> = ({
             type,
             systemInstruction,
             internalStateSettings,
+            contextMode,
           )) !== false
         )
           onClose();
@@ -194,6 +201,14 @@ const RoomModal: React.FC<RoomModalProps> = ({
               </p>
             </div>
 
+            <label className="block text-sm text-zinc-300">
+              既定の長期参照
+              <select aria-label="Room context mode" value={contextMode}
+                onChange={event => setContextMode(event.target.value as ContextMode)}
+                className="mt-2 block w-full bg-zinc-800 rounded p-2">
+                <ContextModeOptions />
+              </select>
+            </label>
             <div>
               <label className="block text-sm font-medium text-zinc-300 mb-3 flex items-center gap-2">
                 Memory Mode <Info className="w-3.5 h-3.5 text-zinc-500" />

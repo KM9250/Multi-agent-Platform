@@ -11,6 +11,8 @@ import {
 } from "./profile.ts";
 import { EMBEDDING_SPACE, formattedInput, hash } from "./embedding.ts";
 import { SearchSources, isSourceBoundary } from "./sources.ts";
+import type { AiSearchBinding } from "./ai-binding.ts";
+import { withVerifiedNoteAncestors } from "../memory/source-validation.ts";
 
 export const DENSE_LIMITS = Object.freeze({
   chunks: 10_000,
@@ -99,17 +101,16 @@ function cosine(vector: unknown, query?: Float32Array) {
 /** Check the entire authorized plan before a query dispatch or a bounded exact scan.
  * Historical profile and receipt prove how an installed vector was created. They grant no current rights.
  */
-export function scanCorpus(
+function selectCorpus(
   app: AppDatabase,
   policy: AuthorizationPolicy,
   actor: Actor,
   roomId: string,
   index: SQLiteSearchBackend,
-  indexPath: string,
   profile: SearchProfile,
-  query?: Float32Array,
-): CorpusInspection {
-  const sources = new SearchSources(app, policy, actor, roomId);
+  aiBinding?: AiSearchBinding,
+) {
+  const sources = new SearchSources(app, policy, actor, roomId, aiBinding);
   const filter = plannedFilter(index, sources, profile);
   const rows = sources.withCandidateSnapshot("memory", () =>
     index.db
@@ -120,6 +121,44 @@ export function scanCorpus(
       )
       .all(...filter.params, DENSE_LIMITS.chunks + 1),
   );
+  return { sources, rows };
+}
+
+function exceedsCorpusLimit(rows: ReturnType<typeof selectCorpus>["rows"]) {
+  return rows.length > DENSE_LIMITS.chunks ||
+    rows.length * EMBEDDING_SPACE.dimensions * 4 > DENSE_LIMITS.bytes ||
+    rows.reduce((size, row) => size + Number(row.size ?? 0), 0) > DENSE_LIMITS.bytes;
+}
+
+/** Synchronous adapter remains available to the read-only Dense worker and existing consumers. */
+export function scanCorpus(
+  app: AppDatabase, policy: AuthorizationPolicy, actor: Actor, roomId: string,
+  index: SQLiteSearchBackend, indexPath: string, profile: SearchProfile,
+  query?: Float32Array, aiBinding?: AiSearchBinding,
+): CorpusInspection {
+  return inspectCorpus(app, actor, roomId, index, indexPath, profile,
+    selectCorpus(app, policy, actor, roomId, index, profile, aiBinding), query);
+}
+
+/** Writable index jobs validate the selected ancestry before readNote opens any writer transaction. */
+export async function scanCorpusAsync(
+  app: AppDatabase, policy: AuthorizationPolicy, actor: Actor, roomId: string,
+  index: SQLiteSearchBackend, indexPath: string, profile: SearchProfile,
+  query?: Float32Array, aiBinding?: AiSearchBinding, signal?: AbortSignal,
+): Promise<CorpusInspection> {
+  signal?.throwIfAborted();
+  const selection = selectCorpus(app, policy, actor, roomId, index, profile, aiBinding);
+  const inspect = () => inspectCorpus(app, actor, roomId, index, indexPath, profile, selection, query);
+  if (exceedsCorpusLimit(selection.rows)) return inspect();
+  const noteIds = selection.rows.map(row => (JSON.parse(String(row.ref)) as MemoryRef).noteId);
+  return withVerifiedNoteAncestors(app, noteIds, inspect, signal);
+}
+
+function inspectCorpus(
+  app: AppDatabase, actor: Actor, roomId: string, index: SQLiteSearchBackend,
+  indexPath: string, profile: SearchProfile,
+  { sources, rows }: ReturnType<typeof selectCorpus>, query?: Float32Array,
+): CorpusInspection {
   const result: CorpusInspection = {
     state: "no_dense_coverage",
     planned: rows.length,
@@ -127,12 +166,7 @@ export function scanCorpus(
     missing: [],
     candidates: [],
   };
-  if (
-    rows.length > DENSE_LIMITS.chunks ||
-    rows.length * EMBEDDING_SPACE.dimensions * 4 > DENSE_LIMITS.bytes ||
-    rows.reduce((size, row) => size + Number(row.size ?? 0), 0) >
-      DENSE_LIMITS.bytes
-  )
+  if (exceedsCorpusLimit(rows))
     return { ...result, state: "dense_limit" };
   if (!rows.length) return result;
 

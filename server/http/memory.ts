@@ -17,6 +17,7 @@ import {
 } from "../memory/notes.ts";
 import { vaultStatus } from "../memory/vault.ts";
 import { retryPublication } from "../memory/worker.ts";
+import { withVerifiedNoteAncestors } from "../memory/source-validation.ts";
 
 function query(url: URL, key?: string): string | undefined {
   const keys = [...url.searchParams.keys()];
@@ -158,7 +159,8 @@ export function memoryRoutes(app: AppDatabase, policy: AuthorizationPolicy) {
         throw new AuthError("NOT_FOUND", 404);
       if (parts.length === 5 && method === "GET") {
         const version = versionQuery(url, "version");
-        return readNote(app, policy, actor, id, version);
+        return withVerifiedNoteAncestors(app, version === undefined ? [id] : [],
+          () => readNote(app, policy, actor, id, version));
       }
       if (action === "history" && method === "GET") {
         const version = versionQuery(url, "before");

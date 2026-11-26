@@ -1,5 +1,7 @@
 import type { AppDatabase } from "../app-data/db.ts";
 import { AuthorizationPolicy, type Actor } from "../auth/authorization.ts";
+import { assertAiSearchBinding, type AiSearchBinding } from "./ai-binding.ts";
+import { markSearchOutcomeUnknown, reserveSearchRunBinding } from "../generation/search-budget.ts";
 import {
   DenseError,
   EMBEDDING_SPACE,
@@ -22,6 +24,11 @@ export interface ProfileConfig {
   maxTokens: number;
   maxCostMicros: number;
   priceMicrosPerThousandTokens: number;
+  aiContext?: {
+    queryEmbedding: boolean;
+    consumerPersonaIds: string[];
+    currency?: string;
+  };
 }
 export interface SearchProfile extends ProfileConfig {
   version: number;
@@ -75,6 +82,7 @@ function parseConfig(input: unknown): ProfileConfig {
           "maxTokens",
           "maxCostMicros",
           "priceMicrosPerThousandTokens",
+          "aiContext",
         ].includes(k),
     ) ||
     typeof config.personaId !== "string" ||
@@ -83,6 +91,20 @@ function parseConfig(input: unknown): ProfileConfig {
     config.personaId.length > 128
   )
     throw invalid();
+  let aiContext: ProfileConfig["aiContext"];
+  if (config.aiContext !== undefined) {
+    const ai = config.aiContext as Record<string, unknown>;
+    if (!ai || typeof ai !== "object" || Array.isArray(ai) ||
+        Object.keys(ai).some(k => !["queryEmbedding", "consumerPersonaIds", "currency"].includes(k)) ||
+        typeof ai.queryEmbedding !== "boolean" || !Array.isArray(ai.consumerPersonaIds) ||
+        ai.consumerPersonaIds.length > 128 ||
+        new Set(ai.consumerPersonaIds).size !== ai.consumerPersonaIds.length ||
+        ai.consumerPersonaIds.some(id => typeof id !== "string" || !id || id === "*" || id.length > 128) ||
+        (ai.queryEmbedding && !ai.consumerPersonaIds.length) ||
+        (ai.currency !== undefined && (typeof ai.currency !== "string" || !/^[A-Z]{3}$/.test(ai.currency)))) throw invalid();
+    aiContext = { queryEmbedding: ai.queryEmbedding, consumerPersonaIds: [...ai.consumerPersonaIds].sort(),
+      ...(ai.currency ? { currency: ai.currency as string } : {}) };
+  }
   return {
     personaId: config.personaId,
     scopes: boundedSet(config.scopes, ["room_shared", "persona_private"]),
@@ -98,6 +120,7 @@ function parseConfig(input: unknown): ProfileConfig {
       config.priceMicrosPerThousandTokens,
       1_000_000,
     ),
+    ...(aiContext ? { aiContext } : {}),
   };
 }
 
@@ -111,8 +134,10 @@ function liveBinding(
     .prepare(
       `SELECT 1 FROM rooms r JOIN room_personas rp USING(workspace_id,room_id)
     JOIN personas p USING(workspace_id,persona_id) JOIN principals a USING(workspace_id)
+    JOIN persona_revisions pr ON pr.workspace_id=p.workspace_id AND pr.persona_id=p.persona_id AND pr.revision=rp.persona_revision
     WHERE r.workspace_id=? AND r.room_id=? AND rp.persona_id=? AND a.actor_id=? AND a.active=1
       AND r.deleted_at IS NULL AND p.deleted_at IS NULL
+      AND COALESCE(json_extract(pr.config_json,'$.isEnabled'),1)!=0
       AND EXISTS(SELECT 1 FROM app_operational_state WHERE singleton=1 AND maintenance=0 AND restored=0)`,
     )
     .get(actor.workspaceId, roomId, personaId, actor.actorId);
@@ -129,6 +154,8 @@ export function configureSearchProfile(
   const args = binding(actor, roomId);
   return app.transaction(() => {
     liveBinding(app, actor, roomId, config.personaId);
+    for (const consumer of config.aiContext?.consumerPersonaIds ?? [])
+      liveBinding(app, actor, roomId, consumer);
     const version = Number(
       app.db
         .prepare(
@@ -243,6 +270,50 @@ export function assertDispatchScope(
     policy.assert(actor, "SEND_TO_PROVIDER", { ...target, provider: "google" });
   }
 }
+/** An enabled human profile never implicitly permits paid AI retrieval. */
+export function assertAiDispatchScope(
+  app: AppDatabase, policy: AuthorizationPolicy, actor: Actor, roomId: string,
+  profile: SearchProfile, ai: AiSearchBinding,
+) {
+  assertAiSearchBinding(app, policy, actor, roomId, ai);
+  if (!profile.aiContext?.queryEmbedding ||
+      !profile.aiContext.consumerPersonaIds.includes(ai.consumerPersonaId) ||
+      !profile.purposes.includes("QUERY_EMBEDDING") || !profile.scopes.includes("room_shared"))
+    throw new DenseError("ai_query_disabled");
+  liveBinding(app, actor, roomId, ai.consumerPersonaId);
+  assertDispatchScope(app, policy, actor, roomId, profile, "QUERY_EMBEDDING", ["room_shared"]);
+  // The query is accepted user input; sending it uses the consumer's destination grant.
+  policy.assert(actor, "SEND_TO_PROVIDER", {
+    workspaceId: actor.workspaceId, roomId, personaId: ai.consumerPersonaId, provider: EMBEDDING_SPACE.provider,
+  });
+}
+/** Revalidates a frozen plan's paid-query receipts; never runs search or reserves a new call. */
+export function revalidateAiSearchOperations(
+  app: AppDatabase, policy: AuthorizationPolicy, actor: Actor, roomId: string,
+  ai: AiSearchBinding, operationIds: readonly string[],
+) {
+  if (operationIds.length > 1 || new Set(operationIds).size !== operationIds.length)
+    throw new DenseError("source_changed");
+  for (const operationId of operationIds) {
+    const operation = app.db.prepare(`SELECT o.*,b.plan_id,b.binding_digest,h.run_id,h.currency
+      FROM search_operations o JOIN search_operation_bindings b USING(operation_id)
+      JOIN app_context_answer_holds h USING(plan_id) WHERE o.operation_id=?`).get(operationId);
+    if (!operation || operation.workspace_id !== actor.workspaceId || operation.actor_id !== actor.actorId ||
+        operation.room_id !== roomId || operation.run_id !== ai.runId || operation.plan_id !== ai.planId ||
+        operation.binding_digest !== ai.bindingDigest || operation.purpose !== "QUERY_EMBEDDING")
+      throw new DenseError("source_changed");
+    if (operation.state === "OUTCOME_UNKNOWN" || operation.state === "DISPATCH_INTENT")
+      throw new DenseError("SEARCH_OUTCOME_UNKNOWN");
+    if (operation.state === "REJECTED") continue;
+    if (operation.state !== "SUCCEEDED") throw new DenseError("source_changed");
+    const profile = getSearchProfile(app, actor, roomId);
+    if (!profile || profile.version !== operation.profile_version)
+      throw new DenseError("profile_changed_or_disabled");
+    assertAiDispatchScope(app, policy, actor, roomId, profile, ai);
+    if (!operation.currency || profile.aiContext?.currency !== operation.currency)
+      throw new DenseError("profile_changed_or_disabled");
+  }
+}
 export const OP_TOKEN_RESERVATION = 8192;
 interface DispatchInput {
   actor: Actor;
@@ -255,6 +326,7 @@ interface DispatchInput {
   signal: AbortSignal;
   /** Reads the current source (including live Vault checks) immediately before send. */
   readText: () => string;
+  aiBinding?: AiSearchBinding;
 }
 export function operationId(
   actor: Actor,
@@ -305,6 +377,11 @@ export async function dispatchEmbedding(
       purpose,
       input.scopes,
     );
+    if (input.aiBinding) {
+      if (purpose !== "QUERY_EMBEDDING" || input.scopes.length !== 1 || input.scopes[0] !== "room_shared")
+        throw new DenseError("invalid_ai_purpose");
+      assertAiDispatchScope(app, policy, actor, roomId, profile, input.aiBinding);
+    }
   };
   check();
   const text = input.readText();
@@ -345,6 +422,8 @@ export async function dispatchEmbedding(
         cost,
         Date.now(),
       );
+    if (input.aiBinding)
+      reserveSearchRunBinding(app, actor, input.aiBinding, op, OP_TOKEN_RESERVATION, cost, profile.aiContext?.currency);
   }, "search-reserve");
 
   try {
@@ -367,7 +446,8 @@ export async function dispatchEmbedding(
     app.transaction(() =>
       app.db
         .prepare(
-          "UPDATE search_operations SET state='REJECTED',finished_at=? WHERE operation_id=? AND state='RESERVED'",
+          // This stack has not called the transport, including a lost Intent COMMIT acknowledgement.
+          "UPDATE search_operations SET state='REJECTED',dispatched_at=NULL,estimated_cost_micros=0,finished_at=? WHERE operation_id=? AND state IN ('RESERVED','DISPATCH_INTENT')",
         )
         .run(Date.now(), op),
     );
@@ -419,12 +499,14 @@ export async function dispatchEmbedding(
         ? "REJECTED"
         : "OUTCOME_UNKNOWN";
     app.transaction(
-      () =>
+      () => {
         app.db
           .prepare(
             "UPDATE search_operations SET state=?,finished_at=? WHERE operation_id=? AND state='DISPATCH_INTENT'",
           )
-          .run(state, Date.now(), op),
+          .run(state, Date.now(), op);
+        if (state === "OUTCOME_UNKNOWN") markSearchOutcomeUnknown(app, op);
+      },
       "search-receipt",
     );
     throw error;
@@ -457,14 +539,19 @@ export async function dispatchEmbedding(
 /** Only while holding the exclusive Host lock, before starting HTTP or workers. */
 export function recoverSearchDispatches(app: AppDatabase) {
   app.transaction(
-    () =>
+    () => {
       app.db
         .prepare(
           `UPDATE search_operations
     SET state=CASE state WHEN 'RESERVED' THEN 'REJECTED' ELSE 'OUTCOME_UNKNOWN' END, finished_at=?
     WHERE state IN ('RESERVED','DISPATCH_INTENT')`,
         )
-        .run(Date.now()),
+        .run(Date.now());
+      for (const row of app.db.prepare(`SELECT o.operation_id FROM search_operations o
+        JOIN search_operation_bindings b USING(operation_id) WHERE o.state='OUTCOME_UNKNOWN'`).all())
+        markSearchOutcomeUnknown(app, String(row.operation_id));
+      app.db.prepare(`UPDATE app_context_answer_holds SET state='RELEASED',finished_at=? WHERE state='HELD'`).run(Date.now());
+    },
     "search-recover",
   );
 }

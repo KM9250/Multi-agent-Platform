@@ -259,9 +259,8 @@ try {
     0,
   );
   await panel
-    .getByText(
-      "The saved state changed. Refresh and review the current version.",
-    )
+    .getByRole("status")
+    .filter({ hasText: "The saved state changed. Refresh and review the current version." })
     .waitFor();
   await manual.getByText("Current text unavailable · File changed").waitFor();
   assert.equal(

@@ -23,6 +23,7 @@ import {
   APP_SCHEMA,
   MEMORY_CONTRACT,
   SEARCH_CONTRACT,
+  CONTEXT_CONTRACT,
 } from "../shared/app-contracts/index.ts";
 
 const schema4Release = "cd1ffca5474902b7b90381e598f0741737e482f7";
@@ -113,7 +114,7 @@ test("MEM-2 migration accepts a released schema 4 installation and backup, and a
             )
             .all()
             .map((row) => row.contract),
-          [MEMORY_CONTRACT, SEARCH_CONTRACT],
+          [MEMORY_CONTRACT, SEARCH_CONTRACT, CONTEXT_CONTRACT],
         );
         assert.equal(
           app.db.prepare("SELECT count(*) n FROM search_profiles").get()!.n,

@@ -17,6 +17,7 @@ import {
   APP_SCHEMA,
   SEARCH_CONTRACT,
   MEMORY_CONTRACT,
+  CONTEXT_CONTRACT,
   AppError,
 } from "../../shared/app-contracts/index.ts";
 import { id } from "./validation.ts";
@@ -31,6 +32,9 @@ import { REVOCATION_SCHEMA } from "../auth/revocations.ts";
 import { memoryRecordsDigest } from "../operations/memory-ledger.ts";
 
 import { SEARCH_PROFILE_SCHEMA } from "../search/profile-schema.ts";
+import { CONTEXT_MIGRATION_SCHEMA } from "./context-schema.ts";
+import { CONTEXT_BUDGET_SCHEMA } from "../generation/context-budget-schema.ts";
+import { CONTEXT_LINEAGE_SCHEMA } from "../memory/context-lineage-schema.ts";
 
 const METADATA_SCHEMA = `CREATE TABLE app_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),contract TEXT NOT NULL,schema_version INTEGER NOT NULL,cursor_key TEXT NOT NULL) STRICT; CREATE TABLE app_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at INTEGER NOT NULL) STRICT;`;
 const FEATURE_SCHEMA = `CREATE TABLE app_feature_contracts(contract TEXT PRIMARY KEY) STRICT;`;
@@ -41,6 +45,7 @@ const migrations = [
   "app_004_resumable_memory_lineage",
   "app_005_search_control",
   "app_006_scoped_archive_changes",
+  "app_007_answer_context",
 ] as const;
 const definitions = [
   [
@@ -76,6 +81,7 @@ const definitions = [
      WHERE target_type='MESSAGE';
    CREATE INDEX search_persona_deletions ON app_changes(workspace_id,target_id,change_id)
      WHERE target_type='PERSONA' AND action='DELETE';`,
+  [CONTEXT_MIGRATION_SCHEMA, CONTEXT_BUDGET_SCHEMA, CONTEXT_LINEAGE_SCHEMA].join("\n"),
 ];
 function schemaObjects(db: DatabaseSync): string {
   return JSON.stringify(
@@ -103,7 +109,7 @@ function expectedCatalogue(version: number): string {
   }
   return catalogue;
 }
-export function identifyAppSchema(db: DatabaseSync): 1 | 2 | 3 | 4 | 5 | 6 {
+export function identifyAppSchema(db: DatabaseSync): 1 | 2 | 3 | 4 | 5 | 6 | 7 {
   try {
     const meta = db
       .prepare(
@@ -118,7 +124,8 @@ export function identifyAppSchema(db: DatabaseSync): 1 | 2 | 3 | 4 | 5 | 6 {
         version !== 3 &&
         version !== 4 &&
         version !== 5 &&
-        version !== 6)
+        version !== 6 &&
+        version !== 7)
     )
       throw new AppError("WRONG_DATABASE");
     const ledger = db
@@ -136,8 +143,9 @@ export function identifyAppSchema(db: DatabaseSync): 1 | 2 | 3 | 4 | 5 | 6 {
       const contracts = db
         .prepare("SELECT contract FROM app_feature_contracts")
         .all();
-      const expected =
-        version >= 5 ? [MEMORY_CONTRACT, SEARCH_CONTRACT] : [MEMORY_CONTRACT];
+      const expected = version >= 7
+        ? [MEMORY_CONTRACT, SEARCH_CONTRACT, CONTEXT_CONTRACT]
+        : version >= 5 ? [MEMORY_CONTRACT, SEARCH_CONTRACT] : [MEMORY_CONTRACT];
       if (
         contracts.length !== expected.length ||
         !expected.every((contract) =>
@@ -352,7 +360,7 @@ export class AppDatabase {
             this.db.exec("COMMIT");
             break;
           }
-          const record = (next: 2 | 3 | 4 | 5 | 6) => {
+          const record = (next: 2 | 3 | 4 | 5 | 6 | 7) => {
             this.db
               .prepare("INSERT INTO app_migrations VALUES(?,?,?)")
               .run(next, migrations[next - 1], Date.now());
@@ -388,6 +396,22 @@ export class AppDatabase {
             record(6);
             this.db.exec("COMMIT");
             this.hooks?.afterCommit?.(migrations[5]);
+            continue;
+          }
+          if (version === 6) {
+            const restored = this.db.prepare(
+              "SELECT restored FROM app_operational_state WHERE singleton=1",
+            ).get()?.restored === 1;
+            const before = restored ? memoryRecordsDigest(this.db) : undefined;
+            this.db.exec(definitions[6]);
+            this.db.prepare("INSERT INTO app_feature_contracts VALUES(?)").run(CONTEXT_CONTRACT);
+            if (before !== undefined) {
+              this.db.prepare("INSERT INTO app_restore_context_migration VALUES(1,6,?,?)")
+                .run(before, memoryRecordsDigest(this.db));
+            }
+            record(7);
+            this.db.exec("COMMIT");
+            this.hooks?.afterCommit?.(migrations[6]);
             continue;
           }
           // A direct upgrade retains the original schema-2 state and never exposes an

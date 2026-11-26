@@ -26,6 +26,8 @@ export interface MemoryBinding {
   targetDigest: string | null;
 }
 export interface MemoryCandidateDTO {
+  /** This candidate depends on an answer that used an existing shared Note. */
+  derivedFromMemory?: true;
   id: string;
   roomId: string;
   revision: number;

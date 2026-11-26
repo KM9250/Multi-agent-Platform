@@ -224,6 +224,11 @@ function CandidateCard({
         <summary className="cursor-pointer">
           Source and generation details
         </summary>
+        {item.derivedFromMemory && (
+          <p className="my-2 text-amber-200">
+            既存のMemoryを参照した回答から作成された候補です。独立した新しい証拠を示すものではありません。
+          </p>
+        )}
         {item.provenance && (
           <p className="my-2">
             {item.provenance.provider} · {item.provenance.model} ·{" "}
