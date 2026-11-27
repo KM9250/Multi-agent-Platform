@@ -4,8 +4,9 @@ import {
   MEMORY_SCOPES,
 } from "../../shared/memory-contracts.ts";
 import type { DatabaseSync } from "node:sqlite";
-import { lstatSync, opendirSync, watch, type FSWatcher } from "node:fs";
-import { join } from "node:path";
+import { lstatSync, statSync, opendirSync, watch, type FSWatcher } from "node:fs";
+import { join, dirname, basename } from "node:path";
+import { NoteVerificationPending, withCompleteNoteInventory } from "./verification-state.ts";
 import { setImmediate as yieldLoop } from "node:timers/promises";
 import { AppError } from "../../shared/app-contracts/index.ts";
 import type { AppDatabase } from "../app-data/db.ts";
@@ -71,6 +72,12 @@ function fileStamp(app: AppDatabase, dir: string, name: string): string {
     return [st.dev, st.ino, st.size, st.mtimeNs, st.ctimeNs].join("/");
   });
 }
+function directoryStamp(app: AppDatabase, dir: string): string {
+  return withVaultDirectory(app, dir, base => {
+    const st = statSync(base, { bigint: true }); // base is the securely pinned directory fd.
+    return [st.dev, st.ino, st.mtimeNs, st.ctimeNs].join("/");
+  });
+}
 
 async function inventory(
   app: AppDatabase,
@@ -82,10 +89,12 @@ async function inventory(
     ids = new Map<string, string[]>();
   const cached = previousFiles.get(app) ?? new Map<string, Stamp>(),
     current = new Map<string, Stamp>();
+  const directories = new Map<string, string>();
   let count = 0,
     bytesRead = 0;
   while (dirs.length) {
     const dir = dirs.pop()!;
+    directories.set(dir, directoryStamp(app, dir));
     const handle = withVaultDirectory(app, dir, (path) => opendirSync(path));
     try {
       let entry;
@@ -113,7 +122,7 @@ async function inventory(
             const bytes = readVaultFile(app, path);
             bytesRead += bytes.length;
             const { noteId } = parseMemoryMarkdown(bytes);
-            if (key !== fileStamp(app, dir, entry.name)) continue;
+            if (key !== fileStamp(app, dir, entry.name)) throw new NoteVerificationPending();
             item = { key, noteId, digest: digest(bytes) };
           }
           current.set(path, item);
@@ -122,7 +131,8 @@ async function inventory(
           const matches = ids.get(noteId);
           if (matches) matches.push(path);
           else ids.set(noteId, [path]);
-        } catch {
+        } catch (error) {
+          if (error instanceof NoteVerificationPending || ["EIO", "EAGAIN", "EBUSY", "EACCES"].includes((error as any)?.code)) throw error;
           // Keep the path occupied. A malformed/replaced tracked file is a conflict, not a deletion.
         }
         if (bytesRead >= byteSlice) {
@@ -136,7 +146,15 @@ async function inventory(
     }
   }
   previousFiles.set(app, current);
-  return { paths, ids, current };
+  return { paths, ids, current, directories };
+}
+
+function verifyInventory(app: AppDatabase, files: Awaited<ReturnType<typeof inventory>>) {
+  for (const [dir, stamp] of files.directories)
+    if (directoryStamp(app, dir) !== stamp) throw new NoteVerificationPending();
+  for (const [path, item] of files.current)
+    if (fileStamp(app, dirname(path) === "." ? "" : dirname(path), basename(path)) !== item.key)
+      throw new NoteVerificationPending();
 }
 
 /** Duplicate IDs are positive evidence even when a note is temporarily excluded from normal reconciliation. */
@@ -192,7 +210,8 @@ function reconcile(
       { actorId: "", workspaceId: row.workspace_id },
       row,
     );
-  } catch {
+  } catch (error) {
+    if (error instanceof NoteVerificationPending) throw error;
     resetObservation();
     setDocumentState(app, row, "NEEDS_REVIEW");
     return;
@@ -214,6 +233,7 @@ function reconcile(
       readVaultFile(app, row.relative_path);
       setDocumentState(app, row, "DIRTY");
     } catch (e) {
+      if (e instanceof NoteVerificationPending) throw e;
       setDocumentState(
         app,
         row,
@@ -234,7 +254,8 @@ function reconcile(
   try {
     bytes = readVaultFile(app, path);
     parsed = parseMemoryMarkdown(bytes);
-  } catch {
+  } catch (error) {
+    if (error instanceof NoteVerificationPending) throw error;
     resetObservation();
     setDocumentState(app, row, "DIRTY");
     return;
@@ -303,6 +324,7 @@ async function scan(
     )
     .all(MAX_LIVE_NOTES + 1);
   try {
+    app.transaction(() => app.db.prepare("UPDATE memory_scan_state SET incomplete=1 WHERE incomplete=0").run());
     if (documents.length > MAX_LIVE_NOTES)
       throw new AppError("VAULT_SCAN_LIMIT", 409);
     const files = await inventory(
@@ -311,6 +333,7 @@ async function scan(
         byteSlice,
       ),
       policy = new AuthorizationPolicy(app);
+    verifyInventory(app, files);
     if (running(app) && !cancelled())
       app.transaction(
         () => holdDuplicateLineage(app.db, files.ids),
@@ -319,11 +342,24 @@ async function scan(
     for (let n = 0; n < documents.length; n++) {
       if (!running(app) || cancelled()) return { status: "PAUSED" };
       app.transaction(() => {
-        if (running(app))
-          reconcile(app, policy, String(documents[n].note_id), files);
+        if (running(app)) withCompleteNoteInventory(app, row => {
+          const paths = files.ids.get(String(row.note_id)) ?? [];
+          if (paths.length !== 1) throw new AppError("SOURCE_CHANGED", 409);
+          const path = paths[0], observed = files.current.get(path);
+          // A file which disappeared after inventory is an interrupted scan, not
+          // a deletion proven by that inventory. A later complete pass can prove it.
+          let current: string;
+          try { current = fileStamp(app, dirname(path) === "." ? "" : dirname(path), basename(path)); }
+          catch { throw new NoteVerificationPending(); }
+          if (!observed || current !== observed.key)
+            throw new NoteVerificationPending();
+          return path;
+        }, () => reconcile(app, policy, String(documents[n].note_id), files));
       }, "memory_import");
       if ((n + 1) % 16 === 0) await yieldLoop();
     }
+    if (!running(app) || cancelled()) return { status: "PAUSED" };
+    verifyInventory(app, files);
     if (running(app))
       app.transaction(() =>
         app.db

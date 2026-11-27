@@ -1,4 +1,7 @@
-import { checkNewLineage } from "./lineage.ts";
+import { checkNewLineage, verifyCurrentNoteFile } from "./lineage.ts";
+import type { AppDatabase } from "../app-data/db.ts";
+import { hasVerifiedNoteAncestors } from "./source-validation.ts";
+import { NoteVerificationPending } from "./verification-state.ts";
 import { AppError, type Actor } from "../../shared/app-contracts/index.ts";
 import type { AppDatabasePort, PolicyPort } from "../generation/types.ts";
 import type { ContextManifest } from "../generation/context.ts";
@@ -92,6 +95,9 @@ export function addDependency(
   revision: number,
   sourceDigest: string,
 ) {
+  const previous = app.db.prepare(`SELECT revision,digest FROM memory_dependencies
+    WHERE candidate_id=? AND resource_type=? AND resource_id=?`).get(candidateId, type, resourceId);
+  if (previous && (previous.revision !== revision || previous.digest !== sourceDigest)) stale();
   app.db
     .prepare(
       `INSERT OR IGNORE INTO memory_dependencies
@@ -197,7 +203,7 @@ export function captureExports(
     authority(app, policy, actor, candidateId, "READ_ROOM", roomId);
     candidateIds.push(candidateId);
   }
-  checkNewLineage(app.db, candidateIds);
+  checkNewLineage(app.db, candidateIds, app as AppDatabase);
 }
 
 /** Current-source gate for the approver, outbox, and ordinary note read. No private source body crosses it. */
@@ -232,10 +238,43 @@ export function assertSourcesCurrent(
     OR (resource_type='ATTACHMENT' AND NOT EXISTS(SELECT 1 FROM attachments a WHERE a.workspace_id=d.workspace_id
       AND a.room_id=d.room_id AND a.attachment_id=d.resource_id AND a.state='AVAILABLE' AND a.digest=d.digest AND a.deleted_at IS NULL))
     OR (resource_type='NOTE' AND NOT EXISTS(SELECT 1 FROM memory_documents n WHERE n.workspace_id=d.workspace_id
-      AND n.room_id=d.room_id AND n.note_id=d.resource_id AND n.state='PUBLISHED' AND n.version=d.revision AND n.digest=d.digest))) LIMIT 1`,
+      AND n.room_id=d.room_id AND n.note_id=d.resource_id AND n.state='PUBLISHED' AND n.version=d.revision AND n.digest=d.digest
+      AND ((n.candidate_id IS NOT NULL AND EXISTS(SELECT 1 FROM memory_candidates origin
+        WHERE origin.candidate_id=n.candidate_id AND origin.state='PUBLISHED'))
+      OR (n.candidate_id IS NULL AND EXISTS(SELECT 1 FROM memory_handwritten h JOIN principals p
+        ON p.workspace_id=h.workspace_id AND p.actor_id=h.registrar_id WHERE h.note_id=n.note_id AND p.active=1
+        AND EXISTS(SELECT 1 FROM memory_handwritten_grants registered WHERE registered.note_id=h.note_id)
+        AND NOT EXISTS(SELECT 1 FROM memory_handwritten_grants used JOIN access_grants revoked USING(grant_id)
+          WHERE used.note_id=h.note_id AND revoked.revoked_at IS NOT NULL))))))
+    OR resource_type NOT IN ('MESSAGE','ATTACHMENT','NOTE')) LIMIT 1`,
     )
     .get(candidateId);
   if (changed) stale();
+  // The flattened proof includes every used Note. Reading only the final Note's DB state
+  // would miss an edited/deleted ancestor until the filesystem watcher happened to run.
+  // This gate reads canonical files internally and never asks the consumer to open the
+  // producer's private conversation or exposes its source references.
+  if (!hasVerifiedNoteAncestors(app, candidateId)) for (const note of app.db.prepare(`SELECT n.* FROM memory_dependencies d JOIN memory_documents n
+    ON n.workspace_id=d.workspace_id AND n.room_id=d.room_id AND n.note_id=d.resource_id
+    WHERE d.candidate_id=? AND d.resource_type='NOTE'`).iterate(candidateId)) {
+    try {
+      verifyCurrentNoteFile(app as AppDatabase, note);
+      if (note.candidate_id) {
+        const origin = app.db.prepare("SELECT state FROM memory_candidates WHERE candidate_id=?").get(note.candidate_id);
+        if (origin?.state !== "PUBLISHED") stale();
+      } else {
+        const origin = app.db.prepare(`SELECT 1 FROM memory_handwritten h JOIN principals p
+          ON p.workspace_id=h.workspace_id AND p.actor_id=h.registrar_id WHERE h.note_id=? AND p.active=1
+          AND EXISTS(SELECT 1 FROM memory_handwritten_grants g WHERE g.note_id=h.note_id)
+          AND NOT EXISTS(SELECT 1 FROM memory_handwritten_grants s JOIN access_grants g USING(grant_id)
+            WHERE s.note_id=h.note_id AND g.revoked_at IS NOT NULL)`).get(note.note_id);
+        if (!origin) stale();
+      }
+    } catch (error) {
+      if (error instanceof NoteVerificationPending) throw error;
+      stale();
+    }
+  }
   for (const grant of app.db
     .prepare("SELECT * FROM memory_authorities WHERE candidate_id=?")
     .all(candidateId) as Row[]) {

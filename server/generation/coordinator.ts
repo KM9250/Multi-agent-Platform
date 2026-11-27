@@ -24,6 +24,26 @@ import {
 } from "./types";
 import type { ProviderRequest, ProviderResult } from "./provider";
 import { applyInitialUserTurnFallback } from "../../utils/responseFallback";
+import {
+  normalizeTurnContext,
+  interpretContextDate,
+} from "./context-router.ts";
+import {
+  prepareContextPlan,
+  revalidateContextPlan,
+  withRevalidatedContextPlan,
+  contextSearchPolicy,
+} from "./context-plan.ts";
+import type { ContextPlan } from "../../shared/context-contracts.ts";
+import { createAiSearchBinding } from "../search/ai-binding.ts";
+import { getSearchProfile, OP_TOKEN_RESERVATION } from "../search/profile.ts";
+import {
+  reserveAnswerHold,
+  consumeAnswerHold,
+  releaseAnswerHolds,
+  runBudgetStatus,
+  getRunSearchUsage,
+} from "./search-budget.ts";
 
 const terminal = new Set([
   "COMPLETED",
@@ -146,12 +166,14 @@ export class GenerationCoordinator {
   private readonly running = new Map<string, AbortController>();
   private readonly wall: () => number;
   private readonly mono: () => number;
+  private readonly searchPolicy: ReturnType<typeof contextSearchPolicy>;
   constructor(
     private app: AppDatabasePort,
     private repository: RepositoryPort,
     private policy: PolicyPort,
     private options: CoordinatorOptions,
   ) {
+    this.searchPolicy = contextSearchPolicy(app, policy);
     this.policy = securePolicy(policy) as PolicyPort;
     this.limits = { ...DEFAULT_GENERATION_LIMITS, ...options.limits };
     for (const [key, value] of Object.entries(this.limits)) {
@@ -167,6 +189,8 @@ export class GenerationCoordinator {
     if (
       options.pricing &&
       (!options.pricing.version ||
+        (options.pricing.currency !== undefined &&
+          !/^[A-Z]{3}$/.test(options.pricing.currency)) ||
         ![
           options.pricing.inputMicrosPerMillion,
           options.pricing.outputMicrosPerMillion,
@@ -178,7 +202,7 @@ export class GenerationCoordinator {
     this.compiler = new ContextCompiler(
       app,
       repository,
-      this.policy,
+      this.searchPolicy,
       this.limits,
       options.attachmentStore,
     );
@@ -219,6 +243,7 @@ export class GenerationCoordinator {
       "content",
       "attachmentIds",
       "recipient",
+      "context",
     ]);
     if (
       !validId(input.requestId) ||
@@ -251,7 +276,11 @@ export class GenerationCoordinator {
       )
         throw new GenerationError("INVALID_INPUT");
     }
-    return structuredClone(input);
+    const normalized = structuredClone(input);
+    const context = normalizeTurnContext(input.context);
+    if (context !== undefined) normalized.context = context;
+    else delete normalized.context;
+    return normalized;
   }
   accept(actor: Actor, roomId: string, input: TurnRequest): any {
     if (this.closing) throw new GenerationError("SERVER_STOPPING", 503);
@@ -362,6 +391,11 @@ export class GenerationCoordinator {
           stable({
             ...input,
             recipient,
+            contextDateInterpretation: interpretContextDate(
+              input.content,
+              input.context,
+              now,
+            ),
             personaIds: active.map((p) => p.id),
             personaRevisions: Object.fromEntries(
               active.map((p) => [p.id, p.revision]),
@@ -497,6 +531,9 @@ export class GenerationCoordinator {
       newlyAccepted: false,
       errorCode: run.error_code ?? undefined,
       callCount: calls.length,
+      searchUsage: getRunSearchUsage(this.app, actor, runId).filter((entry) =>
+        canSeePersona(entry.consumerPersonaId),
+      ),
       usage: calls.map((c) => ({
         callId: c.call_id,
         personaId: c.persona_id,
@@ -591,6 +628,7 @@ export class GenerationCoordinator {
           )
           .run(this.wall(), actor.workspaceId, roomId, runId);
         this.audit(actor, roomId, "GENERATION_CANCELLED", runId);
+        releaseAnswerHolds(this.app, runId);
       }
     });
     this.running.get(runId)?.abort();
@@ -724,6 +762,16 @@ export class GenerationCoordinator {
           stable({
             ...input,
             content: currentInput.content,
+            ...(priorRequest?.context ? { context: priorRequest.context } : {}),
+            contextDateInterpretation:
+              priorRequest?.inputBinding?.revision === inputBinding.revision &&
+              priorRequest?.contextDateInterpretation
+                ? priorRequest.contextDateInterpretation
+                : interpretContextDate(
+                    currentInput.content,
+                    priorRequest?.context,
+                    now,
+                  ),
             expectedRoomRevision: this.repository.getRoom(actor, roomId)
               .revision,
             personaRevisions: {
@@ -733,7 +781,7 @@ export class GenerationCoordinator {
                 row.persona_id,
               ).revision,
             },
-            inputBinding,
+            inputBinding: { ...inputBinding, excludeMessageId: messageId },
             personaIds: [row.persona_id],
             recipient: { type: "agent", agentIds: [row.persona_id] },
           }),
@@ -778,6 +826,12 @@ export class GenerationCoordinator {
           "UPDATE app_generation_runs SET state='NEEDS_REVIEW',error_code='SERVER_STOPPED',completed_at=? WHERE (owner_id=? OR state='QUEUED') AND state IN ('RUNNING','QUEUED')",
         )
         .run(this.wall(), this.owner);
+      for (const row of this.app.db
+        .prepare(
+          "SELECT DISTINCT h.run_id FROM app_context_answer_holds h JOIN app_generation_runs r USING(run_id) WHERE h.state='HELD' AND (r.owner_id=? OR r.state<>'RUNNING')",
+        )
+        .all(this.owner))
+        releaseAnswerHolds(this.app, String(row.run_id), this.wall());
     });
   }
   /** Host startup diagnosis only. It never rebuilds send authority from saved intent. */
@@ -793,6 +847,12 @@ export class GenerationCoordinator {
           "UPDATE app_generation_runs SET state='NEEDS_REVIEW',error_code='PROCESS_INTERRUPTED',completed_at=? WHERE state IN ('RUNNING','QUEUED')",
         )
         .run(this.wall());
+      for (const row of this.app.db
+        .prepare(
+          "SELECT DISTINCT run_id FROM app_context_answer_holds WHERE state='HELD'",
+        )
+        .all())
+        releaseAnswerHolds(this.app, String(row.run_id), this.wall());
     });
   }
   private runRow(runId: string): any {
@@ -804,6 +864,8 @@ export class GenerationCoordinator {
   }
   private verifyManifest(actor: Actor, context: CompiledContext): void {
     const m = context.manifest;
+    if (m.retrieval)
+      revalidateContextPlan(this.app, this.searchPolicy, actor, m.retrieval);
     const room = this.app.db
       .prepare(
         "SELECT revision,deleted_at FROM rooms WHERE workspace_id=? AND room_id=?",
@@ -867,6 +929,24 @@ export class GenerationCoordinator {
         throw new GenerationError("CONTEXT_CHANGED", 409);
     }
   }
+  private async withManifest<T>(
+    actor: Actor,
+    context: CompiledContext,
+    callback: () => T,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    if (context.manifest.retrieval)
+      return withRevalidatedContextPlan(
+        this.app,
+        this.searchPolicy,
+        actor,
+        context.manifest.retrieval,
+        callback,
+        signal,
+      );
+    signal?.throwIfAborted();
+    return callback();
+  }
   private active(run: any, actor: Actor, started: number) {
     const current = this.runRow(run.run_id);
     if (
@@ -881,6 +961,73 @@ export class GenerationCoordinator {
     )
       throw new GenerationError("DEADLINE_EXCEEDED", 409);
     this.assert(actor, "GENERATE", run.room_id);
+  }
+  private pricing() {
+    if (this.options.provider.name !== "synthetic" && !this.options.pricing)
+      throw new GenerationError("PRICING_REQUIRED");
+    return (
+      this.options.pricing ?? {
+        version: "synthetic-v1",
+        inputMicrosPerMillion: 0,
+        outputMicrosPerMillion: 0,
+      }
+    );
+  }
+  private async preflight(
+    run: any,
+    actor: Actor,
+    persona: any,
+    purpose: ProviderRequest["purpose"],
+    start: number,
+    worker?: any,
+    privateReports: PrivateReportRef[] = [],
+  ) {
+    this.active(run, actor, start);
+    if (this.wall() > run.dispatch_before)
+      throw new GenerationError("DISPATCH_EXPIRED", 409);
+    if (this.options.provider.available === false)
+      throw new GenerationError("PROVIDER_NOT_CONFIGURED", 503);
+    const model = worker?.model || persona.model || this.options.defaultModel;
+    if (!this.options.provider.supports(model))
+      throw new GenerationError("MODEL_NOT_ALLOWED");
+    this.pricing();
+    const accepted = JSON.parse(run.request_json);
+    const binding = {
+      ...accepted.inputBinding,
+      ...(run.target_message_id
+        ? { excludeMessageId: run.target_message_id }
+        : {}),
+      recipient: accepted.recipient,
+      runId: run.run_id,
+      privateReports,
+    };
+    const context = await this.compiler.compile(
+      actor,
+      run.room_id,
+      persona.id,
+      purpose,
+      this.options.provider.name,
+      model,
+      worker,
+      binding,
+    );
+    if (
+      context.manifest.roomRevision !== accepted.expectedRoomRevision ||
+      context.manifest.personaRevision !==
+        accepted.personaRevisions?.[persona.id]
+    )
+      throw new GenerationError("CONFIGURATION_REVISION_CHANGED", 409);
+    const budget = context.manifest.thinkingBudget;
+    try {
+      if (this.options.provider.validateThinkingBudget)
+        this.options.provider.validateThinkingBudget(model, budget);
+      else if (budget !== undefined && budget > 0)
+        throw new Error("unsupported");
+    } catch {
+      throw new GenerationError("THINKING_BUDGET_UNSUPPORTED", 409);
+    }
+    this.active(run, actor, start);
+    return { context, binding, model };
   }
   private retryPending() {
     if (this.closing || this.pendingTimer || !this.pending.size) return;
@@ -1053,6 +1200,154 @@ export class GenerationCoordinator {
               );
         }
       });
+      const answerPlans = new Map<string, string>();
+      if (!memory) {
+        const responding = decisions.filter(
+          ({ decision }) => decision.outcome === "RESPOND",
+        );
+        // Validate every mandatory answer before reserving or dispatching optional search.
+        const preflights = [];
+        for (const { agent } of responding) {
+          const baseline = await this.preflight(
+            run,
+            actor,
+            agent,
+            "answer",
+            start,
+          );
+          const planId = randomUUID();
+          answerPlans.set(agent.id, planId);
+          preflights.push({ agent, baseline, planId });
+        }
+        const pricing = this.pricing();
+        let paidSearchPossible = false;
+        let optionalQueryCalls = 0;
+        let optionalQueryCost = 0;
+        try {
+          const profile = getSearchProfile(this.app as any, actor, run.room_id);
+          const roomMode = this.repository.getRoom(
+            actor,
+            run.room_id,
+          ).contextMode;
+          paidSearchPossible =
+            !!profile?.aiContext?.queryEmbedding &&
+            !!pricing.currency &&
+            profile.aiContext.currency === pricing.currency &&
+            profile.purposes.includes("QUERY_EMBEDDING") &&
+            profile.scopes.includes("room_shared") &&
+            responding.some(({ agent }) => {
+              const mode =
+                request.context?.mode ??
+                agent.contextMode ??
+                roomMode ??
+                "auto";
+              return (
+                !["none", "archive"].includes(mode) &&
+                profile.aiContext!.consumerPersonaIds.includes(agent.id)
+              );
+            });
+          if (paidSearchPossible) {
+            // Include every potentially paid query when protecting later mandatory workers.
+            optionalQueryCalls = responding.filter(({ agent }) => {
+              const mode =
+                request.context?.mode ??
+                agent.contextMode ??
+                roomMode ??
+                "auto";
+              return (
+                !["none", "archive"].includes(mode) &&
+                profile!.aiContext!.consumerPersonaIds.includes(agent.id)
+              );
+            }).length;
+            optionalQueryCost =
+              optionalQueryCalls *
+              Math.ceil(
+                (OP_TOKEN_RESERVATION * profile!.priceMicrosPerThousandTokens) /
+                  1000,
+              );
+          }
+        } catch {
+          // An unavailable optional profile cannot prevent ordinary local retrieval.
+        }
+        try {
+          if (paidSearchPossible)
+            this.app.transaction(() => {
+              for (const { agent, baseline, planId } of preflights) {
+                const binding = createAiSearchBinding(
+                  this.app as any,
+                  this.searchPolicy,
+                  actor,
+                  {
+                    runId,
+                    planId,
+                    consumerPersonaId: agent.id,
+                    provider: this.options.provider.name,
+                    model: baseline.model,
+                  },
+                );
+                reserveAnswerHold(this.app, actor, {
+                  binding,
+                  reservedInputTokens: this.limits.maxInputTokens,
+                  reservedOutputTokens:
+                    baseline.context.manifest.maxOutputTokens,
+                  reservedCostMicros: Math.ceil(
+                    (this.limits.maxInputTokens *
+                      pricing.inputMicrosPerMillion +
+                      baseline.context.manifest.maxOutputTokens *
+                        pricing.outputMicrosPerMillion) /
+                      1_000_000,
+                  ),
+                  pricingVersion: pricing.version,
+                  currency: pricing.currency,
+                  now: this.wall(),
+                });
+              }
+              // Holds must also leave room for every mandatory fixed worker that precedes answers.
+              const workers = responding.reduce(
+                (count, { agent }) =>
+                  count +
+                  (agent.subAgentPolicy?.mode === "fixed_serial"
+                    ? (agent.subAgents ?? []).filter(
+                        (worker: any) => worker.isEnabled !== false,
+                      ).length
+                    : 0),
+                0,
+              );
+              const reserved = runBudgetStatus(this.app, runId);
+              const workerTokens =
+                workers *
+                (this.limits.maxInputTokens + this.limits.maxOutputTokens);
+              const workerCost =
+                workers *
+                Math.ceil(
+                  (this.limits.maxInputTokens * pricing.inputMicrosPerMillion +
+                    this.limits.maxOutputTokens *
+                      pricing.outputMicrosPerMillion) /
+                    1_000_000,
+                );
+              if (
+                reserved.calls + workers + (workers ? optionalQueryCalls : 0) >
+                  this.limits.maxCalls ||
+                reserved.tokens +
+                  workerTokens +
+                  (workers ? optionalQueryCalls * OP_TOKEN_RESERVATION : 0) >
+                  this.limits.maxTotalTokens ||
+                reserved.costMicros +
+                  workerCost +
+                  (workers ? optionalQueryCost : 0) >
+                  this.limits.maxCostMicros
+              )
+                throw new GenerationError("BUDGET_EXCEEDED");
+            });
+        } catch (error) {
+          // The outer transaction rolls every hold back. No hold means no paid search.
+          if (
+            !(error instanceof GenerationError) ||
+            error.code !== "BUDGET_EXCEEDED"
+          )
+            throw error;
+        }
+      }
       for (const { agent, decision } of decisions) {
         if (decision.outcome !== "RESPOND") continue;
         this.active(run, actor, start);
@@ -1092,6 +1387,9 @@ export class GenerationCoordinator {
           memory ? "memory" : "answer",
           start,
           controller.signal,
+          undefined,
+          [],
+          answerPlans.get(agent.id),
         );
       }
       this.app.transaction(() => {
@@ -1106,15 +1404,23 @@ export class GenerationCoordinator {
     } catch (error) {
       if (this.stopped) return;
       const code =
-        error instanceof GenerationError ? error.code : "GENERATION_FAILED";
+        error instanceof GenerationError
+          ? error.code
+          : ["CONTEXT_CHANGED", "SEARCH_OUTCOME_UNKNOWN"].includes(
+                (error as any)?.code,
+              )
+            ? (error as any).code
+            : "GENERATION_FAILED";
       this.app.transaction(() => {
         const current = this.runRow(runId);
         if (current.state === "CANCELLED") return;
-        const unknown = this.app.db
-          .prepare(
-            "SELECT 1 FROM app_provider_calls WHERE run_id=? AND state IN ('DISPATCH_INTENT','OUTCOME_UNKNOWN') LIMIT 1",
-          )
-          .get(runId);
+        const unknown =
+          current.state === "NEEDS_REVIEW" ||
+          this.app.db
+            .prepare(
+              "SELECT 1 FROM app_provider_calls WHERE run_id=? AND state IN ('DISPATCH_INTENT','OUTCOME_UNKNOWN') LIMIT 1",
+            )
+            .get(runId);
         const saved = this.app.db
           .prepare(
             "SELECT 1 FROM app_generation_receipts WHERE run_id=? AND message_id IS NOT NULL LIMIT 1",
@@ -1131,7 +1437,9 @@ export class GenerationCoordinator {
           )
           .run(
             unknown ? "NEEDS_REVIEW" : saved ? "PARTIAL" : "FAILED",
-            code,
+            current.state === "NEEDS_REVIEW"
+              ? (current.error_code ?? code)
+              : code,
             this.wall(),
             runId,
           );
@@ -1139,6 +1447,7 @@ export class GenerationCoordinator {
       });
     } finally {
       clearTimeout(timer);
+      releaseAnswerHolds(this.app, runId, this.wall());
       this.running.delete(runId);
       this.completions.get(runId)?.resolve();
       this.completions.delete(runId);
@@ -1160,56 +1469,63 @@ export class GenerationCoordinator {
     signal: AbortSignal,
     worker?: any,
     privateReports: PrivateReportRef[] = [],
+    planId?: string,
   ): Promise<
     ProviderResult & { callId: string; privateSource?: PrivateReportRef }
   > {
-    this.active(run, actor, start);
-    if (this.options.provider.available === false)
-      throw new GenerationError("PROVIDER_NOT_CONFIGURED", 503);
-    const model = worker?.model || persona.model || this.options.defaultModel;
-    if (!this.options.provider.supports(model))
-      throw new GenerationError("MODEL_NOT_ALLOWED");
-    const binding = {
-      ...JSON.parse(run.request_json).inputBinding,
-      recipient: JSON.parse(run.request_json).recipient,
-      runId: run.run_id,
-      privateReports,
-    };
-    const context = await this.compiler.compile(
+    const prepared = await this.preflight(
+      run,
       actor,
-      run.room_id,
-      persona.id,
+      persona,
       purpose,
-      this.options.provider.name,
-      model,
+      start,
       worker,
-      binding,
+      privateReports,
     );
-    const accepted = JSON.parse(run.request_json);
-    if (
-      context.manifest.roomRevision !== accepted.expectedRoomRevision ||
-      context.manifest.personaRevision !==
-        accepted.personaRevisions?.[persona.id]
-    )
-      throw new GenerationError("CONFIGURATION_REVISION_CHANGED", 409);
-    const budget = context.manifest.thinkingBudget;
-    try {
-      if (this.options.provider.validateThinkingBudget)
-        this.options.provider.validateThinkingBudget(model, budget);
-      else if (budget !== undefined && budget > 0)
-        throw new Error("unsupported");
-    } catch {
-      throw new GenerationError("THINKING_BUDGET_UNSUPPORTED", 409);
+    const { model } = prepared;
+    const binding: typeof prepared.binding & {
+      contextPlan?: ContextPlan;
+      signal?: AbortSignal;
+    } = { ...prepared.binding, signal };
+    let context = prepared.context;
+    if (purpose === "answer") {
+      signal.throwIfAborted();
+      const accepted = JSON.parse(run.request_json);
+      const plan = await prepareContextPlan(
+        this.app,
+        this.searchPolicy,
+        actor,
+        {
+          runId: run.run_id,
+          roomId: run.room_id,
+          personaId: persona.id,
+          provider: this.options.provider.name,
+          model,
+          planId,
+          baseline: context,
+          context: accepted.context,
+          dateInterpretation: accepted.contextDateInterpretation,
+          limits: this.limits,
+          signal,
+        },
+      );
+      this.active(run, actor, start);
+      signal.throwIfAborted();
+      binding.contextPlan = plan;
+      context = await this.compiler.compile(
+        actor,
+        run.room_id,
+        persona.id,
+        purpose,
+        this.options.provider.name,
+        model,
+        worker,
+        binding,
+      );
     }
     this.options.hooks?.afterContext?.();
     const callId = randomUUID();
-    const pricing = this.options.pricing ?? {
-      version: "synthetic-v1",
-      inputMicrosPerMillion: 0,
-      outputMicrosPerMillion: 0,
-    };
-    if (this.options.provider.name !== "synthetic" && !this.options.pricing)
-      throw new GenerationError("PRICING_REQUIRED");
+    const pricing = this.pricing();
     const reserveCost = Math.ceil(
       (context.manifest.estimatedInputTokens * pricing.inputMicrosPerMillion +
         context.manifest.maxOutputTokens * pricing.outputMicrosPerMillion) /
@@ -1217,18 +1533,16 @@ export class GenerationCoordinator {
     );
     this.app.transaction(() => {
       this.active(run, actor, start);
-      const used = this.app.db
-        .prepare(
-          `SELECT COUNT(*) AS calls,COALESCE(SUM(CASE WHEN usage_state='COMPLETE' THEN COALESCE(json_extract(usage_json,'$.totalTokens'),reserved_input_tokens+reserved_output_tokens) ELSE reserved_input_tokens+reserved_output_tokens END),0) AS tokens,COALESCE(SUM(CASE WHEN usage_state=\'COMPLETE\' THEN actual_cost_micros ELSE reserved_cost_micros END),0) AS cost FROM app_provider_calls WHERE run_id=?`,
-        )
-        .get(run.run_id) as any;
+      const used = runBudgetStatus(this.app, run.run_id, {
+        excludePlanId: planId,
+      });
       if (
         Number(used.calls) >= this.limits.maxCalls ||
         Number(used.tokens) +
           context.manifest.estimatedInputTokens +
           context.manifest.maxOutputTokens >
           this.limits.maxTotalTokens ||
-        Number(used.cost) + reserveCost > this.limits.maxCostMicros
+        used.costMicros + reserveCost > this.limits.maxCostMicros
       )
         throw new GenerationError("BUDGET_EXCEEDED");
       this.app.db
@@ -1240,7 +1554,7 @@ export class GenerationCoordinator {
           run.room_id,
           run.run_id,
           callId,
-          Number(used.calls) + 1,
+          used.providerCalls + 1,
           persona.id,
           purpose,
           worker?.id ?? null,
@@ -1255,6 +1569,7 @@ export class GenerationCoordinator {
           pricing.version,
           this.wall(),
         );
+      if (planId) consumeAnswerHold(this.app, planId, callId, this.wall());
     });
     // Compile again immediately before send; reference changes/ACL changes invalidate prepared bytes.
     const fresh = await this.compiler.compile(
@@ -1269,70 +1584,89 @@ export class GenerationCoordinator {
     );
     if (fresh.fingerprint !== context.fingerprint)
       throw new GenerationError("CONTEXT_CHANGED", 409);
-    this.app.transaction(() => {
-      this.active(run, actor, start);
-      this.policy.assert(
-        immutable(actor),
-        "SEND_TO_PROVIDER",
-        immutable({
-          workspaceId: actor.workspaceId,
-          roomId: run.room_id,
-          personaId: persona.id,
-          provider: this.options.provider.name,
+    this.options.hooks?.beforeIntentCommit?.();
+    await this.withManifest(
+      actor,
+      context,
+      () =>
+        this.app.transaction(() => {
+          this.active(run, actor, start);
+          this.policy.assert(
+            immutable(actor),
+            "SEND_TO_PROVIDER",
+            immutable({
+              workspaceId: actor.workspaceId,
+              roomId: run.room_id,
+              personaId: persona.id,
+              provider: this.options.provider.name,
+            }),
+          );
+          if (this.policy.revision(actor) !== context.manifest.aclRevision)
+            throw new GenerationError("AUTHORIZATION_CHANGED", 409);
+          this.verifyManifest(actor, context);
+          const result = this.app.db
+            .prepare(
+              "UPDATE app_provider_calls SET state='DISPATCH_INTENT',dispatched_at=? WHERE call_id=? AND state='RESERVED' AND owner_id=?",
+            )
+            .run(this.wall(), callId, this.owner);
+          if (Number(result.changes) !== 1)
+            throw new GenerationError("CALL_CONFLICT", 409);
         }),
-      );
-      if (this.policy.revision(actor) !== context.manifest.aclRevision)
-        throw new GenerationError("AUTHORIZATION_CHANGED", 409);
-      this.verifyManifest(actor, context);
-      const result = this.app.db
-        .prepare(
-          "UPDATE app_provider_calls SET state='DISPATCH_INTENT',dispatched_at=? WHERE call_id=? AND state='RESERVED' AND owner_id=?",
-        )
-        .run(this.wall(), callId, this.owner);
-      if (Number(result.changes) !== 1)
-        throw new GenerationError("CALL_CONFLICT", 409);
-      this.options.hooks?.beforeIntentCommit?.();
-    });
+      signal,
+    );
     // A throwing/lost COMMIT acknowledgement produces no permit and no HTTP call.
     this.options.hooks?.afterIntentCommit?.();
-    this.active(run, actor, start);
-    if (this.closing || this.wall() > run.dispatch_before)
-      throw new GenerationError("DISPATCH_EXPIRED");
-    this.policy.assert(
-      immutable(actor),
-      "SEND_TO_PROVIDER",
-      immutable({
-        workspaceId: actor.workspaceId,
-        roomId: run.room_id,
-        personaId: persona.id,
-        provider: this.options.provider.name,
-      }),
-    );
-    if (this.policy.revision(actor) !== context.manifest.aclRevision)
-      throw new GenerationError("AUTHORIZATION_CHANGED");
-    this.verifyManifest(actor, context);
-    let sendPermit = true;
-    if (!sendPermit) throw new GenerationError("SEND_NOT_AUTHORIZED");
-    sendPermit = false;
     let result: ProviderResult;
+    let dispatched = false;
     try {
-      result = await this.options.provider.generate({
-        ...immutable({
-          model,
-          purpose,
-          systemInstruction: context.systemInstruction,
-          contents: context.contents,
-          maxOutputTokens: context.manifest.maxOutputTokens,
-          ...(context.manifest.thinkingBudget !== undefined
-            ? { thinkingBudget: context.manifest.thinkingBudget }
-            : {}),
-          structured:
-            purpose === "memory" ||
-            (purpose === "answer" && context.persona.separationEnabled),
-        }),
+      const pending = await this.withManifest(
+        actor,
+        context,
+        () => {
+          this.active(run, actor, start);
+          if (this.closing || this.wall() > run.dispatch_before)
+            throw new GenerationError("DISPATCH_EXPIRED");
+          this.policy.assert(
+            immutable(actor),
+            "SEND_TO_PROVIDER",
+            immutable({
+              workspaceId: actor.workspaceId,
+              roomId: run.room_id,
+              personaId: persona.id,
+              provider: this.options.provider.name,
+            }),
+          );
+          if (this.policy.revision(actor) !== context.manifest.aclRevision)
+            throw new GenerationError("AUTHORIZATION_CHANGED");
+          this.verifyManifest(actor, context);
+          let sendPermit = true;
+          if (!sendPermit) throw new GenerationError("SEND_NOT_AUTHORIZED");
+          sendPermit = false;
+          dispatched = true;
+          return {
+            response: this.options.provider.generate({
+              ...immutable({
+                model,
+                purpose,
+                systemInstruction: context.systemInstruction,
+                contents: context.contents,
+                maxOutputTokens: context.manifest.maxOutputTokens,
+                ...(context.manifest.thinkingBudget !== undefined
+                  ? { thinkingBudget: context.manifest.thinkingBudget }
+                  : {}),
+                structured:
+                  purpose === "memory" ||
+                  (purpose === "answer" && context.persona.separationEnabled),
+              }),
+              signal,
+            }),
+          };
+        },
         signal,
-      });
-    } catch {
+      );
+      result = await pending.response;
+    } catch (error) {
+      if (!dispatched) throw error;
       if (this.stopped) throw new GenerationError("SERVER_STOPPED");
       this.app.transaction(() => {
         this.app.db
@@ -1379,13 +1713,20 @@ export class GenerationCoordinator {
           },
         ];
       }
-      this.active(run, actor, start);
-      this.assert(actor, "READ_CONVERSATION", run.room_id);
-      if (this.wall() > run.collect_before)
-        throw new GenerationError("COLLECTION_EXPIRED");
-      if (this.policy.revision(actor) !== context.manifest.aclRevision)
-        throw new GenerationError("AUTHORIZATION_CHANGED");
-      this.verifyManifest(actor, context);
+      await this.withManifest(
+        actor,
+        context,
+        () => {
+          this.active(run, actor, start);
+          this.assert(actor, "READ_CONVERSATION", run.room_id);
+          if (this.wall() > run.collect_before)
+            throw new GenerationError("COLLECTION_EXPIRED");
+          if (this.policy.revision(actor) !== context.manifest.aclRevision)
+            throw new GenerationError("AUTHORIZATION_CHANGED");
+          this.verifyManifest(actor, context);
+        },
+        signal,
+      );
     } catch (error) {
       failure =
         error instanceof GenerationError ? error.code : "OUTPUT_NOT_AUTHORIZED";
@@ -1437,132 +1778,160 @@ export class GenerationCoordinator {
         : null;
     let privateSource: PrivateReportRef | undefined;
     let collectionError: string | undefined;
-    this.app.transaction(() => {
-      const call = this.app.db
-        .prepare(
-          "SELECT state,owner_id FROM app_provider_calls WHERE call_id=?",
-        )
-        .get(callId) as any;
-      if (call.state !== "DISPATCH_INTENT" || call.owner_id !== this.owner)
-        throw new GenerationError("CALL_CONFLICT", 409);
-      let message: any;
-      if (!failure) {
-        try {
-          this.active(run, actor, start);
-          this.assert(actor, "READ_CONVERSATION", run.room_id);
-          if (this.policy.revision(actor) !== context.manifest.aclRevision)
-            throw new GenerationError("AUTHORIZATION_CHANGED");
-          this.verifyManifest(actor, context);
-        } catch (error) {
-          failure =
-            error instanceof GenerationError
-              ? error.code
-              : "OUTPUT_NOT_AUTHORIZED";
+    this.options.hooks?.beforeResultCommit?.();
+    const commitCollection = () =>
+      this.app.transaction(() => {
+        const call = this.app.db
+          .prepare(
+            "SELECT state,owner_id FROM app_provider_calls WHERE call_id=?",
+          )
+          .get(callId) as any;
+        if (call.state !== "DISPATCH_INTENT" || call.owner_id !== this.owner)
+          throw new GenerationError("CALL_CONFLICT", 409);
+        let message: any;
+        if (!failure) {
+          try {
+            this.active(run, actor, start);
+            this.assert(actor, "READ_CONVERSATION", run.room_id);
+            if (this.policy.revision(actor) !== context.manifest.aclRevision)
+              throw new GenerationError("AUTHORIZATION_CHANGED");
+            this.verifyManifest(actor, context);
+          } catch (error) {
+            failure =
+              error instanceof GenerationError
+                ? error.code
+                : "OUTPUT_NOT_AUTHORIZED";
+          }
         }
-      }
-      if (!failure && run.target_message_id && purpose !== "subagent") {
-        const target = this.app.db
-          .prepare(
-            "SELECT current_revision,persona_id,deleted_at FROM messages WHERE workspace_id=? AND room_id=? AND message_id=?",
+        if (!failure && run.target_message_id && purpose !== "subagent") {
+          const target = this.app.db
+            .prepare(
+              "SELECT current_revision,persona_id,deleted_at FROM messages WHERE workspace_id=? AND room_id=? AND message_id=?",
+            )
+            .get(actor.workspaceId, run.room_id, run.target_message_id) as any;
+          if (!target || target.deleted_at !== null) failure = "TARGET_DELETED";
+          else if (target.persona_id !== persona.id)
+            failure = "OUTPUT_NOT_AUTHORIZED";
+          else if (
+            Number(target.current_revision) !==
+            JSON.parse(run.request_json).expectedRevision
           )
-          .get(actor.workspaceId, run.room_id, run.target_message_id) as any;
-        if (!target || target.deleted_at !== null) failure = "TARGET_DELETED";
-        else if (target.persona_id !== persona.id)
-          failure = "OUTPUT_NOT_AUTHORIZED";
-        else if (
-          Number(target.current_revision) !==
-          JSON.parse(run.request_json).expectedRevision
-        )
-          failure = "REVISION_CONFLICT";
-      }
-      if (!failure && segments.length) {
-        if (run.target_message_id && purpose !== "subagent")
-          message = this.repository.appendRevision(
-            actor,
-            run.room_id,
-            run.target_message_id,
-            {
-              expectedRevision: JSON.parse(run.request_json).expectedRevision,
+            failure = "REVISION_CONFLICT";
+        }
+        if (!failure && segments.length) {
+          if (run.target_message_id && purpose !== "subagent")
+            message = this.repository.appendRevision(
+              actor,
+              run.room_id,
+              run.target_message_id,
+              {
+                expectedRevision: JSON.parse(run.request_json).expectedRevision,
+                segments,
+                reason: "regeneration",
+              },
+            );
+          else
+            message = this.repository.appendMessage(actor, run.room_id, {
+              role: "model",
+              personaId: persona.id,
               segments,
-              reason: "regeneration",
-            },
-          );
-        else
-          message = this.repository.appendMessage(actor, run.room_id, {
-            role: "model",
-            personaId: persona.id,
-            segments,
-            reason: purpose,
-          });
-      }
-      if (message && purpose === "subagent") {
-        const segment = this.app.db
+              reason: purpose,
+            });
+        }
+        if (message && purpose === "subagent") {
+          const segment = this.app.db
+            .prepare(
+              "SELECT segment_id,digest FROM message_segments WHERE workspace_id=? AND room_id=? AND message_id=? AND revision=? AND channel='debug_thoughts'",
+            )
+            .get(
+              actor.workspaceId,
+              run.room_id,
+              message.id,
+              message.revision,
+            ) as any;
+          privateSource = {
+            messageId: message.id,
+            revision: message.revision,
+            revisionId: message.revisionId,
+            segmentId: segment.segment_id,
+            digest: segment.digest,
+          };
+        }
+        this.app.db
           .prepare(
-            "SELECT segment_id,digest FROM message_segments WHERE workspace_id=? AND room_id=? AND message_id=? AND revision=? AND channel='debug_thoughts'",
+            "UPDATE app_provider_calls SET state=?,usage_state=?,usage_json=?,actual_cost_micros=?,reason=?,completed_at=?,response_digest=? WHERE call_id=?",
           )
-          .get(
-            actor.workspaceId,
+          .run(
+            failure
+              ? result.finish === "REJECTED"
+                ? "REJECTED"
+                : result.finish === "STOP"
+                  ? "DISCARDED"
+                  : "INVALID"
+              : "COMPLETED",
+            result.usage.completeness,
+            stable(result.usage),
+            actual,
+            failure ?? null,
+            this.wall(),
+            digest(result.text ?? ""),
+            callId,
+          );
+        this.app.db
+          .prepare(
+            "INSERT INTO app_generation_receipts VALUES(?,?,?,?,?,?,?,?)",
+          )
+          .run(
+            run.workspace_id,
             run.room_id,
-            message.id,
-            message.revision,
-          ) as any;
-        privateSource = {
-          messageId: message.id,
-          revision: message.revision,
-          revisionId: message.revisionId,
-          segmentId: segment.segment_id,
-          digest: segment.digest,
-        };
+            run.run_id,
+            callId,
+            message?.id ?? null,
+            message?.revision ?? null,
+            failure ?? "COMPLETED",
+            this.wall(),
+          );
+        const totals = runBudgetStatus(this.app, run.run_id);
+        if (
+          totals.costMicros > this.limits.maxCostMicros ||
+          Number(totals.tokens) > this.limits.maxTotalTokens
+        )
+          collectionError = "ACTUAL_BUDGET_EXCEEDED";
+        else if (result.usage.completeness !== "COMPLETE")
+          collectionError = "USAGE_INCOMPLETE";
+        if (message && !failure && !collectionError && purpose === "memory")
+          captureExports(
+            this.app,
+            this.policy,
+            actor,
+            callId,
+            context.manifest,
+          );
+        this.audit(actor, run.room_id, "PROVIDER_RESULT_RECORDED", callId);
+      });
+    if (failure) commitCollection();
+    else {
+      let commitStarted = false;
+      try {
+        await this.withManifest(
+          actor,
+          context,
+          () => {
+            commitStarted = true;
+            commitCollection();
+          },
+          signal,
+        );
+      } catch (error) {
+        // A validation failure discards output, while a failed storage transaction is never replayed.
+        if (commitStarted) throw error;
+        failure =
+          error instanceof GenerationError
+            ? error.code
+            : "OUTPUT_NOT_AUTHORIZED";
+        commitCollection();
       }
-      this.app.db
-        .prepare(
-          "UPDATE app_provider_calls SET state=?,usage_state=?,usage_json=?,actual_cost_micros=?,reason=?,completed_at=?,response_digest=? WHERE call_id=?",
-        )
-        .run(
-          failure
-            ? result.finish === "REJECTED"
-              ? "REJECTED"
-              : result.finish === "STOP"
-                ? "DISCARDED"
-                : "INVALID"
-            : "COMPLETED",
-          result.usage.completeness,
-          stable(result.usage),
-          actual,
-          failure ?? null,
-          this.wall(),
-          digest(result.text ?? ""),
-          callId,
-        );
-      this.app.db
-        .prepare("INSERT INTO app_generation_receipts VALUES(?,?,?,?,?,?,?,?)")
-        .run(
-          run.workspace_id,
-          run.room_id,
-          run.run_id,
-          callId,
-          message?.id ?? null,
-          message?.revision ?? null,
-          failure ?? "COMPLETED",
-          this.wall(),
-        );
-      const totals = this.app.db
-        .prepare(
-          `SELECT COALESCE(SUM(COALESCE(actual_cost_micros,reserved_cost_micros)),0) AS cost,COALESCE(SUM(CASE WHEN usage_state='COMPLETE' THEN COALESCE(json_extract(usage_json,'$.totalTokens'),reserved_input_tokens+reserved_output_tokens) ELSE reserved_input_tokens+reserved_output_tokens END),0) AS tokens FROM app_provider_calls WHERE run_id=?`,
-        )
-        .get(run.run_id) as any;
-      if (
-        Number(totals.cost) > this.limits.maxCostMicros ||
-        Number(totals.tokens) > this.limits.maxTotalTokens
-      )
-        collectionError = "ACTUAL_BUDGET_EXCEEDED";
-      else if (result.usage.completeness !== "COMPLETE")
-        collectionError = "USAGE_INCOMPLETE";
-      if (message && !failure && !collectionError && purpose === "memory")
-        captureExports(this.app, this.policy, actor, callId, context.manifest);
-      this.audit(actor, run.room_id, "PROVIDER_RESULT_RECORDED", callId);
-      this.options.hooks?.beforeResultCommit?.();
-    });
+    }
     this.options.hooks?.afterResultCommit?.();
     if (failure) throw new GenerationError(failure);
     if (collectionError) throw new GenerationError(collectionError);

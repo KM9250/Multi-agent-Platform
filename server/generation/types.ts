@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { ProviderAdapter } from "./provider";
+import type { TurnContext } from "../../shared/context-contracts.ts";
 export interface Actor {
   actorId: string;
   workspaceId: string;
@@ -18,6 +19,7 @@ export interface PolicyPort {
       roomId?: string;
       personaId?: string;
       provider?: string;
+      visibility?: string;
     },
   ): unknown;
   revision(actor: Actor, workspaceId?: string): number;
@@ -73,6 +75,8 @@ export const DEFAULT_GENERATION_LIMITS: Readonly<GenerationLimits> =
   });
 export interface Pricing {
   version: string;
+  /** Host currency code. Paid context retrieval requires an explicitly matching search currency. */
+  currency?: string;
   inputMicrosPerMillion: number;
   outputMicrosPerMillion: number;
 }
@@ -112,6 +116,7 @@ export interface TurnRequest {
   requestId: string;
   expectedRoomRevision: number;
   content: string;
+  context?: TurnContext;
   attachmentIds?: string[];
   recipient?: {
     type: "auto" | "agent" | "group" | "all";

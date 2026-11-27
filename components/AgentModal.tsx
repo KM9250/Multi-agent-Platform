@@ -25,6 +25,8 @@ import {
   normalizeAgent,
   normalizeContextFileOrder,
 } from "../utils/contextFiles";
+import type { ContextMode } from "../shared/context-contracts";
+import { ContextModeOptions } from "./ContextModeSelect";
 import SubAgentConfigPanel from "./SubAgentConfigPanel";
 
 interface AgentModalProps {
@@ -66,6 +68,7 @@ const AgentModal: React.FC<AgentModalProps> = ({
 
   const [color, setColor] = useState(AVATAR_COLORS[0]);
   const [thinkingBudget, setThinkingBudget] = useState<number>(0);
+  const [contextMode, setContextMode] = useState<ContextMode | "">("");
   const [historyWindow, setHistoryWindow] = useState<number>(0);
   const [pinFirstMessage, setPinFirstMessage] = useState<boolean>(true);
   const [subAgents, setSubAgents] = useState<SubAgentDefinition[]>([]);
@@ -91,6 +94,7 @@ const AgentModal: React.FC<AgentModalProps> = ({
       setFramework(editingAgent.framework || "standard");
       setColor(editingAgent.color);
       setThinkingBudget(editingAgent.thinkingBudget);
+      setContextMode(editingAgent.contextMode ?? "");
       setHistoryWindow(editingAgent.historyWindow ?? 0);
       setPinFirstMessage(editingAgent.pinFirstMessage ?? true);
       setSubAgents(editingAgent.subAgents ?? []);
@@ -125,6 +129,7 @@ const AgentModal: React.FC<AgentModalProps> = ({
     setImageAvatar("");
     setColor(AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)]);
     setThinkingBudget(0);
+    setContextMode("");
     setHistoryWindow(0);
     setPinFirstMessage(true);
     setSubAgents([]);
@@ -160,6 +165,7 @@ const AgentModal: React.FC<AgentModalProps> = ({
         ),
         model,
         framework,
+        ...(contextMode ? { contextMode } : {}),
         color,
         avatar: effectiveAvatarType === "image" ? imageAvatar : emojiAvatar,
         avatarType: effectiveAvatarType,
@@ -536,6 +542,16 @@ const AgentModal: React.FC<AgentModalProps> = ({
               </p>
             </div>
           </div>
+
+          <label className="block text-sm text-zinc-300">
+            既定の長期参照
+            <select aria-label="Persona context mode" value={contextMode}
+              onChange={event => setContextMode(event.target.value as ContextMode | "")}
+              className="mt-2 block w-full bg-zinc-800 rounded p-2">
+              <option value="">Roomの既定値</option>
+              <ContextModeOptions />
+            </select>
+          </label>
 
           {/* Memory Window Config */}
           <div className="border border-zinc-800 rounded-lg p-3 bg-zinc-900/50">

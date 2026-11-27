@@ -34,7 +34,8 @@ import { readNote } from "./notes.ts";
 export { assertSourceAccess, assertSourcesCurrent } from "./sources.ts";
 
 const select = `SELECT c.*,v.revision,v.body,v.body_digest,v.sources_json,v.sources_digest,v.kind,v.assertion_type,v.scope,
-  p.run_id,p.provider,p.model,p.completed_at,p.manifest_digest, recheck.candidate_id AS rechecking
+  p.run_id,p.provider,p.model,p.completed_at,p.manifest_digest, recheck.candidate_id AS rechecking,
+  EXISTS(SELECT 1 FROM memory_dependencies d WHERE d.candidate_id=c.candidate_id AND d.resource_type='NOTE') AS derived_from_memory
   FROM memory_candidates c
   JOIN memory_candidate_revisions v ON c.candidate_id=v.candidate_id AND c.current_revision=v.revision
   JOIN rooms room ON room.room_id=c.room_id AND room.workspace_id=c.workspace_id AND room.deleted_at IS NULL
@@ -73,6 +74,7 @@ function dto(row: Row, sourceVisible: boolean): MemoryCandidateDTO {
       ? { rechecking: true as const }
       : {}),
     createdAt: row.created_at,
+    ...(row.derived_from_memory ? { derivedFromMemory: true as const } : {}),
     sourceRefs: current && sourceVisible ? JSON.parse(row.sources_json) : [],
     binding: bind(row),
     provenance:

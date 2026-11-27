@@ -18,6 +18,10 @@ import { getSearchProfile, type SearchProfile } from "./profile.ts";
 import { searchInput } from "./input.ts";
 import { lexicalQuery } from "./query-process.ts";
 import { SearchSources } from "./sources.ts";
+import { withVerifiedNoteAncestors } from "../memory/source-validation.ts";
+import { assertAiSearchBinding, type AiSearchBinding } from "./ai-binding.ts";
+
+export type AiSearchResponse = SearchResponse & { generationId?: string };
 
 const DEADLINE_MS = 10_000;
 const MAX_CONCURRENT = 4;
@@ -35,8 +39,16 @@ function isAccessError(e: unknown) {
   const status = (e as { status?: number })?.status;
   return status === 401 || status === 403 || status === 404;
 }
+function stopsAiRun(error: unknown) {
+  const code = (error as { code?: string; message?: string })?.code ??
+    (error as { message?: string })?.message;
+  return ["OUTCOME_UNKNOWN", "SEARCH_OUTCOME_UNKNOWN", "RUN_NOT_ACTIVE", "CONTEXT_CHANGED",
+    "DISPATCH_EXPIRED", "DEADLINE_EXCEEDED", "CANCELLED",
+    "INVALID_AI_CONTEXT_BINDING", "AUTHORIZATION_CHANGED", "run_unavailable", "invalid_run_binding",
+    "profile_changed_or_disabled", "source_changed"].includes(code);
+}
 
-/** HTTP sets a human audience. Context delivery needs an explicit MEM-3 authorization policy. */
+/** The public search API deliberately accepts only the human audience. */
 export async function searchRoom(
   app: AppDatabase,
   policy: AuthorizationPolicy,
@@ -52,11 +64,39 @@ export async function searchRoom(
     audience.scope !== req.target
   )
     throw new AppError("FORBIDDEN", 403);
+  return searchInternal(app, policy, actor, roomId, req, clientSignal);
+}
+
+/** Generation-only entry. Its signed binding is constructed from an accepted, live run. */
+export async function searchAiContext(
+  app: AppDatabase,
+  policy: AuthorizationPolicy,
+  actor: Actor,
+  roomId: string,
+  req: ReturnType<typeof searchInput>,
+  binding: AiSearchBinding,
+  signal?: AbortSignal,
+): Promise<AiSearchResponse> {
+  assertAiSearchBinding(app, policy, actor, roomId, binding);
+  if (req.revisionMode !== "current") throw new AppError("AI_CURRENT_REVISION_REQUIRED", 400);
+  if (signal?.aborted) throw signal.reason;
+  return searchInternal(app, policy, actor, roomId, req, signal, binding);
+}
+
+async function searchInternal(
+  app: AppDatabase,
+  policy: AuthorizationPolicy,
+  actor: Actor,
+  roomId: string,
+  req: ReturnType<typeof searchInput>,
+  clientSignal?: AbortSignal,
+  aiBinding?: AiSearchBinding,
+): Promise<AiSearchResponse> {
   const start = performance.now();
-  const sources = new SearchSources(app, policy, actor, roomId);
+  const sources = new SearchSources(app, policy, actor, roomId, aiBinding);
   sources.assertRoom(req.target);
   const acl = policy.revision(actor);
-  const response: SearchResponse = {
+  const response: AiSearchResponse = {
     results: [],
     methods: [],
     reasons: [],
@@ -81,10 +121,11 @@ export async function searchRoom(
   };
   const active = acquireActiveIndex(app, policy, actor, roomId);
   const finish = () => {
+    if (aiBinding && clientSignal?.aborted) throw clientSignal.reason;
     if (policy.revision(actor) !== acl)
       throw new AppError("SEARCH_RESYNC_REQUIRED", 409);
     sources.assertRoom(req.target);
-    if (active.state === "ACTIVE")
+    if (active.state === "ACTIVE" && !aiBinding)
       response.coverage.updating = isIndexUpdatePending(active);
     response.elapsedMs = Math.round(performance.now() - start);
     return response;
@@ -110,8 +151,9 @@ export async function searchRoom(
     );
     return finish();
   }
-  response.coverage.syncedAt = active.syncedAt;
-  if (active.reason) {
+  if (aiBinding) response.generationId = active.generationId;
+  else response.coverage.syncedAt = active.syncedAt;
+  if (active.reason && !aiBinding) {
     response.status = "partial";
     response.reasons.push("INDEX_REFRESH_FAILED");
   }
@@ -133,10 +175,13 @@ export async function searchRoom(
       try {
         profile = getSearchProfile(app, actor, roomId);
         includeDense =
-          req.retrievalMode === "hybrid" ||
+          (!aiBinding && req.retrievalMode === "hybrid") ||
           !!(
             profile?.purposes.includes("QUERY_EMBEDDING") &&
-            (!req.personaId || profile.personaId === req.personaId)
+            (!req.personaId || profile.personaId === req.personaId) &&
+            (!aiBinding || (profile.aiContext?.queryEmbedding === true &&
+              profile.aiContext.consumerPersonaIds.includes(aiBinding.consumerPersonaId) &&
+              profile.scopes.includes("room_shared")))
           );
       } catch (error) {
         if (isAccessError(error)) throw error;
@@ -161,6 +206,7 @@ export async function searchRoom(
         personaId: req.personaId,
         from: req.date?.startInclusive,
         until: req.date?.endExclusive,
+        aiBinding,
       },
       signal,
     );
@@ -200,8 +246,10 @@ export async function searchRoom(
           personaId: req.personaId,
           profile,
           signal: denseSignal,
+          aiBinding,
         },
       ).catch((error) => {
+        if (aiBinding && (clientSignal?.aborted || stopsAiRun(error))) throw error;
         if (isAccessError(error)) throw error;
         return {
           state: "dense_unavailable",
@@ -263,7 +311,10 @@ export async function searchRoom(
           channel,
           visibility,
           revisionKind,
-        } = sources.resolve(hit.citation, { includeHistory });
+        } = hit.citation.target === "memory"
+          ? await withVerifiedNoteAncestors(app, [hit.citation.noteId],
+            () => sources.resolve(hit.citation, { includeHistory }), signal)
+          : sources.resolve(hit.citation, { includeHistory });
         if (
           (req.personaId && req.personaId !== personaId) ||
           (req.date &&
@@ -288,6 +339,7 @@ export async function searchRoom(
         });
       } catch (e) {
         const code = (e as { code?: string }).code;
+        if (aiBinding && ["RUN_NOT_ACTIVE", "CONTEXT_CHANGED", "INVALID_AI_CONTEXT_BINDING"].includes(code)) throw e;
         if (code === "UNAUTHENTICATED") throw e;
         response.verification.excluded++;
         const reason = [
@@ -309,6 +361,7 @@ export async function searchRoom(
       response.status = "partial";
     }
   } catch (e) {
+    if (aiBinding && (clientSignal?.aborted || stopsAiRun(e))) throw e;
     if (
       isAccessError(e) ||
       (e as { code?: string }).code === "SEARCH_RESYNC_REQUIRED"

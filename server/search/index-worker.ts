@@ -181,7 +181,7 @@ export async function updateGeneration(
         const after = backend!.getCursor(stream);
         const page =
           stream === "memory"
-            ? sources.memoryPage(after ?? undefined)
+            ? await sources.memoryPageAsync(after ?? undefined, signal)
             : sources.archivePage(after ?? undefined);
         check();
         observe?.("PAGE_READ");

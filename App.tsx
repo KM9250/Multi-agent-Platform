@@ -9,6 +9,9 @@ import {
   RefreshCw,
 } from "lucide-react";
 import MemoryPanel from "./components/MemoryPanel";
+import AnswerSources from "./components/AnswerSources";
+import { ContextModeOptions } from "./components/ContextModeSelect";
+import type { ContextMode } from "./shared/context-contracts";
 import SearchPanel from "./components/SearchPanel";
 import AgentSidebar from "./components/AgentSidebar";
 import AgentModal from "./components/AgentModal";
@@ -84,6 +87,7 @@ function displayAgent(persona: PersonaDTO, roomId: string): Agent {
     thinkingBudget: Number(persona.thinkingBudget ?? 0),
     historyWindow: Number(persona.historyWindow ?? 0),
     pinFirstMessage: persona.pinFirstMessage !== false,
+    contextMode: persona.contextMode,
     groups: (persona.groups as string[]) ?? [],
     participationProfile: (persona.participationProfile as string) ?? "",
     subAgents: (persona.subAgents as Agent["subAgents"]) ?? [],
@@ -121,6 +125,7 @@ export default function App() {
   const [runs, setRuns] = useState<RunDTO[]>([]);
   const [input, setInput] = useState("");
   const [files, setFiles] = useState<File[]>([]);
+  const [contextMode, setContextMode] = useState<ContextMode | "">("");
   const [recipient, setRecipient] = useState<RecipientSelection>("auto");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -195,6 +200,7 @@ export default function App() {
     afterRef.current = undefined;
     setPageAfter(undefined);
     setInput("");
+    setContextMode("");
     setFiles([]);
     setReader(undefined);
     setMemoryOpen(false);
@@ -295,6 +301,7 @@ export default function App() {
     afterRef.current = undefined;
     setPageAfter(undefined);
     setInput("");
+    setContextMode("");
     setFiles([]);
     setReader(undefined);
     setMemoryOpen(false);
@@ -400,6 +407,7 @@ export default function App() {
     type: RoomTag,
     systemInstruction: string,
     internalStateSettings: InternalStateSettings,
+    contextMode: ContextMode,
   ) {
     const ticket = epoch.current;
     try {
@@ -412,6 +420,7 @@ export default function App() {
           type,
           systemInstruction,
           internalStateSettings,
+          contextMode,
           ...(roomEditor === "edit"
             ? { expectedRevision: roomEditSnapshot?.revision }
             : {}),
@@ -485,6 +494,7 @@ export default function App() {
       } = agent;
       const body = {
         ...settings,
+        contextMode: agent.contextMode ?? null,
         avatar: agent.avatarType === "image" ? "" : agent.avatar,
         ...(avatarAttachmentId ? { avatarAttachmentId } : {}),
         contextAttachmentIds,
@@ -575,6 +585,12 @@ export default function App() {
             requestId: crypto.randomUUID(),
             expectedRoomRevision: room.revision,
             content: input,
+            ...(!memoryCommand
+              ? { context: {
+                  ...(contextMode ? { mode: contextMode } : {}),
+                  timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                } }
+              : {}),
             attachmentIds,
             recipient: createRecipientSnapshot(
               memoryCommand ? "all" : recipient,
@@ -606,6 +622,7 @@ export default function App() {
           cause instanceof AppAPIError &&
           [
             "INVALID_INPUT",
+            "INVALID_CONTEXT_DATE_MODE",
             "REVISION_CONFLICT",
             "MODEL_NOT_ALLOWED",
             "RECIPIENT_NOT_FOUND",
@@ -1057,9 +1074,15 @@ export default function App() {
                   <div
                     className={`border rounded-2xl p-4 ${message.role === "user" ? "bg-zinc-800 border-zinc-700" : "bg-zinc-900 border-zinc-800"}`}
                   >
-                    <p className="whitespace-pre-wrap break-words">
-                      {message.content || "(No public text)"}
-                    </p>
+                    <React.Fragment
+                      key={`${scopeVersion}:${room.id}:${message.id}:${message.revision}`}
+                    >
+                      <AnswerSources
+                        roomId={room.id}
+                        message={message}
+                        onError={fail}
+                      />
+                    </React.Fragment>
                     {message.attachments?.length > 0 && (
                       <div className="mt-3 flex flex-wrap gap-2">
                         {message.attachments.map((attachment) => (
@@ -1157,6 +1180,16 @@ export default function App() {
                         Group: {group}
                       </option>
                     ))}
+                  </select>
+                </label>
+                <label className="text-xs text-zinc-400">
+                  長期参照
+                  <select aria-label="Context mode" value={contextMode}
+                    onChange={event => setContextMode(event.target.value as ContextMode | "")}
+                    disabled={memoryCommand || pending || sending}
+                    className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 ml-2">
+                    <option value="">既定値</option>
+                    <ContextModeOptions />
                   </select>
                 </label>
                 {session.models.length === 0 && (

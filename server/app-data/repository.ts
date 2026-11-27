@@ -12,6 +12,7 @@ import {
   type AttachmentDTO,
 } from "../../shared/app-contracts/index.ts";
 import { AppDatabase } from "./db.ts";
+import { answerContext } from "../generation/citations.ts";
 import {
   bool,
   canonical,
@@ -35,6 +36,7 @@ const ROOM_KEYS = [
   "type",
   "systemInstruction",
   "internalStateSettings",
+  "contextMode",
   "expectedRevision",
 ];
 const PERSONA_KEYS = [
@@ -51,6 +53,7 @@ const PERSONA_KEYS = [
   "thinkingBudget",
   "historyWindow",
   "pinFirstMessage",
+  "contextMode",
   "groups",
   "participationProfile",
   "subAgents",
@@ -171,7 +174,7 @@ export class ConversationRepository {
   }
   #roomConfig(input: unknown, previous?: Row): Row {
     const x = object(input, ROOM_KEYS),
-      cfg = {
+      cfg: Row = {
         title: "New room",
         description: "",
         type: "Sandbox",
@@ -179,6 +182,11 @@ export class ConversationRepository {
         internalStateSettings: { ...DEFAULT_SETTINGS },
         ...previous,
       };
+    if (x.contextMode !== undefined) {
+      if (!["auto", "none", "memory", "archive", "both"].includes(x.contextMode))
+        throw new AppError("INVALID_INPUT");
+      cfg.contextMode = x.contextMode;
+    }
     if (x.title !== undefined) cfg.title = string(x.title, 200);
     if (x.description !== undefined)
       cfg.description = string(x.description, 4000, false);
@@ -429,6 +437,12 @@ export class ConversationRepository {
                 : 200,
           key === "name",
         );
+    if (x.contextMode === null) delete cfg.contextMode;
+    else if (x.contextMode !== undefined) {
+      if (!["auto", "none", "memory", "archive", "both"].includes(x.contextMode))
+        throw new AppError("INVALID_INPUT");
+      cfg.contextMode = x.contextMode;
+    }
     if (x.avatarType === "emoji") delete cfg.avatarAttachmentId;
     if (
       x.avatar?.startsWith("data:") ||
@@ -965,17 +979,22 @@ export class ConversationRepository {
         row.message_id,
         rev.revision,
       ) as Row[];
+    const publicText = segments
+      .filter(segment => segment.channel === "public_message")
+      .map(segment => segment.content)
+      .join("\n");
+    const context = row.role === "model" && segments.length
+      ? answerContext(this.app, this.policy, actor, row.room_id, row.message_id, rev.revision, publicText)
+      : undefined;
     return {
+      ...(context ? { context } : {}),
       id: row.message_id,
       revision: rev.revision,
       revisionId: rev.revision_id,
       ...(rev.parent_revision ? { parentRevision: rev.parent_revision } : {}),
       role: row.role,
       ...(row.persona_id ? { agentId: row.persona_id } : {}),
-      content: segments
-        .filter((s) => s.channel === "public_message")
-        .map((s) => s.content)
-        .join("\n"),
+      content: publicText,
       timestamp: row.occurred_at,
       occurredAt: row.occurred_at,
       ingestedAt: row.ingested_at,

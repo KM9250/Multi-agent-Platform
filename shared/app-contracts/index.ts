@@ -1,6 +1,9 @@
+import type { ContextMode } from "../context-contracts.ts";
+import type { AnswerContextDTO } from "../context-citations.ts";
 /** Browser-safe DATA-1 wire contracts. No server dependencies or credentials. */
 export const APP_CONTRACT = "MAP-DATA-1:SERVER_CONVERSATION:1" as const;
-export const APP_SCHEMA = 6;
+export const APP_SCHEMA = 7;
+export const CONTEXT_CONTRACT = "MAP-MEM-3:CONTEXT:1" as const;
 export const SEARCH_CONTRACT = "MAP-MEM-2:SEARCH:1" as const;
 export const MEMORY_CONTRACT = "MAP-MEM-1:MEMORY_VAULT:1" as const;
 export const APP_LIMITS = Object.freeze({
@@ -64,6 +67,7 @@ export interface MessageDTO {
   modifiedAt: number;
   segments: SegmentDTO[];
   attachments: AttachmentDTO[];
+  context?: AnswerContextDTO;
 }
 export interface PersonaDTO {
   id: string;
@@ -83,6 +87,7 @@ export interface PersonaDTO {
   thinkingBudget: number;
   historyWindow?: number;
   pinFirstMessage?: boolean;
+  contextMode?: ContextMode;
   groups?: string[];
   participationProfile?: string;
   subAgents?: any[];
@@ -98,6 +103,7 @@ export interface RoomDTO {
   type: "Sandbox" | "Recreation" | "Hard";
   systemInstruction?: string;
   revision: number;
+  contextMode?: ContextMode;
   internalStateSettings: {
     enabled: boolean;
     showPrivateState: boolean;

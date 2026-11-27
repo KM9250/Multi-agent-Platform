@@ -21,6 +21,7 @@ import { randomUUID } from "node:crypto";
 import { AppError } from "../../shared/app-contracts/index.ts";
 import type { AppDatabase } from "../app-data/db.ts";
 import { digest } from "../app-data/validation.ts";
+import { VaultRootUnavailable } from "./verification-state.ts";
 
 export const MAX_NOTE_BYTES = 256 * 1024;
 const safeId = /^[a-zA-Z0-9_-]{1,100}$/;
@@ -95,17 +96,25 @@ function vaultRow(app: AppDatabase) {
 function registeredDir(app: AppDatabase): number {
   const row = vaultRow(app);
   if (!row) fail("VAULT_UNREGISTERED");
-  const fd = absoluteDir(String(row.root));
-  const st = fstatSync(fd, { bigint: true });
-  if (
-    String(st.dev) !== row.dev ||
-    String(st.ino) !== row.ino ||
-    (st.mode & 0o077n) !== 0n
-  ) {
-    closeSync(fd);
-    fail("VAULT_IDENTITY_CHANGED");
+  let fd: number | undefined;
+  try {
+    fd = absoluteDir(String(row.root));
+    const st = fstatSync(fd, { bigint: true });
+    if (
+      String(st.dev) !== row.dev ||
+      String(st.ino) !== row.ino ||
+      (st.mode & 0o077n) !== 0n
+    ) fail("VAULT_IDENTITY_CHANGED");
+    return fd;
+  } catch (error) {
+    if (fd !== undefined) closeSync(fd);
+    // Classify the actual root access, including the post-read reopen. ENOENT
+    // below this boundary still means a missing individual original. Identity
+    // mismatches and symlink/non-directory failures remain unsafe, never pending.
+    if (["ENOENT", "EIO", "EAGAIN", "EBUSY", "EACCES", "ESTALE"].includes((error as NodeJS.ErrnoException)?.code ?? ""))
+      throw new VaultRootUnavailable();
+    throw error;
   }
-  return fd;
 }
 export function vaultRoot(app: AppDatabase): string {
   closeSync(registeredDir(app));

@@ -12,6 +12,7 @@ import { assertPublicationCapacity } from "./limits.ts";
 import { parseMemoryMarkdown } from "./markdown.ts";
 import { memoryScope, type Row } from "./sources.ts";
 import { readVaultFile, readVersion } from "./vault.ts";
+import { NoteVerificationPending } from "./verification-state.ts";
 
 /** Migration only schedules verification. Neither a source Vault nor a restored directory is opened here. */
 export function enqueueLegacyLineage(
@@ -393,6 +394,9 @@ export function recoverHeldCandidate(
     db.exec(
       "ROLLBACK TO legacy_memory_evidence; RELEASE legacy_memory_evidence",
     );
+    // Undo temporary publication state, but preserve retryable evidence failures
+    // for the bounded worker without discarding its completed CALL/REF proof.
+    if (error instanceof NoteVerificationPending) throw error;
     // Missing files, unsupported encodings, changed authority and malformed persisted bindings
     // all withhold release. SQLite/programming errors must surface to the worker for retry.
     if (

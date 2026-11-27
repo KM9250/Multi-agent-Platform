@@ -4,7 +4,7 @@ import type { Actor, AuthorizationPolicy } from "../auth/authorization.ts";
 import { SQLiteSearchBackend, type SearchCandidate } from "./backend.ts";
 import {
   DENSE_LIMITS,
-  scanCorpus,
+  scanCorpusAsync,
   documentOperationKey,
 } from "./dense-corpus.ts";
 import type { DenseScanJob } from "./dense-worker.ts";
@@ -15,6 +15,7 @@ import {
   type SearchUsage,
 } from "./embedding.ts";
 import {
+  assertAiDispatchScope,
   assertDispatchScope,
   dispatchEmbedding,
   getSearchProfile,
@@ -23,6 +24,7 @@ import {
   type SearchProfile,
 } from "./profile.ts";
 import { SearchSources } from "./sources.ts";
+import type { AiSearchBinding } from "./ai-binding.ts";
 
 function providerOrEnv(provider?: EmbeddingProvider) {
   return (
@@ -67,7 +69,7 @@ export async function buildDenseIndex(
   try {
     const sources = new SearchSources(app, policy, actor, roomId);
     sources.assertRoom("memory");
-    const inspected = scanCorpus(
+    const inspected = await scanCorpusAsync(
       app,
       policy,
       actor,
@@ -75,6 +77,9 @@ export async function buildDenseIndex(
       index,
       indexPath,
       profile,
+      undefined,
+      undefined,
+      until,
     );
     coverage.planned = inspected.planned;
     coverage.indexed = inspected.indexed;
@@ -154,7 +159,7 @@ function runScan(job: DenseScanJob, signal: AbortSignal): Promise<ScanResult> {
 }
 
 export interface DenseResult extends ScanResult {
-  external: { calls: number; usage: SearchUsage["completeness"] | "NONE" };
+  external: { calls: number; usage: SearchUsage["completeness"] | "NONE"; operationIds?: string[] };
 }
 export async function searchDense(
   app: AppDatabase,
@@ -169,6 +174,7 @@ export async function searchDense(
     profile?: SearchProfile | null;
     signal?: AbortSignal;
     provider?: EmbeddingProvider;
+    aiBinding?: AiSearchBinding;
   } = {},
 ): Promise<DenseResult> {
   const external: DenseResult["external"] = { calls: 0, usage: "NONE" };
@@ -189,14 +195,23 @@ export async function searchDense(
     return empty("profile_scope");
   if (!profile.purposes.includes("QUERY_EMBEDDING"))
     return empty("query_disabled");
+  if (options.aiBinding && (!profile.aiContext?.queryEmbedding ||
+      !profile.aiContext.consumerPersonaIds.includes(options.aiBinding.consumerPersonaId) ||
+      !profile.scopes.includes("room_shared"))) return empty("ai_query_disabled");
   const adapter = providerOrEnv(options.provider);
   if (!adapter) return empty("unconfigured_provider");
   if (running >= DENSE_LIMITS.workers) return empty("worker_saturated");
   running++;
   const signal = deadline(DENSE_LIMITS.deadlineMs, options.signal);
   let attempted = false;
-  const key = operationId(actor, roomId, "QUERY_EMBEDDING", requestId);
+  const operationKey = options.aiBinding ? `ai-context:${options.aiBinding.planId}:query` : requestId;
+  const key = operationId(actor, roomId, "QUERY_EMBEDDING", operationKey);
+  const scopes: MemoryScope[] = options.aiBinding ? ["room_shared"] : profile.scopes;
+  const checkAi = () => {
+    if (options.aiBinding) assertAiDispatchScope(app, policy, actor, roomId, profile, options.aiBinding);
+  };
   try {
+    checkAi();
     assertDispatchScope(
       app,
       policy,
@@ -204,7 +219,7 @@ export async function searchDense(
       roomId,
       profile,
       "QUERY_EMBEDDING",
-      profile.scopes,
+      scopes,
     );
     const job: DenseScanJob = {
       root: app.root,
@@ -214,6 +229,7 @@ export async function searchDense(
       roomId,
       idleTimeoutMs: policy.idleTimeoutMs,
       profileVersion: profile.version,
+      ...(options.aiBinding ? { aiBinding: options.aiBinding } : {}),
     };
     const preflight = await runScan(job, signal);
     if (preflight.state !== "ready") return empty(preflight.state);
@@ -228,13 +244,15 @@ export async function searchDense(
       actor,
       roomId,
       profile,
-      scopes: profile.scopes,
+      scopes,
       purpose: "QUERY_EMBEDDING",
-      operationKey: requestId,
+      operationKey,
       signal,
       readText: () => query,
+      ...(options.aiBinding ? { aiBinding: options.aiBinding } : {}),
     });
     const scored = await runScan({ ...job, query: embedded.vector }, signal);
+    checkAi();
     assertDispatchScope(
       app,
       policy,
@@ -242,10 +260,24 @@ export async function searchDense(
       roomId,
       profile,
       "QUERY_EMBEDDING",
-      profile.scopes,
+      scopes,
     );
     return { ...scored, external };
   } catch (error) {
+    if (options.aiBinding) {
+      // Cancellation, changed authorization/binding, and an uncertain send stop this Run.
+      // Only proven unavailable optional retrieval can become a lexical fallback.
+      options.signal?.throwIfAborted();
+      const receipt = app.db.prepare("SELECT state FROM search_operations WHERE operation_id=?").get(key);
+      if (receipt?.state === "OUTCOME_UNKNOWN") throw new DenseError("SEARCH_OUTCOME_UNKNOWN");
+      const status = (error as { status?: number })?.status;
+      const code = (error as Error)?.message;
+      if (status === 401 || status === 403 || status === 404 ||
+          ["run_unavailable", "invalid_run_binding", "profile_changed_or_disabled", "source_changed",
+            "DISPATCH_EXPIRED", "DEADLINE_EXCEEDED", "CANCELLED"].includes(code)) throw error;
+      // Recheck even failures from worker IPC so revocation is never hidden by fallback.
+      checkAi();
+    }
     return empty(knownError(error, signal));
   } finally {
     running--;
@@ -260,6 +292,8 @@ export async function searchDense(
         ? JSON.parse(String(receipt.usage_json)).completeness
         : "UNKNOWN";
     }
+    if (options.aiBinding && app.db.prepare("SELECT 1 FROM search_operations WHERE operation_id=?").get(key))
+      external.operationIds = [key];
   }
 }
 

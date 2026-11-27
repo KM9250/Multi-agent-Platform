@@ -1,0 +1,57 @@
+{
+  "kind": "MEM-3A synthetic mixed lineage / authenticated loopback HTTP",
+  "node": "v24.19.0",
+  "seededAnswers": 160,
+  "noteDepth": 6,
+  "durationMs": 872.0974009999991,
+  "final": {
+    "calls": 173,
+    "notes": 6,
+    "state": "DONE"
+  },
+  "writerSlices": {
+    "count": 44,
+    "p50Ms": 7.375395999999455,
+    "p95Ms": 23.39462800000183,
+    "maxMs": 28.342114999999467
+  },
+  "httpReads": {
+    "count": 15,
+    "p50Ms": 43.86597999999867,
+    "p95Ms": 105.15501899999981,
+    "maxMs": 105.15501899999981
+  },
+  "eventLoop": {
+    "p95Ms": 51.544063,
+    "maxMs": 54.034431
+  },
+  "maxCallsPerSlice": 4,
+  "realExternalCalls": 0,
+  "plans": {
+    "calls": [
+      {
+        "id": 4,
+        "parent": 0,
+        "notused": 55,
+        "detail": "SEARCH memory_lineage_queue USING COVERING INDEX memory_lineage_queue_ready (candidate_id=?)"
+      }
+    ],
+    "notes": [
+      {
+        "id": 5,
+        "parent": 0,
+        "notused": 62,
+        "detail": "SEARCH memory_lineage_notes USING INDEX memory_lineage_notes_ready (candidate_id=?)"
+      }
+    ],
+    "dependencies": [
+      {
+        "id": 3,
+        "parent": 0,
+        "notused": 61,
+        "detail": "SEARCH memory_dependencies USING INDEX sqlite_autoindex_memory_dependencies_1 (candidate_id=? AND resource_type=?)"
+      }
+    ]
+  },
+  "scope": "Measures one synthetic run and bounded frontier advancement; not production latency or provider quality."
+}

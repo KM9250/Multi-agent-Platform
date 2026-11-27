@@ -76,6 +76,7 @@ for (const migration of [
   "app_004_resumable_memory_lineage",
   "app_005_search_control",
   "app_006_scoped_archive_changes",
+  "app_007_answer_context",
 ])
   for (const when of ["before", "after"])
     test(`C1-08: real SIGKILL ${when} ${migration} COMMIT recovers schema exactly once`, async (t) => {
@@ -95,6 +96,7 @@ for (const migration of [
             app_004_resumable_memory_lineage: [2, 4],
             app_005_search_control: [4, 5],
             app_006_scoped_archive_changes: [5, 6],
+            app_007_answer_context: [6, 7],
           };
           const expectedVersion =
             versions[migration][when === "before" ? 0 : 1];
@@ -150,6 +152,15 @@ for (const migration of [
               .get()!.n,
             expectedVersion >= 6 ? 2 : 0,
           );
+          assert.equal(
+            beforeRestart.prepare(`SELECT count(*) AS n FROM sqlite_schema WHERE type='table'
+              AND name IN ('app_context_answer_holds','search_operation_bindings','memory_lineage_notes','app_restore_context_migration')`).get()!.n,
+            expectedVersion >= 7 ? 4 : 0,
+          );
+          assert.equal(
+            beforeRestart.prepare("SELECT count(*) AS n FROM pragma_table_info('memory_lineage_work') WHERE name='notes_done'").get()!.n,
+            Number(expectedVersion >= 7),
+          );
         } finally {
           beforeRestart.close();
         }
@@ -168,6 +179,7 @@ for (const migration of [
           "app_004_resumable_memory_lineage",
           "app_005_search_control",
           "app_006_scoped_archive_changes",
+          "app_007_answer_context",
         ],
       );
       assert.deepEqual(app.db.prepare("PRAGMA foreign_key_check").all(), []);

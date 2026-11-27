@@ -74,6 +74,7 @@ export function hostConfiguration(env: NodeJS.ProcessEnv = process.env) {
         ? "unconfigured"
         : env.MAP_DEFAULT_MODEL!;
   const pricing = {
+    ...(env.MAP_PRICING_CURRENCY ? { currency: env.MAP_PRICING_CURRENCY } : {}),
     version:
       env.MAP_PRICING_VERSION ??
       (providerMode !== "gemini" ? "synthetic-v1" : ""),
@@ -91,6 +92,8 @@ export function hostConfiguration(env: NodeJS.ProcessEnv = process.env) {
     ),
   };
   if (!pricing.version) throw new AuthError("PRICING_REQUIRED", 500);
+  if (pricing.currency !== undefined && !/^[A-Z]{3}$/.test(pricing.currency))
+    throw new AuthError("INVALID_PRICING_CURRENCY", 500);
   const staticRoot = resolve(env.MAP_STATIC_ROOT ?? "dist"),
     root = protectedDataRoot(env.MAP_DATA_ROOT, staticRoot);
   return {

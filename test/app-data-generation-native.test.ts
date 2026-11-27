@@ -194,6 +194,26 @@ for (const mode of ["socket-close", "503"] as const)
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+test("text-only answer preflight still rejects actual Host overflow before search or dispatch", async () => {
+  const f = appFixture();
+  const generation = new GenerationCoordinator(f.app, f.repository, f.policy, {
+    provider: f.provider, defaultModel: "synthetic", limits: { maxInputTokens: 789 },
+  });
+  try {
+    const run = generation.accept(f.actor, f.room.id, {
+      requestId: randomUUID(), expectedRoomRevision: f.room.revision,
+      content: "本文。".repeat(400), recipient: { type: "all" }, context: { mode: "both" },
+    });
+    await generation.execute(run.runId);
+    assert.equal(generation.get(f.actor, f.room.id, run.runId).errorCode, "CONTEXT_LIMIT");
+    assert.equal(f.provider.calls.length, 0);
+    assert.equal(f.app.db.prepare("SELECT count(*) n FROM app_provider_calls").get()!.n, 0);
+    assert.equal(f.app.db.prepare("SELECT count(*) n FROM search_operations").get()!.n, 0);
+  } finally {
+    await generation.shutdown(); await f.generation.shutdown(); f.dispose();
+  }
+});
+
 for (const count of [1, 8])
   test(`context preflight rejects ${count === 1 ? "single oversized" : "aggregate"} attachments before any body read or provider dispatch`, async () => {
     const f = appFixture();

@@ -1,3 +1,4 @@
+import type { ContextMode } from "./shared/context-contracts";
 
 export enum ModelType {
   // --- Gemini 3 Series ---
@@ -89,6 +90,7 @@ export interface Agent {
   isEnabled: boolean;
   thinkingBudget: number; // 0 to disable
   historyWindow?: number; // Max recent messages sent to the API; 0/undefined = unlimited
+  contextMode?: ContextMode;
   pinFirstMessage?: boolean; // Keep the first user message even when the window cuts it off
   subAgents?: SubAgentDefinition[]; // Private workers; not members of Room.agents
   subAgentPolicy?: SubAgentExecutionPolicy; // undefined is backward-compatible "off"
@@ -164,6 +166,7 @@ export interface MessageReaction {
 export type RoomTag = 'Sandbox' | 'Recreation' | 'Hard';
 
 export interface Room {
+  contextMode?: ContextMode;
   id: string;
   title: string;
   description: string;

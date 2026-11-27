@@ -4,6 +4,7 @@ import { AuthorizationPolicy, type Actor } from "../auth/authorization.ts";
 import { SQLiteSearchBackend } from "./backend.ts";
 import { SearchSources } from "./sources.ts";
 import type { SearchTarget } from "../../shared/search-contracts.ts";
+import type { AiSearchBinding } from "./ai-binding.ts";
 
 export interface LexicalJob {
   root: string;
@@ -19,8 +20,9 @@ export interface LexicalJob {
   personaId?: string;
   from?: number;
   until?: number;
+  aiBinding?: AiSearchBinding;
 }
-const accessCodes = new Set(["FORBIDDEN", "UNAUTHENTICATED", "NOT_FOUND"]);
+const accessCodes = new Set(["FORBIDDEN", "UNAUTHENTICATED", "NOT_FOUND", "RUN_NOT_ACTIVE", "CONTEXT_CHANGED", "INVALID_AI_CONTEXT_BINDING"]);
 
 function freshness(sources: SearchSources, job: LexicalJob) {
   try {
@@ -43,7 +45,7 @@ process.once("message", (job: LexicalJob) => {
       readOnly: true,
     });
     const policy = new AuthorizationPolicy(app, job.idleTimeoutMs);
-    const sources = new SearchSources(app, policy, job.actor, job.roomId);
+    const sources = new SearchSources(app, policy, job.actor, job.roomId, job.aiBinding);
     index = new SQLiteSearchBackend(job.indexPath, { readOnly: true });
     const result = sources.withCandidateSnapshot(job.target, () => {
       const lagging = freshness(sources, job);
@@ -54,6 +56,7 @@ process.once("message", (job: LexicalJob) => {
         personaId: job.personaId,
         from: job.from,
         until: job.until,
+        scopeLocalRanking: !!job.aiBinding,
         limit: 100,
         allowsScope: sources.allowsScope.bind(sources),
         eligible: sources.eligible.bind(sources),

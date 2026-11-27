@@ -32,7 +32,7 @@ export function runSearchProcess<T>(
               ? 403
               : message.error === "NOT_FOUND"
                 ? 404
-                : message.error === "SEARCH_CURSOR_INVALID"
+                : ["SEARCH_CURSOR_INVALID", "CONTEXT_CHANGED", "RUN_NOT_ACTIVE"].includes(message.error)
                   ? 409
                   : 503,
         );

@@ -42,6 +42,8 @@ export interface CandidateFilter {
 export interface LexicalFilter extends CandidateFilter {
   query: string;
   limit?: number;
+  /** AI scope excludes unauthorized originals before ranking and avoids global corpus IDF. */
+  scopeLocalRanking?: boolean;
 }
 export interface SearchCandidate extends SourceMetadata {
   id: string;
@@ -381,7 +383,7 @@ export class SQLiteSearchBackend implements SearchBackend {
   query(filter: LexicalFilter): CandidatePage {
     const terms = analyzeQuery(filter.query);
     const limit = candidateLimit(filter.limit);
-    const allowed = this.allowed(filter, { deferSourceCheck: true });
+    const allowed = this.allowed(filter, { deferSourceCheck: !filter.scopeLocalRanking });
     this.db.function("content_score", (text) =>
       contentScore(String(text), terms),
     );
@@ -415,7 +417,7 @@ export class SQLiteSearchBackend implements SearchBackend {
         `WITH routes AS (${routes.join(" UNION ALL ")}),
       matches AS (SELECT pk,max(bm25_score) AS relevance,max(exact) AS exact FROM routes GROUP BY pk)
       SELECT c.pk,c.source_id,c.version,
-        content_score(c.text) + min(m.relevance,100)*0.01 + m.exact*1000 AS score
+        content_score(c.text) + ${filter.scopeLocalRanking ? "0" : "min(m.relevance,100)*0.01"} + m.exact*1000 AS score
       FROM matches m ${join} chunks c ON c.pk=m.pk WHERE ${allowed.sql}
       ORDER BY score DESC,c.id`,
       )
