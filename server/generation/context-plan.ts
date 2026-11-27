@@ -190,8 +190,11 @@ export async function prepareContextPlan(
             }
             if (route.requiresExactExcerpt) {
               const original = reader.read(candidate.citation);
+              const opening = !primary ? undefined
+                : /最初の行|first line/i.test(content) ? "line"
+                : /冒頭|最初の一?文|opening sentence|first sentence/i.test(content) ? "sentence" : undefined;
               const ranges = partialQuoteRanges(original.text, candidate.citation, route.query.text,
-                primary && /冒頭|最初の(?:一?文|行)|opening sentence|first (?:sentence|line)/i.test(content));
+                opening);
               if (primary) {
                 required = ranges.required;
                 hit = ranges.hit;
@@ -242,7 +245,7 @@ export async function prepareContextPlan(
       citation: { ...original.citation, ...range } };
   };
   const selected: (ResolvedExcerpt | undefined)[] = prepared.map(item => item.verified);
-  let text = "";
+  let text = "", inputTokens = 0;
   const fits = () => {
     plan.sources = []; resolved.length = 0;
     const tokens = { memory: 32, archive: 32 };
@@ -269,9 +272,10 @@ export async function prepareContextPlan(
     });
     text = envelope(plan, resolved);
     const payload = applyContextEnvelope(options.baseline, text);
+    inputTokens = estimate(payload.systemInstruction + stable(payload.contents));
     return tokens.memory <= limits.memory && tokens.archive <= limits.archive &&
       (!text || estimate(text + RETRIEVAL_INSTRUCTION) <= 6144) &&
-      estimate(payload.systemInstruction + stable(payload.contents)) <= options.limits.maxInputTokens;
+      inputTokens <= options.limits.maxInputTokens;
   };
   // Reserve complete required spans for both targets before optional material.
   // Every trial includes the actual truncation/capacity reasons in its envelope.
@@ -279,18 +283,45 @@ export async function prepareContextPlan(
   // otherwise cost more truncation metadata than the text it saves.
   const completeFits = fits();
   if (!completeFits) {
-    prepared.forEach((item, i) => { selected[i] = item.required ? part(i, item.required) : undefined; });
-    if (!fits()) throw new GenerationError("CONTEXT_LIMIT", 413);
+    // Shorter text is not necessarily cheaper: a truncation reason can exceed
+    // the bytes saved. Compare the bounded choices of the two required primary
+    // Sources (at most 3 x 3), including their actual status/reason metadata.
+    const primaries = prepared.flatMap((item, index) => {
+      if (!item.required) return [];
+      const required = item.required, original = item.verified;
+      const ranges = [original.citation, item.hit, required].filter((range): range is ExcerptRange =>
+        !!range && range.start <= required.start && range.end >= required.end &&
+        range.start >= original.citation.start && range.end <= original.citation.end &&
+        range.start < range.end && range.end - range.start <= 4096 &&
+        excerptBoundary(original.text, range.start - original.citation.start) &&
+        excerptBoundary(original.text, range.end - original.citation.start));
+      const unique = new Map(ranges.map(range => [`${range.start}:${range.end}`, range]));
+      return [{ index, choices: [...unique.values()].map(range => part(index, range)) }];
+    });
+    if (primaries.length > 2) throw changed();
+    const [first, second] = primaries;
+    let baseline: typeof selected | undefined, bestInputTokens = Infinity;
+    for (const a of first?.choices ?? [undefined]) for (const b of second?.choices ?? [undefined]) {
+      selected.fill(undefined);
+      if (first) selected[first.index] = a;
+      if (second) selected[second.index] = b;
+      if (fits() && inputTokens < bestInputTokens) {
+        baseline = selected.slice(); bestInputTokens = inputTokens;
+      }
+    }
+    if (!baseline) throw new GenerationError("CONTEXT_LIMIT", 413);
+    selected.splice(0, selected.length, ...baseline);
+    if (!fits()) throw changed();
   }
   for (let index = 0; !completeFits && index < prepared.length; index++) {
-    const item = prepared[index], minimum = selected[index];
+    const item = prepared[index], retained = selected[index];
     selected[index] = item.verified;
     if (fits()) continue;
     if (item.required) {
       // Drop the extra margin first, then retain the complete matching sentence
       // or line. The full-Source case has no smaller required alternative.
       if (item.hit) { selected[index] = part(index, item.hit); if (fits()) continue; }
-      selected[index] = minimum;
+      selected[index] = retained;
     } else {
       let low = 0, high = item.verified.text.length;
       while (low < high) {

@@ -85,3 +85,5 @@ git diff --check
 ```
 
 Browser4本とMACP2本は、利用可能なChromium実体と既存の固定MACP checkoutで実行する。MACPの基準は`e88937d0c8132ae7d18098a24d01ee28bffda655`。実Provider Usage／請求額、実利用者データ移行、対象運用機器のBackup／Restore、実TLSは今回の確認に含めず、既存の本稼働Gateへ引き継ぐ。MEM-3B以降の新機能は含めない。
+
+今回のv1.0記録以降のLEGACY公開復元、行指定、短縮metadataの残存条件と対応は[再修正v1.2記録](map-mem-3a-pr41-reaudit-v12.md)を参照。過去の監査結果・実行HEADは各版の記録として保持する。

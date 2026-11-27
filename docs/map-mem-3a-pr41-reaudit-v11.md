@@ -90,3 +90,12 @@ MACP_REPO_PATH="$PWD/work/macp" MACP_PYTHON="$PWD/work/macp-venv/bin/python" npm
 ```
 
 Browserは利用可能なChromium実体、MACPは既存の固定checkout `e88937d0c8132ae7d18098a24d01ee28bffda655` を使用する。一時DB／Vault、合成Provider、loopbackの検証のみで実Provider呼出しは0件。実Provider疎通・Usage／請求、実データ移行、運用機器のBackup／Restore、実TLSは既存の本稼働前Gateへ残す。
+
+
+## v1.2で確認した残存条件への追記
+
+v1.1の提出HEAD `1869fb7d0feb82662a7704e0d97e98002cc74022` に対する追加監査で、次の3条件が残っていた。上記v1.1の結果とは区別し、修正・実測・最終検証は[再修正v1.2記録](map-mem-3a-pr41-reaudit-v12.md)とPR提出欄へ記録する。
+
+- F-01：LEGACY公開復元のsavepoint rollback後にもPendingを再throwし、既存の再試行へ渡す。新規候補のレビュー待ちではなく、旧公開済みNoteのPUBLISHEDへの復帰を確認する。
+- F-02-A：内部の行指定と文指定を区別し、要求された行の複数文を必要範囲として保持する。
+- F-02-B：全完全版／全最小版だけで判定せず、primaryの最大9候補組み合わせをstatus・reason込みの実容量で評価する。添付なしanswerの固定2,048-byte予約による先行拒否も、既存の実入力検査へ到達させる。添付ありの本文読取前の容量検査は維持する。

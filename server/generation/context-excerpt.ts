@@ -9,7 +9,7 @@ export function excerptBoundary(text: string, offset: number): boolean {
 /** Local sentence/line selection only. Scoring may normalize a copy; offsets and
  * supplied bytes always refer to the unmodified, verified original. A complete
  * sentence crossing a chunk boundary remains part of the required range. */
-export function partialQuoteRanges(text: string, hit: ExcerptRange, query: string, opening: boolean) {
+export function partialQuoteRanges(text: string, hit: ExcerptRange, query: string, opening: "sentence" | "line" | undefined) {
   const analyzed = analyzeQuery(query);
   let start = 0, bestScore = -1;
   let required: ExcerptRange = { start: 0, end: text.length };
@@ -22,7 +22,8 @@ export function partialQuoteRanges(text: string, hit: ExcerptRange, query: strin
   };
   // Keep punctuation, closing quotes and a following line break together. Never
   // split CRLF or a surrogate pair. No arbitrary cut inside the required sentence.
-  const endings = /[。！？!?](?:[」』"')）]*)(?:[ \t]*(?:\r\n|[\r\n]))?|\.(?=\s|$)(?:[ \t]*(?:\r\n|[\r\n]))?|\r\n|[\r\n]/gu;
+  const endings = opening === "line" ? /\r\n|[\r\n]/gu
+    : /[。！？!?](?:[」』"')）]*)(?:[ \t]*(?:\r\n|[\r\n]))?|\.(?=\s|$)(?:[ \t]*(?:\r\n|[\r\n]))?|\r\n|[\r\n]/gu;
   for (const match of text.matchAll(endings)) {
     consider(match.index + match[0].length);
     if ((opening && bestScore >= 0) || (!opening && start >= hit.end)) break;

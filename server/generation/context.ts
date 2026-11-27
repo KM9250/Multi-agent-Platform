@@ -247,7 +247,8 @@ export class ContextCompiler {
       if (
         !Number.isSafeInteger(bytes) ||
         bytes < 0 ||
-        plannedBytes + bytes > byteLimit
+        !Number.isSafeInteger(plannedBytes + bytes) ||
+        (purpose !== "answer" && plannedBytes + bytes > byteLimit)
       )
         throw new GenerationError("CONTEXT_LIMIT", 413);
       plannedBytes += bytes;
@@ -358,6 +359,13 @@ export class ContextCompiler {
       if (segment)
         charge(Buffer.byteLength(JSON.stringify(segment.content), "utf8"));
     }
+    // The fixed framing reserve bounds attachment allocation, but can exceed
+    // an otherwise fitting text-only answer. With no attachment bodies to read,
+    // use the exact serialized Host-input check below (before compile returns,
+    // and therefore before retrieval or dispatch). Keep the conservative bound
+    // for every answer that will allocate attachment data.
+    if (plannedAttachments.size && plannedBytes > byteLimit)
+      throw new GenerationError("CONTEXT_LIMIT", 413);
     const assertPlannedAttachment = (attachmentId: string) => {
       const planned = plannedAttachments.get(attachmentId);
       const current = this.app.db
