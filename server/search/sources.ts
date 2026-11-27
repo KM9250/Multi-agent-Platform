@@ -608,7 +608,8 @@ export class SearchSources
 
   private memoryUnavailable(error: unknown) {
     // Stale/removed after the feed's cutoff. Commit the tombstone; future changes arrive through delta.
-    return error instanceof AppError && ["NOT_FOUND", "SOURCE_CHANGED", "MEMORY_UNAVAILABLE"].includes(error.code);
+    return !(error instanceof NoteVerificationPending) && error instanceof AppError &&
+      ["NOT_FOUND", "SOURCE_CHANGED", "MEMORY_UNAVAILABLE"].includes(error.code);
   }
 
   memoryPage(after?: string): SourcePage {

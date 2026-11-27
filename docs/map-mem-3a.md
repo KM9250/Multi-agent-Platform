@@ -48,7 +48,7 @@ private原典から承認された共有Noteは、共有Note本文だけを公�
 
 資料は通常履歴やシステム方針と区別したenvelopeへ格納し、資料内の区切り文字・指示文をシステム構造へ昇格させない。初期上限はMemory 5件／推定2,048 tokens、Archive 5件／推定4,096 tokens、合計推定6,144 tokens。付随メタデータも見積もりに含め、Host・モデル上限の残容量へ収める。現在入力、必須添付、必須設定、先頭固定発言を追加資料のために押し出さない。
 
-Router v2では原文忠実性を `requiresExactExcerpt`、明示的な全文要求を `requiresFullSource` として分離する。部分引用では同じ原本の検索hit前後を各最大128 UTF-16 units含めて検証し、必要な短文がchunk境界をまたぐ場合にも対応する。「全文から一文だけ」などの部分指定は全文要求にしない。明示的な全文要求だけは各検索先の最初の採用Sourceを `0..length` へ拡張し、必須範囲がtoken枠またはcitation APIの4,096 UTF-16上限に収まらなければ `CONTEXT_LIMIT` を返す。補助候補は全文必須にしない。任意の追加資料を短縮した場合は `EXCERPT_TRUNCATED / partial` を記録する。抜粋は原文のUTF-16半開区間で、surrogate pairとCRLFの途中を境界にしない。
+Router v2では原文忠実性を `requiresExactExcerpt`、明示的な全文要求を `requiresFullSource` として分離する。部分引用では検証済み原本から文・行境界と既存の検索語scoreで必要範囲を選ぶ。検索hit前後の各最大128 UTF-16 unitsは補助範囲とし、必要な文がhitやmarginをまたぐ場合はその文末まで含める。全検索のmetadata確定後、必要範囲を先に予約し、margin、hit、必要な文・行の順に容量を調整してから範囲を固定する。縮小によるstatus・reasonも最終envelopeの見積もりへ含める。「全文から一文だけ」などの部分指定は全文要求にしない。明示的な全文要求だけは各検索先の最初の採用Sourceを `0..length` へ拡張し、必須範囲がtoken枠またはcitation APIの4,096 UTF-16上限に収まらなければ `CONTEXT_LIMIT` を返す。補助候補は全文必須にしない。任意の追加資料を短縮した場合は `EXCERPT_TRUNCATED / partial` を記録する。抜粋は原文のUTF-16半開区間で、surrogate pairとCRLFの途中を境界にしない。
 
 Manifestは `MAP-MEM-3:CONTEXT:1`。旧 `MAP-DATA-1:SERVER_CONVERSATION:1` と併存し、旧digestを維持する。実行主体・設定版・入力binding・Provider・Router version・日付解釈・検索状態・Index世代・採用SourceRef・UTF-16半開範囲・実使用権限・費用操作・payload digestを記録する。新規routeは `map-context-router-v2` とし、全文要求フラグを必須booleanで保存する。既存v1 routeは元の範囲・digestを読み継ぎ、再読時にRouterを実行しない。ACL snapshotは監査証跡であり、将来の許可ではない。未実装Summaryと未知Sourceを「依存なし」として受理しない。
 
@@ -101,3 +101,5 @@ MEM-3BはRolling Summaryと `summary` 呼出し、MEM-3Cは正解SourceRefを持
 本稼働Gateでは実ProviderのUsage・価格・取消／切断時挙動、実データ移行、対象機器でのBackup／Restore・Index再構築、TLS・鍵配置、長時間稼働・容量不足を確認する。合成試験の成功をこれらの確認済みとは扱わない。[設計判断](map-mem-3a-adr.md)と[検証記録](map-mem-3a-validation.md)を参照。
 
 PR #41監査のF-01〜F-05修正と回帰対応は[監査修正記録](map-mem-3a-pr41-audit-fixes.md)を参照。
+
+PR #41再監査v1.1のF-01・F-02残存条件への対応は[再監査修正記録](map-mem-3a-pr41-reaudit-v11.md)を参照。

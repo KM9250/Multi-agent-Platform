@@ -142,7 +142,8 @@ test("F-01 real edits, deletion, duplicate IDs and revoked/regranted authority s
 });
 
 test("F-01 pending NOTE frontier survives outage/restart, yields to another candidate and revalidates before resuming", async t => {
-  for (const action of ["healthy", "changed", "revoked"] as const) await t.test(action, async t => {
+  for (const observer of ["scan-first", "worker-first"] as const)
+  for (const action of ["healthy", "changed", "revoked"] as const) await t.test(`${observer}/${action}`, async t => {
     const f = lineageFixture(); t.after(f.close); permissions(f); f.original();
     const first = await f.memory(); share(f, first.candidate.id);
     for (let n = 0; n < 160; n++) {
@@ -155,7 +156,14 @@ test("F-01 pending NOTE frontier survives outage/restart, yields to another cand
     const pending = await f.memory();
     const frontier = () => f.app.db.prepare("SELECT * FROM memory_lineage_notes WHERE candidate_id=?").all(pending.candidate.id);
     const before = frontier(); assert.equal(before[0].checked, 0);
-    await outage(f);
+    const away = f.vault + "-pending-worker";
+    let moved = false;
+    t.after(() => { if (moved) renameSync(away, f.vault); });
+    if (observer === "scan-first") await outage(f);
+    else {
+      assert.equal(f.app.db.prepare("SELECT incomplete FROM memory_scan_state").get()!.incomplete, 0);
+      renameSync(f.vault, away); moved = true;
+    }
     for (let n = 0; n < 3; n++) advanceLineage(f.app);
     assert.deepEqual(frontier(), before);
     assert.equal(f.app.db.prepare("SELECT status,notes_done FROM memory_lineage_work WHERE candidate_id=?").get(pending.candidate.id)!.status, "PENDING");
@@ -168,6 +176,7 @@ test("F-01 pending NOTE frontier survives outage/restart, yields to another cand
     const reopened = new AppDatabase({ root: f.root }); t.after(() => reopened.close());
     assert.equal(advanceLineage(reopened), true);
     assert.deepEqual(reopened.db.prepare("SELECT * FROM memory_lineage_notes WHERE candidate_id=?").all(pending.candidate.id), before);
+    if (moved) { renameSync(away, f.vault); moved = false; }
     if (action === "changed") {
       const path = join(f.vault, String(reopened.db.prepare("SELECT relative_path FROM memory_documents WHERE note_id=?").get(first.noteId)!.relative_path));
       writeFileSync(path, readFileSync(path, "utf8").replace("月曜", "火曜"));

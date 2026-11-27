@@ -233,6 +233,7 @@ function reconcile(
       readVaultFile(app, row.relative_path);
       setDocumentState(app, row, "DIRTY");
     } catch (e) {
+      if (e instanceof NoteVerificationPending) throw e;
       setDocumentState(
         app,
         row,
@@ -253,7 +254,8 @@ function reconcile(
   try {
     bytes = readVaultFile(app, path);
     parsed = parseMemoryMarkdown(bytes);
-  } catch {
+  } catch (error) {
+    if (error instanceof NoteVerificationPending) throw error;
     resetObservation();
     setDocumentState(app, row, "DIRTY");
     return;

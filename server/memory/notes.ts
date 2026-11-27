@@ -206,11 +206,11 @@ function currentDocument(
       .prepare("SELECT incomplete FROM memory_scan_state WHERE singleton=1")
       .get()?.incomplete
   )
-    return;
+    throw new NoteVerificationPending("MEMORY_UNAVAILABLE");
   try {
     assertDocumentSources(app, policy, actor, row);
   } catch (error) {
-    if (error instanceof NoteVerificationPending) return;
+    if (error instanceof NoteVerificationPending) throw new NoteVerificationPending("MEMORY_UNAVAILABLE");
     setDocumentState(app, row, "NEEDS_REVIEW");
     return;
   }
@@ -227,6 +227,7 @@ function currentDocument(
     }
     return doc;
   } catch (error) {
+    if (error instanceof NoteVerificationPending) throw new NoteVerificationPending("MEMORY_UNAVAILABLE");
     setDocumentState(
       app,
       row,

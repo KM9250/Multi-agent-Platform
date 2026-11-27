@@ -15,6 +15,7 @@ import { revalidateAiSearchOperations } from "../search/profile.ts";
 import { searchAiContext } from "../search/service.ts";
 import { isSourceBoundary, SearchSources } from "../search/sources.ts";
 import type { CompiledContext } from "./context.ts";
+import { excerptBoundary, partialQuoteRanges, type ExcerptRange } from "./context-excerpt.ts";
 import { interpretContextDate, routeContext } from "./context-router.ts";
 import { GenerationError, stable, type Actor, type AppDatabasePort, type GenerationLimits, type PolicyPort } from "./types.ts";
 
@@ -148,8 +149,7 @@ export async function prepareContextPlan(
   };
   const reader = new SearchSources(app, policy, actor, options.roomId, binding);
   const resolved: ResolvedExcerpt[] = [];
-  const requiredAliases = new Set<string>();
-  const selectedTokens = { memory: 32, archive: 32 };
+  const prepared: { source: ContextSource; verified: ResolvedExcerpt; required?: ExcerptRange; hit?: ExcerptRange }[] = [];
   const limits = { memory: 2048, archive: 4096 };
   const ordinarySegments = new Set(options.baseline.manifest.messages.flatMap(message => message.segments.map(segment => segment.id)));
   const targets = route.mode === "both" ? ["memory", "archive"] as const : route.mode === "none" ? [] : [route.mode] as const;
@@ -171,10 +171,11 @@ export async function prepareContextPlan(
     plan.searches.push(search);
     for (const candidate of response.results) {
       if (candidate.citation.target === "archive" && ordinarySegments.has(candidate.citation.segmentId)) continue;
-      if (plan.sources.some(source => sameResource(source.citation, candidate.citation) &&
+      if (prepared.some(({ source }) => sameResource(source.citation, candidate.citation) &&
         (source.citation.version !== candidate.citation.version || (source.citation.start < candidate.citation.end && candidate.citation.start < source.citation.end)))) continue;
       let verified: ResolvedExcerpt;
-      const primary = !plan.sources.some(source => source.citation.target === target);
+      const primary = !prepared.some(({ source }) => source.citation.target === target);
+      let required: ExcerptRange | undefined, hit: ExcerptRange | undefined;
       const fullSource = primary && route.requiresFullSource;
       try {
         verified = await withVerifiedNoteAncestors(app,
@@ -184,18 +185,22 @@ export async function prepareContextPlan(
               // Only explicit whole-Source requests expand the primary hit. Faithful
               // partial quotes and supporting hits retain their verified offsets.
               if (original.text.length > 4096) throw new GenerationError("CONTEXT_LIMIT", 413);
-              return reader.resolve({ ...candidate.citation, start: 0, end: original.text.length });
+              required = { start: 0, end: original.text.length };
+              return reader.resolve({ ...candidate.citation, ...required });
             }
             if (route.requiresExactExcerpt) {
-              // A hit can end inside the requested sentence. Include bounded local
-              // context on both sides, from the same verified original/revision.
               const original = reader.read(candidate.citation);
-              const margin = Math.min(128, Math.max(0, Math.floor((4096 - (candidate.citation.end - candidate.citation.start)) / 2)));
-              let start = Math.max(0, candidate.citation.start - margin);
-              let end = Math.min(original.text.length, candidate.citation.end + margin);
-              if (!isSourceBoundary(original.text, start) || (original.text[start - 1] === "\r" && original.text[start] === "\n")) start++;
-              if (!isSourceBoundary(original.text, end) || (original.text[end - 1] === "\r" && original.text[end] === "\n")) end--;
-              return reader.resolve({ ...candidate.citation, start, end });
+              const ranges = partialQuoteRanges(original.text, candidate.citation, route.query.text,
+                primary && /冒頭|最初の(?:一?文|行)|opening sentence|first (?:sentence|line)/i.test(content));
+              if (primary) {
+                required = ranges.required;
+                hit = ranges.hit;
+                if (required.end - required.start > 4096) throw new GenerationError("CONTEXT_LIMIT", 413);
+              }
+              // Auxiliary candidates may still use a bounded hit when their full
+              // sentence is too large. They cannot make the primary quote fail.
+              const range = ranges.expanded.end - ranges.expanded.start <= 4096 ? ranges.expanded : candidate.citation;
+              return reader.resolve({ ...candidate.citation, ...range });
             }
             let current = reader.resolve(candidate.citation);
             // Chunk offsets may end next to a line break. Keep each CRLF pair whole.
@@ -218,63 +223,91 @@ export async function prepareContextPlan(
         search.status = "partial";
         continue;
       }
-      const source = sourceRecord(`S${plan.sources.length + 1}`, verified);
-      if (plan.sources.some(previous => sameResource(previous.citation, source.citation) &&
+      const source = sourceRecord(`S${prepared.length + 1}`, verified);
+      if (prepared.some(({ source: previous }) => sameResource(previous.citation, source.citation) &&
         previous.citation.start < source.citation.end && source.citation.start < previous.citation.end)) continue;
       if (!verified.current || (target === "memory" ? verified.visibility !== "room_shared" : verified.visibility !== "public")) continue;
-      const available = Math.max(0, limits[target] - selectedTokens[target]);
-      // Binary search a bounded original prefix; never normalize or join source revisions.
-      const fits = (end: number) => {
-        const part = { ...verified, text: verified.text.slice(0, end), citation: { ...verified.citation, end: verified.citation.start + end } };
-        const record = { ...source, citation: part.citation };
-        const own = estimate(stable(reference(record, part.text)));
-        if (!end || own > available) return false;
-        const trial = { ...plan, sources: [...plan.sources, record] };
-        const text = envelope(trial, [...resolved, part]);
-        if (estimate(text + RETRIEVAL_INSTRUCTION) > 6144) return false;
-        const payload = applyContextEnvelope(options.baseline, text);
-        return estimate(payload.systemInstruction + stable(payload.contents)) <= options.limits.maxInputTokens;
-      };
-      if (primary && route.requiresExactExcerpt && !fits(verified.text.length))
-        throw new GenerationError("CONTEXT_LIMIT", 413);
-      let low = 0, high = verified.text.length;
-      while (low < high) { const mid = low + Math.ceil((high - low) / 2); if (fits(safeEnd(verified.text, mid))) low = mid; else high = mid - 1; }
-      let end = safeEnd(verified.text, low);
-      if (!end) continue;
-      if (end < verified.text.length) {
-        if (!search.reasons.includes("EXCERPT_TRUNCATED")) search.reasons.push("EXCERPT_TRUNCATED");
-        search.status = "partial";
-        // Prefer a complete sentence or line when it does not discard most of the useful span.
-        const prefix = verified.text.slice(0, end), boundary = Math.max(prefix.lastIndexOf("\n"), prefix.lastIndexOf("。") + 1, prefix.lastIndexOf(". ") + 1);
-        if (boundary > end / 2) end = safeEnd(verified.text, boundary);
-        verified = { ...verified, text: verified.text.slice(0, end), citation: { ...verified.citation, end: verified.citation.start + end } };
-        source.citation = verified.citation;
-      }
-      selectedTokens[target] += estimate(stable(reference(source, verified.text)));
-      plan.sources.push(source);
-      if (primary && route.requiresExactExcerpt) requiredAliases.add(source.alias);
-      resolved.push(verified);
-      const permission = contextPermission(source);
-      if (!plan.permissions.some(item => stable(item) === stable(permission))) plan.permissions.push(permission);
+      prepared.push({ source, verified, required, hit });
     }
   }
-  let text = envelope(plan, resolved);
-  const totalFits = () => {
-    const packed = applyContextEnvelope(options.baseline, text);
-    return (!text || estimate(text + RETRIEVAL_INSTRUCTION) <= 6144) &&
-      estimate(packed.systemInstruction + stable(packed.contents)) <= options.limits.maxInputTokens;
+  // All searches and original reads finish before packing. Later search metadata
+  // cannot silently consume space reserved for a quote already fixed in the plan.
+  const baseSearches = plan.searches.map(search => ({ status: search.status, reasons: search.reasons.slice() }));
+  const part = (index: number, range: ExcerptRange): ResolvedExcerpt => {
+    const original = prepared[index].verified;
+    const start = range.start - original.citation.start, end = range.end - original.citation.start;
+    if (start < 0 || end > original.text.length || start >= end ||
+      !excerptBoundary(original.text, start) || !excerptBoundary(original.text, end)) throw changed();
+    return { ...original, text: original.text.slice(start, end),
+      citation: { ...original.citation, ...range } };
   };
-  // A later search status can add envelope metadata. Repack before freezing,
-  // without changing normal history, the accepted input, or the selected originals.
-  while (!totalFits() && plan.sources.length) {
-    if (requiredAliases.has(plan.sources.at(-1)!.alias)) throw new GenerationError("CONTEXT_LIMIT", 413);
-    const removed = plan.sources.pop()!;
-    resolved.pop();
-    const search = plan.searches.find(item => item.target === removed.citation.target)!;
-    if (!search.reasons.includes("CONTEXT_CAPACITY")) search.reasons.push("CONTEXT_CAPACITY");
+  const selected: (ResolvedExcerpt | undefined)[] = prepared.map(item => item.verified);
+  let text = "";
+  const fits = () => {
+    plan.sources = []; resolved.length = 0;
+    const tokens = { memory: 32, archive: 32 };
+    plan.searches.forEach((search, index) => {
+      search.status = baseSearches[index].status;
+      search.reasons = baseSearches[index].reasons.slice();
+      const reason = (value: string) => {
+        if (!search.reasons.includes(value)) search.reasons.push(value);
+        search.status = "partial";
+      };
+      prepared.forEach((item, i) => {
+        if (item.source.citation.target !== search.target) return;
+        const value = selected[i];
+        if (!value) reason("CONTEXT_CAPACITY");
+        else if (value.citation.start !== item.verified.citation.start || value.citation.end !== item.verified.citation.end)
+          reason("EXCERPT_TRUNCATED");
+      });
+    });
+    selected.forEach((value, i) => {
+      if (!value) return;
+      const source = { ...prepared[i].source, citation: value.citation };
+      plan.sources.push(source); resolved.push(value);
+      tokens[source.citation.target] += estimate(stable(reference(source, value.text)));
+    });
     text = envelope(plan, resolved);
+    const payload = applyContextEnvelope(options.baseline, text);
+    return tokens.memory <= limits.memory && tokens.archive <= limits.archive &&
+      (!text || estimate(text + RETRIEVAL_INSTRUCTION) <= 6144) &&
+      estimate(payload.systemInstruction + stable(payload.contents)) <= options.limits.maxInputTokens;
+  };
+  // Reserve complete required spans for both targets before optional material.
+  // Every trial includes the actual truncation/capacity reasons in its envelope.
+  // First try the complete selection: removing a very short optional span could
+  // otherwise cost more truncation metadata than the text it saves.
+  const completeFits = fits();
+  if (!completeFits) {
+    prepared.forEach((item, i) => { selected[i] = item.required ? part(i, item.required) : undefined; });
+    if (!fits()) throw new GenerationError("CONTEXT_LIMIT", 413);
   }
-  if (!totalFits()) throw new GenerationError("CONTEXT_LIMIT", 413);
+  for (let index = 0; !completeFits && index < prepared.length; index++) {
+    const item = prepared[index], minimum = selected[index];
+    selected[index] = item.verified;
+    if (fits()) continue;
+    if (item.required) {
+      // Drop the extra margin first, then retain the complete matching sentence
+      // or line. The full-Source case has no smaller required alternative.
+      if (item.hit) { selected[index] = part(index, item.hit); if (fits()) continue; }
+      selected[index] = minimum;
+    } else {
+      let low = 0, high = item.verified.text.length;
+      while (low < high) {
+        const mid = low + Math.ceil((high - low) / 2), end = safeEnd(item.verified.text, mid);
+        selected[index] = end ? part(index, { start: item.verified.citation.start, end: item.verified.citation.start + end }) : undefined;
+        if (end && fits()) low = mid; else high = mid - 1;
+      }
+      let end = safeEnd(item.verified.text, low);
+      const prefix = item.verified.text.slice(0, end);
+      const boundary = Math.max(prefix.lastIndexOf("\n"), prefix.lastIndexOf("。") + 1, prefix.lastIndexOf(". ") + 1);
+      if (boundary > end / 2) end = safeEnd(item.verified.text, boundary);
+      selected[index] = end ? part(index, { start: item.verified.citation.start, end: item.verified.citation.start + end }) : undefined;
+    }
+  }
+  // Protect the chosen exact spans only now; compilation resolves these frozen
+  // offsets and digest, never reselects a range or repeats a search.
+  if (!fits()) throw new GenerationError("CONTEXT_LIMIT", 413);
   plan.permissions = [...new Map(plan.sources.map(source => {
     const permission = contextPermission(source);
     return [stable(permission), permission] as const;

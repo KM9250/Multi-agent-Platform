@@ -28,6 +28,7 @@ function stamp(app: AppDatabase, path: string): string {
       return [stat.dev, stat.ino, stat.size, stat.ctimeNs, stat.mtimeNs].join(":");
     });
   } catch (error) {
+    if (error instanceof NoteVerificationPending) throw error;
     if (error instanceof Error && "code" in error && String(error.code).startsWith("ERR_SQLITE")) throw error;
     return changed();
   }
